@@ -38,3 +38,11 @@ pub const fn uvarint_len(value: u64) -> usize {
     let bits = 64 - (value | 1).leading_zeros() as usize;
     (bits + 6) / 7
 }
+
+const fn zigzag(v: i64) -> u64 {
+    ((v << 1) ^ (v >> 63)) as u64
+}
+
+const fn unzigzag(v: u64) -> i64 {
+    (v >> 1) as i64 ^ -((v & 1) as i64)
+}
