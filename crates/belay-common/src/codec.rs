@@ -457,3 +457,275 @@ impl fmt::Display for DecodeError {
         }
     }
 }
+
+impl std::error::Error for DecodeError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rand::Rng;
+
+    fn kind_of<T: fmt::Debug>(r: Result<T, DecodeError>) -> (usize, DecodeErrorKind) {
+        let e = r.expect_err("decoding should fail");
+        (e.offset(), e.kind().clone())
+    }
+
+    #[test]
+    fn fixed_width_values_are_little_endian() {
+        let mut enc = Encoder::new();
+        enc.put_u16(0x0102)
+            .put_u32(0x0304_0506)
+            .put_u64(1)
+            .put_i64(-1);
+        assert_eq!(
+            enc.as_slice(),
+            &[
+                0x02, 0x01, 0x06, 0x05, 0x04, 0x03, 1, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF,
+                0xFF, 0xFF, 0xFF, 0xFF
+            ]
+        );
+        let mut dec = Decoder::new(enc.as_slice());
+        assert_eq!(dec.get_u16(), Ok(0x0102));
+        assert_eq!(dec.get_u32(), Ok(0x0304_0506));
+        assert_eq!(dec.get_u64(), Ok(1));
+        assert_eq!(dec.get_i64(), Ok(-1));
+        assert!(dec.is_empty());
+    }
+
+    #[test]
+    fn varint_boundaries_and_lengths() {
+        let cases: [(u64, &[u8]); 6] = [
+            (0, &[0x00]),
+            (1, &[0x01]),
+            (127, &[0x7F]),
+            (128, &[0x80, 0x01]),
+            (300, &[0xAC, 0x02]),
+            (16_384, &[0x80, 0x80, 0x01]),
+        ];
+        for (value, bytes) in cases {
+            let mut enc = Encoder::new();
+            enc.put_uvarint(value);
+            assert_eq!(enc.as_slice(), bytes, "{value}");
+            assert_eq!(uvarint_len(value), bytes.len());
+            assert_eq!(Decoder::new(bytes).get_uvarint(), Ok(value));
+        }
+        let mut enc = Encoder::new();
+        enc.put_uvarint(u64::MAX);
+        assert_eq!(enc.len(), MAX_VARINT_LEN);
+        assert_eq!(uvarint_len(u64::MAX), MAX_VARINT_LEN);
+        assert_eq!(Decoder::new(enc.as_slice()).get_uvarint(), Ok(u64::MAX));
+    }
+
+    #[test]
+    fn zigzag_keeps_small_negatives_short() {
+        for (v, z) in [
+            (0i64, 0u64),
+            (-1, 1),
+            (1, 2),
+            (-2, 3),
+            (i64::MAX, u64::MAX - 1),
+            (i64::MIN, u64::MAX),
+        ] {
+            assert_eq!(zigzag(v), z);
+            assert_eq!(unzigzag(z), v);
+        }
+        let mut enc = Encoder::new();
+        enc.put_ivarint(-1).put_ivarint(-64);
+        assert_eq!(enc.as_slice(), &[0x01, 0x7F]);
+    }
+
+    #[test]
+    fn rejects_non_minimal_and_overflowing_varints() {
+        assert_eq!(
+            kind_of(Decoder::new(&[0x80, 0x00]).get_uvarint()),
+            (0, DecodeErrorKind::NonMinimalVarint)
+        );
+        assert_eq!(
+            kind_of(Decoder::new(&[0xFF, 0x80, 0x00]).get_uvarint()),
+            (0, DecodeErrorKind::NonMinimalVarint)
+        );
+        let too_long = [0x80; 11];
+        assert_eq!(
+            kind_of(Decoder::new(&too_long).get_uvarint()),
+            (0, DecodeErrorKind::VarintOverflow)
+        );
+    }
+
+    #[test]
+    fn truncated_input_reports_offset_and_leaves_position() {
+        let mut dec = Decoder::new(&[1, 2, 3]);
+        dec.get_u8().expect("one byte available");
+        assert_eq!(
+            kind_of(dec.get_u32()),
+            (
+                1,
+                DecodeErrorKind::UnexpectedEof {
+                    needed: 4,
+                    available: 2
+                }
+            )
+        );
+        assert_eq!(dec.position(), 1);
+        assert_eq!(dec.rest(), &[2, 3]);
+        assert_eq!(
+            kind_of(Decoder::new(&[0x80]).get_uvarint()),
+            (
+                0,
+                DecodeErrorKind::UnexpectedEof {
+                    needed: 2,
+                    available: 1
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn bytes_and_strings_are_length_prefixed_and_borrowed() {
+        let mut enc = Encoder::new();
+        enc.put_bytes(&[9, 8, 7]).put_str("héllo").put_bytes(&[]);
+        let bytes = enc.into_vec();
+        assert_eq!(&bytes[..4], &[3, 9, 8, 7]);
+        let mut dec = Decoder::new(&bytes);
+        let b = dec.get_bytes().expect("bytes");
+        assert_eq!(b, &[9, 8, 7]);
+        assert!(std::ptr::eq(b.as_ptr(), bytes[1..].as_ptr()), "no copy");
+        assert_eq!(dec.get_str(), Ok("héllo"));
+        assert_eq!(dec.get_bytes(), Ok(&[][..]));
+        dec.expect_end().expect("fully consumed");
+    }
+
+    #[test]
+    fn length_beyond_input_fails_at_the_prefix() {
+        let mut dec = Decoder::new(&[0x05, b'a', b'b']);
+        assert_eq!(
+            kind_of(dec.get_bytes()),
+            (
+                0,
+                DecodeErrorKind::UnexpectedEof {
+                    needed: 5,
+                    available: 2
+                }
+            )
+        );
+        assert_eq!(dec.position(), 0);
+    }
+
+    #[test]
+    fn invalid_utf8_and_bools_are_rejected() {
+        let mut dec = Decoder::new(&[0x02, 0xC3, 0x28]);
+        assert_eq!(kind_of(dec.get_str()), (0, DecodeErrorKind::InvalidUtf8));
+        assert_eq!(dec.position(), 0);
+        let mut dec = Decoder::new(&[1, 0, 2]);
+        assert_eq!(dec.get_bool(), Ok(true));
+        assert_eq!(dec.get_bool(), Ok(false));
+        assert_eq!(
+            kind_of(dec.get_bool()),
+            (2, DecodeErrorKind::InvalidBool(2))
+        );
+        assert_eq!(dec.position(), 2);
+    }
+
+    #[test]
+    fn counts_larger_than_remaining_input_are_rejected() {
+        let mut enc = Encoder::new();
+        enc.put_count(3).put_raw(&[1, 2, 3]);
+        let mut dec = Decoder::new(enc.as_slice());
+        assert_eq!(dec.get_count(), Ok(3));
+
+        let mut enc = Encoder::new();
+        enc.put_uvarint(u64::MAX).put_u8(0);
+        let mut dec = Decoder::new(enc.as_slice());
+        assert_eq!(
+            kind_of(dec.get_count()),
+            (
+                0,
+                DecodeErrorKind::CountTooLarge {
+                    count: u64::MAX,
+                    available: 1
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn expect_end_and_custom_errors() {
+        let mut dec = Decoder::new(&[7, 1, 2]);
+        dec.get_u8().expect("byte");
+        let e = dec.expect_end().unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "decode error at offset 1: 2 unexpected trailing bytes"
+        );
+        let e = dec.invalid(format!("unknown record type {}", 7));
+        assert_eq!(
+            e.to_string(),
+            "decode error at offset 1: unknown record type 7"
+        );
+        let e = DecodeError::new(40, DecodeErrorKind::InvalidBool(9));
+        assert_eq!(
+            e.to_string(),
+            "decode error at offset 40: invalid boolean byte 0x09"
+        );
+    }
+
+    #[test]
+    fn floats_round_trip_bit_exactly() {
+        let nan = f64::from_bits(0x7FF8_0000_0000_1234);
+        let mut enc = Encoder::with_capacity(32);
+        enc.put_f64(-0.0).put_f64(nan).put_f64(f64::INFINITY);
+        let mut dec = Decoder::new(enc.as_slice());
+        assert_eq!(dec.get_f64().map(f64::to_bits), Ok((-0.0f64).to_bits()));
+        assert_eq!(dec.get_f64().map(f64::to_bits), Ok(nan.to_bits()));
+        assert_eq!(dec.get_f64(), Ok(f64::INFINITY));
+    }
+
+    #[test]
+    fn random_mixed_sequences_round_trip() {
+        let mut rng = Rng::seed_from_u64(30);
+        for _ in 0..200 {
+            let values: Vec<(u8, u64)> = (0..rng.gen_range(0..20usize))
+                .map(|_| {
+                    (
+                        rng.gen_range(0..4u8),
+                        rng.next_u64() >> rng.gen_range(0..64u32),
+                    )
+                })
+                .collect();
+            let mut enc = Encoder::from_vec(vec![0xAA]);
+            for &(tag, v) in &values {
+                match tag {
+                    0 => enc.put_uvarint(v),
+                    1 => enc.put_ivarint(v as i64),
+                    2 => enc.put_u64(v),
+                    _ => enc.put_str(&v.to_string()),
+                };
+            }
+            let bytes = enc.into_vec();
+            let mut dec = Decoder::new(&bytes);
+            assert_eq!(dec.get_u8(), Ok(0xAA));
+            for &(tag, v) in &values {
+                match tag {
+                    0 => assert_eq!(dec.get_uvarint(), Ok(v)),
+                    1 => assert_eq!(dec.get_ivarint(), Ok(v as i64)),
+                    2 => assert_eq!(dec.get_u64(), Ok(v)),
+                    _ => assert_eq!(dec.get_str().map(str::to_owned), Ok(v.to_string())),
+                }
+            }
+            dec.expect_end().expect("no trailing bytes");
+        }
+    }
+
+    #[test]
+    fn encoder_buffer_management() {
+        let mut enc = Encoder::new();
+        assert!(enc.is_empty());
+        enc.put_bool(true).put_raw(b"xy");
+        assert_eq!(enc.len(), 3);
+        enc.clear();
+        assert!(enc.is_empty());
+        let mut dec = Decoder::new(b"abcd");
+        assert_eq!(dec.get_array::<2>(), Ok(*b"ab"));
+        assert_eq!(dec.remaining(), 2);
+        assert_eq!(dec.get_raw(2), Ok(&b"cd"[..]));
+    }
+}
