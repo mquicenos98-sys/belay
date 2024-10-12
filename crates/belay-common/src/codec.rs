@@ -374,3 +374,86 @@ impl<'a> Decoder<'a> {
         })
     }
 }
+
+/// Failure to decode, with the offset of the value that could not be read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodeError {
+    offset: usize,
+    kind: DecodeErrorKind,
+}
+
+impl DecodeError {
+    /// An error of `kind` at `offset`, for decoders built on top of this one.
+    #[must_use]
+    pub fn new(offset: usize, kind: DecodeErrorKind) -> DecodeError {
+        DecodeError { offset, kind }
+    }
+
+    /// Byte offset of the value that failed to decode.
+    #[must_use]
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// What went wrong.
+    #[must_use]
+    pub fn kind(&self) -> &DecodeErrorKind {
+        &self.kind
+    }
+}
+
+/// The reason decoding failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DecodeErrorKind {
+    /// The input ended inside a value.
+    UnexpectedEof {
+        /// Bytes the value needs (for varints, at least this many).
+        needed: usize,
+        /// Bytes that were left.
+        available: usize,
+    },
+    /// A varint does not fit in 64 bits.
+    VarintOverflow,
+    /// A varint has redundant trailing zero groups.
+    NonMinimalVarint,
+    /// An element count exceeds the remaining input.
+    CountTooLarge {
+        /// The decoded count.
+        count: u64,
+        /// Bytes that were left after the count.
+        available: usize,
+    },
+    /// A string is not valid UTF-8.
+    InvalidUtf8,
+    /// A boolean byte other than 0 or 1.
+    InvalidBool(u8),
+    /// Input remained after the last expected value.
+    TrailingBytes(usize),
+    /// A format-level check failed.
+    Invalid(String),
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "decode error at offset {}: ", self.offset)?;
+        match &self.kind {
+            DecodeErrorKind::UnexpectedEof { needed, available } => {
+                write!(
+                    f,
+                    "unexpected end of input (needed {needed} bytes, {available} available)"
+                )
+            }
+            DecodeErrorKind::VarintOverflow => f.write_str("varint does not fit in 64 bits"),
+            DecodeErrorKind::NonMinimalVarint => f.write_str("varint is not minimally encoded"),
+            DecodeErrorKind::CountTooLarge { count, available } => write!(
+                f,
+                "element count {count} exceeds the {available} remaining bytes"
+            ),
+            DecodeErrorKind::InvalidUtf8 => f.write_str("string is not valid UTF-8"),
+            DecodeErrorKind::InvalidBool(b) => write!(f, "invalid boolean byte {b:#04x}"),
+            DecodeErrorKind::TrailingBytes(n) => write!(f, "{n} unexpected trailing bytes"),
+            DecodeErrorKind::Invalid(message) => f.write_str(message),
+        }
+    }
+}
