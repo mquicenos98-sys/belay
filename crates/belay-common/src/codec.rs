@@ -177,3 +177,200 @@ impl Encoder {
         self.buf.clear();
     }
 }
+
+/// Reads values back from a byte slice. Borrowed byte strings and strings
+/// point into the input, so decoding does not copy.
+#[derive(Clone, Debug)]
+pub struct Decoder<'a> {
+    buf: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Decoder<'a> {
+    /// A decoder at the start of `buf`.
+    #[must_use]
+    pub fn new(buf: &'a [u8]) -> Decoder<'a> {
+        Decoder { buf, pos: 0 }
+    }
+
+    /// Current offset from the start of the input.
+    #[must_use]
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    /// Bytes left to read.
+    #[must_use]
+    pub fn remaining(&self) -> usize {
+        self.buf.len() - self.pos
+    }
+
+    /// Whether everything has been read.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.remaining() == 0
+    }
+
+    /// The unread bytes, without consuming them.
+    #[must_use]
+    pub fn rest(&self) -> &'a [u8] {
+        &self.buf[self.pos..]
+    }
+
+    /// Fails with [`DecodeErrorKind::TrailingBytes`] unless everything has
+    /// been read.
+    pub fn expect_end(&self) -> Result<(), DecodeError> {
+        match self.remaining() {
+            0 => Ok(()),
+            n => Err(self.error_here(DecodeErrorKind::TrailingBytes(n))),
+        }
+    }
+
+    /// An [`Invalid`](DecodeErrorKind::Invalid) error at the current offset,
+    /// for format-level checks such as an unknown record type.
+    #[must_use]
+    pub fn invalid(&self, message: impl Into<String>) -> DecodeError {
+        self.error_here(DecodeErrorKind::Invalid(message.into()))
+    }
+
+    fn error_here(&self, kind: DecodeErrorKind) -> DecodeError {
+        DecodeError {
+            offset: self.pos,
+            kind,
+        }
+    }
+
+    /// Reads exactly `n` bytes, borrowed from the input.
+    pub fn get_raw(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+        if n > self.remaining() {
+            return Err(self.error_here(DecodeErrorKind::UnexpectedEof {
+                needed: n,
+                available: self.remaining(),
+            }));
+        }
+        let bytes = &self.buf[self.pos..self.pos + n];
+        self.pos += n;
+        Ok(bytes)
+    }
+
+    /// Reads exactly `N` bytes into an array.
+    pub fn get_array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+        let mut out = [0u8; N];
+        out.copy_from_slice(self.get_raw(N)?);
+        Ok(out)
+    }
+
+    /// Reads one byte.
+    pub fn get_u8(&mut self) -> Result<u8, DecodeError> {
+        Ok(self.get_array::<1>()?[0])
+    }
+
+    /// Reads a little-endian `u16`.
+    pub fn get_u16(&mut self) -> Result<u16, DecodeError> {
+        self.get_array().map(u16::from_le_bytes)
+    }
+
+    /// Reads a little-endian `u32`.
+    pub fn get_u32(&mut self) -> Result<u32, DecodeError> {
+        self.get_array().map(u32::from_le_bytes)
+    }
+
+    /// Reads a little-endian `u64`.
+    pub fn get_u64(&mut self) -> Result<u64, DecodeError> {
+        self.get_array().map(u64::from_le_bytes)
+    }
+
+    /// Reads a little-endian `i64`.
+    pub fn get_i64(&mut self) -> Result<i64, DecodeError> {
+        self.get_array().map(i64::from_le_bytes)
+    }
+
+    /// Reads an `f64` from its little-endian bits.
+    pub fn get_f64(&mut self) -> Result<f64, DecodeError> {
+        self.get_u64().map(f64::from_bits)
+    }
+
+    /// Reads a boolean; any byte other than `0` or `1` is an error.
+    pub fn get_bool(&mut self) -> Result<bool, DecodeError> {
+        let start = self.pos;
+        match self.get_u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            other => {
+                self.pos = start;
+                Err(self.error_here(DecodeErrorKind::InvalidBool(other)))
+            }
+        }
+    }
+
+    /// Reads an unsigned LEB128 varint in its minimal encoding.
+    pub fn get_uvarint(&mut self) -> Result<u64, DecodeError> {
+        let start = self.pos;
+        let mut value = 0u64;
+        for i in 0..MAX_VARINT_LEN {
+            let Some(&byte) = self.buf.get(start + i) else {
+                return Err(self.error_here(DecodeErrorKind::UnexpectedEof {
+                    needed: i + 1,
+                    available: i,
+                }));
+            };
+            value |= u64::from(byte & 0x7F) << (7 * i);
+            if byte & 0x80 == 0 {
+                if byte == 0 && i > 0 {
+                    return Err(self.error_here(DecodeErrorKind::NonMinimalVarint));
+                }
+                self.pos = start + i + 1;
+                return Ok(value);
+            }
+        }
+        // Ten bytes, each with its continuation bit set.
+        Err(self.error_here(DecodeErrorKind::VarintOverflow))
+    }
+
+    /// Reads a zigzag-encoded signed varint.
+    pub fn get_ivarint(&mut self) -> Result<i64, DecodeError> {
+        self.get_uvarint().map(unzigzag)
+    }
+
+    /// Reads an element count written by [`Encoder::put_count`].
+    ///
+    /// Counts larger than the remaining input are rejected, on the basis
+    /// that every element takes at least one byte; a corrupt count therefore
+    /// cannot make the caller pre-allocate a huge collection.
+    pub fn get_count(&mut self) -> Result<usize, DecodeError> {
+        let start = self.pos;
+        let n = self.get_uvarint()?;
+        let available = self.remaining();
+        match usize::try_from(n) {
+            Ok(n) if n <= available => Ok(n),
+            _ => {
+                self.pos = start;
+                Err(self.error_here(DecodeErrorKind::CountTooLarge {
+                    count: n,
+                    available,
+                }))
+            }
+        }
+    }
+
+    /// Reads a length-prefixed byte string, borrowed from the input.
+    pub fn get_bytes(&mut self) -> Result<&'a [u8], DecodeError> {
+        let start = self.pos;
+        let len = self.get_uvarint()?;
+        let len = usize::try_from(len).unwrap_or(usize::MAX);
+        self.get_raw(len).map_err(|e| {
+            self.pos = start;
+            DecodeError { offset: start, ..e }
+        })
+    }
+
+    /// Reads a length-prefixed UTF-8 string, borrowed from the input.
+    pub fn get_str(&mut self) -> Result<&'a str, DecodeError> {
+        let start = self.pos;
+        let bytes = self.get_bytes()?;
+        std::str::from_utf8(bytes).map_err(|_| {
+            self.pos = start;
+            self.error_here(DecodeErrorKind::InvalidUtf8)
+        })
+    }
+}
