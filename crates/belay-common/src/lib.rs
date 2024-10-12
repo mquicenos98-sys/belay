@@ -32,13 +32,22 @@
 #![warn(missing_docs)]
 
 pub mod backoff;
-
 pub mod codec;
-
 pub mod duration;
-
 mod error;
-
 pub mod fs;
-
 pub mod hash;
+pub mod id;
+pub mod log;
+pub mod rand;
+pub mod sync;
+pub mod text;
+pub mod time;
+
+pub use backoff::BackoffPolicy;
+pub use duration::{format_duration, parse_duration};
+pub use error::{Error, Result};
+pub use id::Ulid;
+pub use rand::Rng;
+pub use sync::Shutdown;
+pub use time::{system_clock, Clock, ManualClock, SharedClock, SystemClock, Timestamp};
