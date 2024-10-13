@@ -126,3 +126,65 @@ pub fn crc32c(data: &[u8]) -> u32 {
 pub fn crc32c_append(crc: u32, data: &[u8]) -> u32 {
     !crc32c_update(!crc, data)
 }
+
+/// Rotates and offsets a CRC before it is stored next to the data it covers.
+///
+/// Computing the CRC of a buffer that itself contains CRCs tends to yield
+/// degenerate values (the CRC of data followed by its own CRC is constant);
+/// masking, as LevelDB does, breaks that relationship.
+#[must_use]
+pub const fn crc32c_mask(crc: u32) -> u32 {
+    crc.rotate_right(15).wrapping_add(0xA282_EAD8)
+}
+
+/// Inverse of [`crc32c_mask`].
+#[must_use]
+pub const fn crc32c_unmask(masked: u32) -> u32 {
+    masked.wrapping_sub(0xA282_EAD8).rotate_left(15)
+}
+
+/// Incremental CRC-32C. Also an `io::Write` sink, so a file can be checked
+/// with `io::copy(&mut file, &mut crc)`.
+///
+/// ```
+/// use belay_common::hash::{crc32c, Crc32c};
+///
+/// let mut crc = Crc32c::new();
+/// crc.update(b"1234");
+/// crc.update(b"56789");
+/// assert_eq!(crc.finalize(), crc32c(b"123456789"));
+/// ```
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Crc32c {
+    register: u32,
+}
+
+impl Crc32c {
+    /// A CRC over no data yet.
+    #[must_use]
+    pub const fn new() -> Crc32c {
+        Crc32c { register: !0 }
+    }
+
+    /// Feeds `data`.
+    pub fn update(&mut self, data: &[u8]) {
+        self.register = crc32c_update(self.register, data);
+    }
+
+    /// The CRC of everything fed so far. Further updates may follow.
+    #[must_use]
+    pub const fn finalize(&self) -> u32 {
+        !self.register
+    }
+
+    /// Starts over.
+    pub fn reset(&mut self) {
+        *self = Crc32c::new();
+    }
+}
+
+impl Default for Crc32c {
+    fn default() -> Self {
+        Crc32c::new()
+    }
+}
