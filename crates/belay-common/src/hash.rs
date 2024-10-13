@@ -49,3 +49,80 @@ impl Hasher for FnvHasher {
         }
     }
 }
+
+/// `BuildHasher` for [`FnvHasher`], e.g. `HashMap<K, V, FnvBuildHasher>`.
+pub type FnvBuildHasher = BuildHasherDefault<FnvHasher>;
+
+/// CRC-32C (Castagnoli) polynomial, bit-reflected.
+const CRC32C_POLY: u32 = 0x82F6_3B78;
+
+/// Slicing-by-8 tables: `TABLES[0]` is the classic byte-at-a-time table and
+/// `TABLES[k][b]` is the CRC of byte `b` followed by `k` zero bytes, which
+/// lets the main loop fold eight input bytes per step.
+static CRC32C_TABLES: [[u32; 256]; 8] = crc32c_tables();
+
+const fn crc32c_tables() -> [[u32; 256]; 8] {
+    let mut tables = [[0u32; 256]; 8];
+    let mut i = 0;
+    while i < 256 {
+        let mut crc = i as u32;
+        let mut bit = 0;
+        while bit < 8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ CRC32C_POLY
+            } else {
+                crc >> 1
+            };
+            bit += 1;
+        }
+        tables[0][i] = crc;
+        i += 1;
+    }
+    let mut k = 1;
+    while k < 8 {
+        let mut i = 0;
+        while i < 256 {
+            let prev = tables[k - 1][i];
+            tables[k][i] = (prev >> 8) ^ tables[0][(prev & 0xFF) as usize];
+            i += 1;
+        }
+        k += 1;
+    }
+    tables
+}
+
+/// Advances a raw (pre-inverted) CRC register over `data`.
+fn crc32c_update(mut crc: u32, data: &[u8]) -> u32 {
+    let t = &CRC32C_TABLES;
+    let mut chunks = data.chunks_exact(8);
+    for c in &mut chunks {
+        let lo = crc ^ u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+        let hi = u32::from_le_bytes([c[4], c[5], c[6], c[7]]);
+        crc = t[7][(lo & 0xFF) as usize]
+            ^ t[6][((lo >> 8) & 0xFF) as usize]
+            ^ t[5][((lo >> 16) & 0xFF) as usize]
+            ^ t[4][(lo >> 24) as usize]
+            ^ t[3][(hi & 0xFF) as usize]
+            ^ t[2][((hi >> 8) & 0xFF) as usize]
+            ^ t[1][((hi >> 16) & 0xFF) as usize]
+            ^ t[0][(hi >> 24) as usize];
+    }
+    for &b in chunks.remainder() {
+        crc = t[0][((crc ^ u32::from(b)) & 0xFF) as usize] ^ (crc >> 8);
+    }
+    crc
+}
+
+/// CRC-32C of `data`, as used by iSCSI (RFC 3720), ext4 and many storage
+/// formats. `crc32c(b"123456789") == 0xE306_9283`.
+#[must_use]
+pub fn crc32c(data: &[u8]) -> u32 {
+    !crc32c_update(!0, data)
+}
+
+/// Extends a finished CRC-32C with more data:
+/// `crc32c_append(crc32c(a), b) == crc32c(a ++ b)`.
+#[must_use]
+pub fn crc32c_append(crc: u32, data: &[u8]) -> u32 {
+    !crc32c_update(!crc, data)
+}
