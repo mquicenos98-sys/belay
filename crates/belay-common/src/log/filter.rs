@@ -101,3 +101,22 @@ impl Filter {
             .fold(self.default, LevelFilter::max)
     }
 }
+
+fn covers(prefix: &str, target: &str) -> bool {
+    target.starts_with(prefix)
+}
+
+/// `info` with no overrides.
+impl Default for Filter {
+    fn default() -> Self {
+        Filter::new(LevelFilter::Info)
+    }
+}
+
+impl FromStr for Filter {
+    type Err = LogConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Filter::parse(s)
+    }
+}
