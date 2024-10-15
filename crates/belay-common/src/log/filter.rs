@@ -120,3 +120,74 @@ impl FromStr for Filter {
         Filter::parse(s)
     }
 }
+
+/// Renders the directive form accepted by [`Filter::parse`].
+impl fmt::Display for Filter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.default)?;
+        for (target, level) in &self.directives {
+            write!(f, ",{target}={level}")?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log::Level;
+
+    #[test]
+    fn default_filter_is_info() {
+        let f = Filter::default();
+        assert_eq!(f.level_for("anything"), LevelFilter::Info);
+        assert!(f.enabled(&Metadata::new(Level::Info, "x")));
+        assert!(!f.enabled(&Metadata::new(Level::Debug, "x")));
+        assert_eq!(Filter::parse(""), Ok(Filter::default()));
+    }
+
+    #[test]
+    fn most_specific_directive_wins_regardless_of_order() {
+        let a = Filter::parse("a::b::c=trace,a=warn,a::b=off").expect("valid");
+        let b = Filter::parse("a::b=off,a=warn,a::b::c=trace").expect("valid");
+        for f in [&a, &b] {
+            assert_eq!(f.level_for("a::x"), LevelFilter::Warn);
+            assert_eq!(f.level_for("a::b::d"), LevelFilter::Off);
+            assert_eq!(f.level_for("a::b::c::e"), LevelFilter::Trace);
+        }
+    }
+
+    #[test]
+    fn later_directives_replace_earlier_ones() {
+        let f = Filter::parse("debug, x=info , x=error, warn,").expect("valid");
+        assert_eq!(f.level_for("x"), LevelFilter::Error);
+        assert_eq!(f.level_for("y"), LevelFilter::Warn);
+        assert_eq!(f.to_string(), "warn,x=error");
+    }
+
+    #[test]
+    fn max_level_covers_every_directive() {
+        assert_eq!(Filter::new(LevelFilter::Off).max_level(), LevelFilter::Off);
+        let f = Filter::new(Level::Warn).with_target("chatty", Level::Trace);
+        assert_eq!(f.max_level(), LevelFilter::Trace);
+    }
+
+    #[test]
+    fn display_round_trips() {
+        let f = Filter::parse("info,belay_http=warn,belay_store::wal=trace").expect("valid");
+        assert_eq!(f.to_string().parse::<Filter>(), Ok(f));
+    }
+
+    #[test]
+    fn rejects_bad_directives() {
+        assert_eq!(
+            Filter::parse("info,=debug").unwrap_err().to_string(),
+            "log filter directive \"=debug\" has an empty target"
+        );
+        assert_eq!(
+            Filter::parse("belay=loud"),
+            Err(LogConfigError::UnknownLevel("loud".to_owned()))
+        );
+        assert!(Filter::parse("verbose").is_err());
+    }
+}
