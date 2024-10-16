@@ -15,3 +15,28 @@ mod pool;
 mod shutdown;
 
 mod ticker;
+
+mod wait_group;
+
+use std::sync::{Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::Duration;
+
+pub use pool::ThreadPool;
+pub use shutdown::Shutdown;
+pub use ticker::{spawn_periodic, Tick, Ticker};
+pub use wait_group::WaitGroup;
+
+/// Locks `mutex`, recovering the guard if a previous holder panicked.
+pub fn lock<T: ?Sized>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Read-locks `rwlock`, recovering from poisoning.
+pub fn read<T: ?Sized>(rwlock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+    rwlock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Write-locks `rwlock`, recovering from poisoning.
+pub fn write<T: ?Sized>(rwlock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+    rwlock.write().unwrap_or_else(|e| e.into_inner())
+}
