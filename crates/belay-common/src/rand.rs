@@ -263,3 +263,194 @@ impl SampleRange<f64> for Range<f64> {
 thread_local! {
     static THREAD_RNG: RefCell<Rng> = RefCell::new(Rng::from_entropy());
 }
+
+/// A fresh generator forked from a per-thread entropy-seeded stream.
+///
+/// Cheap enough to call wherever randomness is needed; the returned `Rng` is
+/// independent of every other one handed out.
+///
+/// ```
+/// use belay_common::rand::thread_rng;
+///
+/// let mut rng = thread_rng();
+/// let mut ids = [1, 2, 3, 4];
+/// rng.shuffle(&mut ids);
+/// ```
+#[must_use]
+pub fn thread_rng() -> Rng {
+    THREAD_RNG
+        .try_with(|rng| rng.borrow_mut().fork())
+        // Only during thread-local destruction.
+        .unwrap_or_else(|_| Rng::from_entropy())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splitmix64_matches_reference_output() {
+        let mut sm = SplitMix64(0);
+        assert_eq!(sm.next(), 0xE220_A839_7B1D_CDAF);
+    }
+
+    #[test]
+    fn xoshiro256starstar_matches_reference_output() {
+        let mut rng = Rng { s: [1, 2, 3, 4] };
+        let expected = [11_520, 0, 1_509_978_240, 1_215_971_899_390_074_240];
+        for e in expected {
+            assert_eq!(rng.next_u64(), e);
+        }
+    }
+
+    #[test]
+    fn same_seed_same_stream_different_seed_different_stream() {
+        let mut a = Rng::seed_from_u64(1);
+        let mut b = Rng::seed_from_u64(1);
+        let mut c = Rng::seed_from_u64(2);
+        let xs: Vec<u64> = (0..16).map(|_| a.next_u64()).collect();
+        let ys: Vec<u64> = (0..16).map(|_| b.next_u64()).collect();
+        let zs: Vec<u64> = (0..16).map(|_| c.next_u64()).collect();
+        assert_eq!(xs, ys);
+        assert_ne!(xs, zs);
+    }
+
+    #[test]
+    fn entropy_and_thread_generators_differ() {
+        let mut a = Rng::from_entropy();
+        let mut b = Rng::from_entropy();
+        assert_ne!(a.next_u64(), b.next_u64());
+        let mut c = thread_rng();
+        let mut d = thread_rng();
+        assert_ne!(c.next_u64(), d.next_u64());
+        let from_other_thread = std::thread::spawn(|| thread_rng().next_u64())
+            .join()
+            .expect("thread panicked");
+        assert_ne!(from_other_thread, thread_rng().next_u64());
+    }
+
+    #[test]
+    fn gen_range_stays_in_bounds_and_hits_both_ends() {
+        let mut rng = Rng::seed_from_u64(3);
+        let mut seen = [false; 5];
+        for _ in 0..1_000 {
+            let v = rng.gen_range(10..15u64);
+            assert!((10..15).contains(&v));
+            seen[(v - 10) as usize] = true;
+        }
+        assert!(seen.iter().all(|&s| s));
+
+        let mut lo = false;
+        let mut hi = false;
+        for _ in 0..1_000 {
+            let v: i32 = rng.gen_range(-3..=3);
+            assert!((-3..=3).contains(&v));
+            lo |= v == -3;
+            hi |= v == 3;
+        }
+        assert!(lo && hi);
+    }
+
+    #[test]
+    fn gen_range_handles_extreme_bounds() {
+        let mut rng = Rng::seed_from_u64(4);
+        for _ in 0..100 {
+            let _: u64 = rng.gen_range(0..=u64::MAX);
+            let v: i64 = rng.gen_range(i64::MIN..i64::MAX);
+            assert!(v < i64::MAX);
+            let b: u8 = rng.gen_range(0..=255);
+            let _ = b;
+            let s: i8 = rng.gen_range(-128..=127);
+            let _ = s;
+        }
+        assert_eq!(rng.gen_range(7..8u32), 7);
+        assert_eq!(rng.gen_range(9..=9usize), 9);
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot sample from empty range 5..5")]
+    fn gen_range_panics_on_empty_range() {
+        Rng::seed_from_u64(0).gen_range(5..5u32);
+    }
+
+    #[test]
+    fn gen_range_is_roughly_uniform() {
+        // 60k draws over 3 buckets: each should be within 3% of 20k. The
+        // seed is fixed, so this is deterministic, not flaky.
+        let mut rng = Rng::seed_from_u64(5);
+        let mut counts = [0u32; 3];
+        for _ in 0..60_000 {
+            counts[rng.gen_range(0..3usize)] += 1;
+        }
+        for c in counts {
+            assert!((19_400..=20_600).contains(&c), "{counts:?}");
+        }
+    }
+
+    #[test]
+    fn float_range_is_half_open() {
+        let mut rng = Rng::seed_from_u64(6);
+        for _ in 0..1_000 {
+            let v = rng.gen_range(-1.5..2.5);
+            assert!((-1.5..2.5).contains(&v));
+            let u = rng.gen_f64();
+            assert!((0.0..1.0).contains(&u));
+        }
+    }
+
+    #[test]
+    fn gen_bool_edge_probabilities() {
+        let mut rng = Rng::seed_from_u64(7);
+        for _ in 0..100 {
+            assert!(!rng.gen_bool(0.0));
+            assert!(!rng.gen_bool(-1.0));
+            assert!(!rng.gen_bool(f64::NAN));
+            assert!(rng.gen_bool(1.0));
+            assert!(rng.gen_bool(2.0));
+        }
+        let hits = (0..10_000).filter(|_| rng.gen_bool(0.25)).count();
+        assert!((2_300..=2_700).contains(&hits), "{hits}");
+    }
+
+    #[test]
+    fn shuffle_permutes_and_choose_picks_members() {
+        let mut rng = Rng::seed_from_u64(8);
+        let mut v: Vec<u32> = (0..50).collect();
+        rng.shuffle(&mut v);
+        assert_ne!(v, (0..50).collect::<Vec<_>>());
+        let mut sorted = v.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, (0..50).collect::<Vec<_>>());
+
+        let empty: [u8; 0] = [];
+        assert_eq!(rng.choose(&empty), None);
+        let one = [42];
+        assert_eq!(rng.choose(&one), Some(&42));
+        let picked = rng.choose(&v).copied();
+        assert!(picked.is_some_and(|p| p < 50));
+
+        let mut single = [1];
+        rng.shuffle(&mut single);
+        rng.shuffle(&mut [] as &mut [u8]);
+    }
+
+    #[test]
+    fn fill_bytes_covers_partial_words_deterministically() {
+        let mut a = Rng::seed_from_u64(9);
+        let mut b = Rng::seed_from_u64(9);
+        let mut x = [0u8; 13];
+        let mut y = [0u8; 13];
+        a.fill_bytes(&mut x);
+        b.fill_bytes(&mut y);
+        assert_eq!(x, y);
+        assert!(x[8..].iter().any(|&byte| byte != 0));
+    }
+
+    #[test]
+    fn fork_yields_an_independent_stream() {
+        let mut parent = Rng::seed_from_u64(10);
+        let mut child = parent.fork();
+        assert_ne!(parent.next_u64(), child.next_u64());
+        assert_eq!(format!("{child:?}"), "Rng { .. }");
+    }
+}
