@@ -158,3 +158,143 @@ impl Shutdown {
         child
     }
 }
+
+impl Default for Shutdown {
+    fn default() -> Self {
+        Shutdown::new()
+    }
+}
+
+impl fmt::Debug for Shutdown {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Shutdown")
+            .field("triggered", &self.is_triggered())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+    use std::thread;
+
+    #[test]
+    fn trigger_is_visible_to_all_clones() {
+        let a = Shutdown::new();
+        let b = a.clone();
+        assert!(!b.is_triggered());
+        assert!(a.trigger());
+        assert!(b.is_triggered());
+        assert!(!b.trigger(), "second trigger reports false");
+    }
+
+    #[test]
+    fn wait_timeout_returns_false_when_not_triggered() {
+        let s = Shutdown::new();
+        let start = Instant::now();
+        assert!(!s.wait_timeout(Duration::from_millis(10)));
+        assert!(start.elapsed() >= Duration::from_millis(10));
+    }
+
+    #[test]
+    fn waiters_wake_promptly_on_trigger() {
+        let s = Shutdown::new();
+        let waiters: Vec<_> = (0..3)
+            .map(|i| {
+                let s = s.clone();
+                thread::spawn(move || {
+                    if i == 0 {
+                        s.wait();
+                        true
+                    } else {
+                        s.wait_timeout(Duration::from_secs(60))
+                    }
+                })
+            })
+            .collect();
+        let start = Instant::now();
+        s.trigger();
+        for w in waiters {
+            assert!(w.join().expect("waiter panicked"));
+        }
+        assert!(start.elapsed() < Duration::from_secs(10));
+    }
+
+    #[test]
+    fn waiting_after_trigger_returns_immediately() {
+        let s = Shutdown::new();
+        s.trigger();
+        s.wait();
+        assert!(s.wait_timeout(Duration::from_secs(60)));
+        assert!(s.wait_timeout(Duration::MAX));
+    }
+
+    #[test]
+    fn callbacks_run_once_and_late_registrations_run_immediately() {
+        let s = Shutdown::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        for _ in 0..2 {
+            let c = Arc::clone(&count);
+            s.on_trigger(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+            });
+        }
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        s.trigger();
+        s.trigger();
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let c = Arc::clone(&count);
+        s.on_trigger(move || {
+            c.fetch_add(10, Ordering::SeqCst);
+        });
+        assert_eq!(count.load(Ordering::SeqCst), 12);
+    }
+
+    #[test]
+    fn callbacks_may_use_the_signal_without_deadlocking() {
+        let s = Shutdown::new();
+        let s2 = s.clone();
+        let observed = Arc::new(AtomicBool::new(false));
+        let o = Arc::clone(&observed);
+        s.on_trigger(move || {
+            o.store(
+                s2.is_triggered() && s2.wait_timeout(Duration::ZERO),
+                Ordering::SeqCst,
+            );
+        });
+        s.trigger();
+        assert!(observed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn child_follows_parent_but_not_the_reverse() {
+        let parent = Shutdown::new();
+        let child = parent.child();
+        let grandchild = child.child();
+        child.trigger();
+        assert!(child.is_triggered() && grandchild.is_triggered());
+        assert!(!parent.is_triggered());
+
+        let other = parent.child();
+        parent.trigger();
+        assert!(other.is_triggered());
+        assert!(parent.child().is_triggered(), "child of a triggered parent");
+    }
+
+    #[test]
+    fn dropped_children_are_not_kept_alive() {
+        let parent = Shutdown::new();
+        let child = parent.child();
+        let weak = Arc::downgrade(&child.inner);
+        drop(child);
+        assert!(weak.upgrade().is_none());
+        parent.trigger();
+    }
+
+    #[test]
+    fn debug_shows_state() {
+        let s = Shutdown::default();
+        assert_eq!(format!("{s:?}"), "Shutdown { triggered: false }");
+    }
+}
