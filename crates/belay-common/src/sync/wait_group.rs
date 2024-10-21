@@ -82,3 +82,87 @@ impl WaitGroup {
         *lock(&self.inner.count)
     }
 }
+
+impl Default for WaitGroup {
+    fn default() -> Self {
+        WaitGroup::new()
+    }
+}
+
+impl Clone for WaitGroup {
+    fn clone(&self) -> Self {
+        *lock(&self.inner.count) += 1;
+        WaitGroup {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+impl Drop for WaitGroup {
+    fn drop(&mut self) {
+        let mut count = lock(&self.inner.count);
+        *count -= 1;
+        if *count == 0 {
+            self.inner.condvar.notify_all();
+        }
+    }
+}
+
+impl fmt::Debug for WaitGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WaitGroup")
+            .field("count", &self.count())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    #[test]
+    fn wait_returns_after_all_members_drop() {
+        let wg = WaitGroup::new();
+        let done = Arc::new(AtomicUsize::new(0));
+        for _ in 0..8 {
+            let member = wg.clone();
+            let done = Arc::clone(&done);
+            thread::spawn(move || {
+                done.fetch_add(1, Ordering::SeqCst);
+                drop(member);
+            });
+        }
+        wg.wait();
+        assert_eq!(done.load(Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn wait_with_no_other_members_returns_immediately() {
+        WaitGroup::new().wait();
+        assert!(WaitGroup::default().wait_timeout(Duration::ZERO));
+    }
+
+    #[test]
+    fn panicking_member_still_releases_the_group() {
+        let wg = WaitGroup::new();
+        let member = wg.clone();
+        let handle = thread::spawn(move || {
+            let _member = member;
+            panic!("worker failed on purpose");
+        });
+        assert!(wg.wait_timeout(Duration::from_secs(30)));
+        assert!(handle.join().is_err());
+    }
+
+    #[test]
+    fn wait_timeout_gives_up_while_members_remain() {
+        let wg = WaitGroup::new();
+        let straggler = wg.clone();
+        assert_eq!(wg.count(), 2);
+        assert!(!wg.wait_timeout(Duration::from_millis(5)));
+        assert_eq!(straggler.count(), 1);
+        assert_eq!(format!("{straggler:?}"), "WaitGroup { count: 1 }");
+    }
+}
