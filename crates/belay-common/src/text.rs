@@ -198,3 +198,146 @@ pub fn truncate_middle(s: &str, max: usize) -> Cow<'_, str> {
     out.push_str(&s[byte_at(len - tail)..]);
     Cow::Owned(out)
 }
+
+/// Formats a byte count with binary (IEC) units and one decimal:
+/// `"512 B"`, `"1.5 KiB"`, `"20.0 MiB"`.
+#[must_use]
+pub fn humanize_bytes(n: u64) -> String {
+    const UNITS: [&str; 7] = ["B", "KiB", "MiB", "GiB", "TiB", "PiB", "EiB"];
+    if n < 1024 {
+        return format!("{n} B");
+    }
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    // 1023.96 KiB would print as "1024.0 KiB"; move up a unit instead.
+    if (value * 10.0).round() >= 10_240.0 && unit < UNITS.len() - 1 {
+        value /= 1024.0;
+        unit += 1;
+    }
+    format!("{value:.1} {}", UNITS[unit])
+}
+
+/// Parses a byte size such as `"512"`, `"64k"`, `"1.5 GiB"` or `"10MB"`.
+///
+/// Units are case-insensitive. IEC suffixes (`KiB`, `MiB`, `GiB`, `TiB`) are
+/// powers of 1024, SI suffixes (`KB`, `MB`, `GB`, `TB`) powers of 1000, and
+/// the single letters `K`, `M`, `G`, `T` powers of 1024 as in nginx and JVM
+/// flags. One space may separate the number from the unit, so the output of
+/// [`humanize_bytes`] parses back (to within its rounding).
+///
+/// ```
+/// use belay_common::text::parse_bytes;
+///
+/// assert_eq!(parse_bytes("64k"), Ok(65_536));
+/// assert_eq!(parse_bytes("1.5 GiB"), Ok(1_610_612_736));
+/// assert_eq!(parse_bytes("10MB"), Ok(10_000_000));
+/// ```
+pub fn parse_bytes(s: &str) -> Result<u64, ParseBytesError> {
+    let fail = |kind| ParseBytesError {
+        input: s.to_owned(),
+        kind,
+    };
+    let number_end = s
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(s.len());
+    let (number, unit) = s.split_at(number_end);
+    let unit = unit.strip_prefix(' ').unwrap_or(unit);
+
+    let (int, frac) = number.split_once('.').unwrap_or((number, ""));
+    let digits_ok = |d: &str| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit());
+    if !digits_ok(int) || (number.contains('.') && !digits_ok(frac)) {
+        return Err(fail(BytesErrorKind::InvalidNumber));
+    }
+
+    let multiplier: u128 = match unit.to_ascii_lowercase().as_str() {
+        "" | "b" => 1,
+        "k" | "kib" => 1 << 10,
+        "m" | "mib" => 1 << 20,
+        "g" | "gib" => 1 << 30,
+        "t" | "tib" => 1 << 40,
+        "kb" => 1_000,
+        "mb" => 1_000_000,
+        "gb" => 1_000_000_000,
+        "tb" => 1_000_000_000_000,
+        _ => return Err(fail(BytesErrorKind::UnknownUnit(unit.to_owned()))),
+    };
+
+    let overflow = || fail(BytesErrorKind::Overflow);
+    let whole: u128 = int.parse().map_err(|_| overflow())?;
+    // 19 fraction digits are more than enough to resolve single bytes at
+    // the largest multiplier (2^40).
+    let frac = &frac[..frac.len().min(19)];
+    let frac_value: u128 = if frac.is_empty() {
+        0
+    } else {
+        frac.parse().map_err(|_| overflow())?
+    };
+    let scale = 10u128.pow(frac.len() as u32);
+    let total = whole
+        .checked_mul(multiplier)
+        .and_then(|w| w.checked_add(frac_value * multiplier / scale))
+        .ok_or_else(overflow)?;
+    u64::try_from(total).map_err(|_| overflow())
+}
+
+/// Error returned by [`parse_bytes`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseBytesError {
+    input: String,
+    kind: BytesErrorKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BytesErrorKind {
+    InvalidNumber,
+    UnknownUnit(String),
+    Overflow,
+}
+
+impl fmt::Display for ParseBytesError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid byte size {:?}: ", self.input)?;
+        match &self.kind {
+            BytesErrorKind::InvalidNumber => f.write_str("expected a number such as 512 or 1.5"),
+            BytesErrorKind::UnknownUnit(unit) => write!(
+                f,
+                "unknown unit {unit:?} (expected B, K, KB, KiB, M, MB, MiB, G, GB, GiB, T, TB or TiB)"
+            ),
+            BytesErrorKind::Overflow => f.write_str("value does not fit in 64 bits"),
+        }
+    }
+}
+
+impl std::error::Error for ParseBytesError {}
+
+/// `"1 job"`, `"3 jobs"`, `"2 entries"`, `"0 processes"`.
+///
+/// Applies the regular English rules (`-s`, `-es` after sibilants, `-ies`
+/// after a consonant + `y`); use [`plural_with`] for irregular nouns.
+#[must_use]
+pub fn plural(count: u64, singular: &str) -> String {
+    if count == 1 {
+        return format!("1 {singular}");
+    }
+    let lower = singular.to_ascii_lowercase();
+    let ends_with_sibilant = ["s", "x", "z", "ch", "sh"]
+        .iter()
+        .any(|e| lower.ends_with(e));
+    let consonant_y = lower.ends_with('y')
+        && lower
+            .chars()
+            .rev()
+            .nth(1)
+            .is_some_and(|c| c.is_ascii_alphabetic() && !"aeiou".contains(c));
+    if ends_with_sibilant {
+        format!("{count} {singular}es")
+    } else if consonant_y {
+        format!("{count} {}ies", &singular[..singular.len() - 1])
+    } else {
+        format!("{count} {singular}s")
+    }
+}
