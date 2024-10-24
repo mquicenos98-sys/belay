@@ -341,3 +341,194 @@ pub fn plural(count: u64, singular: &str) -> String {
         format!("{count} {singular}s")
     }
 }
+
+/// Like [`plural`] with an explicit plural form: `plural_with(2, "child",
+/// "children")` is `"2 children"`.
+#[must_use]
+pub fn plural_with(count: u64, singular: &str, plural: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural })
+}
+
+/// Greedy word wrap to lines of at most `width` characters. Words longer
+/// than `width` get a line of their own rather than being split, and runs of
+/// whitespace collapse to one space.
+#[must_use]
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut line_len = 0;
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+        if line_len > 0 && line_len + 1 + word_len > width {
+            lines.push(std::mem::take(&mut line));
+            line_len = 0;
+        }
+        if line_len > 0 {
+            line.push(' ');
+            line_len += 1;
+        }
+        line.push_str(word);
+        line_len += word_len;
+    }
+    if !line.is_empty() {
+        lines.push(line);
+    }
+    lines
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn table_aligns_columns_and_trims_trailing_space() {
+        let mut t = Table::new(["ID", "STATE", "ATTEMPTS"]).align(2, Align::Right);
+        t.push_row(["a", "running", "1"]);
+        t.push_row(["bbbbbb", "dead", "25"]);
+        assert_eq!(
+            t.to_string(),
+            "ID      STATE    ATTEMPTS\n\
+             a       running         1\n\
+             bbbbbb  dead           25\n"
+        );
+        assert_eq!(t.len(), 2);
+        assert!(!t.is_empty());
+    }
+
+    #[test]
+    fn table_pads_short_rows_and_widens_for_long_ones() {
+        let mut t = Table::new(["A", "B"]);
+        t.push_row(["1"]);
+        t.push_row(["1", "2", "3"]);
+        assert_eq!(t.to_string(), "A  B\n1\n1  2  3\n");
+    }
+
+    #[test]
+    fn table_without_headers_prints_only_rows() {
+        let mut t = Table::new(Vec::<String>::new());
+        t.push_row(["key", "value"]);
+        t.push_row(["longer-key", "v"]);
+        assert_eq!(t.to_string(), "key         value\nlonger-key  v\n");
+    }
+
+    #[test]
+    fn empty_table_renders_just_the_header() {
+        let t = Table::new(["NAME"]);
+        assert!(t.is_empty());
+        assert_eq!(t.to_string(), "NAME\n");
+        assert_eq!(Table::default().to_string(), "");
+    }
+
+    #[test]
+    fn table_truncates_cells_over_max_width() {
+        let mut t = Table::new(["ID", "N"]).max_width(0, 7);
+        t.push_row(["0123456789", "1"]);
+        assert_eq!(t.to_string(), "ID       N\n012…789  1\n");
+    }
+
+    #[test]
+    fn table_replaces_control_characters() {
+        let mut t = Table::new(["MSG", "X"]);
+        t.push_row(["line1\nline2\tend", "x"]);
+        assert_eq!(t.to_string(), "MSG              X\nline1 line2 end  x\n");
+    }
+
+    #[test]
+    fn table_accepts_display_values() {
+        let mut t = Table::new(["N", "OK"]);
+        t.push_row([&1 as &dyn fmt::Display, &true]);
+        assert_eq!(t.to_string(), "N  OK\n1  true\n");
+    }
+
+    #[test]
+    fn truncate_middle_respects_char_boundaries() {
+        assert_eq!(truncate_middle("héllo wörld", 5), "hé…ld");
+        assert_eq!(truncate_middle("abcdef", 6), "abcdef");
+        assert_eq!(truncate_middle("abcdef", 5), "ab…ef");
+        assert_eq!(truncate_middle("abcdef", 4), "ab…f");
+        assert_eq!(truncate_middle("abcdef", 1), "…");
+        assert_eq!(truncate_middle("abcdef", 0), "");
+        assert!(matches!(truncate_middle("abc", 3), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn humanize_bytes_picks_binary_units() {
+        assert_eq!(humanize_bytes(0), "0 B");
+        assert_eq!(humanize_bytes(1023), "1023 B");
+        assert_eq!(humanize_bytes(1024), "1.0 KiB");
+        assert_eq!(humanize_bytes(1536), "1.5 KiB");
+        assert_eq!(humanize_bytes(20 * 1024 * 1024), "20.0 MiB");
+        assert_eq!(humanize_bytes(u64::MAX), "16.0 EiB");
+    }
+
+    #[test]
+    fn humanize_bytes_promotes_values_that_round_up() {
+        // Regression: 1 MiB - 1 used to print as "1024.0 KiB".
+        assert_eq!(humanize_bytes(1024 * 1024 - 1), "1.0 MiB");
+        assert_eq!(humanize_bytes(1024 * 1024 - 100), "1023.9 KiB");
+    }
+
+    #[test]
+    fn parse_bytes_accepts_iec_si_and_short_units() {
+        assert_eq!(parse_bytes("0"), Ok(0));
+        assert_eq!(parse_bytes("512"), Ok(512));
+        assert_eq!(parse_bytes("512B"), Ok(512));
+        assert_eq!(parse_bytes("64k"), Ok(64 * 1024));
+        assert_eq!(parse_bytes("64KiB"), Ok(64 * 1024));
+        assert_eq!(parse_bytes("64kb"), Ok(64_000));
+        assert_eq!(parse_bytes("16M"), Ok(16 << 20));
+        assert_eq!(parse_bytes("2 GB"), Ok(2_000_000_000));
+        assert_eq!(parse_bytes("1TiB"), Ok(1 << 40));
+        assert_eq!(parse_bytes("0.5k"), Ok(512));
+        assert_eq!(parse_bytes("1.5 KiB"), Ok(1536));
+    }
+
+    #[test]
+    fn parse_bytes_round_trips_humanized_values() {
+        for n in [0u64, 1, 1023, 1024, 1536, 5 << 20, 3 << 30] {
+            assert_eq!(parse_bytes(&humanize_bytes(n)), Ok(n));
+        }
+    }
+
+    #[test]
+    fn parse_bytes_rejects_bad_input() {
+        for bad in ["", "k", ".5k", "1.k", "1..5", "-1", " 1", "1  k", "1e3"] {
+            assert!(parse_bytes(bad).is_err(), "{bad:?} should be rejected");
+        }
+        assert_eq!(
+            parse_bytes("12XB").unwrap_err().to_string(),
+            "invalid byte size \"12XB\": unknown unit \"XB\" (expected B, K, KB, KiB, M, MB, MiB, G, GB, GiB, T, TB or TiB)"
+        );
+        assert_eq!(
+            parse_bytes("16777216TiB").unwrap_err().to_string(),
+            "invalid byte size \"16777216TiB\": value does not fit in 64 bits"
+        );
+        assert_eq!(parse_bytes("16777215TiB"), Ok(16_777_215 << 40));
+    }
+
+    #[test]
+    fn plural_follows_regular_english_rules() {
+        assert_eq!(plural(1, "job"), "1 job");
+        assert_eq!(plural(0, "job"), "0 jobs");
+        assert_eq!(plural(3, "job"), "3 jobs");
+        assert_eq!(plural(2, "entry"), "2 entries");
+        assert_eq!(plural(2, "day"), "2 days");
+        assert_eq!(plural(2, "process"), "2 processes");
+        assert_eq!(plural(2, "batch"), "2 batches");
+        assert_eq!(plural(2, "box"), "2 boxes");
+        assert_eq!(plural(2, "y"), "2 ys");
+        assert_eq!(plural_with(2, "child", "children"), "2 children");
+        assert_eq!(plural_with(1, "child", "children"), "1 child");
+    }
+
+    #[test]
+    fn wrap_breaks_on_word_boundaries() {
+        assert_eq!(
+            wrap("the quick brown fox jumps over the lazy dog", 10),
+            vec!["the quick", "brown fox", "jumps over", "the lazy", "dog"]
+        );
+        assert_eq!(wrap("  spaced   out  ", 80), vec!["spaced out"]);
+        assert_eq!(wrap("a verylongword b", 4), vec!["a", "verylongword", "b"]);
+        assert!(wrap("", 10).is_empty());
+    }
+}
