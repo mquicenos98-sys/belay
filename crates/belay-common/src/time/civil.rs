@@ -63,3 +63,110 @@ pub const fn civil_from_days(days: i64) -> (i32, u8, u8) {
     let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
     (year as i32, month as u8, day as u8)
 }
+
+/// A day of the week.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Weekday {
+    /// Monday.
+    Monday,
+    /// Tuesday.
+    Tuesday,
+    /// Wednesday.
+    Wednesday,
+    /// Thursday.
+    Thursday,
+    /// Friday.
+    Friday,
+    /// Saturday.
+    Saturday,
+    /// Sunday.
+    Sunday,
+}
+
+impl Weekday {
+    /// All weekdays, Monday first (ISO 8601 order).
+    pub const ALL: [Weekday; 7] = [
+        Weekday::Monday,
+        Weekday::Tuesday,
+        Weekday::Wednesday,
+        Weekday::Thursday,
+        Weekday::Friday,
+        Weekday::Saturday,
+        Weekday::Sunday,
+    ];
+
+    /// The weekday of the day that is `days` days after 1970-01-01 (a Thursday).
+    #[must_use]
+    pub const fn from_days_since_epoch(days: i64) -> Weekday {
+        Weekday::ALL[(days + 3).rem_euclid(7) as usize]
+    }
+
+    /// ISO 8601 number: Monday = 1 through Sunday = 7.
+    #[must_use]
+    pub const fn number_from_monday(self) -> u8 {
+        self as u8 + 1
+    }
+
+    /// Days since the preceding Sunday: Sunday = 0 through Saturday = 6 (the
+    /// numbering used by cron).
+    #[must_use]
+    pub const fn days_from_sunday(self) -> u8 {
+        (self as u8 + 1) % 7
+    }
+
+    /// The following day.
+    #[must_use]
+    pub const fn succ(self) -> Weekday {
+        Weekday::ALL[(self as usize + 1) % 7]
+    }
+
+    /// The preceding day.
+    #[must_use]
+    pub const fn pred(self) -> Weekday {
+        Weekday::ALL[(self as usize + 6) % 7]
+    }
+
+    /// English name, e.g. `"Monday"`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Weekday::Monday => "Monday",
+            Weekday::Tuesday => "Tuesday",
+            Weekday::Wednesday => "Wednesday",
+            Weekday::Thursday => "Thursday",
+            Weekday::Friday => "Friday",
+            Weekday::Saturday => "Saturday",
+            Weekday::Sunday => "Sunday",
+        }
+    }
+
+    /// Three-letter abbreviation, e.g. `"Mon"`.
+    #[must_use]
+    pub fn short_name(self) -> &'static str {
+        &self.name()[..3]
+    }
+
+    /// Whether this is Saturday or Sunday.
+    #[must_use]
+    pub const fn is_weekend(self) -> bool {
+        matches!(self, Weekday::Saturday | Weekday::Sunday)
+    }
+}
+
+impl fmt::Display for Weekday {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// Accepts full names and three-letter abbreviations, case-insensitively.
+impl FromStr for Weekday {
+    type Err = TimeError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Weekday::ALL
+            .into_iter()
+            .find(|d| s.eq_ignore_ascii_case(d.name()) || s.eq_ignore_ascii_case(d.short_name()))
+            .ok_or_else(|| TimeError::InvalidWeekday(s.to_owned()))
+    }
+}
