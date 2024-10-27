@@ -311,3 +311,33 @@ impl FromStr for Timestamp {
         Timestamp::parse_rfc3339(s)
     }
 }
+
+impl From<SystemTime> for Timestamp {
+    fn from(t: SystemTime) -> Self {
+        Timestamp::from_system_time(t)
+    }
+}
+
+/// Saturates at [`Timestamp::MAX`] rather than panicking.
+impl Add<Duration> for Timestamp {
+    type Output = Timestamp;
+
+    fn add(self, rhs: Duration) -> Timestamp {
+        self.saturating_add(rhs)
+    }
+}
+
+/// Saturates at [`Timestamp::MIN`] rather than panicking.
+impl Sub<Duration> for Timestamp {
+    type Output = Timestamp;
+
+    fn sub(self, rhs: Duration) -> Timestamp {
+        self.saturating_sub(rhs)
+    }
+}
+
+impl AddAssign<Duration> for Timestamp {
+    fn add_assign(&mut self, rhs: Duration) {
+        *self = self.saturating_add(rhs);
+    }
+}
