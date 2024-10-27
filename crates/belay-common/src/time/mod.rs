@@ -9,9 +9,7 @@
 //! retention can be driven by a [`ManualClock`] in tests.
 
 mod civil;
-
 mod clock;
-
 mod rfc3339;
 
 use std::fmt;
@@ -24,12 +22,10 @@ pub use clock::{system_clock, Clock, ManualClock, SharedClock, SystemClock};
 
 /// Milliseconds of 0000-01-01T00:00:00.000Z.
 const MIN_MILLIS: i64 = -62_167_219_200_000;
-
 /// Milliseconds of 9999-12-31T23:59:59.999Z.
 const MAX_MILLIS: i64 = 253_402_300_799_999;
 
 const MILLIS_PER_SEC: i64 = 1_000;
-
 const MILLIS_PER_DAY: i64 = 86_400_000;
 
 /// A UTC instant with millisecond precision.
@@ -339,5 +335,237 @@ impl Sub<Duration> for Timestamp {
 impl AddAssign<Duration> for Timestamp {
     fn add_assign(&mut self, rhs: Duration) {
         *self = self.saturating_add(rhs);
+    }
+}
+
+impl SubAssign<Duration> for Timestamp {
+    fn sub_assign(&mut self, rhs: Duration) {
+        *self = self.saturating_sub(rhs);
+    }
+}
+
+/// Errors from parsing or constructing timestamps.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum TimeError {
+    /// The input does not follow the expected grammar at byte `pos`.
+    Syntax {
+        /// Byte offset of the offending character (or the input length).
+        pos: usize,
+        /// What the parser was looking for.
+        expected: &'static str,
+    },
+    /// A calendar or clock field is outside its valid range.
+    FieldRange {
+        /// Field name, e.g. `"day"`.
+        field: &'static str,
+        /// The rejected value.
+        value: i64,
+        /// Smallest valid value.
+        min: i64,
+        /// Largest valid value (for days, depends on month and year).
+        max: i64,
+    },
+    /// Second 60 was given; leap seconds cannot be represented.
+    LeapSecond,
+    /// The instant falls outside years 0000-9999 (possibly after applying
+    /// the UTC offset).
+    OutOfRange,
+    /// A weekday name was not recognised.
+    InvalidWeekday(String),
+}
+
+impl fmt::Display for TimeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TimeError::Syntax { pos, expected } => {
+                write!(f, "invalid timestamp: expected {expected} at byte {pos}")
+            }
+            TimeError::FieldRange {
+                field,
+                value,
+                min,
+                max,
+            } => write!(f, "{field} {value} is out of range ({min}-{max})"),
+            TimeError::LeapSecond => f.write_str("leap seconds (second 60) are not supported"),
+            TimeError::OutOfRange => {
+                f.write_str("timestamp is outside the supported range (years 0000-9999)")
+            }
+            TimeError::InvalidWeekday(name) => write!(f, "unknown weekday {name:?}"),
+        }
+    }
+}
+
+impl std::error::Error for TimeError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_millis_saturates_outside_supported_range() {
+        assert_eq!(Timestamp::from_millis(i64::MAX), Timestamp::MAX);
+        assert_eq!(Timestamp::from_millis(i64::MIN), Timestamp::MIN);
+        assert_eq!(Timestamp::try_from_millis(MAX_MILLIS + 1), None);
+        assert_eq!(Timestamp::try_from_millis(MAX_MILLIS), Some(Timestamp::MAX));
+        assert_eq!(Timestamp::from_secs(i64::MAX), Timestamp::MAX);
+    }
+
+    #[test]
+    fn min_and_max_have_the_expected_calendar_values() {
+        assert_eq!(Timestamp::MIN.to_rfc3339(), "0000-01-01T00:00:00.000Z");
+        assert_eq!(Timestamp::MAX.to_rfc3339(), "9999-12-31T23:59:59.999Z");
+        assert_eq!(Timestamp::EPOCH.to_rfc3339(), "1970-01-01T00:00:00.000Z");
+    }
+
+    #[test]
+    fn as_secs_floors_negative_timestamps() {
+        assert_eq!(Timestamp::from_millis(-1).as_secs(), -1);
+        assert_eq!(Timestamp::from_millis(-1).subsec_millis(), 999);
+        assert_eq!(Timestamp::from_millis(-1000).as_secs(), -1);
+        assert_eq!(Timestamp::from_millis(-1001).as_secs(), -2);
+        assert_eq!(Timestamp::from_millis(1999).as_secs(), 1);
+        assert_eq!(Timestamp::from_millis(1999).subsec_millis(), 999);
+    }
+
+    #[test]
+    fn checked_arithmetic_stops_at_the_bounds() {
+        let t = Timestamp::MAX - Duration::from_millis(5);
+        assert_eq!(
+            t.checked_add(Duration::from_millis(5)),
+            Some(Timestamp::MAX)
+        );
+        assert_eq!(t.checked_add(Duration::from_millis(6)), None);
+        assert_eq!(Timestamp::MIN.checked_sub(Duration::from_millis(1)), None);
+        assert_eq!(Timestamp::EPOCH.checked_add(Duration::MAX), None);
+        assert_eq!(
+            Timestamp::EPOCH.saturating_add(Duration::MAX),
+            Timestamp::MAX
+        );
+        assert_eq!(
+            Timestamp::EPOCH.saturating_sub(Duration::MAX),
+            Timestamp::MIN
+        );
+    }
+
+    #[test]
+    fn adding_sub_millisecond_durations_truncates() {
+        let t = Timestamp::from_millis(10);
+        assert_eq!(t + Duration::from_micros(999), t);
+        assert_eq!(t + Duration::from_micros(1_500), Timestamp::from_millis(11));
+        let mut u = t;
+        u += Duration::from_secs(1);
+        u -= Duration::from_millis(1);
+        assert_eq!(u.as_millis(), 1_009);
+    }
+
+    #[test]
+    fn duration_since_is_none_when_earlier_is_later() {
+        let a = Timestamp::from_millis(1_000);
+        let b = Timestamp::from_millis(3_500);
+        assert_eq!(b.duration_since(a), Some(Duration::from_millis(2_500)));
+        assert_eq!(a.duration_since(b), None);
+        assert_eq!(a.saturating_duration_since(b), Duration::ZERO);
+        assert_eq!(
+            Timestamp::MAX.duration_since(Timestamp::MIN),
+            Some(Duration::from_millis((MAX_MILLIS - MIN_MILLIS) as u64))
+        );
+    }
+
+    #[test]
+    fn system_time_round_trips_including_before_epoch() {
+        for ms in [0, 1, -1, 1_741_064_767_089, -2_208_988_800_000] {
+            let t = Timestamp::from_millis(ms);
+            assert_eq!(Timestamp::from_system_time(t.to_system_time()), t);
+        }
+    }
+
+    #[test]
+    fn system_time_before_epoch_floors_to_the_millisecond() {
+        let t = UNIX_EPOCH - Duration::from_micros(500);
+        assert_eq!(Timestamp::from_system_time(t).as_millis(), -1);
+        let t = UNIX_EPOCH - Duration::from_micros(2_000);
+        assert_eq!(Timestamp::from_system_time(t).as_millis(), -2);
+        let t = UNIX_EPOCH + Duration::from_micros(2_999);
+        assert_eq!(Timestamp::from_system_time(t).as_millis(), 2);
+    }
+
+    #[test]
+    fn now_is_after_2020() {
+        let jan_2020 = Timestamp::from_secs(1_577_836_800);
+        assert!(Timestamp::now() > jan_2020);
+    }
+
+    #[test]
+    fn from_civil_validates_every_field() {
+        let err = Timestamp::from_civil(2023, 2, 29, 0, 0, 0, 0).unwrap_err();
+        assert_eq!(err.to_string(), "day 29 is out of range (1-28)");
+        assert!(Timestamp::from_civil(2024, 2, 29, 0, 0, 0, 0).is_ok());
+        assert!(Timestamp::from_civil(2024, 0, 1, 0, 0, 0, 0).is_err());
+        assert!(Timestamp::from_civil(2024, 1, 1, 24, 0, 0, 0).is_err());
+        assert!(Timestamp::from_civil(2024, 1, 1, 0, 60, 0, 0).is_err());
+        assert_eq!(
+            Timestamp::from_civil(2024, 1, 1, 0, 0, 60, 0),
+            Err(TimeError::LeapSecond)
+        );
+        assert!(Timestamp::from_civil(2024, 1, 1, 0, 0, 0, 1000).is_err());
+        assert!(Timestamp::from_civil(-1, 1, 1, 0, 0, 0, 0).is_err());
+        assert!(Timestamp::from_civil(10_000, 1, 1, 0, 0, 0, 0).is_err());
+    }
+
+    #[test]
+    fn civil_round_trips_known_instants() {
+        let cases = [
+            (0, (1970, 1, 1, 0, 0, 0, 0), Weekday::Thursday),
+            (-1, (1969, 12, 31, 23, 59, 59, 999), Weekday::Wednesday),
+            (946_684_800_000, (2000, 1, 1, 0, 0, 0, 0), Weekday::Saturday),
+            (
+                1_709_164_800_000,
+                (2024, 2, 29, 0, 0, 0, 0),
+                Weekday::Thursday,
+            ),
+            (
+                2_147_483_647_000,
+                (2038, 1, 19, 3, 14, 7, 0),
+                Weekday::Tuesday,
+            ),
+            (
+                -2_208_988_800_000,
+                (1900, 1, 1, 0, 0, 0, 0),
+                Weekday::Monday,
+            ),
+            (4_107_542_400_000, (2100, 3, 1, 0, 0, 0, 0), Weekday::Monday),
+        ];
+        for (ms, (y, mo, d, h, mi, s, milli), wd) in cases {
+            let t = Timestamp::from_millis(ms);
+            let c = t.to_civil();
+            assert_eq!(
+                (c.year, c.month, c.day, c.hour, c.minute, c.second, c.millis),
+                (y, mo, d, h, mi, s, milli),
+                "breakdown of {ms}"
+            );
+            assert_eq!(c.weekday, wd, "weekday of {ms}");
+            assert_eq!(Timestamp::from_civil(y, mo, d, h, mi, s, milli), Ok(t));
+            assert_eq!(c.to_timestamp(), Ok(t));
+        }
+    }
+
+    #[test]
+    fn debug_shows_the_rfc3339_form() {
+        let t = Timestamp::from_millis(1_741_064_767_089);
+        assert_eq!(format!("{t:?}"), "Timestamp(2025-03-04T05:06:07.089Z)");
+    }
+
+    #[test]
+    fn ordering_follows_the_timeline() {
+        let mut v = vec![
+            Timestamp::from_millis(5),
+            Timestamp::MIN,
+            Timestamp::from_millis(-5),
+            Timestamp::MAX,
+        ];
+        v.sort();
+        let ms: Vec<i64> = v.iter().map(|t| t.as_millis()).collect();
+        assert_eq!(ms, vec![MIN_MILLIS, -5, 5, MAX_MILLIS]);
     }
 }
