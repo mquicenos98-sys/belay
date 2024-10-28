@@ -77,3 +77,20 @@ impl<'a> Cursor<'a> {
         }
     }
 }
+
+/// Parses `YYYY-MM-DD` and returns days since the epoch.
+fn date(cur: &mut Cursor<'_>) -> Result<i64, TimeError> {
+    let year = cur.digits(4, "4-digit year")? as i32;
+    cur.expect(b'-', "'-' after year")?;
+    let month = cur.digits(2, "2-digit month")? as u8;
+    check_field("month", i64::from(month), 1, 12)?;
+    cur.expect(b'-', "'-' after month")?;
+    let day = cur.digits(2, "2-digit day")? as u8;
+    check_field(
+        "day",
+        i64::from(day),
+        1,
+        i64::from(days_in_month(year, month)),
+    )?;
+    Ok(days_from_civil(year, month, day))
+}
