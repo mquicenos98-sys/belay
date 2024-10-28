@@ -19,3 +19,61 @@ pub(super) fn write(ts: Timestamp, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         c.year, c.month, c.day, c.hour, c.minute, c.second, c.millis
     )
 }
+
+/// Byte cursor that reports failures with the offset where they happened.
+struct Cursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(s: &'a str) -> Self {
+        Cursor {
+            bytes: s.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn syntax(&self, expected: &'static str) -> TimeError {
+        TimeError::Syntax {
+            pos: self.pos,
+            expected,
+        }
+    }
+
+    /// Reads exactly `n` ASCII digits.
+    fn digits(&mut self, n: usize, expected: &'static str) -> Result<u32, TimeError> {
+        let mut value = 0u32;
+        for _ in 0..n {
+            match self.peek() {
+                Some(b @ b'0'..=b'9') => {
+                    value = value * 10 + u32::from(b - b'0');
+                    self.pos += 1;
+                }
+                _ => return Err(self.syntax(expected)),
+            }
+        }
+        Ok(value)
+    }
+
+    fn expect(&mut self, byte: u8, expected: &'static str) -> Result<(), TimeError> {
+        if self.peek() == Some(byte) {
+            self.pos += 1;
+            Ok(())
+        } else {
+            Err(self.syntax(expected))
+        }
+    }
+
+    fn finish(&self) -> Result<(), TimeError> {
+        if self.pos == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(self.syntax("end of input"))
+        }
+    }
+}
