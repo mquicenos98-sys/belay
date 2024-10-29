@@ -174,3 +174,233 @@ pub(super) fn parse(s: &str) -> Result<Timestamp, TimeError> {
     let utc_ms = local_ms - offset_minutes * 60_000;
     Timestamp::try_from_millis(utc_ms).ok_or(TimeError::OutOfRange)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn p(s: &str) -> Timestamp {
+        match Timestamp::parse_rfc3339(s) {
+            Ok(t) => t,
+            Err(e) => panic!("{s:?} failed to parse: {e}"),
+        }
+    }
+
+    fn err(s: &str) -> String {
+        match Timestamp::parse_rfc3339(s) {
+            Ok(t) => panic!("{s:?} unexpectedly parsed as {t}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn formats_with_fixed_millisecond_precision() {
+        assert_eq!(
+            Timestamp::from_millis(1_741_064_767_089).to_rfc3339(),
+            "2025-03-04T05:06:07.089Z"
+        );
+        assert_eq!(
+            Timestamp::from_millis(1_741_064_767_000).to_rfc3339(),
+            "2025-03-04T05:06:07.000Z"
+        );
+        assert_eq!(
+            Timestamp::from_millis(-1).to_rfc3339(),
+            "1969-12-31T23:59:59.999Z"
+        );
+        assert_eq!(
+            Timestamp::from_secs(-2_208_988_800).to_rfc3339(),
+            "1900-01-01T00:00:00.000Z"
+        );
+    }
+
+    #[test]
+    fn parses_utc_and_offsets() {
+        assert_eq!(p("2025-03-04T05:06:07.089Z").as_millis(), 1_741_064_767_089);
+        assert_eq!(p("2025-03-04T05:06:07Z").as_millis(), 1_741_064_767_000);
+        assert_eq!(p("2025-03-04T07:06:07+02:00"), p("2025-03-04T05:06:07Z"));
+        assert_eq!(p("2025-03-04T00:36:07-04:30"), p("2025-03-04T05:06:07Z"));
+        assert_eq!(p("2025-03-04T05:06:07-00:00"), p("2025-03-04T05:06:07Z"));
+        assert_eq!(p("2025-03-04T05:06:07+00:00"), p("2025-03-04T05:06:07Z"));
+    }
+
+    #[test]
+    fn accepts_lowercase_separators_and_space() {
+        let expected = p("2025-03-04T05:06:07Z");
+        assert_eq!(p("2025-03-04t05:06:07z"), expected);
+        assert_eq!(p("2025-03-04 05:06:07Z"), expected);
+    }
+
+    #[test]
+    fn rejects_more_than_nine_fractional_digits() {
+        assert_eq!(
+            err("1970-01-01T00:00:00.1234567891Z"),
+            "invalid timestamp: expected at most 9 fractional digits at byte 29"
+        );
+        assert_eq!(
+            err("1970-01-01T00:00:00.Z"),
+            "invalid timestamp: expected fractional digits after '.' at byte 20"
+        );
+    }
+
+    #[test]
+    fn offsets_can_cross_day_month_and_year_boundaries() {
+        assert_eq!(
+            p("2024-12-31T23:30:00-01:00").to_rfc3339(),
+            "2025-01-01T00:30:00.000Z"
+        );
+        assert_eq!(
+            p("2025-01-01T00:15:00+05:30").to_rfc3339(),
+            "2024-12-31T18:45:00.000Z"
+        );
+        assert_eq!(
+            p("2024-03-01T00:00:00+00:01").to_rfc3339(),
+            "2024-02-29T23:59:00.000Z"
+        );
+        assert_eq!(
+            p("2023-03-01T00:00:00+00:01").to_rfc3339(),
+            "2023-02-28T23:59:00.000Z"
+        );
+    }
+
+    #[test]
+    fn leap_days_are_validated_per_year() {
+        assert!(Timestamp::parse_rfc3339("2024-02-29T00:00:00Z").is_ok());
+        assert!(Timestamp::parse_rfc3339("2000-02-29T00:00:00Z").is_ok());
+        assert_eq!(err("1900-02-29T00:00:00Z"), "day 29 is out of range (1-28)");
+        assert_eq!(err("2023-04-31T00:00:00Z"), "day 31 is out of range (1-30)");
+    }
+
+    #[test]
+    fn negative_timestamps_before_1970() {
+        assert_eq!(p("1969-12-31T23:59:59.999Z").as_millis(), -1);
+        assert_eq!(p("1960-06-15T12:00:00Z").as_millis(), -301_233_600_000);
+        assert_eq!(p("0000-01-01T00:00:00Z"), Timestamp::MIN);
+        assert_eq!(p("9999-12-31T23:59:59.999999Z"), Timestamp::MAX);
+    }
+
+    #[test]
+    fn offsets_pushing_outside_supported_range_are_rejected() {
+        assert_eq!(
+            Timestamp::parse_rfc3339("0000-01-01T00:00:00+00:01"),
+            Err(TimeError::OutOfRange)
+        );
+        assert_eq!(
+            Timestamp::parse_rfc3339("9999-12-31T23:59:59-00:01"),
+            Err(TimeError::OutOfRange)
+        );
+    }
+
+    #[test]
+    fn rejects_field_values_out_of_range() {
+        assert_eq!(
+            err("2025-13-01T00:00:00Z"),
+            "month 13 is out of range (1-12)"
+        );
+        assert_eq!(
+            err("2025-00-01T00:00:00Z"),
+            "month 0 is out of range (1-12)"
+        );
+        assert_eq!(err("2025-01-00T00:00:00Z"), "day 0 is out of range (1-31)");
+        assert_eq!(
+            err("2025-01-01T24:00:00Z"),
+            "hour 24 is out of range (0-23)"
+        );
+        assert_eq!(
+            err("2025-01-01T00:60:00Z"),
+            "minute 60 is out of range (0-59)"
+        );
+        assert_eq!(
+            err("2025-01-01T00:00:61Z"),
+            "second 61 is out of range (0-59)"
+        );
+        assert_eq!(
+            err("2025-01-01T00:00:00+24:00"),
+            "offset hour 24 is out of range (0-23)"
+        );
+        assert_eq!(
+            err("2025-01-01T00:00:00+01:60"),
+            "offset minute 60 is out of range (0-59)"
+        );
+        assert_eq!(
+            Timestamp::parse_rfc3339("2016-12-31T23:59:60Z"),
+            Err(TimeError::LeapSecond)
+        );
+    }
+
+    #[test]
+    fn rejects_malformed_syntax_with_position() {
+        assert_eq!(
+            err(""),
+            "invalid timestamp: expected 4-digit year at byte 0"
+        );
+        assert_eq!(
+            err("25-03-04T05:06:07Z"),
+            "invalid timestamp: expected 4-digit year at byte 2"
+        );
+        assert_eq!(
+            err("2025/03/04T05:06:07Z"),
+            "invalid timestamp: expected '-' after year at byte 4"
+        );
+        assert_eq!(
+            err("2025-3-04T05:06:07Z"),
+            "invalid timestamp: expected 2-digit month at byte 6"
+        );
+        assert_eq!(
+            err("2025-03-04_05:06:07Z"),
+            "invalid timestamp: expected 'T' between date and time at byte 10"
+        );
+        assert_eq!(
+            err("2025-03-04T05:06Z"),
+            "invalid timestamp: expected ':' after minute at byte 16"
+        );
+        assert_eq!(
+            err("2025-03-04T05:06:07"),
+            "invalid timestamp: expected 'Z' or a numeric offset at byte 19"
+        );
+        assert_eq!(
+            err("2025-03-04T05:06:07+0200"),
+            "invalid timestamp: expected ':' in offset at byte 22"
+        );
+        assert_eq!(
+            err("2025-03-04T05:06:07Z "),
+            "invalid timestamp: expected end of input at byte 20"
+        );
+        assert_eq!(
+            err("+2025-03-04T05:06:07Z"),
+            "invalid timestamp: expected 4-digit year at byte 0"
+        );
+    }
+
+    #[test]
+    fn non_ascii_input_is_rejected_without_panicking() {
+        assert!(Timestamp::parse_rfc3339("2025-03-04T05:06:07\u{00e9}").is_err());
+        assert!(Timestamp::parse_rfc3339("\u{0662}025-03-04T05:06:07Z").is_err());
+    }
+
+    #[test]
+    fn format_then_parse_round_trips() {
+        // Sample the range with a fixed stride that is coprime with the day
+        // length so that every time-of-day component varies.
+        let mut ms = Timestamp::MIN.as_millis();
+        let step = 97_777_777_777;
+        while ms <= Timestamp::MAX.as_millis() {
+            let t = Timestamp::from_millis(ms);
+            assert_eq!(p(&t.to_rfc3339()), t);
+            ms += step;
+        }
+    }
+
+    #[test]
+    fn parse_date_only_accepts_calendar_dates() {
+        assert_eq!(
+            Timestamp::parse_date("2024-02-29").map(|t| t.to_rfc3339()),
+            Ok("2024-02-29T00:00:00.000Z".to_owned())
+        );
+        assert_eq!(
+            Timestamp::parse_date("1969-12-31").map(|t| t.as_secs()),
+            Ok(-86_400)
+        );
+        assert!(Timestamp::parse_date("2023-02-29").is_err());
+        assert!(Timestamp::parse_date("2024-02-29T00:00:00Z").is_err());
+    }
+}
