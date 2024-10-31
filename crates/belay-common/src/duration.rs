@@ -166,3 +166,29 @@ fn unit_rank(unit: &str) -> Option<usize> {
     };
     UNITS.iter().position(|(name, _)| *name == canonical)
 }
+
+fn unknown_unit(unit: &str, pos: usize) -> DurationErrorKind {
+    // A unit run swallows everything up to the next digit, so a stray
+    // space or sign shows up here; report it as a character problem.
+    match unit.char_indices().find(|(_, c)| !c.is_alphabetic()) {
+        Some((offset, ch)) => DurationErrorKind::UnexpectedChar {
+            ch,
+            pos: pos + offset,
+        },
+        None => DurationErrorKind::UnknownUnit(unit.to_owned()),
+    }
+}
+
+/// Formats a duration in the compact, exact form accepted by
+/// [`parse_duration`]: `1h30m`, `250ms`, `1d2h`, `1s500ms`, `0s`.
+///
+/// Days are the largest unit used; weeks are accepted on input only.
+#[must_use]
+pub fn format_duration(d: Duration) -> String {
+    CompactDuration(d).to_string()
+}
+
+/// `Display` adapter for [`format_duration`] that avoids an intermediate
+/// `String`, e.g. inside `format!` or log fields.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CompactDuration(pub Duration);
