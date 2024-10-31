@@ -192,3 +192,74 @@ pub fn format_duration(d: Duration) -> String {
 /// `String`, e.g. inside `format!` or log fields.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompactDuration(pub Duration);
+
+impl fmt::Display for CompactDuration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut rest = self.0.as_nanos();
+        if rest == 0 {
+            return f.write_str("0s");
+        }
+        // Skip "w": "14d" reads better than "2w" and both parse.
+        for (name, size) in &UNITS[1..] {
+            let count = rest / size;
+            if count > 0 {
+                write!(f, "{count}{name}")?;
+                rest %= size;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A rough, human-friendly rendering using the largest unit that fits,
+/// rounded down: `"3 minutes"`, `"2 hours"`, `"1 day"`, `"450 milliseconds"`.
+///
+/// ```
+/// use belay_common::duration::humanize;
+/// use std::time::Duration;
+///
+/// assert_eq!(humanize(Duration::from_secs(185)), "3 minutes");
+/// assert_eq!(humanize(Duration::from_secs(3_600)), "1 hour");
+/// ```
+#[must_use]
+pub fn humanize(d: Duration) -> String {
+    const SCALES: [(&str, u128); 8] = [
+        ("year", 365 * 86_400 * NANOS_PER_SEC),
+        ("day", 86_400 * NANOS_PER_SEC),
+        ("hour", 3_600 * NANOS_PER_SEC),
+        ("minute", 60 * NANOS_PER_SEC),
+        ("second", NANOS_PER_SEC),
+        ("millisecond", 1_000_000),
+        ("microsecond", 1_000),
+        ("nanosecond", 1),
+    ];
+    let nanos = d.as_nanos();
+    for (word, size) in SCALES {
+        if nanos >= size {
+            let count = u64::try_from(nanos / size).unwrap_or(u64::MAX);
+            return plural(count, word);
+        }
+    }
+    "0 seconds".to_owned()
+}
+
+/// Error returned by [`parse_duration`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseDurationError {
+    input: String,
+    kind: DurationErrorKind,
+}
+
+impl ParseDurationError {
+    /// What went wrong.
+    #[must_use]
+    pub fn kind(&self) -> &DurationErrorKind {
+        &self.kind
+    }
+
+    /// The rejected input.
+    #[must_use]
+    pub fn input(&self) -> &str {
+        &self.input
+    }
+}
