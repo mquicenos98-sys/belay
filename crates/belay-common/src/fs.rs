@@ -275,3 +275,34 @@ impl LockFile {
         fs::remove_file(&self.path)
     }
 }
+
+impl Drop for LockFile {
+    fn drop(&mut self) {
+        if !self.released {
+            let _ = fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn read_pid(path: &Path) -> Option<u32> {
+    let mut contents = String::new();
+    File::open(path)
+        .and_then(|f| f.take(64).read_to_string(&mut contents))
+        .ok()?;
+    contents.trim().parse().ok()
+}
+
+/// Whether the process that wrote a lock file is known to have exited.
+fn holder_is_gone(pid: u32) -> bool {
+    if pid == process::id() {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        Path::new("/proc/self").exists() && !Path::new("/proc").join(pid.to_string()).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        false
+    }
+}
