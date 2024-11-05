@@ -306,3 +306,194 @@ fn holder_is_gone(pid: u32) -> bool {
         false
     }
 }
+
+/// Error returned by [`LockFile::acquire`].
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum LockError {
+    /// Someone else holds the lock.
+    Held {
+        /// The lock file.
+        path: PathBuf,
+        /// The holder's process id, if the file records a valid one.
+        pid: Option<u32>,
+    },
+    /// The lock file could not be created or inspected.
+    Io {
+        /// The lock file.
+        path: PathBuf,
+        /// The underlying error.
+        source: io::Error,
+    },
+}
+
+impl fmt::Display for LockError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            LockError::Held {
+                path,
+                pid: Some(pid),
+            } => write!(
+                f,
+                "lock {} is held by process {pid}; if that process is gone, delete the file",
+                path.display()
+            ),
+            LockError::Held { path, pid: None } => write!(
+                f,
+                "lock {} is held by another process (no pid recorded); if none is running, delete the file",
+                path.display()
+            ),
+            LockError::Io { path, source } => {
+                write!(f, "cannot take lock {}: {source}", path.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for LockError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            LockError::Io { source, .. } => Some(source),
+            LockError::Held { .. } => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    fn temp() -> TempDir {
+        TempDir::with_prefix("belay-fs-test").expect("creating temp dir")
+    }
+
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("listing dir")
+            .map(|e| {
+                e.expect("dir entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn atomic_write_creates_and_replaces_without_leftovers() {
+        let dir = temp();
+        let path = dir.join("data.bin");
+        atomic_write(&path, b"first").expect("first write");
+        atomic_write(&path, b"second, longer").expect("second write");
+        assert_eq!(fs::read(&path).expect("read back"), b"second, longer");
+        assert_eq!(entries(dir.path()), vec!["data.bin"]);
+    }
+
+    #[test]
+    fn atomic_write_reports_missing_directory_with_path() {
+        let dir = temp();
+        let path = dir.join("missing").join("f");
+        let err = atomic_write(&path, b"x").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+        assert!(err.to_string().starts_with("writing "), "{err}");
+    }
+
+    #[test]
+    fn atomic_write_rejects_paths_without_a_file_name() {
+        let err = atomic_write(Path::new(".."), b"x").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn bare_file_names_live_in_the_current_directory() {
+        assert_eq!(parent_dir(Path::new("file")), Path::new("."));
+        assert_eq!(parent_dir(Path::new("a/file")), Path::new("a"));
+    }
+
+    #[test]
+    fn sync_dir_accepts_existing_directories() {
+        let dir = temp();
+        sync_dir(dir.path()).expect("syncing a directory");
+    }
+
+    #[test]
+    fn temp_dirs_are_unique_and_removed_on_drop() {
+        let a = temp();
+        let b = temp();
+        assert_ne!(a.path(), b.path());
+        assert!(a.path().is_dir());
+        let name = a
+            .path()
+            .file_name()
+            .expect("has name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with("belay-fs-test-"), "{name}");
+        fs::create_dir(a.join("nested")).expect("mkdir");
+        fs::write(a.join("nested").join("f"), b"x").expect("write");
+        let path = a.path().to_path_buf();
+        drop(a);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn keep_preserves_the_directory() {
+        let dir = temp();
+        let inner = TempDir::new_in(dir.path(), "kept").expect("nested temp dir");
+        let kept = inner.keep();
+        assert!(kept.is_dir());
+        assert!(kept.starts_with(dir.path()));
+    }
+
+    #[test]
+    fn lock_is_exclusive_and_records_the_pid() {
+        let dir = temp();
+        let path = dir.join("LOCK");
+        let lock = LockFile::acquire(&path).expect("first acquire");
+        assert_eq!(lock.path(), path);
+        assert_eq!(read_pid(&path), Some(process::id()));
+        match LockFile::acquire(&path) {
+            Err(LockError::Held { pid, .. }) => assert_eq!(pid, Some(process::id())),
+            other => panic!("expected Held, got {other:?}"),
+        }
+        lock.release().expect("release");
+        assert!(!path.exists());
+        let again = LockFile::acquire(&path).expect("reacquire after release");
+        drop(again);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn unreadable_lock_contents_count_as_held() {
+        let dir = temp();
+        let path = dir.join("LOCK");
+        fs::write(&path, b"not a pid").expect("write junk");
+        let err = LockFile::acquire(&path).unwrap_err();
+        assert!(matches!(err, LockError::Held { pid: None, .. }));
+        assert!(err.to_string().contains("no pid recorded"), "{err}");
+        assert!(err.source().is_none());
+    }
+
+    #[test]
+    fn lock_in_missing_directory_is_an_io_error() {
+        let dir = temp();
+        let err = LockFile::acquire(dir.join("nope").join("LOCK")).unwrap_err();
+        assert!(matches!(err, LockError::Io { .. }));
+        assert!(err.source().is_some());
+        assert!(err.to_string().starts_with("cannot take lock "), "{err}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_lock_from_a_dead_process_is_taken_over() {
+        let dir = temp();
+        let path = dir.join("LOCK");
+        // Above the kernel's maximum pid (2^22), so it cannot be running.
+        fs::write(&path, b"4194305\n").expect("write stale lock");
+        let lock = LockFile::acquire(&path).expect("stale lock is taken over");
+        assert_eq!(read_pid(lock.path()), Some(process::id()));
+    }
+}
