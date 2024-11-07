@@ -151,3 +151,71 @@ impl Logger for CaptureLogger {
         lock(&self.records).push(captured);
     }
 }
+
+impl fmt::Debug for CaptureLogger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CaptureLogger")
+            .field("level", &self.level)
+            .field("records", &self.len())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clones_share_the_buffer() {
+        let a = CaptureLogger::new();
+        let b = a.clone();
+        a.scope(|| crate::warn!("from a"));
+        assert_eq!(b.len(), 1);
+        assert_eq!(b.take()[0].level, Level::Warn);
+        assert!(a.is_empty());
+    }
+
+    #[test]
+    fn level_limit_applies() {
+        let c = CaptureLogger::with_level(Level::Info);
+        c.scope(|| {
+            crate::debug!("dropped");
+            crate::info!("kept");
+        });
+        assert_eq!(c.messages(), vec!["kept"]);
+    }
+
+    #[test]
+    fn find_and_contains_search_records() {
+        let c = CaptureLogger::default();
+        c.scope(|| {
+            crate::info!("job leased"; job = "a");
+            crate::info!("job leased"; job = "b");
+        });
+        assert!(c.contains("leased"));
+        assert!(!c.contains("expired"));
+        let b = c
+            .find(|r| r.field("job") == Some("b"))
+            .expect("record for b");
+        assert_eq!(b.message, "job leased");
+        assert_eq!(c.find(|r| r.field("missing").is_some()), None);
+        c.clear();
+        assert!(c.is_empty());
+        assert_eq!(
+            format!("{c:?}"),
+            "CaptureLogger { level: Trace, records: 0 }"
+        );
+    }
+
+    #[test]
+    fn records_from_other_threads_are_not_captured_by_scope() {
+        let c = CaptureLogger::new();
+        c.scope(|| {
+            std::thread::spawn(|| crate::trace!("elsewhere"))
+                .join()
+                .expect("thread panicked");
+            crate::trace!("here");
+        });
+        assert_eq!(c.messages(), vec!["here"]);
+    }
+}
