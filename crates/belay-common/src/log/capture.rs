@@ -125,3 +125,29 @@ impl CaptureLogger {
         lock(&self.records).iter().find(|r| predicate(r)).cloned()
     }
 }
+
+impl Default for CaptureLogger {
+    fn default() -> Self {
+        CaptureLogger::new()
+    }
+}
+
+impl Logger for CaptureLogger {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        self.level.allows(metadata.level())
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        let captured = CapturedRecord {
+            level: record.level(),
+            target: record.target().to_owned(),
+            message: record.message().to_string(),
+            fields: record
+                .fields()
+                .iter()
+                .map(|f| (f.key().to_owned(), f.value().to_string()))
+                .collect(),
+        };
+        lock(&self.records).push(captured);
+    }
+}
