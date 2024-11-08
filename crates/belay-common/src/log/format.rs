@@ -65,3 +65,67 @@ impl LogFormat {
         }
     }
 }
+
+impl fmt::Display for LogFormat {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Case-insensitive; `text` is accepted for `logfmt`.
+impl FromStr for LogFormat {
+    type Err = LogConfigError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "logfmt" | "text" => Ok(LogFormat::Logfmt),
+            "json" => Ok(LogFormat::Json),
+            _ => Err(LogConfigError::UnknownFormat(s.to_owned())),
+        }
+    }
+}
+
+fn field_key(key: &str) -> (&'static str, &str) {
+    if RESERVED_KEYS.contains(&key) {
+        ("_", key)
+    } else {
+        ("", key)
+    }
+}
+
+fn write_logfmt(ts: Timestamp, record: &Record<'_>, out: &mut String) {
+    let mut scratch = String::new();
+    let _ = write!(out, "ts={ts} level={} target=", record.level().as_str());
+    logfmt_value(record.target(), out);
+    out.push_str(" msg=");
+    let _ = write!(scratch, "{}", record.message());
+    logfmt_value(&scratch, out);
+
+    for field in record.fields() {
+        out.push(' ');
+        let (prefix, key) = field_key(field.key());
+        out.push_str(prefix);
+        logfmt_key(key, out);
+        out.push('=');
+        match field.value() {
+            Value::Bool(b) => {
+                let _ = write!(out, "{b}");
+            }
+            Value::I64(n) => {
+                let _ = write!(out, "{n}");
+            }
+            Value::U64(n) => {
+                let _ = write!(out, "{n}");
+            }
+            Value::F64(x) => {
+                let _ = write!(out, "{x}");
+            }
+            Value::Str(s) => logfmt_value(s, out),
+            other => {
+                scratch.clear();
+                let _ = write!(scratch, "{other}");
+                logfmt_value(&scratch, out);
+            }
+        }
+    }
+}
