@@ -129,3 +129,79 @@ fn write_logfmt(ts: Timestamp, record: &Record<'_>, out: &mut String) {
         }
     }
 }
+
+/// Keys cannot be quoted in logfmt, so characters that would break parsing
+/// are replaced.
+fn logfmt_key(key: &str, out: &mut String) {
+    if key.is_empty() {
+        out.push('_');
+        return;
+    }
+    out.extend(key.chars().map(|c| {
+        if c.is_alphanumeric() || "_.-:/".contains(c) {
+            c
+        } else {
+            '_'
+        }
+    }));
+}
+
+fn logfmt_value(value: &str, out: &mut String) {
+    let needs_quotes = value.is_empty()
+        || value
+            .chars()
+            .any(|c| c == ' ' || c == '=' || c == '"' || c == '\\' || c.is_control());
+    if !needs_quotes {
+        out.push_str(value);
+        return;
+    }
+    out.push('"');
+    escape_into(value, out);
+    out.push('"');
+}
+
+fn write_json(ts: Timestamp, record: &Record<'_>, out: &mut String) {
+    let _ = write!(
+        out,
+        "{{\"ts\":\"{ts}\",\"level\":\"{}\",\"target\":",
+        record.level().as_str()
+    );
+    json_string(record.target(), out);
+    out.push_str(",\"msg\":");
+    let mut scratch = String::new();
+    let _ = write!(scratch, "{}", record.message());
+    json_string(&scratch, out);
+
+    for field in record.fields() {
+        out.push(',');
+        let (prefix, key) = field_key(field.key());
+        out.push('"');
+        out.push_str(prefix);
+        escape_into(key, out);
+        out.push_str("\":");
+        match field.value() {
+            Value::Null => out.push_str("null"),
+            Value::Bool(b) => {
+                let _ = write!(out, "{b}");
+            }
+            Value::I64(n) => {
+                let _ = write!(out, "{n}");
+            }
+            Value::U64(n) => {
+                let _ = write!(out, "{n}");
+            }
+            // JSON has no NaN or infinity.
+            Value::F64(x) if !x.is_finite() => out.push_str("null"),
+            Value::F64(x) => {
+                let _ = write!(out, "{x}");
+            }
+            Value::Str(s) => json_string(s, out),
+            other => {
+                scratch.clear();
+                let _ = write!(scratch, "{other}");
+                json_string(&scratch, out);
+            }
+        }
+    }
+    out.push('}');
+}
