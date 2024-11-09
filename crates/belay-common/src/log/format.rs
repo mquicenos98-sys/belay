@@ -205,3 +205,79 @@ fn write_json(ts: Timestamp, record: &Record<'_>, out: &mut String) {
     }
     out.push('}');
 }
+
+fn json_string(s: &str, out: &mut String) {
+    out.push('"');
+    escape_into(s, out);
+    out.push('"');
+}
+
+/// Escaping shared by both formats: valid inside a JSON string and inside a
+/// quoted logfmt value.
+fn escape_into(s: &str, out: &mut String) {
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+}
+
+/// Writes each record as one line to a byte stream (stderr by default).
+///
+/// Lines are written with a single `write_all` under a mutex, so records
+/// from concurrent threads never interleave. Write errors are ignored:
+/// failing to log must not take the process down.
+pub struct StreamLogger {
+    out: Mutex<Box<dyn Write + Send>>,
+    format: LogFormat,
+    filter: Filter,
+    clock: SharedClock,
+}
+
+impl StreamLogger {
+    /// Logfmt to stderr, filtered at `info`, stamped with the system clock.
+    #[must_use]
+    pub fn stderr() -> StreamLogger {
+        StreamLogger::new(io::stderr())
+    }
+
+    /// Logfmt to `writer`, filtered at `info`, stamped with the system clock.
+    #[must_use]
+    pub fn new(writer: impl Write + Send + 'static) -> StreamLogger {
+        StreamLogger {
+            out: Mutex::new(Box::new(writer)),
+            format: LogFormat::Logfmt,
+            filter: Filter::default(),
+            clock: system_clock(),
+        }
+    }
+
+    /// Sets the line format.
+    #[must_use]
+    pub fn with_format(mut self, format: LogFormat) -> StreamLogger {
+        self.format = format;
+        self
+    }
+
+    /// Sets the per-target filter.
+    #[must_use]
+    pub fn with_filter(mut self, filter: Filter) -> StreamLogger {
+        self.filter = filter;
+        self
+    }
+
+    /// Sets the clock used for the `ts` key; handy for exact-output tests.
+    #[must_use]
+    pub fn with_clock(mut self, clock: SharedClock) -> StreamLogger {
+        self.clock = clock;
+        self
+    }
+}
