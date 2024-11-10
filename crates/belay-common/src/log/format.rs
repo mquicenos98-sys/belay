@@ -281,3 +281,172 @@ impl StreamLogger {
         self
     }
 }
+
+impl Logger for StreamLogger {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        self.filter.enabled(metadata)
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        let mut line = String::with_capacity(160);
+        self.format.write(self.clock.now(), record, &mut line);
+        line.push('\n');
+        let _ = lock(&self.out).write_all(line.as_bytes());
+    }
+
+    fn flush(&self) {
+        let _ = lock(&self.out).flush();
+    }
+}
+
+impl fmt::Debug for StreamLogger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StreamLogger")
+            .field("format", &self.format)
+            .field("filter", &self.filter)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log::{with_logger, Field, Level};
+    use crate::time::ManualClock;
+    use std::sync::Arc;
+
+    /// A `Write` that appends into shared memory.
+    #[derive(Clone, Default)]
+    struct SharedBuf(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for SharedBuf {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            lock(&self.0).extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl SharedBuf {
+        fn text(&self) -> String {
+            String::from_utf8(lock(&self.0).clone()).expect("log output is UTF-8")
+        }
+    }
+
+    fn render(format: LogFormat, fields: &[Field<'_>], msg: fmt::Arguments<'_>) -> String {
+        let record = Record::new(Level::Warn, "t", msg, fields);
+        let mut out = String::new();
+        format.write(Timestamp::EPOCH, &record, &mut out);
+        out
+    }
+
+    #[test]
+    fn logfmt_quotes_only_when_needed() {
+        let fields = [
+            Field::new("a", Value::Str("plain")),
+            Field::new("b", Value::Str("two words")),
+            Field::new("c", Value::Str("")),
+            Field::new("d", Value::Str("k=v")),
+            Field::new("e", Value::Str("say \"hi\"\n")),
+            Field::new("f", Value::Null),
+            Field::new("g", Value::F64(0.25)),
+            Field::new("h", Value::I64(-3)),
+        ];
+        assert_eq!(
+            render(LogFormat::Logfmt, &fields, format_args!("m")),
+            "ts=1970-01-01T00:00:00.000Z level=warn target=t msg=m a=plain b=\"two words\" c=\"\" d=\"k=v\" e=\"say \\\"hi\\\"\\n\" f=null g=0.25 h=-3"
+        );
+    }
+
+    #[test]
+    fn logfmt_sanitizes_keys_and_prefixes_reserved_ones() {
+        let fields = [
+            Field::new("has space", Value::Bool(true)),
+            Field::new("msg", Value::Str("user")),
+            Field::new("", Value::U64(1)),
+        ];
+        assert_eq!(
+            render(LogFormat::Logfmt, &fields, format_args!("m")),
+            "ts=1970-01-01T00:00:00.000Z level=warn target=t msg=m has_space=true _msg=user _=1"
+        );
+    }
+
+    #[test]
+    fn json_escapes_and_types_values() {
+        let dur = crate::duration::CompactDuration(std::time::Duration::from_millis(1500));
+        let fields = [
+            Field::new("s", Value::Str("tab\there \u{1}")),
+            Field::new("n", Value::U64(7)),
+            Field::new("nan", Value::F64(f64::NAN)),
+            Field::new("none", Value::Null),
+            Field::new("dur", Value::Display(&dur)),
+            Field::new("level", Value::Bool(false)),
+        ];
+        assert_eq!(
+            render(LogFormat::Json, &fields, format_args!("quote \" backslash \\")),
+            "{\"ts\":\"1970-01-01T00:00:00.000Z\",\"level\":\"warn\",\"target\":\"t\",\"msg\":\"quote \\\" backslash \\\\\",\"s\":\"tab\\there \\u0001\",\"n\":7,\"nan\":null,\"none\":null,\"dur\":\"1s500ms\",\"_level\":false}"
+        );
+    }
+
+    #[test]
+    fn stream_logger_writes_whole_lines_with_injected_clock() {
+        let buf = SharedBuf::default();
+        let clock = ManualClock::new(Timestamp::from_millis(1_741_064_767_089));
+        let logger = StreamLogger::new(buf.clone())
+            .with_clock(clock.shared())
+            .with_filter(Filter::parse("warn,noisy=off").expect("valid filter"));
+        with_logger(Arc::new(logger), || {
+            crate::warn!("disk almost full"; free_pct = 3u8);
+            crate::info!("filtered out");
+            crate::error!(target: "noisy::sub", "silenced");
+        });
+        assert_eq!(
+            buf.text(),
+            format!(
+                "ts=2025-03-04T05:06:07.089Z level=warn target={} msg=\"disk almost full\" free_pct=3\n",
+                module_path!()
+            )
+        );
+    }
+
+    #[test]
+    fn json_lines_from_many_threads_do_not_interleave() {
+        let buf = SharedBuf::default();
+        let logger: Arc<dyn Logger> =
+            Arc::new(StreamLogger::new(buf.clone()).with_format(LogFormat::Json));
+        let threads: Vec<_> = (0..4)
+            .map(|t| {
+                let logger = Arc::clone(&logger);
+                std::thread::spawn(move || {
+                    with_logger(logger, || {
+                        for i in 0..50 {
+                            crate::info!("line"; thread = t, i);
+                        }
+                    });
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().expect("logging thread panicked");
+        }
+        let text = buf.text();
+        assert_eq!(text.lines().count(), 200);
+        assert!(text
+            .lines()
+            .all(|l| l.starts_with("{\"ts\":") && l.ends_with('}')));
+    }
+
+    #[test]
+    fn log_format_parses_names() {
+        assert_eq!("JSON".parse::<LogFormat>(), Ok(LogFormat::Json));
+        assert_eq!("text".parse::<LogFormat>(), Ok(LogFormat::Logfmt));
+        assert_eq!(
+            "xml".parse::<LogFormat>().unwrap_err().to_string(),
+            "unknown log format \"xml\" (expected logfmt or json)"
+        );
+        assert_eq!(LogFormat::Json.to_string(), "json");
+    }
+}
