@@ -296,3 +296,51 @@ impl ToValue for bool {
         Value::Bool(*self)
     }
 }
+
+impl ToValue for str {
+    fn to_value(&self) -> Value<'_> {
+        Value::Str(self)
+    }
+}
+
+impl ToValue for String {
+    fn to_value(&self) -> Value<'_> {
+        Value::Str(self)
+    }
+}
+
+impl ToValue for std::borrow::Cow<'_, str> {
+    fn to_value(&self) -> Value<'_> {
+        Value::Str(self)
+    }
+}
+
+impl ToValue for char {
+    fn to_value(&self) -> Value<'_> {
+        Value::Display(self)
+    }
+}
+
+impl ToValue for Duration {
+    fn to_value(&self) -> Value<'_> {
+        Value::Duration(*self)
+    }
+}
+
+impl ToValue for crate::time::Timestamp {
+    fn to_value(&self) -> Value<'_> {
+        Value::Display(self)
+    }
+}
+
+impl ToValue for crate::id::Ulid {
+    fn to_value(&self) -> Value<'_> {
+        Value::Display(self)
+    }
+}
+
+impl<T: ToValue> ToValue for Option<T> {
+    fn to_value(&self) -> Value<'_> {
+        self.as_ref().map_or(Value::Null, ToValue::to_value)
+    }
+}
