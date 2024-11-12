@@ -236,3 +236,81 @@ impl Default for BackoffPolicy {
             .with_jitter(Jitter::Proportional(0.1))
     }
 }
+
+impl fmt::Display for Backoff {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let cap = |f: &mut fmt::Formatter<'_>, max: Duration| {
+            if max == Duration::MAX {
+                Ok(())
+            } else {
+                write!(f, "..{}", CompactDuration(max))
+            }
+        };
+        match *self {
+            Backoff::Constant { delay } => write!(f, "const:{}", CompactDuration(delay)),
+            Backoff::Linear { initial, step, max } => {
+                write!(
+                    f,
+                    "linear:{}+{}",
+                    CompactDuration(initial),
+                    CompactDuration(step)
+                )?;
+                cap(f, max)
+            }
+            Backoff::Exponential {
+                initial,
+                factor,
+                max,
+            } => {
+                write!(f, "exp:{}*{factor}", CompactDuration(initial))?;
+                cap(f, max)
+            }
+        }
+    }
+}
+
+impl fmt::Display for Jitter {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match *self {
+            Jitter::None => f.write_str("none"),
+            Jitter::Full => f.write_str("full"),
+            Jitter::Equal => f.write_str("equal"),
+            // Round away float noise such as 0.07 * 100 = 7.000000000000001.
+            Jitter::Proportional(p) => write!(f, "{}%", (p * 100.0 * 1e6).round() / 1e6),
+        }
+    }
+}
+
+impl fmt::Display for BackoffPolicy {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.backoff)?;
+        match self.jitter {
+            Jitter::None => Ok(()),
+            jitter => write!(f, "~{jitter}"),
+        }
+    }
+}
+
+impl FromStr for Jitter {
+    type Err = ParseBackoffError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        parse_jitter(s).ok_or_else(|| ParseBackoffError {
+            input: s.to_owned(),
+            kind: BackoffErrorKind::Jitter(s.to_owned()),
+        })
+    }
+}
+
+fn parse_jitter(s: &str) -> Option<Jitter> {
+    match s {
+        "none" => Some(Jitter::None),
+        "full" => Some(Jitter::Full),
+        "equal" => Some(Jitter::Equal),
+        _ => s
+            .strip_suffix('%')
+            .and_then(|p| p.parse::<f64>().ok())
+            .filter(|p| p.is_finite() && (0.0..=100.0).contains(p))
+            .map(|p| Jitter::Proportional(p / 100.0)),
+    }
+}
