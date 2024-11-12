@@ -314,3 +314,388 @@ fn parse_jitter(s: &str) -> Option<Jitter> {
             .map(|p| Jitter::Proportional(p / 100.0)),
     }
 }
+
+impl FromStr for BackoffPolicy {
+    type Err = ParseBackoffError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let fail = |kind| ParseBackoffError {
+            input: s.to_owned(),
+            kind,
+        };
+        let (curve, jitter) = match s.split_once('~') {
+            Some((curve, jitter)) => (
+                curve,
+                parse_jitter(jitter)
+                    .ok_or_else(|| fail(BackoffErrorKind::Jitter(jitter.to_owned())))?,
+            ),
+            None => (s, Jitter::None),
+        };
+        let (kind, body) = curve.split_once(':').ok_or_else(|| {
+            fail(BackoffErrorKind::Syntax(
+                "expected <kind>:<parameters>, e.g. exp:1s*2..10m",
+            ))
+        })?;
+        let duration =
+            |text: &str| parse_duration(text).map_err(|e| fail(BackoffErrorKind::Duration(e)));
+        let (head, max) = match body.split_once("..") {
+            Some((head, max)) => (head, Some(duration(max)?)),
+            None => (body, None),
+        };
+
+        let backoff = match kind {
+            "const" | "constant" => {
+                if max.is_some() {
+                    return Err(fail(BackoffErrorKind::Syntax("const takes no ..max")));
+                }
+                Backoff::Constant {
+                    delay: duration(head)?,
+                }
+            }
+            "linear" => {
+                let (initial, step) = head.split_once('+').ok_or_else(|| {
+                    fail(BackoffErrorKind::Syntax(
+                        "expected linear:<initial>+<step>[..<max>]",
+                    ))
+                })?;
+                Backoff::Linear {
+                    initial: duration(initial)?,
+                    step: duration(step)?,
+                    max: max.unwrap_or(Duration::MAX),
+                }
+            }
+            "exp" | "exponential" => {
+                let (initial, factor) = head.split_once('*').ok_or_else(|| {
+                    fail(BackoffErrorKind::Syntax(
+                        "expected exp:<initial>*<factor>[..<max>]",
+                    ))
+                })?;
+                let factor = factor
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|f| f.is_finite() && *f >= 1.0)
+                    .ok_or_else(|| fail(BackoffErrorKind::Factor(factor.to_owned())))?;
+                Backoff::Exponential {
+                    initial: duration(initial)?,
+                    factor,
+                    max: max.unwrap_or(Duration::MAX),
+                }
+            }
+            other => return Err(fail(BackoffErrorKind::UnknownKind(other.to_owned()))),
+        };
+
+        if let Backoff::Linear { initial, max, .. } | Backoff::Exponential { initial, max, .. } =
+            backoff
+        {
+            if max < initial {
+                return Err(fail(BackoffErrorKind::MaxBelowInitial { initial, max }));
+            }
+        }
+        Ok(BackoffPolicy::new(backoff, jitter))
+    }
+}
+
+/// Error returned when parsing a [`BackoffPolicy`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParseBackoffError {
+    input: String,
+    kind: BackoffErrorKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BackoffErrorKind {
+    UnknownKind(String),
+    Syntax(&'static str),
+    Duration(ParseDurationError),
+    Factor(String),
+    Jitter(String),
+    MaxBelowInitial { initial: Duration, max: Duration },
+}
+
+impl fmt::Display for ParseBackoffError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid backoff {:?}: ", self.input)?;
+        match &self.kind {
+            BackoffErrorKind::UnknownKind(kind) => {
+                write!(f, "unknown kind {kind:?} (expected const, linear or exp)")
+            }
+            BackoffErrorKind::Syntax(expected) => f.write_str(expected),
+            BackoffErrorKind::Duration(e) => write!(f, "{e}"),
+            BackoffErrorKind::Factor(factor) => {
+                write!(f, "factor must be a finite number >= 1, got {factor:?}")
+            }
+            BackoffErrorKind::Jitter(jitter) => write!(
+                f,
+                "jitter must be full, equal, none or a percentage 0%-100%, got {jitter:?}"
+            ),
+            BackoffErrorKind::MaxBelowInitial { initial, max } => write!(
+                f,
+                "max {} is below initial delay {}",
+                CompactDuration(*max),
+                CompactDuration(*initial)
+            ),
+        }
+    }
+}
+
+impl std::error::Error for ParseBackoffError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match &self.kind {
+            BackoffErrorKind::Duration(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    fn secs(n: u64) -> Duration {
+        Duration::from_secs(n)
+    }
+
+    fn policy(s: &str) -> BackoffPolicy {
+        s.parse().unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn parse_err(s: &str) -> String {
+        match s.parse::<BackoffPolicy>() {
+            Ok(p) => panic!("{s:?} unexpectedly parsed as {p}"),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    #[test]
+    fn constant_linear_and_exponential_curves() {
+        let c = Backoff::Constant { delay: secs(5) };
+        assert_eq!([1, 2, 10].map(|a| c.base_delay(a)), [secs(5); 3]);
+
+        let l = Backoff::Linear {
+            initial: secs(1),
+            step: secs(2),
+            max: secs(60),
+        };
+        assert_eq!(
+            [1, 2, 3, 30, 31].map(|a| l.base_delay(a)),
+            [secs(1), secs(3), secs(5), secs(59), secs(60)]
+        );
+
+        let e = Backoff::Exponential {
+            initial: secs(1),
+            factor: 2.0,
+            max: secs(600),
+        };
+        assert_eq!(
+            [1, 2, 3, 10, 11].map(|a| e.base_delay(a)),
+            [secs(1), secs(2), secs(4), secs(512), secs(600)]
+        );
+    }
+
+    #[test]
+    fn attempt_zero_behaves_like_the_first_retry() {
+        let e = Backoff::Exponential {
+            initial: secs(3),
+            factor: 2.0,
+            max: Duration::MAX,
+        };
+        assert_eq!(e.base_delay(0), e.base_delay(1));
+    }
+
+    #[test]
+    fn fractional_factors_are_exact_to_the_nanosecond() {
+        let e = Backoff::Exponential {
+            initial: Duration::from_millis(250),
+            factor: 1.5,
+            max: Duration::MAX,
+        };
+        assert_eq!(e.base_delay(3), Duration::from_micros(562_500));
+        let e = Backoff::Exponential {
+            initial: secs(1),
+            factor: 1.1,
+            max: Duration::MAX,
+        };
+        assert_eq!(e.base_delay(2), Duration::from_millis(1_100));
+    }
+
+    #[test]
+    fn huge_attempts_and_factors_saturate_instead_of_panicking() {
+        let uncapped_exp = Backoff::Exponential {
+            initial: Duration::MAX,
+            factor: 1e300,
+            max: Duration::MAX,
+        };
+        assert_eq!(uncapped_exp.base_delay(u32::MAX), Duration::MAX);
+        let capped = Backoff::Exponential {
+            initial: secs(1),
+            factor: 10.0,
+            max: secs(3600),
+        };
+        assert_eq!(capped.base_delay(u32::MAX), secs(3600));
+        let linear = Backoff::Linear {
+            initial: Duration::MAX,
+            step: Duration::MAX,
+            max: Duration::MAX,
+        };
+        assert_eq!(linear.base_delay(u32::MAX), Duration::MAX);
+        let jittered = BackoffPolicy::new(uncapped_exp, Jitter::Full);
+        let _ = jittered.delay_for(u32::MAX, &mut Rng::seed_from_u64(1));
+    }
+
+    #[test]
+    fn nonsensical_factors_act_as_one() {
+        for factor in [0.5, f64::NAN, f64::INFINITY, -2.0] {
+            let e = Backoff::Exponential {
+                initial: secs(2),
+                factor,
+                max: secs(100),
+            };
+            assert_eq!(e.base_delay(5), secs(2), "factor {factor}");
+        }
+    }
+
+    #[test]
+    fn full_and_equal_jitter_stay_within_their_ranges() {
+        let mut rng = Rng::seed_from_u64(40);
+        let d = secs(10);
+        let full: Vec<Duration> = (0..500).map(|_| Jitter::Full.apply(d, &mut rng)).collect();
+        assert!(full.iter().all(|x| *x <= d));
+        assert!(full.iter().any(|x| *x < secs(1)));
+        let equal: Vec<Duration> = (0..500).map(|_| Jitter::Equal.apply(d, &mut rng)).collect();
+        assert!(equal.iter().all(|x| *x >= secs(5) && *x <= d));
+        assert!(equal.iter().any(|x| *x < Duration::from_millis(5_500)));
+        assert_eq!(Jitter::Full.apply(Duration::ZERO, &mut rng), Duration::ZERO);
+    }
+
+    #[test]
+    fn proportional_jitter_spreads_around_the_base() {
+        let mut rng = Rng::seed_from_u64(41);
+        let d = secs(100);
+        let samples: Vec<Duration> = (0..1_000)
+            .map(|_| Jitter::Proportional(0.2).apply(d, &mut rng))
+            .collect();
+        assert!(samples.iter().all(|x| *x >= secs(80) && *x <= secs(120)));
+        assert!(samples.iter().any(|x| *x < secs(85)) && samples.iter().any(|x| *x > secs(115)));
+        // Out-of-range fractions are clamped, NaN disables the jitter.
+        assert!(Jitter::Proportional(7.0).apply(d, &mut rng) <= secs(200));
+        assert_eq!(Jitter::Proportional(f64::NAN).apply(d, &mut rng), d);
+    }
+
+    #[test]
+    fn delay_for_is_deterministic_for_a_seed() {
+        let p = BackoffPolicy::default();
+        let run = |seed| {
+            let mut rng = Rng::seed_from_u64(seed);
+            (1..=10)
+                .map(|a| p.delay_for(a, &mut rng))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(run(5), run(5));
+        assert_ne!(run(5), run(6));
+    }
+
+    #[test]
+    fn parses_the_documented_forms() {
+        assert_eq!(policy("const:5s"), BackoffPolicy::constant(secs(5)));
+        assert_eq!(
+            policy("linear:1s+2s..1m"),
+            BackoffPolicy::linear(secs(1), secs(2), secs(60))
+        );
+        assert_eq!(
+            policy("exp:1s*2..10m"),
+            BackoffPolicy::exponential(secs(1), 2.0, secs(600))
+        );
+        assert_eq!(
+            policy("exponential:1.5s*1.5"),
+            BackoffPolicy::exponential(Duration::from_millis(1500), 1.5, Duration::MAX)
+        );
+        assert_eq!(
+            policy("constant:250ms"),
+            BackoffPolicy::constant(Duration::from_millis(250))
+        );
+        assert_eq!(
+            policy("exp:1s*2..10m~full"),
+            BackoffPolicy::exponential(secs(1), 2.0, secs(600)).with_jitter(Jitter::Full)
+        );
+        assert_eq!(policy("const:1s~equal").jitter, Jitter::Equal);
+        assert_eq!(policy("const:1s~none").jitter, Jitter::None);
+        assert_eq!(policy("const:1s~25%").jitter, Jitter::Proportional(0.25));
+    }
+
+    #[test]
+    fn display_is_canonical_and_round_trips() {
+        let texts = [
+            "const:5s",
+            "linear:1s+2s..1m",
+            "linear:0s+500ms",
+            "exp:1s*2..10m",
+            "exp:250ms*1.5..1h30m~full",
+            "exp:1s*2..1h~10%",
+            "const:1m~7%",
+            "const:1s~12.5%",
+            "linear:1s+1s..1d~equal",
+        ];
+        for text in texts {
+            let p = policy(text);
+            assert_eq!(p.to_string(), text);
+            assert_eq!(policy(&p.to_string()), p);
+        }
+        assert_eq!(policy("constant:60s~none").to_string(), "const:1m");
+        assert_eq!(BackoffPolicy::default().to_string(), "exp:1s*2..1h~10%");
+    }
+
+    #[test]
+    fn parse_errors_are_specific() {
+        assert_eq!(
+            parse_err("fib:1s"),
+            "invalid backoff \"fib:1s\": unknown kind \"fib\" (expected const, linear or exp)"
+        );
+        assert_eq!(
+            parse_err("5s"),
+            "invalid backoff \"5s\": expected <kind>:<parameters>, e.g. exp:1s*2..10m"
+        );
+        assert_eq!(
+            parse_err("exp:1s*0.5..1m"),
+            "invalid backoff \"exp:1s*0.5..1m\": factor must be a finite number >= 1, got \"0.5\""
+        );
+        assert_eq!(
+            parse_err("exp:1s..1m"),
+            "invalid backoff \"exp:1s..1m\": expected exp:<initial>*<factor>[..<max>]"
+        );
+        assert_eq!(
+            parse_err("linear:1s..1m"),
+            "invalid backoff \"linear:1s..1m\": expected linear:<initial>+<step>[..<max>]"
+        );
+        assert_eq!(
+            parse_err("exp:10m*2..1m"),
+            "invalid backoff \"exp:10m*2..1m\": max 1m is below initial delay 10m"
+        );
+        assert_eq!(
+            parse_err("const:5s..1m"),
+            "invalid backoff \"const:5s..1m\": const takes no ..max"
+        );
+        assert_eq!(
+            parse_err("const:1s~150%"),
+            "invalid backoff \"const:1s~150%\": jitter must be full, equal, none or a percentage 0%-100%, got \"150%\""
+        );
+        assert!(parse_err("exp:1s*NaN").contains("factor must be"));
+    }
+
+    #[test]
+    fn duration_errors_are_exposed_as_the_source() {
+        let e = "exp:1x*2".parse::<BackoffPolicy>().unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "invalid backoff \"exp:1x*2\": invalid duration \"1x\": unknown unit \"x\" (expected ns, us, ms, s, m, h, d or w)"
+        );
+        assert!(e.source().is_some());
+    }
+
+    #[test]
+    fn max_delay_reports_the_cap() {
+        assert_eq!(policy("const:5s").backoff.max_delay(), secs(5));
+        assert_eq!(policy("exp:1s*2..10m").backoff.max_delay(), secs(600));
+        assert_eq!(policy("linear:1s+1s").backoff.max_delay(), Duration::MAX);
+    }
+}
