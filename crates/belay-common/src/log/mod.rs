@@ -344,3 +344,215 @@ impl<T: ToValue> ToValue for Option<T> {
         self.as_ref().map_or(Value::Null, ToValue::to_value)
     }
 }
+
+impl<T: ToValue + ?Sized> ToValue for &T {
+    fn to_value(&self) -> Value<'_> {
+        (**self).to_value()
+    }
+}
+
+impl ToValue for Value<'_> {
+    fn to_value(&self) -> Value<'_> {
+        *self
+    }
+}
+
+/// A key/value pair attached to a record.
+#[derive(Clone, Copy, Debug)]
+pub struct Field<'a> {
+    key: &'a str,
+    value: Value<'a>,
+}
+
+impl<'a> Field<'a> {
+    /// A field; keys are usually identifiers such as `job` or `attempt`.
+    #[must_use]
+    pub const fn new(key: &'a str, value: Value<'a>) -> Field<'a> {
+        Field { key, value }
+    }
+
+    /// The key.
+    #[must_use]
+    pub fn key(&self) -> &'a str {
+        self.key
+    }
+
+    /// The value.
+    #[must_use]
+    pub fn value(&self) -> Value<'a> {
+        self.value
+    }
+}
+
+/// The level and target of a record, available before it is built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Metadata<'a> {
+    level: Level,
+    target: &'a str,
+}
+
+impl<'a> Metadata<'a> {
+    /// Metadata for a record at `level` from `target`.
+    #[must_use]
+    pub const fn new(level: Level, target: &'a str) -> Metadata<'a> {
+        Metadata { level, target }
+    }
+
+    /// The level.
+    #[must_use]
+    pub fn level(&self) -> Level {
+        self.level
+    }
+
+    /// The target, usually a module path such as `belay_queue::lease`.
+    #[must_use]
+    pub fn target(&self) -> &'a str {
+        self.target
+    }
+}
+
+/// A log record as handed to a [`Logger`].
+#[derive(Clone, Debug)]
+pub struct Record<'a> {
+    metadata: Metadata<'a>,
+    message: fmt::Arguments<'a>,
+    fields: &'a [Field<'a>],
+    module_path: &'static str,
+    file: &'static str,
+    line: u32,
+}
+
+impl<'a> Record<'a> {
+    /// Builds a record by hand, for code that assembles fields at run time
+    /// or tests a [`Logger`]; emit it with [`log_record`]. Location fields
+    /// are left empty.
+    #[must_use]
+    pub fn new(
+        level: Level,
+        target: &'a str,
+        message: fmt::Arguments<'a>,
+        fields: &'a [Field<'a>],
+    ) -> Record<'a> {
+        Record {
+            metadata: Metadata::new(level, target),
+            message,
+            fields,
+            module_path: "",
+            file: "",
+            line: 0,
+        }
+    }
+
+    /// Level and target.
+    #[must_use]
+    pub fn metadata(&self) -> Metadata<'a> {
+        self.metadata
+    }
+
+    /// The level.
+    #[must_use]
+    pub fn level(&self) -> Level {
+        self.metadata.level
+    }
+
+    /// The target.
+    #[must_use]
+    pub fn target(&self) -> &'a str {
+        self.metadata.target
+    }
+
+    /// The message; format it with `Display` (`record.message().to_string()`).
+    #[must_use]
+    pub fn message(&self) -> &fmt::Arguments<'a> {
+        &self.message
+    }
+
+    /// The structured fields in the order they were written.
+    #[must_use]
+    pub fn fields(&self) -> &'a [Field<'a>] {
+        self.fields
+    }
+
+    /// Module path of the logging statement.
+    #[must_use]
+    pub fn module_path(&self) -> &'static str {
+        self.module_path
+    }
+
+    /// Source file of the logging statement.
+    #[must_use]
+    pub fn file(&self) -> &'static str {
+        self.file
+    }
+
+    /// Source line of the logging statement.
+    #[must_use]
+    pub fn line(&self) -> u32 {
+        self.line
+    }
+}
+
+/// A destination for log records.
+pub trait Logger: Send + Sync {
+    /// Whether a record with this metadata would be logged. Called before
+    /// the record's fields are evaluated.
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        let _ = metadata;
+        true
+    }
+
+    /// Writes one record.
+    fn log(&self, record: &Record<'_>);
+
+    /// Flushes buffered output.
+    fn flush(&self) {}
+}
+
+static MAX_LEVEL: AtomicUsize = AtomicUsize::new(LevelFilter::Info as usize);
+static LOGGER: RwLock<Option<Arc<dyn Logger>>> = RwLock::new(None);
+/// Number of active thread-scoped loggers across all threads; lets the
+/// fast path skip the thread-local lookup when nobody uses them.
+static SCOPED_ACTIVE: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    static SCOPED: RefCell<Option<Arc<dyn Logger>>> = const { RefCell::new(None) };
+}
+
+/// Sets the most verbose level that reaches the global logger. Accepts a
+/// [`Level`] or a [`LevelFilter`]. The default is `Info`.
+pub fn set_max_level(filter: impl Into<LevelFilter>) {
+    MAX_LEVEL.store(filter.into() as usize, Ordering::Relaxed);
+}
+
+/// The current global maximum level.
+#[must_use]
+pub fn max_level() -> LevelFilter {
+    LevelFilter::from_usize(MAX_LEVEL.load(Ordering::Relaxed))
+}
+
+/// Replaces the global logger, flushing the previous one.
+pub fn set_logger(logger: Box<dyn Logger>) {
+    let previous = write(&LOGGER).replace(Arc::from(logger));
+    if let Some(previous) = previous {
+        previous.flush();
+    }
+}
+
+/// Installs a [`StreamLogger`] on stderr with the given filter and format,
+/// and sets the global maximum level to match the filter.
+pub fn init_stderr(filter: Filter, format: LogFormat) {
+    set_max_level(filter.max_level());
+    set_logger(Box::new(
+        StreamLogger::stderr()
+            .with_filter(filter)
+            .with_format(format),
+    ));
+}
+
+fn global_logger() -> Arc<dyn Logger> {
+    static DEFAULT: OnceLock<Arc<dyn Logger>> = OnceLock::new();
+    match &*read(&LOGGER) {
+        Some(logger) => Arc::clone(logger),
+        None => Arc::clone(DEFAULT.get_or_init(|| Arc::new(StreamLogger::stderr()))),
+    }
+}
