@@ -21,11 +21,8 @@
 //! each other's records.
 
 mod capture;
-
 mod filter;
-
 mod format;
-
 pub mod macros;
 
 use std::cell::RefCell;
@@ -554,5 +551,204 @@ fn global_logger() -> Arc<dyn Logger> {
     match &*read(&LOGGER) {
         Some(logger) => Arc::clone(logger),
         None => Arc::clone(DEFAULT.get_or_init(|| Arc::new(StreamLogger::stderr()))),
+    }
+}
+
+fn scoped_logger() -> Option<Arc<dyn Logger>> {
+    if SCOPED_ACTIVE.load(Ordering::Relaxed) == 0 {
+        return None;
+    }
+    SCOPED.try_with(|s| s.borrow().clone()).ok().flatten()
+}
+
+/// Flushes the logger in effect on this thread.
+pub fn flush() {
+    match scoped_logger() {
+        Some(logger) => logger.flush(),
+        None => global_logger().flush(),
+    }
+}
+
+/// Whether a record at `level` from `target` would be logged on this
+/// thread. Use it (or [`log_enabled!`](crate::log_enabled)) to skip
+/// expensive preparation of log data.
+#[must_use]
+pub fn enabled(level: Level, target: &str) -> bool {
+    __private::logger_for(level, target).is_some()
+}
+
+/// Sends a hand-built record through the same filtering as the macros.
+pub fn log_record(record: &Record<'_>) {
+    if let Some(logger) = __private::logger_for(record.level(), record.target()) {
+        logger.log(record);
+    }
+}
+
+/// Runs `f` with `logger` receiving every record logged *on this thread*,
+/// instead of the global logger and regardless of the global maximum level
+/// (the scoped logger's own [`Logger::enabled`] decides). Scopes nest.
+pub fn with_logger<R>(logger: Arc<dyn Logger>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<Arc<dyn Logger>>);
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let previous = self.0.take();
+            let _ = SCOPED.try_with(|s| *s.borrow_mut() = previous);
+            SCOPED_ACTIVE.fetch_sub(1, Ordering::Relaxed);
+        }
+    }
+
+    let previous = SCOPED.with(|s| s.replace(Some(logger)));
+    SCOPED_ACTIVE.fetch_add(1, Ordering::Relaxed);
+    let _restore = Restore(previous);
+    f()
+}
+
+/// Implementation details of the logging macros. Not public API.
+#[doc(hidden)]
+pub mod __private {
+    use super::*;
+
+    /// The cheap check done before evaluating any macro argument.
+    #[inline]
+    pub fn enabled_fast(level: Level) -> bool {
+        level as usize <= MAX_LEVEL.load(Ordering::Relaxed)
+            || SCOPED_ACTIVE.load(Ordering::Relaxed) > 0
+    }
+
+    /// The logger that should receive a record, if any.
+    pub fn logger_for(level: Level, target: &str) -> Option<Arc<dyn Logger>> {
+        let metadata = Metadata::new(level, target);
+        if let Some(scoped) = scoped_logger() {
+            return scoped.enabled(&metadata).then_some(scoped);
+        }
+        if !max_level().allows(level) {
+            return None;
+        }
+        let logger = global_logger();
+        logger.enabled(&metadata).then_some(logger)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn dispatch(
+        logger: &dyn Logger,
+        level: Level,
+        target: &str,
+        message: fmt::Arguments<'_>,
+        fields: &[Field<'_>],
+        module_path: &'static str,
+        file: &'static str,
+        line: u32,
+    ) {
+        logger.log(&Record {
+            metadata: Metadata::new(level, target),
+            message,
+            fields,
+            module_path,
+            file,
+            line,
+        });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn levels_parse_case_insensitively() {
+        assert_eq!("INFO".parse::<Level>(), Ok(Level::Info));
+        assert_eq!("Warning".parse::<Level>(), Ok(Level::Warn));
+        assert_eq!("off".parse::<LevelFilter>(), Ok(LevelFilter::Off));
+        assert!("off".parse::<Level>().is_err());
+        assert_eq!(
+            "verbose".parse::<Level>().unwrap_err().to_string(),
+            "unknown log level \"verbose\" (expected off, error, warn, info, debug or trace)"
+        );
+    }
+
+    #[test]
+    fn levels_order_from_severe_to_verbose() {
+        assert!(Level::Error < Level::Warn && Level::Debug < Level::Trace);
+        assert!(LevelFilter::Info.allows(Level::Warn));
+        assert!(LevelFilter::Info.allows(Level::Info));
+        assert!(!LevelFilter::Info.allows(Level::Debug));
+        assert!(!LevelFilter::Off.allows(Level::Error));
+        assert_eq!(LevelFilter::from(Level::Debug), LevelFilter::Debug);
+        assert_eq!(LevelFilter::Off.to_level(), None);
+        for level in Level::ALL {
+            assert_eq!(level.as_str().parse::<Level>(), Ok(level));
+            assert_eq!(LevelFilter::from(level).to_level(), Some(level));
+        }
+    }
+
+    #[test]
+    fn level_display_honours_padding() {
+        assert_eq!(format!("{:<5}|", Level::Warn), "warn |");
+        assert_eq!(format!("{}", LevelFilter::Off), "off");
+    }
+
+    #[test]
+    fn to_value_covers_common_types() {
+        assert!(matches!(5u16.to_value(), Value::U64(5)));
+        assert!(matches!((-5i32).to_value(), Value::I64(-5)));
+        assert!(matches!(true.to_value(), Value::Bool(true)));
+        assert!(matches!("x".to_value(), Value::Str("x")));
+        assert!(matches!(None::<u8>.to_value(), Value::Null));
+        assert!(matches!(Some(3u8).to_value(), Value::U64(3)));
+        assert_eq!(Duration::from_secs(90).to_value().to_string(), "1m30s");
+        assert_eq!(1.5f32.to_value().to_string(), "1.5");
+        assert_eq!('q'.to_value().to_string(), "q");
+        let s = String::from("owned");
+        assert_eq!(format!("{:?}", s.to_value()), "\"owned\"");
+    }
+
+    #[test]
+    fn scoped_logger_receives_records_and_nests() {
+        let outer = CaptureLogger::new();
+        let inner = CaptureLogger::new();
+        outer.scope(|| {
+            crate::info!("outer one");
+            inner.scope(|| crate::info!("inner"));
+            crate::info!("outer two");
+        });
+        assert_eq!(outer.messages(), vec!["outer one", "outer two"]);
+        assert_eq!(inner.messages(), vec!["inner"]);
+    }
+
+    #[test]
+    fn scoped_logger_is_restored_after_a_panic() {
+        let capture = CaptureLogger::new();
+        let result = std::panic::catch_unwind(|| {
+            capture.scope(|| panic!("inside scope on purpose"));
+        });
+        assert!(result.is_err());
+        assert!(scoped_logger().is_none());
+    }
+
+    #[test]
+    fn log_record_applies_filtering() {
+        let capture = CaptureLogger::with_level(LevelFilter::Warn);
+        let fields = [Field::new("n", Value::U64(1))];
+        capture.scope(|| {
+            log_record(&Record::new(
+                Level::Error,
+                "manual",
+                format_args!("kept"),
+                &fields,
+            ));
+            log_record(&Record::new(
+                Level::Info,
+                "manual",
+                format_args!("dropped"),
+                &fields,
+            ));
+            assert!(enabled(Level::Warn, "x"));
+            assert!(!enabled(Level::Info, "x"));
+        });
+        let records = capture.records();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].target, "manual");
+        assert_eq!(records[0].field("n"), Some("1"));
     }
 }
