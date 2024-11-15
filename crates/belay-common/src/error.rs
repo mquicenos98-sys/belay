@@ -61,3 +61,20 @@ pub enum Error {
 
 /// `Result` defaulting to this crate's [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Time(e) => e.fmt(f),
+            Error::Duration(e) => e.fmt(f),
+            Error::Ulid(e) => e.fmt(f),
+            Error::UlidOverflow(e) => e.fmt(f),
+            Error::Backoff(e) => e.fmt(f),
+            Error::Decode(e) => e.fmt(f),
+            Error::LogConfig(e) => e.fmt(f),
+            Error::Bytes(e) => e.fmt(f),
+            Error::Lock(e) => e.fmt(f),
+            Error::Io(e) => e.fmt(f),
+        }
+    }
+}
