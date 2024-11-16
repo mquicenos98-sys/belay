@@ -114,3 +114,151 @@ fn latest_slot(due: Instant, period: Duration, now: Instant) -> (u64, Instant) {
     let offset = period.saturating_mul(u32::try_from(missed).unwrap_or(u32::MAX));
     (missed, due + offset)
 }
+
+/// Spawns a thread named `name` that calls `f` on every tick until
+/// `shutdown` triggers.
+///
+/// A panic in `f` is caught and logged at error level, and the thread keeps
+/// ticking: a background chore such as lease expiry must not silently stop
+/// because of one bad iteration.
+pub fn spawn_periodic<F>(
+    name: &str,
+    period: Duration,
+    shutdown: Shutdown,
+    mut f: F,
+) -> io::Result<JoinHandle<()>>
+where
+    F: FnMut(Tick) + Send + 'static,
+{
+    let thread_name = name.to_owned();
+    thread::Builder::new().name(thread_name.clone()).spawn(move || {
+        for tick in Ticker::new(period, shutdown) {
+            if panic::catch_unwind(AssertUnwindSafe(|| f(tick))).is_err() {
+                crate::error!("periodic task panicked"; thread = thread_name.as_str(), seq = tick.seq);
+            }
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn on_time_tick_skips_nothing() {
+        let due = Instant::now();
+        let period = Duration::from_millis(10);
+        assert_eq!(latest_slot(due, period, due), (0, due));
+        let slightly_late = due + Duration::from_millis(9);
+        assert_eq!(latest_slot(due, period, slightly_late), (0, due));
+    }
+
+    #[test]
+    fn overrun_skips_whole_periods_and_stays_on_the_grid() {
+        let due = Instant::now();
+        let period = Duration::from_millis(10);
+        let now = due + Duration::from_millis(25);
+        assert_eq!(
+            latest_slot(due, period, now),
+            (2, due + Duration::from_millis(20))
+        );
+        let now = due + Duration::from_millis(30);
+        assert_eq!(
+            latest_slot(due, period, now),
+            (3, due + Duration::from_millis(30))
+        );
+    }
+
+    #[test]
+    fn ticks_follow_the_grid_without_drift() {
+        let shutdown = Shutdown::new();
+        let period = Duration::from_millis(2);
+        let start = Instant::now();
+        let mut ticker = Ticker::new(period, shutdown.clone());
+        let mut first: Option<Tick> = None;
+        let mut ticks = 0;
+        while let Some(tick) = ticker.wait() {
+            assert!(Instant::now() >= tick.scheduled, "never fires early");
+            // Slot n is due exactly n periods after slot 0, however long
+            // the previous iterations took.
+            let base = *first.get_or_insert(tick);
+            let slots = (tick.seq - base.seq) as u32;
+            assert_eq!(tick.scheduled, base.scheduled + period * slots);
+            assert!(base.scheduled >= start + period * (base.seq as u32 + 1));
+            ticks += 1;
+            if ticks == 3 {
+                shutdown.trigger();
+            }
+        }
+        assert_eq!(ticks, 3);
+        assert!(start.elapsed() >= period * 3);
+    }
+
+    #[test]
+    fn slow_handler_reports_missed_ticks() {
+        let shutdown = Shutdown::new();
+        let mut ticker = Ticker::starting_now(Duration::from_millis(2), shutdown.clone());
+        let first = ticker.wait().expect("first tick");
+        assert_eq!((first.seq, first.missed), (0, 0));
+        thread::sleep(Duration::from_millis(9));
+        let second = ticker.wait().expect("second tick");
+        assert!(second.missed >= 3, "{second:?}");
+        assert_eq!(second.seq, 1 + second.missed);
+    }
+
+    #[test]
+    fn shutdown_interrupts_a_long_wait() {
+        let shutdown = Shutdown::new();
+        let mut ticker = Ticker::new(Duration::from_secs(3600), shutdown.clone());
+        let trigger = {
+            let s = shutdown.clone();
+            thread::spawn(move || {
+                s.trigger();
+            })
+        };
+        let start = Instant::now();
+        assert_eq!(ticker.wait(), None);
+        assert!(start.elapsed() < Duration::from_secs(60));
+        trigger.join().expect("trigger thread panicked");
+        assert_eq!(ticker.next(), None, "stays stopped");
+    }
+
+    #[test]
+    fn starting_now_fires_immediately_and_zero_period_is_clamped() {
+        let shutdown = Shutdown::new();
+        let mut ticker = Ticker::starting_now(Duration::from_secs(3600), shutdown.clone());
+        let start = Instant::now();
+        assert!(ticker.wait().is_some());
+        assert!(start.elapsed() < Duration::from_secs(60));
+        assert_eq!(Ticker::new(Duration::ZERO, shutdown).period(), MIN_PERIOD);
+    }
+
+    #[test]
+    fn spawn_periodic_survives_panics_and_stops_on_shutdown() {
+        let shutdown = Shutdown::new();
+        let calls = Arc::new(AtomicU64::new(0));
+        let handle = {
+            let calls = Arc::clone(&calls);
+            let s = shutdown.clone();
+            spawn_periodic(
+                "ticker-test",
+                Duration::from_millis(1),
+                shutdown.clone(),
+                move |_| {
+                    let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                    if n == 1 {
+                        panic!("first iteration fails on purpose");
+                    }
+                    if n == 3 {
+                        s.trigger();
+                    }
+                },
+            )
+            .expect("spawning ticker thread")
+        };
+        handle.join().expect("ticker thread exits cleanly");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+}
