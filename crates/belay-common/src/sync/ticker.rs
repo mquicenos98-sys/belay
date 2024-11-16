@@ -97,3 +97,20 @@ impl Ticker {
         Some(tick)
     }
 }
+
+impl Iterator for Ticker {
+    type Item = Tick;
+
+    fn next(&mut self) -> Option<Tick> {
+        self.wait()
+    }
+}
+
+/// Given a slot `due` that has been reached at `now`, returns how many
+/// further whole slots have also passed and the latest slot not after `now`.
+fn latest_slot(due: Instant, period: Duration, now: Instant) -> (u64, Instant) {
+    let late = now.saturating_duration_since(due);
+    let missed = u64::try_from(late.as_nanos() / period.as_nanos()).unwrap_or(u64::MAX);
+    let offset = period.saturating_mul(u32::try_from(missed).unwrap_or(u32::MAX));
+    (missed, due + offset)
+}
