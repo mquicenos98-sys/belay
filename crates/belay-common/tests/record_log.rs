@@ -107,3 +107,51 @@ fn records_survive_a_round_trip_through_a_file() {
     assert_eq!(decoded, entries);
     assert!(decoded.windows(2).all(|w| w[0].id < w[1].id));
 }
+
+#[test]
+fn every_truncation_point_yields_a_clean_prefix() {
+    let entries = sample_entries(5);
+    let payloads: Vec<Vec<u8>> = entries.iter().map(encode_entry).collect();
+    let bytes = frame(&payloads);
+    let boundaries: Vec<usize> = payloads
+        .iter()
+        .scan(0, |end, p| {
+            *end += 8 + p.len();
+            Some(*end)
+        })
+        .collect();
+    for cut in 0..bytes.len() {
+        let (read, damage) = unframe(&bytes[..cut]);
+        let complete = boundaries.iter().filter(|&&b| b <= cut).count();
+        assert_eq!(read, payloads[..complete], "cut at {cut}");
+        let torn = !boundaries.contains(&cut) && cut != 0;
+        assert_eq!(damage.is_some(), torn, "cut at {cut}");
+    }
+}
+
+#[test]
+fn flipped_bits_are_caught_by_the_checksum() {
+    let payloads: Vec<Vec<u8>> = sample_entries(3).iter().map(encode_entry).collect();
+    let clean = frame(&payloads);
+    let first_len = 8 + payloads[0].len();
+    // Flip one bit in each payload byte of the second record.
+    for offset in first_len + 8..first_len + 8 + payloads[1].len() {
+        let mut bytes = clean.clone();
+        bytes[offset] ^= 0x10;
+        let (read, damage) = unframe(&bytes);
+        assert_eq!(read.len(), 1, "flip at {offset}");
+        assert_eq!(damage, Some(first_len));
+    }
+}
+
+#[test]
+fn damaged_payloads_report_where_decoding_failed() {
+    let entry = &sample_entries(1)[0];
+    let mut payload = encode_entry(entry);
+    payload.push(0xFF);
+    let err = decode_entry(&payload).unwrap_err();
+    assert_eq!(err.kind(), &DecodeErrorKind::TrailingBytes(1));
+    assert_eq!(err.offset(), payload.len() - 1);
+    let err = decode_entry(&payload[..10]).unwrap_err();
+    assert!(matches!(err.kind(), DecodeErrorKind::UnexpectedEof { .. }));
+}
