@@ -64,3 +64,23 @@ fn jittered_policies_never_exceed_their_bounds_over_many_jobs() {
         }
     }
 }
+
+#[test]
+fn ids_from_a_manual_clock_carry_its_time() {
+    let start = Timestamp::from_date(2030, 7, 4).expect("valid date");
+    let clock = ManualClock::new(start);
+    let ids = SyncUlidGenerator::new(clock.shared());
+    let first = ids.generate().expect("id space");
+    clock.advance(parse_duration("1h").expect("valid duration"));
+    let second = ids.generate().expect("id space");
+    assert_eq!(first.timestamp(), start);
+    assert_eq!(
+        second.timestamp().duration_since(first.timestamp()),
+        Some(Duration::from_secs(3600))
+    );
+    assert_eq!(
+        humanize(second.timestamp().saturating_duration_since(start)),
+        "1 hour"
+    );
+    assert!(first.to_string() < second.to_string());
+}
