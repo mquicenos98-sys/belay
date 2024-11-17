@@ -128,3 +128,51 @@ pub enum Error {
 
 /// `Result` with this crate's [`Error`] as the default error type.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Parse(e) => write!(f, "invalid JSON: {e}"),
+            Error::Convert(e) => e.fmt(f),
+            Error::Io(e) => write!(f, "reading JSON failed: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Parse(e) => Some(e),
+            Error::Convert(e) => Some(e),
+            Error::Io(e) => Some(e),
+        }
+    }
+}
+
+impl From<ParseError> for Error {
+    fn from(e: ParseError) -> Error {
+        Error::Parse(e)
+    }
+}
+
+impl From<FromJsonError> for Error {
+    fn from(e: FromJsonError) -> Error {
+        Error::Convert(e)
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Error {
+        Error::Io(e)
+    }
+}
+
+/// Parses `src` strictly and decodes it as `T`.
+///
+/// ```
+/// let ids: Vec<u64> = belay_json::from_str("[1, 2, 3]").unwrap();
+/// assert_eq!(ids, [1, 2, 3]);
+/// ```
+pub fn from_str<T: FromJson>(src: &str) -> Result<T> {
+    Ok(T::from_json_owned(parse(src)?)?)
+}
