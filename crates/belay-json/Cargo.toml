@@ -1,0 +1,15 @@
+[package]
+name = "belay-json"
+description = "JSON value model, strict RFC 8259 parser, serializer and conversion traits for belay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "belay_json"
+path = "src/lib.rs"
+
+[dependencies]
