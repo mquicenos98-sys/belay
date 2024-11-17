@@ -81,19 +81,12 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
 mod convert;
-
 mod macros;
-
 pub mod map;
-
 mod number;
-
 mod parse;
-
 mod pointer;
-
 mod value;
-
 mod write;
 
 use std::fmt;
@@ -175,4 +168,75 @@ impl From<io::Error> for Error {
 /// ```
 pub fn from_str<T: FromJson>(src: &str) -> Result<T> {
     Ok(T::from_json_owned(parse(src)?)?)
+}
+
+/// Parses UTF-8 bytes strictly and decodes them as `T`.
+pub fn from_bytes<T: FromJson>(bytes: &[u8]) -> Result<T> {
+    Ok(T::from_json_owned(parse_bytes(bytes)?)?)
+}
+
+/// Reads `reader` to the end, then parses and decodes it as `T`.
+pub fn from_reader<T: FromJson, R: io::Read>(mut reader: R) -> Result<T> {
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes)?;
+    from_bytes(&bytes)
+}
+
+/// Serializes any [`ToJson`] type to compact JSON.
+#[must_use]
+pub fn to_string_of<T: ToJson + ?Sized>(value: &T) -> String {
+    to_string(&value.to_json())
+}
+
+/// Serializes any [`ToJson`] type to two-space indented JSON.
+#[must_use]
+pub fn to_string_pretty_of<T: ToJson + ?Sized>(value: &T) -> String {
+    to_string_pretty(&value.to_json())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn from_str_distinguishes_parse_and_convert_errors() {
+        let parse_err = from_str::<u8>("[").unwrap_err();
+        assert!(matches!(parse_err, Error::Parse(_)));
+        assert_eq!(
+            parse_err.to_string(),
+            "invalid JSON: unexpected end of input, expected a value at line 1, column 2"
+        );
+        assert!(parse_err.source().is_some());
+        let convert_err = from_str::<u8>("300").unwrap_err();
+        assert!(matches!(convert_err, Error::Convert(_)));
+        assert_eq!(
+            convert_err.to_string(),
+            "$: expected integer in range 0..=255, found 300"
+        );
+    }
+
+    #[test]
+    fn from_reader_and_bytes() {
+        let v: Vec<String> = from_reader(&b"[\"a\", \"b\"]"[..]).unwrap();
+        assert_eq!(v, ["a", "b"]);
+        assert!(matches!(from_bytes::<Value>(b"\xff"), Err(Error::Parse(_))));
+
+        struct Broken;
+        impl io::Read for Broken {
+            fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(io::ErrorKind::ConnectionReset, "reset"))
+            }
+        }
+        let err = from_reader::<Value, _>(Broken).unwrap_err();
+        assert!(matches!(err, Error::Io(_)));
+        assert_eq!(err.to_string(), "reading JSON failed: reset");
+    }
+
+    #[test]
+    fn to_string_of_accepts_unsized_and_references() {
+        assert_eq!(to_string_of("x"), r#""x""#);
+        assert_eq!(to_string_of(&[1u8, 2][..]), "[1,2]");
+        assert_eq!(to_string_pretty_of(&vec![true]), "[\n  true\n]");
+    }
 }
