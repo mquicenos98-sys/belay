@@ -160,3 +160,13 @@ impl ParseError {
         self.column
     }
 }
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{} at line {}, column {}",
+            self.kind, self.line, self.column
+        )
+    }
+}
