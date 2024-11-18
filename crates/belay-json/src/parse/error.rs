@@ -170,3 +170,44 @@ impl fmt::Display for ParseError {
         )
     }
 }
+
+impl std::error::Error for ParseError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn position_clamps_to_char_boundary() {
+        let src = "\"é\"";
+        let err = ParseError::at(ParseErrorKind::InvalidUtf8, src, 2);
+        assert_eq!(err.offset(), 1);
+        assert_eq!(err.column(), 2);
+        let end = ParseError::at(ParseErrorKind::UnterminatedString, src, 99);
+        assert_eq!(end.offset(), src.len());
+    }
+
+    #[test]
+    fn messages_are_specific() {
+        let err = ParseError::at(
+            ParseErrorKind::UnexpectedChar {
+                found: '\u{7}',
+                expected: "a value",
+            },
+            "[\u{7}]",
+            1,
+        );
+        assert_eq!(
+            err.to_string(),
+            "unexpected character '\\u{7}', expected a value at line 1, column 2"
+        );
+        assert_eq!(
+            ParseErrorKind::ControlCharacter('\n').to_string(),
+            "unescaped control character U+000A in string"
+        );
+        assert_eq!(
+            ParseErrorKind::LoneSurrogate(0xd83d).to_string(),
+            "unpaired surrogate \\uD83D in string"
+        );
+    }
+}
