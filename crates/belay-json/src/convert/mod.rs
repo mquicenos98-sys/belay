@@ -226,3 +226,38 @@ impl FromJsonError {
         &self.message
     }
 }
+
+impl fmt::Display for FromJsonError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.path_string(), self.message)
+    }
+}
+
+impl std::error::Error for FromJsonError {}
+
+/// Decodes a JSON string through `T`'s `FromStr`, for types with a canonical
+/// text form (identifiers, enums with lowercase names, durations).
+///
+/// `what` names the type in messages: `expected queue name string, found 5`,
+/// `invalid queue name "Bad Name": must be lowercase`.
+///
+/// ```
+/// use std::net::Ipv4Addr;
+/// use belay_json::{json, parse_str_as};
+///
+/// let ip: Ipv4Addr = parse_str_as(&json!("10.0.0.1"), "IPv4 address").unwrap();
+/// assert_eq!(ip, Ipv4Addr::new(10, 0, 0, 1));
+/// let err = parse_str_as::<Ipv4Addr>(&json!("10.0.0"), "IPv4 address").unwrap_err();
+/// assert_eq!(err.message(), r#"invalid IPv4 address "10.0.0": invalid IPv4 address syntax"#);
+/// ```
+pub fn parse_str_as<T>(value: &Value, what: &str) -> Result<T, FromJsonError>
+where
+    T: FromStr,
+    T::Err: fmt::Display,
+{
+    let s = value
+        .as_str()
+        .ok_or_else(|| FromJsonError::expected(format_args!("{what} string"), value))?;
+    s.parse()
+        .map_err(|e| FromJsonError::new(format!("invalid {what} {}: {e}", quote(s))))
+}
