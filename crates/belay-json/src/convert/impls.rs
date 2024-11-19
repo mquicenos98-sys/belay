@@ -216,3 +216,102 @@ impl<T: ToJson + ?Sized> ToJson for Box<T> {
         (**self).to_json()
     }
 }
+
+impl<T: FromJson> FromJson for Box<T> {
+    fn from_json(value: &Value) -> Result<Box<T>, FromJsonError> {
+        T::from_json(value).map(Box::new)
+    }
+
+    fn from_json_owned(value: Value) -> Result<Box<T>, FromJsonError> {
+        T::from_json_owned(value).map(Box::new)
+    }
+}
+
+impl<T: ToJson + ?Sized> ToJson for Arc<T> {
+    fn to_json(&self) -> Value {
+        (**self).to_json()
+    }
+}
+
+impl<T: FromJson> FromJson for Arc<T> {
+    fn from_json(value: &Value) -> Result<Arc<T>, FromJsonError> {
+        T::from_json(value).map(Arc::new)
+    }
+
+    fn from_json_owned(value: Value) -> Result<Arc<T>, FromJsonError> {
+        T::from_json_owned(value).map(Arc::new)
+    }
+}
+
+impl<T: ToJson + ?Sized> ToJson for Rc<T> {
+    fn to_json(&self) -> Value {
+        (**self).to_json()
+    }
+}
+
+impl<T: FromJson> FromJson for Rc<T> {
+    fn from_json(value: &Value) -> Result<Rc<T>, FromJsonError> {
+        T::from_json(value).map(Rc::new)
+    }
+}
+
+impl<T: ToJson + ToOwned + ?Sized> ToJson for Cow<'_, T> {
+    fn to_json(&self) -> Value {
+        (**self).to_json()
+    }
+}
+
+impl<T: ToJson> ToJson for Option<T> {
+    /// `None` becomes `null`. To omit the field instead, use
+    /// [`ObjectBuilder::opt_field`](crate::ObjectBuilder::opt_field).
+    fn to_json(&self) -> Value {
+        self.as_ref().map_or(Value::Null, ToJson::to_json)
+    }
+}
+
+impl<T: FromJson> FromJson for Option<T> {
+    /// `null` decodes as `None`; anything else must decode as `T`.
+    fn from_json(value: &Value) -> Result<Option<T>, FromJsonError> {
+        match value {
+            Value::Null => Ok(None),
+            other => T::from_json(other).map(Some),
+        }
+    }
+
+    fn from_json_owned(value: Value) -> Result<Option<T>, FromJsonError> {
+        match value {
+            Value::Null => Ok(None),
+            other => T::from_json_owned(other).map(Some),
+        }
+    }
+}
+
+impl<T: ToJson> ToJson for [T] {
+    fn to_json(&self) -> Value {
+        Value::Array(self.iter().map(ToJson::to_json).collect())
+    }
+}
+
+impl<T: ToJson, const N: usize> ToJson for [T; N] {
+    fn to_json(&self) -> Value {
+        self.as_slice().to_json()
+    }
+}
+
+impl<T: ToJson> ToJson for Vec<T> {
+    fn to_json(&self) -> Value {
+        self.as_slice().to_json()
+    }
+}
+
+impl<T: ToJson> ToJson for VecDeque<T> {
+    fn to_json(&self) -> Value {
+        Value::Array(self.iter().map(ToJson::to_json).collect())
+    }
+}
+
+impl<T: ToJson> ToJson for BTreeSet<T> {
+    fn to_json(&self) -> Value {
+        Value::Array(self.iter().map(ToJson::to_json).collect())
+    }
+}
