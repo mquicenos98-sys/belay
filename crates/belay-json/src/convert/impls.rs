@@ -315,3 +315,73 @@ impl<T: ToJson> ToJson for BTreeSet<T> {
         Value::Array(self.iter().map(ToJson::to_json).collect())
     }
 }
+
+impl<T: ToJson + Ord, S> ToJson for HashSet<T, S> {
+    /// Elements are written in sorted order so output is deterministic.
+    fn to_json(&self) -> Value {
+        let mut items: Vec<&T> = self.iter().collect();
+        items.sort_unstable();
+        Value::Array(items.into_iter().map(ToJson::to_json).collect())
+    }
+}
+
+/// "array of 1 element" / "array of 3 elements", for length mismatches.
+fn array_of(len: usize) -> String {
+    if len == 1 {
+        "array of 1 element".to_owned()
+    } else {
+        format!("array of {len} elements")
+    }
+}
+
+/// Decodes every element of an array, attaching the index to errors.
+fn decode_elements<'v, T: FromJson>(
+    value: &'v Value,
+) -> Result<impl Iterator<Item = Result<T, FromJsonError>> + 'v, FromJsonError> {
+    let items = value
+        .as_array()
+        .ok_or_else(|| FromJsonError::expected("array", value))?;
+    Ok(items
+        .iter()
+        .enumerate()
+        .map(|(i, item)| T::from_json(item).map_err(|e| e.at_index(i))))
+}
+
+impl<T: FromJson> FromJson for Vec<T> {
+    fn from_json(value: &Value) -> Result<Vec<T>, FromJsonError> {
+        decode_elements(value)?.collect()
+    }
+
+    fn from_json_owned(value: Value) -> Result<Vec<T>, FromJsonError> {
+        match value {
+            Value::Array(items) => items
+                .into_iter()
+                .enumerate()
+                .map(|(i, item)| T::from_json_owned(item).map_err(|e| e.at_index(i)))
+                .collect(),
+            other => Err(FromJsonError::expected("array", &other)),
+        }
+    }
+}
+
+impl<T: FromJson> FromJson for VecDeque<T> {
+    fn from_json(value: &Value) -> Result<VecDeque<T>, FromJsonError> {
+        decode_elements(value)?.collect()
+    }
+}
+
+impl<T: FromJson + Ord> FromJson for BTreeSet<T> {
+    fn from_json(value: &Value) -> Result<BTreeSet<T>, FromJsonError> {
+        decode_elements(value)?.collect()
+    }
+}
+
+impl<T, S> FromJson for HashSet<T, S>
+where
+    T: FromJson + Eq + Hash,
+    S: BuildHasher + Default,
+{
+    fn from_json(value: &Value) -> Result<HashSet<T, S>, FromJsonError> {
+        decode_elements(value)?.collect()
+    }
+}
