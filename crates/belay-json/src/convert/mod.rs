@@ -261,3 +261,60 @@ where
     s.parse()
         .map_err(|e| FromJsonError::new(format!("invalid {what} {}: {e}", quote(s))))
 }
+
+/// Short description of a value for "found ..." messages. Scalars are shown
+/// literally (long strings truncated); containers by type and size.
+pub(crate) fn describe(value: &Value) -> String {
+    const MAX_CHARS: usize = 40;
+    match value {
+        Value::Null => "null".to_owned(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n.to_string(),
+        Value::String(s) if s.chars().count() > MAX_CHARS => {
+            let head: String = s.chars().take(MAX_CHARS - 3).collect();
+            format!("string {}", quote(&(head + "...")))
+        }
+        Value::String(s) => format!("string {}", quote(s)),
+        Value::Array(items) => match items.len() {
+            0 => "empty array".to_owned(),
+            1 => "array of 1 element".to_owned(),
+            n => format!("array of {n} elements"),
+        },
+        Value::Object(map) if map.is_empty() => "empty object".to_owned(),
+        Value::Object(_) => "object".to_owned(),
+    }
+}
+
+/// Quotes a string the way JSON does, so control characters stay visible.
+fn quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    // Writing to a String cannot fail.
+    let _ = write_string(&mut out, s);
+    out
+}
+
+fn is_identifier(key: &str) -> bool {
+    let mut chars = key.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphabetic() || c == '_')
+        && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+/// Adds `, did you mean "x"?` or `, expected one of: ...` to a message about
+/// an unrecognised name.
+fn append_hint(message: &mut String, found: &str, known: &[&str]) {
+    if known.is_empty() {
+        return;
+    }
+    if let Some(best) = closest(found, known) {
+        message.push_str(&format!(", did you mean {}?", quote(best)));
+        return;
+    }
+    let mut unique: Vec<&str> = Vec::with_capacity(known.len());
+    for k in known {
+        if !unique.contains(k) {
+            unique.push(k);
+        }
+    }
+    message.push_str(", expected one of: ");
+    message.push_str(&unique.join(", "));
+}
