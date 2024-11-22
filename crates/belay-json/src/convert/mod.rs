@@ -7,7 +7,6 @@
 //! path.
 
 mod impls;
-
 mod object;
 
 pub use object::{ObjectBuilder, ObjectReader};
@@ -317,4 +316,148 @@ fn append_hint(message: &mut String, found: &str, known: &[&str]) {
     }
     message.push_str(", expected one of: ");
     message.push_str(&unique.join(", "));
+}
+
+/// The known name most likely meant by `found`: equal after ignoring case and
+/// `_`/`-` (so `maxAttempts` finds `max_attempts`), or within a small edit
+/// distance.
+fn closest<'k>(found: &str, known: &[&'k str]) -> Option<&'k str> {
+    let normalize = |s: &str| -> String {
+        s.chars()
+            .filter(|c| *c != '_' && *c != '-')
+            .flat_map(char::to_lowercase)
+            .collect()
+    };
+    let wanted = normalize(found);
+    if let Some(k) = known.iter().find(|k| normalize(k) == wanted) {
+        return Some(k);
+    }
+    // Scale the tolerance with length, and never suggest a name that shares
+    // nothing with the input (any 1-char key is 1 edit from any other).
+    let len = found.chars().count();
+    let limit = match len {
+        0..=3 => 1,
+        4..=8 => 2,
+        _ => 3,
+    };
+    known
+        .iter()
+        .map(|k| (edit_distance(found, k), *k))
+        .filter(|(d, _)| *d <= limit && *d < len)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k)
+}
+
+/// Levenshtein distance over chars, with a two-row table.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b: Vec<char> = b.chars().collect();
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, ca) in a.chars().enumerate() {
+        cur[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let substitution = prev[j] + usize::from(ca != *cb);
+            cur[j + 1] = substitution.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::json;
+
+    #[test]
+    fn path_notation_quotes_non_identifiers() {
+        let err = FromJsonError::new("bad")
+            .at_key("priority")
+            .at_index(2)
+            .at_key("jobs");
+        assert_eq!(err.to_string(), "$.jobs[2].priority: bad");
+        let odd = FromJsonError::new("bad")
+            .at_key("belay.schedule")
+            .at_key("meta");
+        assert_eq!(odd.path_string(), r#"$.meta["belay.schedule"]"#);
+        let empty = FromJsonError::new("bad").at_key("").at_key("9lives");
+        assert_eq!(empty.path_string(), r#"$["9lives"][""]"#);
+        assert_eq!(FromJsonError::new("bad").to_string(), "$: bad");
+    }
+
+    #[test]
+    fn pointer_form_escapes_tokens() {
+        let err = FromJsonError::new("x")
+            .at_key("a/b")
+            .at_index(0)
+            .at_key("m~n");
+        assert_eq!(err.pointer(), "/m~0n/0/a~1b");
+        assert_eq!(FromJsonError::new("x").pointer(), "");
+    }
+
+    #[test]
+    fn describes_found_values() {
+        assert_eq!(describe(&json!(null)), "null");
+        assert_eq!(describe(&json!(false)), "false");
+        assert_eq!(describe(&json!(40000)), "40000");
+        assert_eq!(describe(&json!(1.5)), "1.5");
+        assert_eq!(describe(&json!("hi\n")), r#"string "hi\n""#);
+        assert_eq!(describe(&json!([])), "empty array");
+        assert_eq!(describe(&json!([1, 2])), "array of 2 elements");
+        assert_eq!(describe(&json!({})), "empty object");
+        assert_eq!(describe(&json!({"a": 1})), "object");
+        let long = "x".repeat(100);
+        assert_eq!(
+            describe(&json!(long)),
+            format!("string \"{}...\"", "x".repeat(37))
+        );
+    }
+
+    #[test]
+    fn suggestions_catch_typos_and_case_styles() {
+        let known = ["queue", "kind", "max_attempts", "run_at"];
+        assert_eq!(closest("qeueu", &known), Some("queue"));
+        assert_eq!(closest("maxAttempts", &known), Some("max_attempts"));
+        assert_eq!(closest("run-at", &known), Some("run_at"));
+        assert_eq!(closest("knd", &known), Some("kind"));
+        assert_eq!(closest("payload", &known), None);
+        assert_eq!(closest("x", &["y", "zz"]), None);
+        assert_eq!(closest("ab", &["ac"]), Some("ac"));
+    }
+
+    #[test]
+    fn unknown_field_lists_known_names_without_duplicates() {
+        let err = FromJsonError::unknown_field("colour", "Style", &["size", "weight", "size"]);
+        assert_eq!(
+            err.message(),
+            r#"unknown field "colour" in Style, expected one of: size, weight"#
+        );
+        let err = FromJsonError::unknown_field("sise", "Style", &["size"]);
+        assert_eq!(
+            err.message(),
+            r#"unknown field "sise" in Style, did you mean "size"?"#
+        );
+        let err = FromJsonError::unknown_field("x", "Empty", &[]);
+        assert_eq!(err.message(), r#"unknown field "x" in Empty"#);
+    }
+
+    #[test]
+    fn edit_distance_basics() {
+        assert_eq!(edit_distance("", ""), 0);
+        assert_eq!(edit_distance("abc", ""), 3);
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("héllo", "hello"), 1);
+    }
+
+    #[test]
+    fn parse_str_as_reports_type_and_parse_errors() {
+        let err = parse_str_as::<u16>(&json!(5), "port").unwrap_err();
+        assert_eq!(err.message(), "expected port string, found 5");
+        let err = parse_str_as::<u16>(&json!("99999"), "port").unwrap_err();
+        assert_eq!(
+            err.message(),
+            r#"invalid port "99999": number too large to fit in target type"#
+        );
+        assert_eq!(parse_str_as::<u16>(&json!("8080"), "port"), Ok(8080));
+    }
 }
