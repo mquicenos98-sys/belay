@@ -136,3 +136,61 @@ impl ObjectBuilder {
         self.map
     }
 }
+
+impl From<ObjectBuilder> for Value {
+    fn from(builder: ObjectBuilder) -> Value {
+        builder.build()
+    }
+}
+
+/// Reads the fields of a JSON object for a `FromJson` impl.
+///
+/// Every accessor records the field name, so that after all fields are read
+/// [`deny_unknown_fields`](ObjectReader::deny_unknown_fields) can reject
+/// anything unexpected and suggest what was probably meant. Field names are
+/// `&'static str` because they are part of the type's schema. Errors from a
+/// field's decoder get the field name added to their path.
+///
+/// Accessors take `&self`, so a reader does not need to be `mut` and can be
+/// passed to helper functions by shared reference.
+///
+/// ```
+/// use belay_json::{json, FromJson, FromJsonError, ObjectReader, Value};
+///
+/// #[derive(Debug)]
+/// struct Retry { max: u32, backoff: String, jitter: bool }
+///
+/// impl FromJson for Retry {
+///     fn from_json(value: &Value) -> Result<Self, FromJsonError> {
+///         let r = ObjectReader::new(value, "Retry")?;
+///         let retry = Retry {
+///             max: r.req("max")?,
+///             backoff: r.or_else("backoff", || "exp:1s*2..10m".to_owned())?,
+///             jitter: r.or_default("jitter")?,
+///         };
+///         if retry.max == 0 {
+///             return Err(r.invalid("max", "must be at least 1"));
+///         }
+///         r.deny_unknown_fields()?;
+///         Ok(retry)
+///     }
+/// }
+///
+/// let err = Retry::from_json(&json!({"max": 3, "jiter": true})).unwrap_err();
+/// assert_eq!(err.to_string(), r#"$: unknown field "jiter" in Retry, did you mean "jitter"?"#);
+///
+/// let err = Retry::from_json(&json!({"max": 0})).unwrap_err();
+/// assert_eq!(err.to_string(), "$.max: must be at least 1");
+///
+/// let err = Retry::from_json(&json!({"backoff": "const:5s"})).unwrap_err();
+/// assert_eq!(err.to_string(), r#"$: missing required field "max" in Retry"#);
+/// ```
+#[derive(Debug)]
+pub struct ObjectReader<'a> {
+    map: &'a Map,
+    type_name: &'static str,
+    /// Per entry position: has a field accessor looked at it?
+    consumed: Vec<Cell<bool>>,
+    /// Every field name asked for, present or not.
+    known: RefCell<Vec<&'static str>>,
+}
