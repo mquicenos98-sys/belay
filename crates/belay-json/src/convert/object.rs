@@ -194,3 +194,183 @@ pub struct ObjectReader<'a> {
     /// Every field name asked for, present or not.
     known: RefCell<Vec<&'static str>>,
 }
+
+impl<'a> ObjectReader<'a> {
+    /// Starts reading `value`, which must be an object. `type_name` appears in
+    /// messages: `expected JobSpec object, found array of 2 elements`.
+    pub fn new(
+        value: &'a Value,
+        type_name: &'static str,
+    ) -> Result<ObjectReader<'a>, FromJsonError> {
+        match value {
+            Value::Object(map) => Ok(ObjectReader::from_map(map, type_name)),
+            other => Err(FromJsonError::expected(
+                format_args!("{type_name} object"),
+                other,
+            )),
+        }
+    }
+
+    /// Starts reading an already-unwrapped map.
+    #[must_use]
+    pub fn from_map(map: &'a Map, type_name: &'static str) -> ObjectReader<'a> {
+        ObjectReader {
+            map,
+            type_name,
+            consumed: vec![Cell::new(false); map.len()],
+            known: RefCell::new(Vec::with_capacity(map.len())),
+        }
+    }
+
+    /// The type name given at construction.
+    #[must_use]
+    pub fn type_name(&self) -> &'static str {
+        self.type_name
+    }
+
+    /// The underlying map.
+    #[must_use]
+    pub fn map(&self) -> &'a Map {
+        self.map
+    }
+
+    /// Looks up a field and marks it as read. An explicit `null` is returned
+    /// as `Some(&Value::Null)`.
+    #[must_use]
+    pub fn value(&self, key: &'static str) -> Option<&'a Value> {
+        self.known.borrow_mut().push(key);
+        let position = self.map.get_index_of(key)?;
+        self.consumed[position].set(true);
+        self.map.get_index(position).map(|(_, v)| v)
+    }
+
+    /// Like [`value`](ObjectReader::value), but treats `null` as absent.
+    fn present(&self, key: &'static str) -> Option<&'a Value> {
+        self.value(key).filter(|v| !v.is_null())
+    }
+
+    /// Decodes a required field. A missing field is an error; an explicit
+    /// `null` is handed to `T`, so `req::<Option<T>>` accepts it.
+    pub fn req<T: FromJson>(&self, key: &'static str) -> Result<T, FromJsonError> {
+        self.req_with(key, T::from_json)
+    }
+
+    /// Decodes an optional field: absent or `null` gives `None`.
+    pub fn opt<T: FromJson>(&self, key: &'static str) -> Result<Option<T>, FromJsonError> {
+        self.opt_with(key, T::from_json)
+    }
+
+    /// Decodes a field, using `default` when it is absent or `null`.
+    pub fn or<T: FromJson>(&self, key: &'static str, default: T) -> Result<T, FromJsonError> {
+        Ok(self.opt(key)?.unwrap_or(default))
+    }
+
+    /// Decodes a field, calling `default` when it is absent or `null`.
+    pub fn or_else<T: FromJson>(
+        &self,
+        key: &'static str,
+        default: impl FnOnce() -> T,
+    ) -> Result<T, FromJsonError> {
+        Ok(self.opt(key)?.unwrap_or_else(default))
+    }
+
+    /// Decodes a field, using `T::default()` when it is absent or `null`.
+    pub fn or_default<T: FromJson + Default>(&self, key: &'static str) -> Result<T, FromJsonError> {
+        Ok(self.opt(key)?.unwrap_or_default())
+    }
+
+    /// Decodes a required field with a custom function; its errors get the
+    /// field added to their path.
+    ///
+    /// ```
+    /// use belay_json::{json, parse_str_as, ObjectReader};
+    /// use std::net::SocketAddr;
+    ///
+    /// let v = json!({"listen": "127.0.0.1:7070"});
+    /// let r = ObjectReader::new(&v, "ServerConfig").unwrap();
+    /// let addr: SocketAddr = r.req_with("listen", |v| parse_str_as(v, "socket address")).unwrap();
+    /// assert_eq!(addr.port(), 7070);
+    /// ```
+    pub fn req_with<T>(
+        &self,
+        key: &'static str,
+        decode: impl FnOnce(&'a Value) -> Result<T, FromJsonError>,
+    ) -> Result<T, FromJsonError> {
+        match self.value(key) {
+            Some(v) => decode(v).map_err(|e| e.at_key(key)),
+            None => Err(FromJsonError::missing_field(key, self.type_name)),
+        }
+    }
+
+    /// Decodes an optional field with a custom function; absent or `null`
+    /// gives `None`.
+    pub fn opt_with<T>(
+        &self,
+        key: &'static str,
+        decode: impl FnOnce(&'a Value) -> Result<T, FromJsonError>,
+    ) -> Result<Option<T>, FromJsonError> {
+        self.present(key)
+            .map(|v| decode(v).map_err(|e| e.at_key(key)))
+            .transpose()
+    }
+
+    /// Borrows a required string field, e.g. an enum tag, without allocating.
+    pub fn req_str(&self, key: &'static str) -> Result<&'a str, FromJsonError> {
+        self.req_with(key, |v| {
+            v.as_str()
+                .ok_or_else(|| FromJsonError::expected("string", v))
+        })
+    }
+
+    /// Borrows an optional string field; absent or `null` gives `None`.
+    pub fn opt_str(&self, key: &'static str) -> Result<Option<&'a str>, FromJsonError> {
+        self.opt_with(key, |v| {
+            v.as_str()
+                .ok_or_else(|| FromJsonError::expected("string", v))
+        })
+    }
+
+    /// True if the field is present with a non-null value. Does not count as
+    /// reading it.
+    #[must_use]
+    pub fn has(&self, key: &str) -> bool {
+        self.map.get(key).is_some_and(|v| !v.is_null())
+    }
+
+    /// Accepts a field without decoding it, e.g. a deprecated field that is
+    /// still tolerated.
+    pub fn ignore(&self, key: &'static str) {
+        let _ = self.value(key);
+    }
+
+    /// Builds an error for a field whose value decoded but is not acceptable.
+    #[must_use]
+    pub fn invalid(&self, key: &str, message: impl fmt::Display) -> FromJsonError {
+        FromJsonError::new(message.to_string()).at_key(key)
+    }
+
+    /// Fields present in the object that no accessor has read, in document
+    /// order. Useful to log instead of reject.
+    #[must_use]
+    pub fn unknown_fields(&self) -> Vec<&'a str> {
+        self.map
+            .keys()
+            .zip(&self.consumed)
+            .filter(|(_, consumed)| !consumed.get())
+            .map(|(key, _)| key)
+            .collect()
+    }
+
+    /// Fails on the first field that no accessor has read. Call it after all
+    /// fields are read, since only then are all known names recorded.
+    pub fn deny_unknown_fields(&self) -> Result<(), FromJsonError> {
+        match self.unknown_fields().first() {
+            None => Ok(()),
+            Some(field) => Err(FromJsonError::unknown_field(
+                field,
+                self.type_name,
+                &self.known.borrow(),
+            )),
+        }
+    }
+}
