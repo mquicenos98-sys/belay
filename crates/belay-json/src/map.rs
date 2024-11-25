@@ -326,3 +326,37 @@ impl DoubleEndedIterator for Iter<'_> {
 impl ExactSizeIterator for Iter<'_> {}
 
 impl FusedIterator for Iter<'_> {}
+
+/// Iterator over `(&str, &mut Value)` entries of a [`Map`].
+#[derive(Debug)]
+pub struct IterMut<'a> {
+    inner: std::slice::IterMut<'a, (String, Value)>,
+}
+
+impl<'a> Iterator for IterMut<'a> {
+    type Item = (&'a str, &'a mut Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, v)| (k.as_str(), v))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for IterMut<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back().map(|(k, v)| (k.as_str(), v))
+    }
+}
+
+impl ExactSizeIterator for IterMut<'_> {}
+
+impl FusedIterator for IterMut<'_> {}
+
+/// Owning iterator over `(String, Value)` entries of a [`Map`].
+#[derive(Debug)]
+pub struct IntoIter {
+    inner: std::vec::IntoIter<(String, Value)>,
+}
