@@ -360,3 +360,34 @@ impl FusedIterator for IterMut<'_> {}
 pub struct IntoIter {
     inner: std::vec::IntoIter<(String, Value)>,
 }
+
+impl Iterator for IntoIter {
+    type Item = (String, Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for IntoIter {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back()
+    }
+}
+
+impl ExactSizeIterator for IntoIter {}
+
+impl FusedIterator for IntoIter {}
+
+/// A view into one key of a [`Map`], from [`Map::entry`].
+#[derive(Debug)]
+pub enum Entry<'a> {
+    /// The key is absent.
+    Vacant(VacantEntry<'a>),
+    /// The key is present.
+    Occupied(OccupiedEntry<'a>),
+}
