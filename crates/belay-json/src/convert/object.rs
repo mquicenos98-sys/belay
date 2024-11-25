@@ -374,3 +374,244 @@ impl<'a> ObjectReader<'a> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::json;
+
+    #[derive(Debug, Clone, PartialEq)]
+    struct Step {
+        name: String,
+        depends_on: Vec<String>,
+        timeout_ms: Option<u64>,
+        weight: i16,
+    }
+
+    impl ToJson for Step {
+        fn to_json(&self) -> Value {
+            ObjectBuilder::new()
+                .field("name", &self.name)
+                .field_if(!self.depends_on.is_empty(), "depends_on", &self.depends_on)
+                .opt_field("timeout_ms", &self.timeout_ms)
+                .field_if(self.weight != 1, "weight", self.weight)
+                .build()
+        }
+    }
+
+    impl FromJson for Step {
+        fn from_json(value: &Value) -> Result<Step, FromJsonError> {
+            let r = ObjectReader::new(value, "Step")?;
+            let step = Step {
+                name: r.req("name")?,
+                depends_on: r.or_default("depends_on")?,
+                timeout_ms: r.opt("timeout_ms")?,
+                weight: r.or("weight", 1)?,
+            };
+            r.deny_unknown_fields()?;
+            Ok(step)
+        }
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct Flow {
+        steps: Vec<Step>,
+    }
+
+    impl FromJson for Flow {
+        fn from_json(value: &Value) -> Result<Flow, FromJsonError> {
+            let r = ObjectReader::new(value, "Flow")?;
+            let flow = Flow {
+                steps: r.req("steps")?,
+            };
+            r.deny_unknown_fields()?;
+            Ok(flow)
+        }
+    }
+
+    fn step(name: &str) -> Step {
+        Step {
+            name: name.into(),
+            depends_on: vec![],
+            timeout_ms: None,
+            weight: 1,
+        }
+    }
+
+    #[test]
+    fn builder_omits_defaults_and_reader_restores_them() {
+        let minimal = step("fetch");
+        assert_eq!(minimal.to_json(), json!({"name": "fetch"}));
+        assert_eq!(Step::from_json(&minimal.to_json()), Ok(minimal));
+
+        let full = Step {
+            name: "store".into(),
+            depends_on: vec!["fetch".into()],
+            timeout_ms: Some(500),
+            weight: -3,
+        };
+        let v = full.to_json();
+        assert_eq!(
+            v.to_string(),
+            r#"{"name":"store","depends_on":["fetch"],"timeout_ms":500,"weight":-3}"#
+        );
+        assert_eq!(Step::from_json(&v), Ok(full));
+    }
+
+    #[test]
+    fn nested_errors_carry_full_path() {
+        let v = json!({"steps": [{"name": "a"}, {"name": "b", "weight": 40000}]});
+        let err = Flow::from_json(&v).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "$.steps[1].weight: expected integer in range -32768..=32767, found 40000"
+        );
+        assert_eq!(err.pointer(), "/steps/1/weight");
+    }
+
+    #[test]
+    fn wrong_container_type_names_the_struct() {
+        let err = Flow::from_json(&json!({"steps": [["a"]]})).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$.steps[0]: expected Step object, found array of 1 element"#
+        );
+    }
+
+    #[test]
+    fn missing_and_null_required_fields() {
+        let err = Step::from_json(&json!({})).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$: missing required field "name" in Step"#
+        );
+        let err = Step::from_json(&json!({"name": null})).unwrap_err();
+        assert_eq!(err.to_string(), "$.name: expected string, found null");
+    }
+
+    #[test]
+    fn null_optional_fields_use_defaults() {
+        let v = json!({"name": "x", "depends_on": null, "timeout_ms": null, "weight": null});
+        assert_eq!(Step::from_json(&v), Ok(step("x")));
+    }
+
+    #[test]
+    fn unknown_fields_are_reported_with_suggestions() {
+        let err = Step::from_json(&json!({"name": "x", "dependsOn": ["y"]})).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$: unknown field "dependsOn" in Step, did you mean "depends_on"?"#
+        );
+        let err = Step::from_json(&json!({"name": "x", "color": "red"})).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$: unknown field "color" in Step, expected one of: name, depends_on, timeout_ms, weight"#
+        );
+        let nested = json!({"steps": [{"name": "x", "tiemout_ms": 5}]});
+        assert_eq!(
+            Flow::from_json(&nested).unwrap_err().to_string(),
+            r#"$.steps[0]: unknown field "tiemout_ms" in Step, did you mean "timeout_ms"?"#
+        );
+    }
+
+    #[test]
+    fn unknown_fields_can_be_listed_instead_of_rejected() {
+        let v = json!({"a": 1, "b": 2, "c": 3, "d": 4});
+        let r = ObjectReader::new(&v, "Loose").unwrap();
+        let _: u8 = r.req("b").unwrap();
+        r.ignore("d");
+        assert_eq!(r.unknown_fields(), ["a", "c"]);
+        assert!(r.has("a"));
+        assert!(!r.has("zzz"));
+    }
+
+    #[test]
+    fn string_accessors_borrow() {
+        let v = json!({"type": "fire_all", "note": null, "n": 3});
+        let r = ObjectReader::new(&v, "Misfire").unwrap();
+        assert_eq!(r.req_str("type"), Ok("fire_all"));
+        assert_eq!(r.opt_str("note"), Ok(None));
+        assert_eq!(r.opt_str("absent"), Ok(None));
+        assert_eq!(
+            r.req_str("n").unwrap_err().to_string(),
+            "$.n: expected string, found 3"
+        );
+        assert_eq!(
+            r.req_str("missing").unwrap_err().message(),
+            r#"missing required field "missing" in Misfire"#
+        );
+    }
+
+    #[test]
+    fn custom_decoders_get_path_and_invalid_builds_field_errors() {
+        let v = json!({"cron": "*/5 * * * *", "tz": 5});
+        let r = ObjectReader::new(&v, "Schedule").unwrap();
+        let cron = r
+            .req_with("cron", |v| {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| FromJsonError::expected("string", v))?;
+                Ok(s.split(' ').count())
+            })
+            .unwrap();
+        assert_eq!(cron, 5);
+        let tz = r.opt_with("tz", |v| {
+            v.as_str()
+                .map(str::to_owned)
+                .ok_or_else(|| FromJsonError::expected("time zone name", v))
+        });
+        assert_eq!(
+            tz.unwrap_err().to_string(),
+            "$.tz: expected time zone name, found 5"
+        );
+        assert_eq!(
+            r.invalid("cron", format_args!("has {} fields", 5))
+                .to_string(),
+            "$.cron: has 5 fields"
+        );
+    }
+
+    #[test]
+    fn builder_insert_merge_and_raw() {
+        let mut b = ObjectBuilder::with_capacity(4);
+        assert!(b.is_empty());
+        for i in 0..3 {
+            b.insert(&format!("k{i}"), i);
+        }
+        let extra: Map = [("x", true)].into_iter().collect();
+        let v: Value = b.raw("payload", json!([1])).merge(extra).into();
+        assert_eq!(
+            v,
+            json!({"k0": 0, "k1": 1, "k2": 2, "payload": [1], "x": true})
+        );
+        let map = ObjectBuilder::new().field("a", 1).field("a", 2).into_map();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.get("a"), Some(&json!(2)));
+    }
+
+    #[test]
+    fn opt_field_with_encodes_only_present_values() {
+        let encode_calls = std::cell::Cell::new(0);
+        let encode = |n: &u32| {
+            encode_calls.set(encode_calls.get() + 1);
+            Value::from(format!("#{n}"))
+        };
+        let v = ObjectBuilder::new()
+            .opt_field_with("some", &Some(7), encode)
+            .opt_field_with("none", &None, encode)
+            .build();
+        assert_eq!(v, json!({"some": "#7"}));
+        assert_eq!(encode_calls.get(), 1);
+    }
+
+    #[test]
+    fn reader_exposes_map_and_type_name() {
+        let map: Map = [("a", 1)].into_iter().collect();
+        let r = ObjectReader::from_map(&map, "Thing");
+        assert_eq!(r.type_name(), "Thing");
+        assert_eq!(r.map().len(), 1);
+        assert_eq!(r.value("a"), Some(&json!(1)));
+        assert_eq!(r.value("b"), None);
+        assert!(r.deny_unknown_fields().is_ok());
+    }
+}
