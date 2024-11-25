@@ -324,7 +324,6 @@ impl DoubleEndedIterator for Iter<'_> {
 }
 
 impl ExactSizeIterator for Iter<'_> {}
-
 impl FusedIterator for Iter<'_> {}
 
 /// Iterator over `(&str, &mut Value)` entries of a [`Map`].
@@ -352,7 +351,6 @@ impl DoubleEndedIterator for IterMut<'_> {
 }
 
 impl ExactSizeIterator for IterMut<'_> {}
-
 impl FusedIterator for IterMut<'_> {}
 
 /// Owning iterator over `(String, Value)` entries of a [`Map`].
@@ -380,7 +378,6 @@ impl DoubleEndedIterator for IntoIter {
 }
 
 impl ExactSizeIterator for IntoIter {}
-
 impl FusedIterator for IntoIter {}
 
 /// A view into one key of a [`Map`], from [`Map::entry`].
@@ -504,4 +501,230 @@ impl<'a> OccupiedEntry<'a> {
 struct Index {
     hasher: RandomState,
     slots: HashMap<u64, Slot, BuildHasherDefault<PrehashedHasher>>,
+}
+
+#[derive(Clone)]
+enum Slot {
+    One(usize),
+    Many(Vec<usize>),
+}
+
+impl Index {
+    fn build(entries: &[(String, Value)]) -> Index {
+        let mut index = Index {
+            hasher: RandomState::new(),
+            slots: HashMap::with_capacity_and_hasher(entries.len(), Default::default()),
+        };
+        for (position, (key, _)) in entries.iter().enumerate() {
+            index.add(key, position);
+        }
+        index
+    }
+
+    fn hash(&self, key: &str) -> u64 {
+        self.hasher.hash_one(key)
+    }
+
+    fn find(&self, entries: &[(String, Value)], key: &str) -> Option<usize> {
+        let matches = |&p: &usize| entries[p].0 == key;
+        match self.slots.get(&self.hash(key))? {
+            Slot::One(p) => Some(*p).filter(matches),
+            Slot::Many(ps) => ps.iter().copied().find(matches),
+        }
+    }
+
+    fn add(&mut self, key: &str, position: usize) {
+        let hash = self.hash(key);
+        match self.slots.get_mut(&hash) {
+            None => {
+                self.slots.insert(hash, Slot::One(position));
+            }
+            Some(slot) => match slot {
+                Slot::One(p) => *slot = Slot::Many(vec![*p, position]),
+                Slot::Many(ps) => ps.push(position),
+            },
+        }
+    }
+
+    /// Forgets `key` at `position` and shifts every later position down by
+    /// one, mirroring `Vec::remove` on the entries.
+    fn remove(&mut self, key: &str, position: usize) {
+        let hash = self.hash(key);
+        let emptied = match self.slots.get_mut(&hash) {
+            Some(Slot::One(_)) => true,
+            Some(Slot::Many(ps)) => {
+                ps.retain(|&p| p != position);
+                ps.is_empty()
+            }
+            None => false,
+        };
+        if emptied {
+            self.slots.remove(&hash);
+        }
+        let shift = |p: &mut usize| {
+            if *p > position {
+                *p -= 1;
+            }
+        };
+        for slot in self.slots.values_mut() {
+            match slot {
+                Slot::One(p) => shift(p),
+                Slot::Many(ps) => ps.iter_mut().for_each(shift),
+            }
+        }
+    }
+}
+
+/// Hasher for keys that are already uniformly distributed `u64` hashes.
+#[derive(Default)]
+struct PrehashedHasher(u64);
+
+impl Hasher for PrehashedHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        // Only `write_u64` is used by `HashMap<u64, _>`; fold anything else
+        // FNV-style so the hasher stays correct if that ever changes.
+        for &b in bytes {
+            self.0 = (self.0 ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = n;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn numbered(n: usize) -> Map {
+        (0..n).map(|i| (format!("k{i}"), i)).collect()
+    }
+
+    #[test]
+    fn preserves_insertion_order_and_replace_keeps_position() {
+        let mut map = Map::new();
+        map.insert("b", 1);
+        map.insert("a", 2);
+        map.insert("c", 3);
+        assert_eq!(map.insert("a", 20), Some(Value::from(2)));
+        let entries: Vec<(&str, &Value)> = map.iter().collect();
+        assert_eq!(
+            entries,
+            [
+                ("b", &Value::from(1)),
+                ("a", &Value::from(20)),
+                ("c", &Value::from(3))
+            ]
+        );
+    }
+
+    #[test]
+    fn lookups_work_on_both_sides_of_index_threshold() {
+        for n in [0, 1, INDEX_THRESHOLD, INDEX_THRESHOLD + 1, 200] {
+            let map = numbered(n);
+            assert_eq!(map.len(), n);
+            assert_eq!(map.index.is_some(), n > INDEX_THRESHOLD);
+            for i in 0..n {
+                assert_eq!(
+                    map.get(&format!("k{i}")),
+                    Some(&Value::from(i)),
+                    "n={n} i={i}"
+                );
+                assert_eq!(map.get_index_of(&format!("k{i}")), Some(i));
+            }
+            assert!(map.get("missing").is_none());
+        }
+    }
+
+    #[test]
+    fn remove_keeps_order_and_index_consistent() {
+        let mut map = numbered(40);
+        assert_eq!(map.remove("k0"), Some(Value::from(0)));
+        assert_eq!(map.remove("k17"), Some(Value::from(17)));
+        assert_eq!(map.remove("k39"), Some(Value::from(39)));
+        assert_eq!(map.remove("k17"), None);
+        assert_eq!(map.len(), 37);
+        let expected: Vec<String> = (1..39)
+            .filter(|&i| i != 17)
+            .map(|i| format!("k{i}"))
+            .collect();
+        assert_eq!(map.keys().collect::<Vec<_>>(), expected);
+        for (position, key) in expected.iter().enumerate() {
+            assert_eq!(map.get_index_of(key), Some(position));
+        }
+        // Re-inserting a removed key appends it.
+        map.insert("k17", 17);
+        assert_eq!(map.get_index_of("k17"), Some(37));
+    }
+
+    #[test]
+    fn colliding_slot_positions_are_tracked() {
+        // Force every key into one slot to exercise `Slot::Many`.
+        let mut index = Index::build(&[]);
+        let entries: Vec<(String, Value)> = ["x", "y", "z"]
+            .iter()
+            .map(|k| (k.to_string(), Value::Null))
+            .collect();
+        let hash = index.hash("x");
+        index.slots.insert(hash, Slot::Many(vec![0, 1, 2]));
+        assert_eq!(index.find(&entries, "x"), Some(0));
+        index
+            .slots
+            .insert(index.hash("z"), Slot::Many(vec![0, 1, 2]));
+        assert_eq!(index.find(&entries, "z"), Some(2));
+    }
+
+    #[test]
+    fn equality_ignores_order() {
+        let a: Map = [("x", 1), ("y", 2)].into_iter().collect();
+        let b: Map = [("y", 2), ("x", 1)].into_iter().collect();
+        let c: Map = [("x", 1), ("y", 3)].into_iter().collect();
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert_ne!(a, numbered(2));
+    }
+
+    #[test]
+    fn retain_and_sort_rebuild_index() {
+        let mut map = numbered(30);
+        map.retain(|_, v| v.as_u64().is_some_and(|n| n % 3 == 0));
+        assert_eq!(map.len(), 10);
+        assert_eq!(map.get_index_of("k27"), Some(9));
+        map.sort_keys();
+        // Bytewise: "k0" < "k12" < "k15" < ... < "k3" < ...
+        assert_eq!(map.get_index(0).map(|(k, _)| k), Some("k0"));
+        assert_eq!(map.get_index(1).map(|(k, _)| k), Some("k12"));
+        assert_eq!(map.get("k12"), Some(&Value::from(12)));
+        for (position, key) in map.keys().enumerate() {
+            assert_eq!(map.get_index_of(key), Some(position));
+        }
+    }
+
+    #[test]
+    fn iterators_are_double_ended_and_sized() {
+        let mut map = numbered(3);
+        assert_eq!(map.iter().len(), 3);
+        assert_eq!(map.iter().next_back().map(|(k, _)| k), Some("k2"));
+        for (_, v) in map.iter_mut() {
+            *v = Value::Null;
+        }
+        assert!(map.values().all(Value::is_null));
+        let owned: Vec<(String, Value)> = map.into_iter().rev().collect();
+        assert_eq!(owned[0].0, "k2");
+    }
+
+    #[test]
+    fn clear_drops_index() {
+        let mut map = numbered(20);
+        map.clear();
+        assert!(map.is_empty());
+        assert!(map.index.is_none());
+        map.insert("a", 1);
+        assert_eq!(map.get("a"), Some(&Value::from(1)));
+    }
 }
