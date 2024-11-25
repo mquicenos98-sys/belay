@@ -391,3 +391,117 @@ pub enum Entry<'a> {
     /// The key is present.
     Occupied(OccupiedEntry<'a>),
 }
+
+impl<'a> Entry<'a> {
+    /// The entry's key.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        match self {
+            Entry::Vacant(e) => e.key(),
+            Entry::Occupied(e) => e.key(),
+        }
+    }
+
+    /// Inserts `default` if the key is absent; returns the value either way.
+    pub fn or_insert(self, default: impl Into<Value>) -> &'a mut Value {
+        match self {
+            Entry::Vacant(e) => e.insert(default),
+            Entry::Occupied(e) => e.into_mut(),
+        }
+    }
+
+    /// Inserts the result of `default` if the key is absent.
+    pub fn or_insert_with<V: Into<Value>>(self, default: impl FnOnce() -> V) -> &'a mut Value {
+        match self {
+            Entry::Vacant(e) => e.insert(default()),
+            Entry::Occupied(e) => e.into_mut(),
+        }
+    }
+
+    /// Runs `update` on the value if the key is present.
+    #[must_use]
+    pub fn and_modify(self, update: impl FnOnce(&mut Value)) -> Entry<'a> {
+        match self {
+            Entry::Occupied(mut e) => {
+                update(e.get_mut());
+                Entry::Occupied(e)
+            }
+            vacant => vacant,
+        }
+    }
+}
+
+/// An absent key of a [`Map`].
+#[derive(Debug)]
+pub struct VacantEntry<'a> {
+    map: &'a mut Map,
+    key: String,
+}
+
+impl<'a> VacantEntry<'a> {
+    /// The key that would be inserted.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.key
+    }
+
+    /// Inserts the value at the end of the map.
+    pub fn insert(self, value: impl Into<Value>) -> &'a mut Value {
+        let position = self.map.push_new(self.key, value.into());
+        &mut self.map.entries[position].1
+    }
+}
+
+/// A present key of a [`Map`].
+#[derive(Debug)]
+pub struct OccupiedEntry<'a> {
+    map: &'a mut Map,
+    position: usize,
+}
+
+impl<'a> OccupiedEntry<'a> {
+    /// The entry's key.
+    #[must_use]
+    pub fn key(&self) -> &str {
+        &self.map.entries[self.position].0
+    }
+
+    /// The current value.
+    #[must_use]
+    pub fn get(&self) -> &Value {
+        &self.map.entries[self.position].1
+    }
+
+    /// The current value, mutably.
+    pub fn get_mut(&mut self) -> &mut Value {
+        &mut self.map.entries[self.position].1
+    }
+
+    /// Converts into a mutable reference tied to the map.
+    #[must_use]
+    pub fn into_mut(self) -> &'a mut Value {
+        &mut self.map.entries[self.position].1
+    }
+
+    /// Replaces the value, returning the old one.
+    pub fn insert(&mut self, value: impl Into<Value>) -> Value {
+        mem::replace(self.get_mut(), value.into())
+    }
+
+    /// Removes the entry, returning its value.
+    pub fn remove(self) -> Value {
+        self.map.entries.remove(self.position).1
+    }
+}
+
+/// Hash index from key hash to entry positions.
+///
+/// Keys are hashed once with a per-map `RandomState` (so adversarial keys
+/// cannot be precomputed to collide) and the resulting `u64` is used directly
+/// as the key of the inner table. Distinct keys may still share a 64-bit hash,
+/// so a slot can hold several positions and lookups always compare the key.
+#[derive(Clone)]
+struct Index {
+    hasher: RandomState,
+    slots: HashMap<u64, Slot, BuildHasherDefault<PrehashedHasher>>,
+}
