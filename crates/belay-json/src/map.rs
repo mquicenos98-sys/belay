@@ -247,3 +247,82 @@ impl PartialEq for Map {
 }
 
 impl Eq for Map {}
+
+impl fmt::Debug for Map {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+impl<K: Into<String>, V: Into<Value>> FromIterator<(K, V)> for Map {
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Map {
+        let mut map = Map::new();
+        map.extend(iter);
+        map
+    }
+}
+
+impl<K: Into<String>, V: Into<Value>> Extend<(K, V)> for Map {
+    fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
+        for (k, v) in iter {
+            self.insert(k, v);
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a Map {
+    type Item = (&'a str, &'a Value);
+    type IntoIter = Iter<'a>;
+
+    fn into_iter(self) -> Iter<'a> {
+        self.iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a mut Map {
+    type Item = (&'a str, &'a mut Value);
+    type IntoIter = IterMut<'a>;
+
+    fn into_iter(self) -> IterMut<'a> {
+        self.iter_mut()
+    }
+}
+
+impl IntoIterator for Map {
+    type Item = (String, Value);
+    type IntoIter = IntoIter;
+
+    fn into_iter(self) -> IntoIter {
+        IntoIter {
+            inner: self.entries.into_iter(),
+        }
+    }
+}
+
+/// Iterator over `(&str, &Value)` entries of a [`Map`].
+#[derive(Debug, Clone)]
+pub struct Iter<'a> {
+    inner: std::slice::Iter<'a, (String, Value)>,
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = (&'a str, &'a Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(k, v)| (k.as_str(), v))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl DoubleEndedIterator for Iter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.inner.next_back().map(|(k, v)| (k.as_str(), v))
+    }
+}
+
+impl ExactSizeIterator for Iter<'_> {}
+
+impl FusedIterator for Iter<'_> {}
