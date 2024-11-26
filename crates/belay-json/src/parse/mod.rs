@@ -125,3 +125,41 @@ pub fn parse_with(src: &str, options: &ParseOptions) -> Result<Value, ParseError
 pub fn parse_bytes(bytes: &[u8]) -> Result<Value, ParseError> {
     parse_bytes_with(bytes, &ParseOptions::strict())
 }
+
+/// Parses a document from raw bytes with the given options.
+pub fn parse_bytes_with(bytes: &[u8], options: &ParseOptions) -> Result<Value, ParseError> {
+    match std::str::from_utf8(bytes) {
+        Ok(src) => parse_with(src, options),
+        Err(e) => {
+            let valid = &bytes[..e.valid_up_to()];
+            // The prefix is valid by definition; it only serves to compute
+            // line and column of the first bad byte.
+            let prefix = std::str::from_utf8(valid).unwrap_or("");
+            Err(ParseError::at(
+                ParseErrorKind::InvalidUtf8,
+                prefix,
+                valid.len(),
+            ))
+        }
+    }
+}
+
+/// Parses exactly one number literal (for `Number: FromStr`).
+pub(crate) fn parse_number_literal(src: &str) -> Result<Number, ParseError> {
+    let options = ParseOptions::strict();
+    let mut parser = Parser::new(src, &options);
+    match parser.peek() {
+        Some(b'-' | b'0'..=b'9') => {}
+        Some(_) => return Err(parser.unexpected("a number")),
+        None => {
+            return Err(parser.error(ParseErrorKind::UnexpectedEof {
+                expected: "a number",
+            }))
+        }
+    }
+    let number = parser.number()?;
+    if parser.pos < src.len() {
+        return Err(parser.error(ParseErrorKind::TrailingCharacters));
+    }
+    Ok(number)
+}
