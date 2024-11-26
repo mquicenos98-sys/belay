@@ -310,3 +310,160 @@ struct StackBuf {
     bytes: [u8; 32],
     len: usize,
 }
+
+impl StackBuf {
+    fn new() -> StackBuf {
+        StackBuf {
+            bytes: [0; 32],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        // Only whole `&str`s are ever copied in, so the prefix is valid UTF-8;
+        // the fallback is unreachable but keeps this free of panics.
+        std::str::from_utf8(&self.bytes[..self.len]).unwrap_or("")
+    }
+}
+
+impl fmt::Write for StackBuf {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len + s.len();
+        let dst = self.bytes.get_mut(self.len..end).ok_or(fmt::Error)?;
+        dst.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::hash_map::DefaultHasher;
+
+    fn fmt_f64(f: f64) -> String {
+        Number::from_f64(f).expect("finite").to_string()
+    }
+
+    fn hash_of(n: Number) -> u64 {
+        let mut h = DefaultHasher::new();
+        n.hash(&mut h);
+        h.finish()
+    }
+
+    #[test]
+    fn integers_are_canonical_across_source_types() {
+        assert_eq!(Number::from(5u8), Number::from(5i64));
+        assert_eq!(Number::from(-5i8), Number::from(-5isize));
+        assert_eq!(Number::from(0i32), Number::from(0u64));
+        assert!(Number::from(0i32).is_u64());
+    }
+
+    #[test]
+    fn integer_never_equals_float() {
+        let one = Number::from(1);
+        let one_f = Number::from_f64(1.0).unwrap();
+        assert_ne!(one, one_f);
+        assert_eq!(one.as_f64(), one_f.as_f64());
+    }
+
+    #[test]
+    fn signed_zeros_are_equal_and_hash_alike() {
+        let pos = Number::from_f64(0.0).unwrap();
+        let neg = Number::from_f64(-0.0).unwrap();
+        assert_eq!(pos, neg);
+        assert_eq!(hash_of(pos), hash_of(neg));
+    }
+
+    #[test]
+    fn rejects_non_finite_floats() {
+        assert!(Number::from_f64(f64::NAN).is_none());
+        assert!(Number::from_f64(f64::INFINITY).is_none());
+        assert!(Number::from_f64(f64::NEG_INFINITY).is_none());
+    }
+
+    #[test]
+    fn accessor_ranges() {
+        let big = Number::from(u64::MAX);
+        assert_eq!(big.as_u64(), Some(u64::MAX));
+        assert_eq!(big.as_i64(), None);
+        let min = Number::from(i64::MIN);
+        assert_eq!(min.as_i64(), Some(i64::MIN));
+        assert_eq!(min.as_u64(), None);
+        let f = Number::from_f64(2.0).unwrap();
+        assert_eq!(f.as_i64(), None);
+        assert!(f.is_f64() && !f.is_integer());
+    }
+
+    #[test]
+    fn exact_i128_accepts_integral_floats_only() {
+        assert_eq!(Number::from_f64(3.0).unwrap().as_i128_exact(), Some(3));
+        assert_eq!(Number::from_f64(3.5).unwrap().as_i128_exact(), None);
+        assert_eq!(Number::from_f64(-0.0).unwrap().as_i128_exact(), Some(0));
+        assert_eq!(
+            Number::from_f64(1e19).unwrap().as_i128_exact(),
+            Some(10_000_000_000_000_000_000)
+        );
+        assert_eq!(Number::from_f64(1e20).unwrap().as_i128_exact(), None);
+        assert_eq!(Number::from_f64(-1e19).unwrap().as_i128_exact(), None);
+    }
+
+    #[test]
+    fn integer_digits_boundaries() {
+        assert_eq!(
+            integer_from_digits(b"18446744073709551615", false),
+            Some(Number::from(u64::MAX))
+        );
+        assert_eq!(integer_from_digits(b"18446744073709551616", false), None);
+        assert_eq!(
+            integer_from_digits(b"9223372036854775808", true),
+            Some(Number::from(i64::MIN))
+        );
+        assert_eq!(integer_from_digits(b"9223372036854775809", true), None);
+        assert_eq!(
+            integer_from_digits(b"0", true),
+            None,
+            "-0 must become a float"
+        );
+    }
+
+    #[test]
+    fn floats_always_look_like_floats() {
+        assert_eq!(fmt_f64(1.0), "1.0");
+        assert_eq!(fmt_f64(-1.0), "-1.0");
+        assert_eq!(fmt_f64(100.0), "100.0");
+        assert_eq!(fmt_f64(0.0), "0.0");
+        assert_eq!(fmt_f64(-0.0), "-0.0");
+        assert_eq!(fmt_f64(1e20), "100000000000000000000.0");
+    }
+
+    #[test]
+    fn float_layout_switches_to_scientific_outside_window() {
+        assert_eq!(fmt_f64(1e21), "1e21");
+        assert_eq!(fmt_f64(1.5e21), "1.5e21");
+        assert_eq!(fmt_f64(1e-7), "0.0000001");
+        assert_eq!(fmt_f64(1.25e-8), "1.25e-8");
+        assert_eq!(fmt_f64(f64::MAX), "1.7976931348623157e308");
+        assert_eq!(fmt_f64(f64::MIN_POSITIVE), "2.2250738585072014e-308");
+        assert_eq!(fmt_f64(5e-324), "5e-324");
+    }
+
+    #[test]
+    fn float_layout_places_decimal_point() {
+        assert_eq!(fmt_f64(0.1), "0.1");
+        assert_eq!(fmt_f64(123.456), "123.456");
+        assert_eq!(fmt_f64(-0.0015), "-0.0015");
+        assert_eq!(fmt_f64(123456789.125), "123456789.125");
+        assert_eq!(fmt_f64(0.30000000000000004), "0.30000000000000004");
+    }
+
+    #[test]
+    fn parses_literal_strictly() {
+        assert_eq!("42".parse::<Number>().unwrap(), Number::from(42));
+        assert_eq!("-0.5".parse::<Number>().unwrap().as_f64(), -0.5);
+        assert!(" 42".parse::<Number>().is_err());
+        assert!("42 ".parse::<Number>().is_err());
+        assert!("042".parse::<Number>().is_err());
+        assert!("".parse::<Number>().is_err());
+    }
+}
