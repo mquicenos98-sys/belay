@@ -164,3 +164,149 @@ macro_rules! from_signed {
 // `as` casts above are lossless.
 from_unsigned!(u8, u16, u32, u64, usize);
 from_signed!(i8, i16, i32, i64, isize);
+
+impl PartialEq for Number {
+    fn eq(&self, other: &Number) -> bool {
+        match (self.0, other.0) {
+            (Repr::PosInt(a), Repr::PosInt(b)) => a == b,
+            (Repr::NegInt(a), Repr::NegInt(b)) => a == b,
+            (Repr::Float(a), Repr::Float(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for Number {}
+
+impl Hash for Number {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self.0 {
+            Repr::PosInt(u) => {
+                state.write_u8(0);
+                state.write_u64(u);
+            }
+            Repr::NegInt(i) => {
+                state.write_u8(1);
+                state.write_i64(i);
+            }
+            Repr::Float(f) => {
+                state.write_u8(2);
+                // -0.0 == 0.0, so they must hash identically.
+                let f = if f == 0.0 { 0.0 } else { f };
+                state.write_u64(f.to_bits());
+            }
+        }
+    }
+}
+
+impl fmt::Display for Number {
+    /// Formats the number exactly as the JSON writer does.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            Repr::PosInt(u) => write!(f, "{u}"),
+            Repr::NegInt(i) => write!(f, "{i}"),
+            Repr::Float(x) => write_f64(f, x),
+        }
+    }
+}
+
+impl fmt::Debug for Number {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+impl FromStr for Number {
+    type Err = ParseError;
+
+    /// Parses a JSON number literal. The whole string must be the literal;
+    /// surrounding whitespace is rejected.
+    fn from_str(s: &str) -> Result<Number, ParseError> {
+        crate::parse::parse_number_literal(s)
+    }
+}
+
+/// Builds a number from an integer literal's digits (no sign, no leading
+/// zeros). Returns `None` if the magnitude does not fit, in which case the
+/// caller falls back to `f64`. `-0` also returns `None` so that it becomes the
+/// float `-0.0` and keeps its sign.
+pub(crate) fn integer_from_digits(digits: &[u8], negative: bool) -> Option<Number> {
+    let mut magnitude: u64 = 0;
+    for &d in digits {
+        magnitude = magnitude
+            .checked_mul(10)?
+            .checked_add(u64::from(d - b'0'))?;
+    }
+    if !negative {
+        return Some(Number(Repr::PosInt(magnitude)));
+    }
+    match magnitude {
+        0 => None,
+        m if m <= i64::MAX as u64 => Some(Number(Repr::NegInt(-(m as i64)))),
+        m if m == i64::MIN.unsigned_abs() => Some(Number(Repr::NegInt(i64::MIN))),
+        _ => None,
+    }
+}
+
+/// Writes a finite float as the shortest decimal string that parses back to
+/// the same `f64`, always marked as a float (`1.0`, never `1`).
+///
+/// The digits come from `{:e}`, which std guarantees to be the shortest
+/// round-tripping representation; only the layout is decided here. Plain
+/// decimal notation is used for exponents in `-7..21` (the same window
+/// ECMAScript's `Number.prototype.toString` uses, so values look familiar to
+/// JavaScript consumers) and scientific notation outside it.
+pub(crate) fn write_f64<W: fmt::Write + ?Sized>(out: &mut W, f: f64) -> fmt::Result {
+    debug_assert!(f.is_finite());
+    if f == 0.0 {
+        return out.write_str(if f.is_sign_negative() { "-0.0" } else { "0.0" });
+    }
+    let mut sci = StackBuf::new();
+    fmt::write(&mut sci, format_args!("{:e}", f.abs()))?;
+    let sci = sci.as_str();
+    let (mantissa, exp) = sci.split_once('e').ok_or(fmt::Error)?;
+    let exp: i32 = exp.parse().map_err(|_| fmt::Error)?;
+    let (lead, frac) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+
+    if f < 0.0 {
+        out.write_char('-')?;
+    }
+    if !(-7..21).contains(&exp) {
+        out.write_str(lead)?;
+        if !frac.is_empty() {
+            out.write_char('.')?;
+            out.write_str(frac)?;
+        }
+        return write!(out, "e{exp}");
+    }
+    if exp < 0 {
+        out.write_str("0.")?;
+        for _ in 0..(-exp - 1) {
+            out.write_char('0')?;
+        }
+        out.write_str(lead)?;
+        return out.write_str(frac);
+    }
+    // `exp` digits of `frac` belong before the decimal point.
+    let exp = exp as usize;
+    out.write_str(lead)?;
+    if frac.len() > exp {
+        out.write_str(&frac[..exp])?;
+        out.write_char('.')?;
+        out.write_str(&frac[exp..])
+    } else {
+        out.write_str(frac)?;
+        for _ in frac.len()..exp {
+            out.write_char('0')?;
+        }
+        out.write_str(".0")
+    }
+}
+
+/// A fixed buffer for the `{:e}` rendering of one `f64`, so formatting a float
+/// does not allocate. The longest rendering, e.g. `2.2250738585072014e-308`,
+/// is 23 bytes.
+struct StackBuf {
+    bytes: [u8; 32],
+    len: usize,
+}
