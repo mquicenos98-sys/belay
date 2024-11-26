@@ -115,3 +115,13 @@ impl Default for ParseOptions {
 pub fn parse(src: &str) -> Result<Value, ParseError> {
     parse_with(src, &ParseOptions::strict())
 }
+
+/// Parses a complete JSON document with the given options.
+pub fn parse_with(src: &str, options: &ParseOptions) -> Result<Value, ParseError> {
+    Parser::new(src, options).document()
+}
+
+/// Parses a document from raw bytes, which must be UTF-8 (RFC 8259 §8.1).
+pub fn parse_bytes(bytes: &[u8]) -> Result<Value, ParseError> {
+    parse_bytes_with(bytes, &ParseOptions::strict())
+}
