@@ -64,3 +64,46 @@ impl From<&str> for Value {
         Value::String(s.to_owned())
     }
 }
+
+impl From<&String> for Value {
+    fn from(s: &String) -> Value {
+        Value::String(s.clone())
+    }
+}
+
+impl From<Cow<'_, str>> for Value {
+    fn from(s: Cow<'_, str>) -> Value {
+        Value::String(s.into_owned())
+    }
+}
+
+impl From<char> for Value {
+    fn from(c: char) -> Value {
+        Value::String(c.to_string())
+    }
+}
+
+impl From<Map> for Value {
+    fn from(map: Map) -> Value {
+        Value::Object(map)
+    }
+}
+
+impl<T: Into<Value>> From<Vec<T>> for Value {
+    fn from(items: Vec<T>) -> Value {
+        Value::Array(items.into_iter().map(Into::into).collect())
+    }
+}
+
+impl<T: Clone + Into<Value>> From<&[T]> for Value {
+    fn from(items: &[T]) -> Value {
+        Value::Array(items.iter().cloned().map(Into::into).collect())
+    }
+}
+
+impl<T: Into<Value>> From<Option<T>> for Value {
+    /// `None` becomes `null`.
+    fn from(opt: Option<T>) -> Value {
+        opt.map_or(Value::Null, Into::into)
+    }
+}
