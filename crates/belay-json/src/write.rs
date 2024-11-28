@@ -84,3 +84,81 @@ impl WriteOptions {
 pub fn to_string(value: &Value) -> String {
     to_string_with(value, &WriteOptions::compact())
 }
+
+/// Serializes with two-space indentation.
+///
+/// ```
+/// use belay_json::json;
+///
+/// let v = json!({"queue": "emails", "attempts": [1, 2]});
+/// assert_eq!(
+///     belay_json::to_string_pretty(&v),
+///     "{\n  \"queue\": \"emails\",\n  \"attempts\": [\n    1,\n    2\n  ]\n}"
+/// );
+/// ```
+#[must_use]
+pub fn to_string_pretty(value: &Value) -> String {
+    to_string_with(value, &WriteOptions::pretty())
+}
+
+/// Serializes with explicit options.
+#[must_use]
+pub fn to_string_with(value: &Value, options: &WriteOptions) -> String {
+    let mut out = String::with_capacity(128);
+    Emitter::new(&mut out, options)
+        .value(value)
+        .expect("writing JSON into a String cannot fail");
+    out
+}
+
+/// Writes compact JSON to an `io::Write` sink.
+///
+/// Output is buffered internally, so passing an unbuffered `File` or
+/// `TcpStream` is fine. The sink is not flushed.
+pub fn write_to<W: io::Write + ?Sized>(writer: &mut W, value: &Value) -> io::Result<()> {
+    write_with(writer, value, &WriteOptions::compact())
+}
+
+/// Writes pretty JSON to an `io::Write` sink.
+pub fn write_pretty_to<W: io::Write + ?Sized>(writer: &mut W, value: &Value) -> io::Result<()> {
+    write_with(writer, value, &WriteOptions::pretty())
+}
+
+/// Writes JSON with explicit options to an `io::Write` sink.
+pub fn write_with<W: io::Write + ?Sized>(
+    writer: &mut W,
+    value: &Value,
+    options: &WriteOptions,
+) -> io::Result<()> {
+    let mut sink = IoSink {
+        inner: writer,
+        buf: Vec::with_capacity(IoSink::<W>::CHUNK),
+        error: None,
+    };
+    let result = Emitter::new(&mut sink, options).value(value);
+    match (result, sink.error.take()) {
+        (_, Some(e)) => Err(e),
+        (Err(_), None) => Err(io::Error::other("JSON formatter failed")),
+        (Ok(()), None) => sink.drain(),
+    }
+}
+
+/// Writes into a `fmt::Formatter`; backs `Display for Value`.
+pub(crate) fn write_fmt(
+    f: &mut fmt::Formatter<'_>,
+    value: &Value,
+    options: &WriteOptions,
+) -> fmt::Result {
+    Emitter::new(f, options).value(value)
+}
+
+/// Writes `s` as a quoted JSON string literal.
+///
+/// ```
+/// let mut out = String::new();
+/// belay_json::write_string(&mut out, "tab\there \"quoted\"").unwrap();
+/// assert_eq!(out, r#""tab\there \"quoted\"""#);
+/// ```
+pub fn write_string<W: fmt::Write + ?Sized>(out: &mut W, s: &str) -> fmt::Result {
+    write_escaped(out, s, false)
+}
