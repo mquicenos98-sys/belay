@@ -392,3 +392,136 @@ impl<T: ValueIndex + ?Sized> ValueIndex for &T {
         (**self).lookup_or_insert(value)
     }
 }
+
+impl<I: ValueIndex> ops::Index<I> for Value {
+    type Output = Value;
+
+    /// Returns `&Value::Null` for missing keys, out-of-range positions and
+    /// mismatched types, so lookups can be chained: `v["a"][0]["b"]`.
+    fn index(&self, index: I) -> &Value {
+        index.lookup(self).unwrap_or(&NULL)
+    }
+}
+
+impl<I: ValueIndex> ops::IndexMut<I> for Value {
+    /// Returns a mutable slot, inserting missing object keys as `null` (a
+    /// `null` value first becomes an empty object).
+    ///
+    /// # Panics
+    ///
+    /// Panics when indexing a non-object with a key, a non-array with a
+    /// position, or an array past its end.
+    fn index_mut(&mut self, index: I) -> &mut Value {
+        index.lookup_or_insert(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::json;
+
+    #[test]
+    fn index_misses_return_null() {
+        let v = json!({"a": [1, {"b": true}]});
+        assert_eq!(v["a"][1]["b"], true);
+        assert!(v["a"][5].is_null());
+        assert!(v["a"]["key-on-array"].is_null());
+        assert!(v[0].is_null());
+        assert!(v["missing"]["deeper"][3].is_null());
+    }
+
+    #[test]
+    fn index_mut_autovivifies_objects() {
+        let mut v = Value::Null;
+        v["retry"]["max"] = json!(5);
+        v["retry"]["base"] = json!("1s");
+        assert_eq!(v, json!({"retry": {"max": 5, "base": "1s"}}));
+        let mut arr = json!([1, 2]);
+        arr[1] = json!("two");
+        assert_eq!(arr, json!([1, "two"]));
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot index array of length 2 with position 2")]
+    fn index_mut_past_array_end_panics() {
+        let mut v = json!([1, 2]);
+        v[2] = Value::Null;
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot index string with key \"k\"")]
+    fn index_mut_key_on_scalar_panics() {
+        let mut v = json!("text");
+        v["k"] = Value::Null;
+    }
+
+    #[test]
+    fn get_accepts_str_string_and_usize() {
+        let v = json!({"k": [7]});
+        let key = String::from("k");
+        assert_eq!(v.get("k"), v.get(&key));
+        assert_eq!(v.get(key.clone()), Some(&json!([7])));
+        assert_eq!(v["k"].get(0), Some(&json!(7)));
+        let mut v = v;
+        if let Some(slot) = v.get_mut("k").and_then(|a| a.get_mut(0)) {
+            *slot = json!(8);
+        }
+        assert_eq!(v["k"][0], 8);
+    }
+
+    #[test]
+    fn accessors_match_kinds() {
+        let cases = [
+            (json!(null), Kind::Null),
+            (json!(false), Kind::Bool),
+            (json!(1.5), Kind::Number),
+            (json!("s"), Kind::String),
+            (json!([]), Kind::Array),
+            (json!({}), Kind::Object),
+        ];
+        for (value, kind) in cases {
+            assert_eq!(value.kind(), kind);
+            assert_eq!(value.is_null(), kind == Kind::Null);
+            assert_eq!(value.as_bool().is_some(), kind == Kind::Bool);
+            assert_eq!(value.as_f64().is_some(), kind == Kind::Number);
+            assert_eq!(value.as_str().is_some(), kind == Kind::String);
+            assert_eq!(value.as_array().is_some(), kind == Kind::Array);
+            assert_eq!(value.as_object().is_some(), kind == Kind::Object);
+        }
+        assert_eq!(Kind::Bool.to_string(), "boolean");
+    }
+
+    #[test]
+    fn number_accessors_respect_representation() {
+        assert_eq!(json!(-3).as_i64(), Some(-3));
+        assert_eq!(json!(-3).as_u64(), None);
+        assert_eq!(json!(u64::MAX).as_u64(), Some(u64::MAX));
+        assert_eq!(json!(u64::MAX).as_i64(), None);
+        assert!(json!(2.0).is_f64());
+        assert_eq!(json!(2.0).as_i64(), None);
+        assert_eq!(json!(2).as_f64(), Some(2.0));
+    }
+
+    #[test]
+    fn take_leaves_null() {
+        let mut v = json!({"payload": [1, 2, 3]});
+        let payload = v["payload"].take();
+        assert_eq!(payload, json!([1, 2, 3]));
+        assert_eq!(v, json!({"payload": null}));
+    }
+
+    #[test]
+    fn display_is_compact_and_alternate_is_pretty() {
+        let v = json!({"a": [1, 2]});
+        assert_eq!(format!("{v}"), r#"{"a":[1,2]}"#);
+        assert_eq!(format!("{v:#}"), "{\n  \"a\": [\n    1,\n    2\n  ]\n}");
+    }
+
+    #[test]
+    fn from_str_parses_strictly() {
+        let v: Value = r#"{"x": [true]}"#.parse().unwrap();
+        assert_eq!(v, json!({"x": [true]}));
+        assert!("[1,]".parse::<Value>().is_err());
+    }
+}
