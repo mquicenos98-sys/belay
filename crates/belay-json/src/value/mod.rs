@@ -344,3 +344,51 @@ impl ValueIndex for usize {
         }
     }
 }
+
+impl ValueIndex for str {
+    fn lookup<'v>(&self, value: &'v Value) -> Option<&'v Value> {
+        value.as_object()?.get(self)
+    }
+
+    fn lookup_mut<'v>(&self, value: &'v mut Value) -> Option<&'v mut Value> {
+        value.as_object_mut()?.get_mut(self)
+    }
+
+    fn lookup_or_insert<'v>(&self, value: &'v mut Value) -> &'v mut Value {
+        if value.is_null() {
+            *value = Value::Object(Map::new());
+        }
+        match value {
+            Value::Object(map) => map.entry(self).or_insert(Value::Null),
+            other => panic!("cannot index {} with key {self:?}", other.kind()),
+        }
+    }
+}
+
+impl ValueIndex for String {
+    fn lookup<'v>(&self, value: &'v Value) -> Option<&'v Value> {
+        self.as_str().lookup(value)
+    }
+
+    fn lookup_mut<'v>(&self, value: &'v mut Value) -> Option<&'v mut Value> {
+        self.as_str().lookup_mut(value)
+    }
+
+    fn lookup_or_insert<'v>(&self, value: &'v mut Value) -> &'v mut Value {
+        self.as_str().lookup_or_insert(value)
+    }
+}
+
+impl<T: ValueIndex + ?Sized> ValueIndex for &T {
+    fn lookup<'v>(&self, value: &'v Value) -> Option<&'v Value> {
+        (**self).lookup(value)
+    }
+
+    fn lookup_mut<'v>(&self, value: &'v mut Value) -> Option<&'v mut Value> {
+        (**self).lookup_mut(value)
+    }
+
+    fn lookup_or_insert<'v>(&self, value: &'v mut Value) -> &'v mut Value {
+        (**self).lookup_or_insert(value)
+    }
+}
