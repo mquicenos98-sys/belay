@@ -490,3 +490,81 @@ fn i_string_unpaired_surrogates_are_rejected() {
         assert_eq!(err.column(), 3, "points at the escape in {src}");
     }
 }
+
+#[test]
+fn i_structure_byte_order_mark_is_rejected() {
+    assert_eq!(
+        parse("\u{FEFF}{}").unwrap_err().kind(),
+        &ParseErrorKind::ByteOrderMark
+    );
+}
+
+#[test]
+fn i_structure_500_nested_arrays_needs_a_raised_limit() {
+    let src = format!("{}{}", "[".repeat(500), "]".repeat(500));
+    let err = parse(&src).unwrap_err();
+    assert_eq!(err.kind(), &ParseErrorKind::DepthLimitExceeded(128));
+    assert_eq!(err.column(), 129);
+    let value = parse_with(&src, &ParseOptions::strict().max_depth(500)).unwrap();
+    assert_eq!(to_string(&value), src);
+}
+
+#[test]
+fn hostile_nesting_fails_fast_without_overflowing_the_stack() {
+    let arrays = "[".repeat(100_000);
+    assert_eq!(
+        parse(&arrays).unwrap_err().kind(),
+        &ParseErrorKind::DepthLimitExceeded(128)
+    );
+    let objects = r#"{"a":"#.repeat(50_000);
+    assert_eq!(
+        parse(&objects).unwrap_err().kind(),
+        &ParseErrorKind::DepthLimitExceeded(128)
+    );
+    let mixed = r#"[{"":"#.repeat(50_000);
+    assert_eq!(
+        parse(&mixed).unwrap_err().kind(),
+        &ParseErrorKind::DepthLimitExceeded(128)
+    );
+}
+
+#[test]
+fn error_messages_locate_the_problem() {
+    let message = |src: &str| parse(src).unwrap_err().to_string();
+    assert_eq!(
+        message("[\"a\",\n4\n,1,"),
+        "unexpected end of input, expected a value at line 3, column 4"
+    );
+    assert_eq!(
+        message("[1 true]"),
+        "unexpected character 't', expected ',' or ']' at line 1, column 4"
+    );
+    assert_eq!(
+        message(r#"{"a" "b"}"#),
+        "unexpected character '\"', expected ':' after object key at line 1, column 6"
+    );
+    assert_eq!(
+        message("{1:1}"),
+        "unexpected character '1', expected a string key at line 1, column 2"
+    );
+    assert_eq!(
+        message("[tru]"),
+        "invalid literal, expected `true` at line 1, column 2"
+    );
+    assert_eq!(
+        message("[\"\t\"]"),
+        "unescaped control character U+0009 in string at line 1, column 3"
+    );
+    assert_eq!(
+        message("[1]x"),
+        "unexpected characters after the top-level value at line 1, column 4"
+    );
+    assert_eq!(
+        message(""),
+        "unexpected end of input, expected a value at line 1, column 1"
+    );
+    assert_eq!(
+        message("[\u{e9}]"),
+        "unexpected character '\u{e9}', expected a value at line 1, column 2"
+    );
+}
