@@ -357,3 +357,136 @@ const RELAXED_ACCEPTS: &[&str] = &[
     "n_object_trailing_comment_slash_open",
     "n_structure_object_with_comment",
 ];
+
+#[test]
+fn accepts_every_y_case() {
+    let failures: Vec<String> = MUST_ACCEPT
+        .iter()
+        .filter_map(|(name, src)| parse(src).err().map(|e| format!("{name}: {e}")))
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "rejected valid documents: {failures:#?}"
+    );
+}
+
+#[test]
+fn rejects_every_n_case() {
+    let accepted: Vec<String> = MUST_REJECT
+        .iter()
+        .filter_map(|(name, src)| parse(src).ok().map(|v| format!("{name}: {v}")))
+        .collect();
+    assert!(
+        accepted.is_empty(),
+        "accepted invalid documents: {accepted:#?}"
+    );
+}
+
+#[test]
+fn rejects_invalid_utf8() {
+    for (name, bytes) in MUST_REJECT_BYTES {
+        let err = parse_bytes(bytes).expect_err(name);
+        assert_eq!(err.kind(), &ParseErrorKind::InvalidUtf8, "{name}");
+    }
+}
+
+#[test]
+fn accepted_documents_survive_a_write_and_reparse() {
+    for (name, src) in MUST_ACCEPT {
+        let value = parse(src).unwrap();
+        for text in [to_string(&value), to_string_pretty(&value)] {
+            let again = parse(&text).unwrap_or_else(|e| panic!("{name}: {e} in {text:?}"));
+            assert_eq!(again, value, "{name}");
+        }
+    }
+}
+
+#[test]
+fn relaxed_mode_accepts_only_comments_and_single_trailing_commas() {
+    let relaxed = ParseOptions::relaxed();
+    for (name, src) in MUST_REJECT {
+        let expected = RELAXED_ACCEPTS.contains(name);
+        assert_eq!(parse_with(src, &relaxed).is_ok(), expected, "{name}");
+    }
+    for (name, src) in MUST_ACCEPT {
+        assert!(parse_with(src, &relaxed).is_ok(), "{name}");
+    }
+}
+
+#[test]
+fn decoded_strings_match_their_escapes() {
+    let decoded = |src: &str| parse(src).unwrap()[0].as_str().unwrap().to_owned();
+    assert_eq!(decoded(r#"["\uD834\uDd1e"]"#), "\u{1D11E}");
+    assert_eq!(decoded(r#"["\uDBFF\uDFFF"]"#), "\u{10FFFF}");
+    assert_eq!(decoded(r#"["\\u0000"]"#), "\\u0000");
+    assert_eq!(decoded(r#"["\u005C"]"#), "\\");
+    assert_eq!(decoded(r#"["new\u000Aline"]"#), "new\nline");
+    assert_eq!(decoded(r#"["\"\\\/\b\f\n\r\t"]"#), "\"\\/\u{8}\u{c}\n\r\t");
+    let key = parse(r#"{"foo\u0000bar": 42}"#).unwrap();
+    assert_eq!(key["foo\u{0}bar"], 42);
+}
+
+#[test]
+fn numbers_decode_to_the_expected_representation() {
+    let first = |src: &str| parse(src).unwrap()[0].clone();
+    assert_eq!(
+        first("[-0]").as_f64().map(f64::is_sign_negative),
+        Some(true)
+    );
+    assert_eq!(first("[20e1]"), json!(200.0));
+    assert_eq!(first("[1E22]"), json!(1e22));
+    assert_eq!(first("[123]"), json!(123));
+    let extremes = parse(r#"{ "min": -1.0e+28, "max": 1.0e+28 }"#).unwrap();
+    assert_eq!(extremes, json!({"min": -1e28, "max": 1e28}));
+}
+
+#[test]
+fn i_number_overflow_is_rejected() {
+    let huge_exponent = format!("[0.4e0066{}969999999006]", "9".repeat(400));
+    let cases = [
+        huge_exponent.as_str(),
+        "[-1e+9999]",
+        "[1.5e+9999]",
+        "[-123123e100000]",
+        "[123123e100000]",
+    ];
+    for src in cases {
+        let err = parse(src).unwrap_err();
+        assert_eq!(err.kind(), &ParseErrorKind::NumberOutOfRange, "{src}");
+        assert_eq!(err.column(), 2, "{src}");
+    }
+}
+
+#[test]
+fn i_number_underflow_and_wide_integers_are_accepted_as_floats() {
+    let first = |src: &str| parse(src).unwrap()[0].clone();
+    assert_eq!(first("[123.456e-789]"), json!(0.0));
+    assert_eq!(first("[123e-10000000]"), json!(0.0));
+    assert_eq!(first("[100000000000000000000]"), json!(1e20));
+    assert_eq!(
+        first("[-123123123123123123123123123123]"),
+        json!(-1.2312312312312312e29)
+    );
+    let big_negative = first("[-237462374673276894279832749832423479823246327846]");
+    assert!(big_negative.is_f64());
+    assert!(big_negative.as_f64().unwrap() < -2.3e47);
+}
+
+#[test]
+fn i_string_unpaired_surrogates_are_rejected() {
+    let cases = [
+        (r#"["\uDADA"]"#, 0xDADA),
+        (r#"["\uD888\u1234"]"#, 0xD888),
+        (r#"["\uD800\n"]"#, 0xD800),
+        (r#"["\uD800\uD800\n"]"#, 0xD800),
+        (r#"["\ud800"]"#, 0xD800),
+        (r#"["\ud800abc"]"#, 0xD800),
+        (r#"["\uDd1e\uD834"]"#, 0xDD1E),
+        (r#"["\uDFAA"]"#, 0xDFAA),
+    ];
+    for (src, unit) in cases {
+        let err = parse(src).unwrap_err();
+        assert_eq!(err.kind(), &ParseErrorKind::LoneSurrogate(unit), "{src}");
+        assert_eq!(err.column(), 3, "points at the escape in {src}");
+    }
+}
