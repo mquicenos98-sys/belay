@@ -221,3 +221,99 @@ fn full_spec() -> JobSpec {
 fn decode_err<T: FromJson + fmt::Debug>(value: Value) -> String {
     T::from_json(&value).unwrap_err().to_string()
 }
+
+#[test]
+fn minimal_spec_omits_every_default() {
+    let spec = JobSpec::new("emails", "noop");
+    assert_eq!(
+        spec.to_json().to_string(),
+        r#"{"queue":"emails","kind":"noop"}"#
+    );
+    assert_eq!(JobSpec::from_json(&spec.to_json()), Ok(spec));
+}
+
+#[test]
+fn full_spec_round_trips_through_text() {
+    let spec = full_spec();
+    let text = belay_json::to_string_of(&spec);
+    assert_eq!(
+        text,
+        concat!(
+            r#"{"queue":"emails","kind":"send_welcome","payload":{"to":"a@example.com","retries":[1,2]},"#,
+            r#""priority":-5,"run_at":1741064767089,"max_attempts":3,"tags":["onboarding"],"#,
+            r#""meta":{"belay.schedule":"daily"},"unique":{"key":"welcome:42","scope":{"for_ms":60000}}}"#
+        )
+    );
+    let back: JobSpec = belay_json::from_str(&text).unwrap();
+    assert_eq!(back, spec);
+    let pretty = belay_json::to_string_pretty_of(&spec);
+    assert_eq!(belay_json::from_str::<JobSpec>(&pretty).unwrap(), spec);
+}
+
+#[test]
+fn json_macro_and_builder_agree() {
+    let spec = full_spec();
+    let by_macro = json!({
+        "queue": spec.queue,
+        "kind": "send_welcome",
+        "payload": {"to": "a@example.com", "retries": [1, 2]},
+        "priority": -5,
+        "run_at": spec.run_at,
+        "max_attempts": 3,
+        "tags": ["onboarding"],
+        "meta": spec.meta,
+        "unique": spec.unique,
+    });
+    assert_eq!(by_macro, spec.to_json());
+}
+
+#[test]
+fn range_errors_point_into_nested_arrays() {
+    let request = json!({"jobs": [
+        {"queue": "a", "kind": "k"},
+        {"queue": "b", "kind": "k"},
+        {"queue": "c", "kind": "k", "priority": 40000},
+    ]});
+    let err = EnqueueRequest::from_json(&request).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "$.jobs[2].priority: expected integer in range -32768..=32767, found 40000"
+    );
+    assert_eq!(err.pointer(), "/jobs/2/priority");
+    assert_eq!(
+        err.message(),
+        "expected integer in range -32768..=32767, found 40000"
+    );
+}
+
+#[test]
+fn validation_errors_name_the_field() {
+    let request = json!({"jobs": [{"queue": "a", "kind": "k", "priority": 5000}]});
+    assert_eq!(
+        decode_err::<EnqueueRequest>(request),
+        "$.jobs[0].priority: must be between -1000 and 1000, got 5000"
+    );
+}
+
+#[test]
+fn enum_errors_suggest_the_intended_variant() {
+    let request = json!({"jobs": [
+        {"queue": "a", "kind": "k"},
+        {"queue": "a", "kind": "k", "unique": {"key": "x", "scope": "until_strated"}},
+    ]});
+    assert_eq!(
+        decode_err::<EnqueueRequest>(request),
+        r#"$.jobs[1].unique.scope: unknown UniqueScope "until_strated", did you mean "until_started"?"#
+    );
+    let bad_object =
+        json!({"queue": "a", "kind": "k", "unique": {"key": "x", "scope": {"for_ms": -1}}});
+    assert_eq!(
+        decode_err::<JobSpec>(bad_object),
+        "$.unique.scope.for_ms: expected integer in range 0..=18446744073709551615, found -1"
+    );
+    let wrong_type = json!({"queue": "a", "kind": "k", "unique": {"key": "x", "scope": 7}});
+    assert_eq!(
+        decode_err::<JobSpec>(wrong_type),
+        "$.unique.scope: expected UniqueScope string or object, found 7"
+    );
+}
