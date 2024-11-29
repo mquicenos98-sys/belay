@@ -317,3 +317,112 @@ fn enum_errors_suggest_the_intended_variant() {
         "$.unique.scope: expected UniqueScope string or object, found 7"
     );
 }
+
+#[test]
+fn unknown_fields_are_caught_at_every_level() {
+    let camel = json!({"queue": "a", "kind": "k", "maxAttempts": 3});
+    assert_eq!(
+        decode_err::<JobSpec>(camel),
+        r#"$: unknown field "maxAttempts" in JobSpec, did you mean "max_attempts"?"#
+    );
+    let nested = json!({"jobs": [{"queue": "a", "kind": "k", "unique": {"key": "x", "scoop": "until_started"}}]});
+    assert_eq!(
+        decode_err::<EnqueueRequest>(nested),
+        r#"$.jobs[0].unique: unknown field "scoop" in Unique, did you mean "scope"?"#
+    );
+    let stray = json!({"jobs": [], "dry_run": true});
+    assert_eq!(
+        decode_err::<EnqueueRequest>(stray),
+        r#"$: unknown field "dry_run" in EnqueueRequest, expected one of: jobs"#
+    );
+}
+
+#[test]
+fn map_and_identifier_errors_carry_quoted_paths() {
+    let meta = json!({"queue": "a", "kind": "k", "meta": {"owner": "ops", "belay.schedule": 5}});
+    assert_eq!(
+        decode_err::<JobSpec>(meta),
+        r#"$.meta["belay.schedule"]: expected string, found 5"#
+    );
+    let queue = json!({"queue": "Emails", "kind": "k"});
+    assert_eq!(
+        decode_err::<JobSpec>(queue),
+        r#"$.queue: invalid queue name "Emails": must match [a-z0-9][a-z0-9_.:-]{0,63}"#
+    );
+    let queue_type = json!({"queue": ["emails"], "kind": "k"});
+    assert_eq!(
+        decode_err::<JobSpec>(queue_type),
+        "$.queue: expected queue name string, found array of 1 element"
+    );
+}
+
+#[test]
+fn missing_and_mistyped_required_fields() {
+    assert_eq!(
+        decode_err::<JobSpec>(json!({"queue": "a"})),
+        r#"$: missing required field "kind" in JobSpec"#
+    );
+    assert_eq!(
+        decode_err::<JobSpec>(json!({"queue": "a", "kind": null})),
+        "$.kind: expected string, found null"
+    );
+    assert_eq!(
+        decode_err::<EnqueueRequest>(json!([{"queue": "a"}])),
+        "$: expected EnqueueRequest object, found array of 1 element"
+    );
+    assert_eq!(
+        decode_err::<EnqueueRequest>(json!({"jobs": {"queue": "a"}})),
+        "$.jobs: expected array, found object"
+    );
+}
+
+#[test]
+fn enqueue_accepts_single_spec_or_batch() {
+    let single = belay_json::from_str::<EnqueueRequest>(r#"{"queue": "a", "kind": "k"}"#).unwrap();
+    assert_eq!(single.jobs, vec![JobSpec::new("a", "k")]);
+    let batch = belay_json::from_str::<EnqueueRequest>(
+        r#"{"jobs": [{"queue": "a", "kind": "k"}, {"queue": "b", "kind": "k"}]}"#,
+    )
+    .unwrap();
+    assert_eq!(batch.jobs.len(), 2);
+    // A bare spec is still checked for unknown fields.
+    assert_eq!(
+        belay_json::from_str::<EnqueueRequest>(r#"{"queue": "a", "kind": "k", "jbos": []}"#)
+            .unwrap_err()
+            .to_string(),
+        r#"$: unknown field "jbos" in JobSpec, expected one of: queue, kind, payload, priority, run_at, max_attempts, tags, meta, unique"#
+    );
+}
+
+#[test]
+fn text_level_errors_are_distinguished() {
+    use std::error::Error as _;
+
+    let syntax = belay_json::from_str::<JobSpec>("{\"queue\": \"a\",\n \"kind\": }").unwrap_err();
+    assert!(matches!(syntax, Error::Parse(_)));
+    assert_eq!(
+        syntax.to_string(),
+        "invalid JSON: unexpected character '}', expected a value at line 2, column 10"
+    );
+    let shape = belay_json::from_str::<JobSpec>(r#"{"queue": "a", "kind": 1}"#).unwrap_err();
+    match &shape {
+        Error::Convert(e) => assert_eq!(e.path_string(), "$.kind"),
+        other => panic!("expected a conversion error, got {other:?}"),
+    }
+    assert!(shape.source().is_some());
+}
+
+#[test]
+fn integral_floats_decode_into_integer_fields() {
+    let spec: JobSpec = belay_json::from_str(
+        r#"{"queue": "a", "kind": "k", "priority": 5.0, "max_attempts": 1e1}"#,
+    )
+    .unwrap();
+    assert_eq!((spec.priority, spec.max_attempts), (5, 10));
+    assert_eq!(
+        belay_json::from_str::<JobSpec>(r#"{"queue": "a", "kind": "k", "max_attempts": 2.5}"#)
+            .unwrap_err()
+            .to_string(),
+        "$.max_attempts: expected integer in range 0..=4294967295, found 2.5"
+    );
+}
