@@ -154,3 +154,70 @@ impl ToJson for JobSpec {
             .build()
     }
 }
+
+impl FromJson for JobSpec {
+    fn from_json(value: &Value) -> Result<JobSpec, FromJsonError> {
+        let r = ObjectReader::new(value, "JobSpec")?;
+        let spec = JobSpec {
+            queue: r.req("queue")?,
+            kind: r.req("kind")?,
+            payload: r.or_default("payload")?,
+            priority: r.or_default("priority")?,
+            run_at: r.opt("run_at")?,
+            max_attempts: r.or("max_attempts", 25)?,
+            tags: r.or_default("tags")?,
+            meta: r.or_default("meta")?,
+            unique: r.opt("unique")?,
+        };
+        if !(-1000..=1000).contains(&spec.priority) {
+            return Err(r.invalid(
+                "priority",
+                format_args!("must be between -1000 and 1000, got {}", spec.priority),
+            ));
+        }
+        r.deny_unknown_fields()?;
+        Ok(spec)
+    }
+}
+
+/// `POST /v1/jobs` accepts one bare `JobSpec` or `{"jobs": [...]}`.
+#[derive(Debug, PartialEq)]
+struct EnqueueRequest {
+    jobs: Vec<JobSpec>,
+}
+
+impl FromJson for EnqueueRequest {
+    fn from_json(value: &Value) -> Result<EnqueueRequest, FromJsonError> {
+        let r = ObjectReader::new(value, "EnqueueRequest")?;
+        if !r.has("jobs") {
+            return Ok(EnqueueRequest {
+                jobs: vec![JobSpec::from_json(value)?],
+            });
+        }
+        let request = EnqueueRequest {
+            jobs: r.req("jobs")?,
+        };
+        r.deny_unknown_fields()?;
+        Ok(request)
+    }
+}
+
+fn full_spec() -> JobSpec {
+    let mut spec = JobSpec::new("emails", "send_welcome");
+    spec.payload = json!({"to": "a@example.com", "retries": [1, 2]});
+    spec.priority = -5;
+    spec.run_at = Some(1_741_064_767_089);
+    spec.max_attempts = 3;
+    spec.tags = vec!["onboarding".to_owned()];
+    spec.meta
+        .insert("belay.schedule".to_owned(), "daily".to_owned());
+    spec.unique = Some(Unique {
+        key: "welcome:42".to_owned(),
+        scope: UniqueScope::For { ms: 60_000 },
+    });
+    spec
+}
+
+fn decode_err<T: FromJson + fmt::Debug>(value: Value) -> String {
+    T::from_json(&value).unwrap_err().to_string()
+}
