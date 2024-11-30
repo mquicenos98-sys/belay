@@ -182,3 +182,124 @@ fn strings_round_trip_through_every_writer_mode() {
         assert_eq!(parse(&escaped).unwrap(), value, "{escaped}");
     }
 }
+
+fn random_value(rng: &mut Rng, depth: u32) -> Value {
+    let leaf_only = depth == 0;
+    match rng.below(if leaf_only { 7 } else { 9 }) {
+        0 => Value::Null,
+        1 => Value::Bool(rng.chance(50)),
+        2 => Value::from(rng.next() >> rng.below(64)),
+        3 => Value::from(-((rng.next() >> 1) as i64 >> rng.below(63)) - 1),
+        4 => {
+            let f = f64::from_bits(rng.next());
+            if f.is_finite() {
+                Value::from(f)
+            } else {
+                Value::from(0.5)
+            }
+        }
+        5 => Value::from(rng.below(10_000) as f64 / 8.0),
+        6 => Value::from(random_string(rng, 12)),
+        7 => (0..rng.below(6))
+            .map(|_| random_value(rng, depth - 1))
+            .collect(),
+        _ => {
+            let mut map = Map::new();
+            for _ in 0..rng.below(12) {
+                // Few distinct keys, so objects also exercise replacement.
+                let key = match rng.below(4) {
+                    0 => random_string(rng, 6),
+                    _ => format!("k{}", rng.below(16)),
+                };
+                map.insert(key, random_value(rng, depth - 1));
+            }
+            Value::Object(map)
+        }
+    }
+}
+
+fn keys_are_sorted(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().all(keys_are_sorted),
+        Value::Object(map) => {
+            let keys: Vec<&str> = map.keys().collect();
+            keys.windows(2).all(|w| w[0] <= w[1]) && map.values().all(keys_are_sorted)
+        }
+        _ => true,
+    }
+}
+
+#[test]
+fn random_documents_round_trip_in_every_mode() {
+    let mut rng = Rng(0xd0c5);
+    let modes = [
+        WriteOptions::compact(),
+        WriteOptions::pretty(),
+        WriteOptions::compact().sort_keys(true),
+        WriteOptions::pretty().ascii_only(true).indent(Some(3)),
+    ];
+    for _ in 0..1_500 {
+        let doc = random_value(&mut rng, 4);
+        for mode in &modes {
+            let text = to_string_with(&doc, mode);
+            let back = parse(&text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+            assert_eq!(back, doc, "{mode:?}\n{text}");
+            if mode.sort_keys {
+                assert!(keys_are_sorted(&back), "{text}");
+            }
+        }
+        // Canonical output is a fixpoint of parse-then-write.
+        let compact = to_string(&doc);
+        assert_eq!(to_string(&parse(&compact).unwrap()), compact);
+        let mut bytes = Vec::new();
+        write_to(&mut bytes, &doc).unwrap();
+        assert_eq!(bytes, compact.as_bytes());
+        assert_eq!(doc.to_string(), compact);
+    }
+}
+
+#[test]
+fn pretty_printer_golden_output() {
+    let job = json!({
+        "id": "01J9ZC0W5Q6XG1Q3V6YB3N0K7D",
+        "queue": "emails",
+        "state": "retrying",
+        "attempt": 2,
+        "priority": -5,
+        "payload": {"to": ["a@example.com"], "subject": "Welcome\n", "vars": {}},
+        "errors": [
+            {"attempt": 1, "message": "smtp timeout", "retryable": true},
+        ],
+        "progress": {"percent": 42.5, "message": null},
+        "tags": [],
+    });
+    let expected = r#"{
+  "id": "01J9ZC0W5Q6XG1Q3V6YB3N0K7D",
+  "queue": "emails",
+  "state": "retrying",
+  "attempt": 2,
+  "priority": -5,
+  "payload": {
+    "to": [
+      "a@example.com"
+    ],
+    "subject": "Welcome\n",
+    "vars": {}
+  },
+  "errors": [
+    {
+      "attempt": 1,
+      "message": "smtp timeout",
+      "retryable": true
+    }
+  ],
+  "progress": {
+    "percent": 42.5,
+    "message": null
+  },
+  "tags": []
+}"#;
+    assert_eq!(to_string_pretty(&job), expected);
+    assert_eq!(format!("{job:#}"), expected);
+    assert_eq!(parse(expected).unwrap(), job);
+}
