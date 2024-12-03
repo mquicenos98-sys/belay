@@ -1,0 +1,17 @@
+[package]
+name = "belay-proto"
+description = "Domain model and HTTP API types for belay: jobs, queues, schedules, workflows, events and their JSON wire format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "belay_proto"
+path = "src/lib.rs"
+
+[dependencies]
+belay-common = { path = "../belay-common" }
+belay-json = { path = "../belay-json" }
