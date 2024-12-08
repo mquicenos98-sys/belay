@@ -46,3 +46,48 @@ pub const MAX_META_ENTRIES: usize = 32;
 
 /// Longest `meta` key.
 pub const MAX_META_KEY_LEN: usize = 64;
+
+/// Longest `meta` value, in bytes.
+pub const MAX_META_VALUE_BYTES: usize = 1024;
+
+/// Longest uniqueness key, in bytes.
+pub const MAX_UNIQUE_KEY_BYTES: usize = 256;
+
+/// Longest period a `for:` uniqueness scope may cover.
+pub const MAX_UNIQUE_FOR: Duration = Duration::from_secs(30 * DAY);
+
+/// Longest `delay` (and longest `retry_in`) accepted.
+pub const MAX_DELAY: Duration = Duration::from_secs(365 * DAY);
+
+/// Shortest per-attempt execution timeout.
+pub const MIN_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// Longest per-attempt execution timeout.
+pub const MAX_TIMEOUT: Duration = Duration::from_secs(7 * DAY);
+
+/// Queue default for the per-attempt execution timeout.
+pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30 * MINUTE);
+
+/// Error history kept per job; older entries are dropped first.
+pub const MAX_ERROR_HISTORY: usize = 10;
+
+/// Error messages are truncated to this many bytes when recorded.
+pub const MAX_ERROR_MESSAGE_BYTES: usize = 4096;
+
+/// Longest error kind label.
+pub const MAX_ERROR_KIND_LEN: usize = 64;
+
+/// Longest progress message, in bytes.
+pub const MAX_PROGRESS_MESSAGE_BYTES: usize = 1024;
+
+/// Most jobs in one enqueue request.
+pub const MAX_ENQUEUE_BATCH: usize = 1000;
+
+/// Most jobs handed out by one lease request.
+pub const MAX_LEASE_JOBS: u32 = 100;
+
+/// Most queues named in one lease request.
+pub const MAX_LEASE_QUEUES: usize = 32;
+
+/// Shortest lease.
+pub const MIN_LEASE: Duration = Duration::from_secs(1);
