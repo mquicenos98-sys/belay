@@ -320,3 +320,145 @@ impl From<TransitionError> for ApiError {
             .with_details(json!({"state": e.from, "requested": e.to}))
     }
 }
+
+impl From<belay_json::Error> for ApiError {
+    fn from(e: belay_json::Error) -> ApiError {
+        match e {
+            belay_json::Error::Convert(e) => e.into(),
+            belay_json::Error::Parse(e) => ApiError::invalid_argument(format!("invalid JSON: {e}"))
+                .with_details(json!({"line": e.line(), "column": e.column()})),
+            other => ApiError::internal(other.to_string()),
+        }
+    }
+}
+
+impl From<Error> for ApiError {
+    fn from(e: Error) -> ApiError {
+        match e {
+            Error::Parse(e) => e.into(),
+            Error::Json(e) => e.into(),
+            Error::Invalid(e) => e.into(),
+            Error::Transition(e) => e.into(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job::{JobSpec, JobState};
+    use crate::validate::Validate;
+
+    #[test]
+    fn every_code_has_a_status_and_round_trips() {
+        for code in ErrorCode::ALL {
+            let status = code.http_status();
+            assert!((400..=599).contains(&status), "{code}");
+            let err = ApiError::new(*code, "m").with_details(json!([1]));
+            assert_eq!(ApiError::from_json(&err.to_json()), Ok(err));
+        }
+        assert_eq!(ErrorCode::LeaseLost.http_status(), 409);
+    }
+
+    #[test]
+    fn status_mapping_for_bodiless_responses() {
+        let cases = [
+            (400, ErrorCode::InvalidArgument),
+            (401, ErrorCode::Unauthenticated),
+            (404, ErrorCode::NotFound),
+            (413, ErrorCode::InvalidArgument),
+            (429, ErrorCode::ResourceExhausted),
+            (500, ErrorCode::Internal),
+            (502, ErrorCode::Unavailable),
+            (504, ErrorCode::Unavailable),
+        ];
+        for (status, code) in cases {
+            assert_eq!(ErrorCode::from_http_status(status), code, "{status}");
+        }
+        let err = ApiError::from_http_status(502, "  <html>Bad Gateway</html> ");
+        assert_eq!(
+            err.to_string(),
+            "unavailable: HTTP 502: <html>Bad Gateway</html>"
+        );
+        assert!(err.is_retryable());
+        assert_eq!(ApiError::from_http_status(500, "").message, "HTTP 500");
+    }
+
+    #[test]
+    fn constructors_carry_useful_details() {
+        let id: JobId = "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().unwrap();
+        let err = ApiError::lease_lost(id);
+        assert!(err.is(ErrorCode::LeaseLost));
+        assert_eq!(
+            err.details,
+            Some(json!({"job": "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z"}))
+        );
+        let err = ApiError::already_exists("schedule", "nightly");
+        assert_eq!(
+            err.to_string(),
+            "already_exists: schedule nightly already exists"
+        );
+        let err: ApiError = JobState::Succeeded
+            .check_transition(JobState::Cancelled)
+            .unwrap_err()
+            .into();
+        assert_eq!(err.code, ErrorCode::FailedPrecondition);
+        assert_eq!(
+            err.details,
+            Some(json!({"state": "succeeded", "requested": "cancelled"}))
+        );
+    }
+
+    #[test]
+    fn violations_become_invalid_argument_with_fields() {
+        let problems = JobSpec::new("q", "k")
+            .priority(3000)
+            .max_attempts(0)
+            .validate()
+            .unwrap_err();
+        let err = ApiError::from(problems);
+        assert_eq!(err.http_status(), 400);
+        assert_eq!(
+            err.message,
+            "$.priority: must be between -1000 and 1000, got 3000 (and 1 more problem)"
+        );
+        assert_eq!(
+            err.details,
+            Some(json!({"violations": [
+                {"field": "$.priority", "message": "must be between -1000 and 1000, got 3000"},
+                {"field": "$.max_attempts", "message": "must be between 1 and 1000, got 0"}
+            ]}))
+        );
+    }
+
+    #[test]
+    fn json_errors_map_to_invalid_argument() {
+        let err: ApiError = belay_json::from_str::<JobSpec>("{").unwrap_err().into();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.starts_with("invalid JSON: "), "{}", err.message);
+        assert_eq!(
+            err.details.as_ref().map(|d| d["line"].clone()),
+            Some(json!(1))
+        );
+        let err: ApiError = belay_json::from_str::<JobSpec>(r#"{"queue": "q"}"#)
+            .unwrap_err()
+            .into();
+        assert_eq!(
+            err.message,
+            r#"$: missing required field "kind" in JobSpec"#
+        );
+    }
+
+    #[test]
+    fn unknown_codes_from_newer_servers_degrade_to_internal() {
+        let v = json!({"error": {"code": "quota_frozen", "message": "try tomorrow"}});
+        let err = ApiError::from_json(&v).unwrap();
+        assert_eq!(err.code, ErrorCode::Internal);
+        assert_eq!(err.message, "quota_frozen: try tomorrow");
+        let err = ApiError::from_json(&json!({"message": "x"})).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$: missing required field "error" in ApiError"#
+        );
+    }
+}
