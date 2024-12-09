@@ -301,3 +301,22 @@ impl From<Violations> for ApiError {
         ApiError::invalid_argument(v.to_string()).with_details(json!({ "violations": list }))
     }
 }
+
+impl From<FromJsonError> for ApiError {
+    fn from(e: FromJsonError) -> ApiError {
+        Violations::from(e).into()
+    }
+}
+
+impl From<ParseError> for ApiError {
+    fn from(e: ParseError) -> ApiError {
+        ApiError::invalid_argument(e.to_string())
+    }
+}
+
+impl From<TransitionError> for ApiError {
+    fn from(e: TransitionError) -> ApiError {
+        ApiError::failed_precondition(e.to_string())
+            .with_details(json!({"state": e.from, "requested": e.to}))
+    }
+}
