@@ -266,3 +266,38 @@ impl ToJson for ApiError {
         ObjectBuilder::new().raw("error", inner).build()
     }
 }
+
+impl FromJson for ApiError {
+    /// Tolerant, since it decodes whatever a server sent: an error code this
+    /// version does not know becomes `internal` with the code kept in the
+    /// message.
+    fn from_json(value: &Value) -> Result<ApiError, FromJsonError> {
+        let outer = ObjectReader::new(value, "ApiError")?;
+        outer.req_with("error", |inner| {
+            let r = ObjectReader::new(inner, "ApiError")?;
+            let raw_code = r.req_str("code")?;
+            let mut message: String = r.or_default("message")?;
+            let code = raw_code.parse().unwrap_or_else(|_| {
+                message = format!("{raw_code}: {message}");
+                ErrorCode::Internal
+            });
+            Ok(ApiError {
+                code,
+                message,
+                details: r.value("details").filter(|d| !d.is_null()).cloned(),
+            })
+        })
+    }
+}
+
+/// Invalid input: `invalid_argument` listing every problem under
+/// `details.violations` as `{"field": "$.path", "message": "..."}`.
+impl From<Violations> for ApiError {
+    fn from(v: Violations) -> ApiError {
+        let list: Vec<Value> = v
+            .iter()
+            .map(|x| json!({"field": x.path(), "message": x.message()}))
+            .collect();
+        ApiError::invalid_argument(v.to_string()).with_details(json!({ "violations": list }))
+    }
+}
