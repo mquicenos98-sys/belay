@@ -247,3 +247,22 @@ impl ApiError {
         self.code.is_retryable()
     }
 }
+
+impl fmt::Display for ApiError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for ApiError {}
+
+impl ToJson for ApiError {
+    fn to_json(&self) -> Value {
+        let inner = ObjectBuilder::new()
+            .field("code", self.code)
+            .field("message", &self.message)
+            .opt_field("details", &self.details)
+            .build();
+        ObjectBuilder::new().raw("error", inner).build()
+    }
+}
