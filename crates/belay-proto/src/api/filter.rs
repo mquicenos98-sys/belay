@@ -179,3 +179,45 @@ impl Cursor {
         }
     }
 }
+
+fn base32_encode(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity((bytes.len() * 8).div_ceil(5));
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for &b in bytes {
+        acc = (acc << 8) | u32::from(b);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(char::from(BASE32[((acc >> bits) & 31) as usize]));
+        }
+        acc &= (1 << bits) - 1;
+    }
+    if bits > 0 {
+        out.push(char::from(BASE32[((acc << (5 - bits)) & 31) as usize]));
+    }
+    out
+}
+
+/// Case-insensitive; rejects non-zero padding bits so that every cursor
+/// has exactly one spelling (modulo case).
+fn base32_decode(text: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() * 5 / 8);
+    let (mut acc, mut bits) = (0u32, 0u32);
+    for c in text.bytes() {
+        let digit = BASE32.iter().position(|&a| a == c.to_ascii_lowercase())?;
+        acc = (acc << 5) | digit as u32;
+        bits += 5;
+        if bits >= 8 {
+            bits -= 8;
+            out.push((acc >> bits) as u8);
+            acc &= (1 << bits) - 1;
+        }
+    }
+    (bits < 5 && acc == 0).then_some(out)
+}
+
+impl fmt::Display for Cursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&base32_encode(&self.to_bytes()))
+    }
+}
