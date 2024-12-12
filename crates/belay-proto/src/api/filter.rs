@@ -501,3 +501,60 @@ impl JobFilter {
         Ok(filter)
     }
 }
+
+/// One page of a listing: `{"items": [...], "next_cursor": "..."}`, where
+/// `next_cursor` is absent on the last page.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Page<T> {
+    /// The items, in listing order.
+    pub items: Vec<T>,
+    /// Where the next page starts; `None` on the last page.
+    pub next_cursor: Option<Cursor>,
+}
+
+impl<T> Page<T> {
+    /// A page from its parts.
+    #[must_use]
+    pub fn new(items: Vec<T>, next_cursor: Option<Cursor>) -> Page<T> {
+        Page { items, next_cursor }
+    }
+
+    /// A final page (or an unpaginated list).
+    #[must_use]
+    pub fn last(items: Vec<T>) -> Page<T> {
+        Page::new(items, None)
+    }
+
+    /// Builds a page from up to `limit + 1` items fetched in listing order:
+    /// fetching one extra tells whether another page exists without a
+    /// second query. The cursor points at the last item kept.
+    #[must_use]
+    pub fn paginate(mut items: Vec<T>, limit: u32, cursor_of: impl Fn(&T) -> Cursor) -> Page<T> {
+        let limit = limit as usize;
+        if items.len() > limit {
+            let next_cursor = items.last().map(cursor_of);
+            items.truncate(limit);
+            Page::new(items, next_cursor)
+        } else {
+            Page::last(items)
+        }
+    }
+
+    /// Whether another page follows.
+    #[must_use]
+    pub fn has_more(&self) -> bool {
+        self.next_cursor.is_some()
+    }
+
+    /// Converts the items, keeping the cursor.
+    #[must_use]
+    pub fn map<U>(self, f: impl FnMut(T) -> U) -> Page<U> {
+        Page::new(self.items.into_iter().map(f).collect(), self.next_cursor)
+    }
+}
+
+impl<T> Default for Page<T> {
+    fn default() -> Page<T> {
+        Page::last(Vec::new())
+    }
+}
