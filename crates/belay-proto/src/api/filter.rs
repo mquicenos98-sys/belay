@@ -29,16 +29,11 @@ text_enum! {
 }
 
 const CURSOR_VERSION: u8 = 1;
-
 const TAG_ULID: u8 = b'u';
-
 const TAG_NAME: u8 = b'n';
-
 const TAG_SEQ: u8 = b's';
-
 /// Longest name a cursor carries; every listed name type is shorter.
 const MAX_CURSOR_NAME: usize = 128;
-
 const BASE32: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
 
 /// An opaque position in a listing: the last item of a page, after which
@@ -556,5 +551,249 @@ impl<T> Page<T> {
 impl<T> Default for Page<T> {
     fn default() -> Page<T> {
         Page::last(Vec::new())
+    }
+}
+
+impl<T: ToJson> ToJson for Page<T> {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("items", &self.items)
+            .opt_field("next_cursor", &self.next_cursor)
+            .build()
+    }
+}
+
+impl<T: FromJson> FromJson for Page<T> {
+    fn from_json(value: &Value) -> Result<Page<T>, FromJsonError> {
+        let r = ObjectReader::new(value, "Page")?;
+        Ok(Page {
+            items: r.or_default("items")?,
+            next_cursor: r.opt("next_cursor")?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job::JobSpec;
+
+    fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
+        items
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+            .collect()
+    }
+
+    fn lines(r: Result<JobFilter, Violations>) -> Vec<String> {
+        match r {
+            Ok(f) => panic!("unexpectedly parsed {f:?}"),
+            Err(e) => e.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    fn job(id: &str, spec: JobSpec, created_ms: i64) -> Job {
+        Job::new(
+            id.parse().unwrap(),
+            spec,
+            Timestamp::from_millis(created_ms),
+        )
+    }
+
+    #[test]
+    fn base32_round_trips_every_length() {
+        let data: Vec<u8> = (0u8..=40).map(|i| i.wrapping_mul(37)).collect();
+        for len in 0..data.len() {
+            let text = base32_encode(&data[..len]);
+            assert_eq!(text.len(), (len * 8).div_ceil(5));
+            assert_eq!(base32_decode(&text).as_deref(), Some(&data[..len]));
+            assert_eq!(
+                base32_decode(&text.to_ascii_uppercase()).as_deref(),
+                Some(&data[..len])
+            );
+        }
+        // "1" carries a set padding bit: not a canonical encoding of anything.
+        assert_eq!(base32_decode("01"), None);
+        assert_eq!(base32_decode("0u"), None, "u is not in the alphabet");
+    }
+
+    #[test]
+    fn cursors_round_trip_every_key_kind() {
+        let id: JobId = "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().unwrap();
+        for cursor in [
+            Cursor::after_job(id),
+            Cursor::from_name("nightly-report"),
+            Cursor::from_name(""),
+            Cursor::from_seq(u64::MAX),
+        ] {
+            let text = cursor.to_string();
+            assert!(text.bytes().all(|b| BASE32.contains(&b)), "{text}");
+            assert_eq!(text.parse::<Cursor>(), Ok(cursor.clone()));
+            assert_eq!(Cursor::from_json(&cursor.to_json()), Ok(cursor));
+        }
+        assert_eq!(Cursor::after_job(id).job_id(), Some(id));
+        assert_eq!(Cursor::from_name("q").as_name(), Some("q"));
+        assert_eq!(Cursor::from_seq(9).as_seq(), Some(9));
+        assert_eq!(Cursor::from_seq(9).job_id(), None);
+        assert_eq!(
+            Cursor::from_name(&"é".repeat(100)).as_name().map(str::len),
+            Some(128)
+        );
+    }
+
+    #[test]
+    fn tampered_cursors_are_rejected() {
+        let text = Cursor::from_seq(41).to_string();
+        let mut chars: Vec<char> = text.chars().collect();
+        let i = chars.len() / 2;
+        chars[i] = if chars[i] == '0' { '1' } else { '0' };
+        let tampered: String = chars.into_iter().collect();
+        assert_eq!(
+            tampered.parse::<Cursor>().unwrap_err().to_string(),
+            format!("invalid cursor {tampered:?}: not a cursor issued by this server")
+        );
+        assert!(
+            text[..text.len() - 2].parse::<Cursor>().is_err(),
+            "truncated"
+        );
+        assert!("".parse::<Cursor>().is_err());
+        assert!("z".repeat(300).parse::<Cursor>().is_err());
+    }
+
+    #[test]
+    fn full_filter_round_trips_through_query_pairs() {
+        let filter = JobFilter::new()
+            .queue(QueueName::from_static("emails"))
+            .state(JobState::Ready)
+            .state(JobState::Running)
+            .kind("send_welcome")
+            .tag("signup")
+            .tenant("acme".parse().unwrap())
+            .created_between(
+                Some(Timestamp::from_millis(1_000)),
+                Some(Timestamp::from_millis(2_000)),
+            )
+            .order(SortOrder::Asc)
+            .after(Cursor::after_job(
+                "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().unwrap(),
+            ))
+            .limit(25);
+        let q = filter.to_query();
+        let keys: Vec<&str> = q.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, JobFilter::QUERY_KEYS);
+        assert_eq!(q[5].1, "1970-01-01T00:00:01.000Z");
+        assert_eq!(JobFilter::from_query(&q), Ok(filter));
+        assert!(JobFilter::new().to_query().is_empty());
+        assert_eq!(JobFilter::from_query(&[]), Ok(JobFilter::new()));
+    }
+
+    #[test]
+    fn query_accepts_repeats_blanks_and_offsets() {
+        let f = JobFilter::from_query(&pairs(&[
+            ("state", "dead"),
+            ("state", "cancelled,"),
+            ("kind", ""),
+            ("created_after", "2025-01-01T05:00:00+05:00"),
+        ]))
+        .unwrap();
+        assert_eq!(f.states, [JobState::Dead, JobState::Cancelled]);
+        assert_eq!(f.kind, None);
+        assert_eq!(
+            f.created_after.map(|t| t.to_rfc3339()).as_deref(),
+            Some("2025-01-01T00:00:00.000Z")
+        );
+    }
+
+    #[test]
+    fn query_errors_name_each_parameter() {
+        let job_cursor = Cursor::from_name("q").to_string();
+        assert_eq!(
+            lines(JobFilter::from_query(&pairs(&[
+                ("queue", "emails"),
+                ("queue", "sms"),
+                ("state", "redy"),
+                ("kind", "a b"),
+                ("created_after", "2025-02-01T00:00:00Z"),
+                ("created_before", "2025-01-01T00:00:00Z"),
+                ("order", "newest"),
+                ("limit", "0"),
+                ("cursor", &job_cursor),
+                ("ordr", "asc"),
+            ]))),
+            [
+                r#"$: unknown query parameter "ordr", did you mean "order"?"#,
+                "$.queue: may be given only once",
+                r#"$.state: unknown job state "redy", did you mean "ready"?"#,
+                "$.kind: ' ' at position 1 is not allowed (use letters, digits, '_', '.', ':', '/' or '-')",
+                r#"$.order: unknown sort order "newest", expected one of: asc, desc"#,
+                "$.created_before: must be after created_after (2025-02-01T00:00:00.000Z)",
+                "$.limit: must be between 1 and 1000, got 0",
+                "$.cursor: was not issued by a job listing",
+            ]
+        );
+        assert_eq!(
+            lines(JobFilter::from_query(&pairs(&[
+                ("created_after", "yesterday"),
+                ("limit", "ten")
+            ]))),
+            [
+                r#"$.created_after: invalid timestamp "yesterday": expected 4-digit year at byte 0"#,
+                r#"$.limit: invalid number "ten": invalid digit found in string"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn matches_checks_every_criterion() {
+        let spec = JobSpec::new("emails", "send")
+            .tag("signup")
+            .tenant("acme".parse().unwrap());
+        let j = job("01HQ3K9Z8N6V2T4R5S7W0X1Y2Z", spec, 1_500);
+        assert!(JobFilter::new().matches(&j));
+        let all = JobFilter::new()
+            .queue(QueueName::from_static("emails"))
+            .state(JobState::Ready)
+            .kind("send")
+            .tag("signup")
+            .tenant("acme".parse().unwrap())
+            .created_between(
+                Some(Timestamp::from_millis(1_000)),
+                Some(Timestamp::from_millis(2_000)),
+            );
+        assert!(all.matches(&j));
+        let misses = [
+            JobFilter::new().queue(QueueName::from_static("sms")),
+            JobFilter::new().state(JobState::Dead),
+            JobFilter::new().kind("other"),
+            JobFilter::new().tag("other"),
+            JobFilter::new().tenant("globex".parse().unwrap()),
+            JobFilter::new().created_between(Some(Timestamp::from_millis(1_500)), None),
+            JobFilter::new().created_between(None, Some(Timestamp::from_millis(1_500))),
+        ];
+        for f in misses {
+            assert!(!f.matches(&j), "{f:?}");
+        }
+    }
+
+    #[test]
+    fn cursor_position_depends_on_order() {
+        let a: JobId = "01HQ3K9Z8N6V2T4R5S7W0X1Y2A".parse().unwrap();
+        let b: JobId = "01HQ3K9Z8N6V2T4R5S7W0X1Y2B".parse().unwrap();
+        let c: JobId = "01HQ3K9Z8N6V2T4R5S7W0X1Y2C".parse().unwrap();
+        let desc = JobFilter::new().after(Cursor::after_job(b));
+        assert!(desc.past_cursor(a) && !desc.past_cursor(b) && !desc.past_cursor(c));
+        let asc = desc.clone().order(SortOrder::Asc);
+        assert!(!asc.past_cursor(a) && !asc.past_cursor(b) && asc.past_cursor(c));
+        assert!(JobFilter::new().past_cursor(a));
+    }
+
+    #[test]
+    fn effective_limit_clamps() {
+        assert_eq!(JobFilter::new().effective_limit(), DEFAULT_PAGE_LIMIT);
+        assert_eq!(JobFilter::new().limit(0).effective_limit(), 1);
+        assert_eq!(
+            JobFilter::new().limit(5_000).effective_limit(),
+            MAX_PAGE_LIMIT
+        );
     }
 }
