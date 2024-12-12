@@ -221,3 +221,283 @@ impl fmt::Display for Cursor {
         f.write_str(&base32_encode(&self.to_bytes()))
     }
 }
+
+impl FromStr for Cursor {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<Cursor, ParseError> {
+        // A name cursor is at most 131 bytes framed, 210 characters.
+        const MAX_TEXT: usize = 256;
+        (s.len() <= MAX_TEXT)
+            .then(|| base32_decode(s))
+            .flatten()
+            .and_then(|bytes| Cursor::from_bytes(&bytes))
+            .ok_or_else(|| ParseError::invalid("cursor", s, "not a cursor issued by this server"))
+    }
+}
+
+text_json!(Cursor, "cursor");
+
+/// Criteria for `GET /v1/jobs`. All criteria must hold; list criteria
+/// (`states`) match any of their values.
+///
+/// Query form (see [`to_query`](Self::to_query)):
+/// `queue`, `state` (comma-separated or repeated), `kind`, `tag`, `tenant`,
+/// `created_after`, `created_before` (RFC 3339, exclusive), `order`
+/// (`asc`/`desc`), `cursor`, `limit`. Unknown parameters are rejected with a
+/// hint, single-valued ones may not repeat, and empty values count as
+/// absent.
+///
+/// ```
+/// use belay_proto::api::JobFilter;
+/// use belay_proto::{JobState, QueueName};
+///
+/// let filter = JobFilter::new()
+///     .queue(QueueName::from_static("emails"))
+///     .state(JobState::Dead)
+///     .state(JobState::Retrying)
+///     .limit(50);
+/// let pairs = filter.to_query();
+/// assert_eq!(
+///     pairs.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>(),
+///     ["queue=emails", "state=dead,retrying", "limit=50"]
+/// );
+/// assert_eq!(JobFilter::from_query(&pairs), Ok(filter));
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct JobFilter {
+    /// Only this queue.
+    pub queue: Option<QueueName>,
+    /// Only these states; empty for all.
+    pub states: Vec<JobState>,
+    /// Only this kind.
+    pub kind: Option<String>,
+    /// Only jobs carrying this tag.
+    pub tag: Option<String>,
+    /// Only this tenant.
+    pub tenant: Option<TenantId>,
+    /// Only jobs created strictly after this time.
+    pub created_after: Option<Timestamp>,
+    /// Only jobs created strictly before this time.
+    pub created_before: Option<Timestamp>,
+    /// Listing order.
+    pub order: SortOrder,
+    /// Continue after this position.
+    pub cursor: Option<Cursor>,
+    /// Page size; default 100, at most 1000.
+    pub limit: Option<u32>,
+}
+
+impl JobFilter {
+    /// Query parameters understood by [`from_query`](Self::from_query).
+    pub const QUERY_KEYS: &'static [&'static str] = &[
+        "queue",
+        "state",
+        "kind",
+        "tag",
+        "tenant",
+        "created_after",
+        "created_before",
+        "order",
+        "cursor",
+        "limit",
+    ];
+
+    /// Every job, newest first, default page size.
+    #[must_use]
+    pub fn new() -> JobFilter {
+        JobFilter::default()
+    }
+
+    /// Restricts to a queue.
+    #[must_use]
+    pub fn queue(mut self, queue: QueueName) -> JobFilter {
+        self.queue = Some(queue);
+        self
+    }
+
+    /// Adds an accepted state.
+    #[must_use]
+    pub fn state(mut self, state: JobState) -> JobFilter {
+        self.states.push(state);
+        self
+    }
+
+    /// Restricts to a kind.
+    #[must_use]
+    pub fn kind(mut self, kind: impl Into<String>) -> JobFilter {
+        self.kind = Some(kind.into());
+        self
+    }
+
+    /// Restricts to jobs with a tag.
+    #[must_use]
+    pub fn tag(mut self, tag: impl Into<String>) -> JobFilter {
+        self.tag = Some(tag.into());
+        self
+    }
+
+    /// Restricts to a tenant.
+    #[must_use]
+    pub fn tenant(mut self, tenant: TenantId) -> JobFilter {
+        self.tenant = Some(tenant);
+        self
+    }
+
+    /// Restricts to creation times strictly between the bounds.
+    #[must_use]
+    pub fn created_between(
+        mut self,
+        after: Option<Timestamp>,
+        before: Option<Timestamp>,
+    ) -> JobFilter {
+        self.created_after = after;
+        self.created_before = before;
+        self
+    }
+
+    /// Sets the order.
+    #[must_use]
+    pub fn order(mut self, order: SortOrder) -> JobFilter {
+        self.order = order;
+        self
+    }
+
+    /// Continues after `cursor`.
+    #[must_use]
+    pub fn after(mut self, cursor: Cursor) -> JobFilter {
+        self.cursor = Some(cursor);
+        self
+    }
+
+    /// Sets the page size.
+    #[must_use]
+    pub fn limit(mut self, limit: u32) -> JobFilter {
+        self.limit = Some(limit);
+        self
+    }
+
+    /// The page size to use: the requested one clamped to
+    /// `1..=MAX_PAGE_LIMIT`, or the default.
+    #[must_use]
+    pub fn effective_limit(&self) -> u32 {
+        self.limit
+            .unwrap_or(DEFAULT_PAGE_LIMIT)
+            .clamp(1, MAX_PAGE_LIMIT)
+    }
+
+    /// Whether `job` meets every criterion (cursor and limit aside).
+    #[must_use]
+    pub fn matches(&self, job: &Job) -> bool {
+        self.queue.as_ref().map_or(true, |q| job.queue() == q)
+            && (self.states.is_empty() || self.states.contains(&job.state))
+            && self.kind.as_deref().map_or(true, |k| job.kind() == k)
+            && self.tag.as_deref().map_or(true, |t| job.spec.has_tag(t))
+            && self
+                .tenant
+                .as_ref()
+                .map_or(true, |t| job.spec.tenant.as_ref() == Some(t))
+            && self.created_after.map_or(true, |t| job.created_at > t)
+            && self.created_before.map_or(true, |t| job.created_at < t)
+    }
+
+    /// Whether a job with `id` comes after the cursor in this filter's
+    /// order (always true without a cursor).
+    #[must_use]
+    pub fn past_cursor(&self, id: JobId) -> bool {
+        match self.cursor.as_ref().and_then(Cursor::job_id) {
+            None => true,
+            Some(last) => match self.order {
+                SortOrder::Asc => id > last,
+                SortOrder::Desc => id < last,
+            },
+        }
+    }
+
+    /// The decoded query pairs, in [`QUERY_KEYS`](Self::QUERY_KEYS) order;
+    /// unset criteria and the default order are left out.
+    #[must_use]
+    pub fn to_query(&self) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        let mut push = |key: &str, value: String| pairs.push((key.to_owned(), value));
+        if let Some(q) = &self.queue {
+            push("queue", q.to_string());
+        }
+        if !self.states.is_empty() {
+            let states: Vec<&str> = self.states.iter().map(|s| s.as_str()).collect();
+            push("state", states.join(","));
+        }
+        if let Some(kind) = &self.kind {
+            push("kind", kind.clone());
+        }
+        if let Some(tag) = &self.tag {
+            push("tag", tag.clone());
+        }
+        if let Some(tenant) = &self.tenant {
+            push("tenant", tenant.to_string());
+        }
+        if let Some(t) = self.created_after {
+            push("created_after", t.to_rfc3339());
+        }
+        if let Some(t) = self.created_before {
+            push("created_before", t.to_rfc3339());
+        }
+        if self.order != SortOrder::default() {
+            push("order", self.order.to_string());
+        }
+        if let Some(cursor) = &self.cursor {
+            push("cursor", cursor.to_string());
+        }
+        if let Some(limit) = self.limit {
+            push("limit", limit.to_string());
+        }
+        pairs
+    }
+
+    /// Parses decoded query pairs (see the type docs for the rules),
+    /// reporting every bad parameter with its name as the path.
+    pub fn from_query(pairs: &[(String, String)]) -> Result<JobFilter, Violations> {
+        JobFilter::from_pairs(borrow_pairs(pairs))
+    }
+
+    /// Like [`from_query`](Self::from_query) for borrowed pairs, such as an
+    /// HTTP server's query map yields.
+    pub fn from_pairs<'a>(
+        pairs: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) -> Result<JobFilter, Violations> {
+        let mut q = QueryReader::new(pairs, JobFilter::QUERY_KEYS);
+        let filter = JobFilter {
+            queue: q.text("queue"),
+            states: q.list("state"),
+            kind: q.name("kind", LABEL_RULE.max(MAX_KIND_LEN)),
+            tag: q.name("tag", LABEL_RULE.max(MAX_TAG_LEN)),
+            tenant: q.text("tenant"),
+            created_after: q.timestamp("created_after"),
+            created_before: q.timestamp("created_before"),
+            order: q.text("order").unwrap_or_default(),
+            cursor: q.text("cursor"),
+            limit: q.number("limit"),
+        };
+        if let (Some(after), Some(before)) = (filter.created_after, filter.created_before) {
+            if before <= after {
+                q.report(
+                    "created_before",
+                    format!("must be after created_after ({after})"),
+                );
+            }
+        }
+        if let Some(limit) = filter.limit {
+            if !(1..=MAX_PAGE_LIMIT).contains(&limit) {
+                q.report(
+                    "limit",
+                    format!("must be between 1 and {MAX_PAGE_LIMIT}, got {limit}"),
+                );
+            }
+        }
+        if filter.cursor.as_ref().is_some_and(|c| c.job_id().is_none()) {
+            q.report("cursor", "was not issued by a job listing");
+        }
+        q.finish()?;
+        Ok(filter)
+    }
+}
