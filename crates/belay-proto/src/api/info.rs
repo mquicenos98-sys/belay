@@ -179,3 +179,44 @@ impl ToJson for MemberInfo {
             .build()
     }
 }
+
+impl FromJson for MemberInfo {
+    fn from_json(value: &Value) -> Result<MemberInfo, FromJsonError> {
+        let r = ObjectReader::new(value, "MemberInfo")?;
+        Ok(MemberInfo {
+            id: r.req("id")?,
+            addr: r.req("addr")?,
+            state: r.req("state")?,
+            leader: r.or_default("leader")?,
+        })
+    }
+}
+
+/// `POST /v1/queues/:name/purge` response.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PurgeResponse {
+    /// Jobs removed.
+    pub purged: u64,
+}
+
+impl ToJson for PurgeResponse {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new().field("purged", self.purged).build()
+    }
+}
+
+impl FromJson for PurgeResponse {
+    fn from_json(value: &Value) -> Result<PurgeResponse, FromJsonError> {
+        let r = ObjectReader::new(value, "PurgeResponse")?;
+        Ok(PurgeResponse {
+            purged: r.req("purged")?,
+        })
+    }
+}
+
+/// `POST /v1/schedules/:id/trigger` response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TriggerResponse {
+    /// The job enqueued by the manual fire.
+    pub job: JobId,
+}
