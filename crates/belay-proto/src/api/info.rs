@@ -220,3 +220,33 @@ pub struct TriggerResponse {
     /// The job enqueued by the manual fire.
     pub job: JobId,
 }
+
+impl ToJson for TriggerResponse {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new().field("job", self.job).build()
+    }
+}
+
+impl FromJson for TriggerResponse {
+    fn from_json(value: &Value) -> Result<TriggerResponse, FromJsonError> {
+        let r = ObjectReader::new(value, "TriggerResponse")?;
+        Ok(TriggerResponse { job: r.req("job")? })
+    }
+}
+
+/// `GET /v1/schedules/:id/preview?n=` response: upcoming fire times,
+/// before jitter and calendar filtering.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PreviewResponse {
+    /// Fire times, earliest first.
+    pub times: Vec<Timestamp>,
+}
+
+impl ToJson for PreviewResponse {
+    fn to_json(&self) -> Value {
+        let times = self.times.iter().map(|t| timestamp_to_json(*t)).collect();
+        ObjectBuilder::new()
+            .raw("times", Value::Array(times))
+            .build()
+    }
+}
