@@ -250,3 +250,133 @@ impl ToJson for PreviewResponse {
             .build()
     }
 }
+
+impl FromJson for PreviewResponse {
+    fn from_json(value: &Value) -> Result<PreviewResponse, FromJsonError> {
+        let r = ObjectReader::new(value, "PreviewResponse")?;
+        let times = r.req_with("times", |v| {
+            let items = v
+                .as_array()
+                .ok_or_else(|| FromJsonError::expected("array of timestamps", v))?;
+            items
+                .iter()
+                .enumerate()
+                .map(|(i, t)| timestamp_from_json(t).map_err(|e| e.at_index(i)))
+                .collect()
+        })?;
+        Ok(PreviewResponse { times })
+    }
+}
+
+/// `POST /v1/admin/checkpoint` response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointResponse {
+    /// Store sequence number the snapshot covers.
+    pub seq: u64,
+    /// How long writing it took.
+    pub took: Duration,
+}
+
+impl ToJson for CheckpointResponse {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("seq", self.seq)
+            .duration("took", self.took)
+            .build()
+    }
+}
+
+impl FromJson for CheckpointResponse {
+    fn from_json(value: &Value) -> Result<CheckpointResponse, FromJsonError> {
+        let r = ObjectReader::new(value, "CheckpointResponse")?;
+        Ok(CheckpointResponse {
+            seq: r.req("seq")?,
+            took: r.req_duration("took")?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::json;
+
+    fn t(s: &str) -> Timestamp {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn server_info_round_trips_and_ignores_new_fields() {
+        let info = ServerInfo {
+            version: "0.6.0".into(),
+            node: "node-a".into(),
+            started_at: t("2025-03-04T00:00:00Z"),
+            uptime: Duration::from_secs(3_723),
+            time: t("2025-03-04T01:02:03Z"),
+            storage: "disk".into(),
+            cluster_size: 3,
+        };
+        let mut v = info.to_json();
+        assert_eq!(v["uptime"], "1h2m3s");
+        assert_eq!(ServerInfo::from_json(&v), Ok(info.clone()));
+        v.as_object_mut().unwrap().insert("build", "abc123");
+        assert_eq!(ServerInfo::from_json(&v), Ok(info));
+    }
+
+    #[test]
+    fn worker_info_round_trips_and_detects_loss() {
+        let now = t("2025-03-04T00:00:00Z");
+        let mut w = WorkerInfo::new(WorkerId::from_static("web-1:4121"), now);
+        w.queues = vec![QueueName::from_static("emails")];
+        w.addr = Some("10.0.0.7:51234".into());
+        w.active_jobs = 2;
+        w.leased = 10;
+        w.succeeded = 7;
+        w.failed = 1;
+        assert_eq!(WorkerInfo::from_json(&w.to_json()), Ok(w.clone()));
+        assert!(!w.is_lost(now + Duration::from_secs(59), Duration::from_secs(60)));
+        assert!(w.is_lost(now + Duration::from_secs(60), Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn small_responses_round_trip() {
+        let m = MemberInfo {
+            id: "node-b".into(),
+            addr: "10.0.0.2:7070".into(),
+            state: MemberState::Suspect,
+            leader: false,
+        };
+        assert_eq!(MemberInfo::from_json(&m.to_json()), Ok(m));
+        let p = PurgeResponse { purged: 12 };
+        assert_eq!(p.to_json(), json!({"purged": 12}));
+        assert_eq!(PurgeResponse::from_json(&p.to_json()), Ok(p));
+        let tr = TriggerResponse {
+            job: "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().unwrap(),
+        };
+        assert_eq!(TriggerResponse::from_json(&tr.to_json()), Ok(tr));
+        let c = CheckpointResponse {
+            seq: 991,
+            took: Duration::from_millis(42),
+        };
+        assert_eq!(c.to_json(), json!({"seq": 991, "took": "42ms"}));
+        assert_eq!(CheckpointResponse::from_json(&c.to_json()), Ok(c));
+    }
+
+    #[test]
+    fn preview_times_are_rfc3339_with_indexed_errors() {
+        let p = PreviewResponse {
+            times: vec![t("2025-03-04T02:00:00Z"), t("2025-03-05T02:00:00Z")],
+        };
+        assert_eq!(
+            p.to_json(),
+            json!({"times": ["2025-03-04T02:00:00.000Z", "2025-03-05T02:00:00.000Z"]})
+        );
+        assert_eq!(PreviewResponse::from_json(&p.to_json()), Ok(p));
+        let err =
+            PreviewResponse::from_json(&json!({"times": ["2025-03-04T02:00:00Z", 5]})).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "$.times[1]: expected RFC 3339 timestamp string, found 5"
+        );
+    }
+}
