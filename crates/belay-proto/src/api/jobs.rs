@@ -349,3 +349,67 @@ pub struct HeartbeatRequest {
     /// Progress to record.
     pub progress: Option<Progress>,
 }
+
+impl HeartbeatRequest {
+    /// A plain renewal.
+    #[must_use]
+    pub fn new(token: LeaseToken) -> HeartbeatRequest {
+        HeartbeatRequest {
+            token,
+            extend_by: None,
+            progress: None,
+        }
+    }
+}
+
+impl ToJson for HeartbeatRequest {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("token", self.token)
+            .opt_duration("extend_by", self.extend_by)
+            .opt_field("progress", &self.progress)
+            .build()
+    }
+}
+
+impl FromJson for HeartbeatRequest {
+    fn from_json(value: &Value) -> Result<HeartbeatRequest, FromJsonError> {
+        let r = ObjectReader::new(value, "HeartbeatRequest")?;
+        let req = HeartbeatRequest {
+            token: r.req("token")?,
+            extend_by: r.opt_duration("extend_by")?,
+            progress: r.opt("progress")?,
+        };
+        r.deny_unknown_fields()?;
+        Ok(req)
+    }
+}
+
+impl Validate for HeartbeatRequest {
+    fn validate_into(&self, v: &mut Validator) {
+        if let Some(d) = self.extend_by {
+            v.check_duration("extend_by", d, MIN_LEASE, MAX_LEASE);
+        }
+        if let Some(p) = &self.progress {
+            v.nested("progress", p);
+        }
+    }
+}
+
+/// `POST /v1/jobs/:id/heartbeat` response.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HeartbeatResponse {
+    /// When the lease now expires.
+    pub expires_at: Timestamp,
+    /// Cancellation was requested: stop, then report with `fail`.
+    pub cancel_requested: bool,
+}
+
+impl ToJson for HeartbeatResponse {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .timestamp("expires_at", self.expires_at)
+            .field("cancel_requested", self.cancel_requested)
+            .build()
+    }
+}
