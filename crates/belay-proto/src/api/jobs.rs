@@ -413,3 +413,66 @@ impl ToJson for HeartbeatResponse {
             .build()
     }
 }
+
+impl FromJson for HeartbeatResponse {
+    fn from_json(value: &Value) -> Result<HeartbeatResponse, FromJsonError> {
+        let r = ObjectReader::new(value, "HeartbeatResponse")?;
+        Ok(HeartbeatResponse {
+            expires_at: r.req_timestamp("expires_at")?,
+            cancel_requested: r.or_default("cancel_requested")?,
+        })
+    }
+}
+
+/// `POST /v1/jobs/:id/complete` body: it worked.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CompleteRequest {
+    /// The lease token.
+    pub token: LeaseToken,
+    /// What the handler returned. `Some(Value::Null)` (an explicit `null`)
+    /// is kept apart from `None` (no `result` field).
+    pub result: Option<Value>,
+}
+
+impl CompleteRequest {
+    /// A completion without a result.
+    #[must_use]
+    pub fn new(token: LeaseToken) -> CompleteRequest {
+        CompleteRequest {
+            token,
+            result: None,
+        }
+    }
+}
+
+impl ToJson for CompleteRequest {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("token", self.token)
+            .opt_field("result", &self.result)
+            .build()
+    }
+}
+
+impl FromJson for CompleteRequest {
+    fn from_json(value: &Value) -> Result<CompleteRequest, FromJsonError> {
+        let r = ObjectReader::new(value, "CompleteRequest")?;
+        let req = CompleteRequest {
+            token: r.req("token")?,
+            result: r.value("result").cloned(),
+        };
+        r.deny_unknown_fields()?;
+        Ok(req)
+    }
+}
+
+impl Validate for CompleteRequest {
+    fn validate_into(&self, v: &mut Validator) {
+        if let Some(result) = &self.result {
+            let size = encoded_len(result);
+            v.check(size <= MAX_RESULT_BYTES, "result", || {
+                format!("is {size} bytes as JSON; the limit is {MAX_RESULT_BYTES}")
+            });
+        }
+    }
+}
