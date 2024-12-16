@@ -87,3 +87,84 @@ impl FromJson for EnqueueRequest {
         Ok(EnqueueRequest::Batch(jobs))
     }
 }
+
+impl Validate for EnqueueRequest {
+    fn validate_into(&self, v: &mut Validator) {
+        match self {
+            EnqueueRequest::One(spec) => spec.validate_into(v),
+            EnqueueRequest::Batch(specs) => {
+                if specs.is_empty() {
+                    v.report("jobs", "must contain at least one job");
+                } else if specs.len() > MAX_ENQUEUE_BATCH {
+                    v.report(
+                        "jobs",
+                        format!(
+                            "at most {MAX_ENQUEUE_BATCH} jobs per request, got {}",
+                            specs.len()
+                        ),
+                    );
+                } else {
+                    v.nested("jobs", specs);
+                }
+            }
+        }
+    }
+}
+
+text_enum! {
+    /// What an enqueue did with one spec.
+    EnqueueStatus, "enqueue status" {
+        /// A new job was created.
+        Created = "created",
+        /// The uniqueness key was held; `id` is the existing job.
+        Duplicate = "duplicate",
+        /// The uniqueness key's holder was cancelled and a new job created.
+        Replaced = "replaced",
+    }
+}
+
+/// The outcome for one spec of an enqueue request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EnqueueResult {
+    /// The new job, or the existing one for `duplicate`.
+    pub id: JobId,
+    /// What happened.
+    pub status: EnqueueStatus,
+    /// The job's state after the call (`scheduled` or `ready` for new jobs).
+    pub state: JobState,
+}
+
+impl ToJson for EnqueueResult {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("id", self.id)
+            .field("status", self.status)
+            .field("state", self.state)
+            .build()
+    }
+}
+
+impl FromJson for EnqueueResult {
+    fn from_json(value: &Value) -> Result<EnqueueResult, FromJsonError> {
+        let r = ObjectReader::new(value, "EnqueueResult")?;
+        Ok(EnqueueResult {
+            id: r.req("id")?,
+            status: r.req("status")?,
+            state: r.req("state")?,
+        })
+    }
+}
+
+/// `POST /v1/jobs` response: one result per submitted spec, in order,
+/// whichever body form was used.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EnqueueResponse {
+    /// Per-spec outcomes.
+    pub results: Vec<EnqueueResult>,
+}
+
+impl ToJson for EnqueueResponse {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new().field("results", &self.results).build()
+    }
+}
