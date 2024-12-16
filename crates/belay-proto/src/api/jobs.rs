@@ -168,3 +168,184 @@ impl ToJson for EnqueueResponse {
         ObjectBuilder::new().field("results", &self.results).build()
     }
 }
+
+impl FromJson for EnqueueResponse {
+    fn from_json(value: &Value) -> Result<EnqueueResponse, FromJsonError> {
+        let r = ObjectReader::new(value, "EnqueueResponse")?;
+        Ok(EnqueueResponse {
+            results: r.req("results")?,
+        })
+    }
+}
+
+/// `POST /v1/lease` body: hand me up to `max_jobs` jobs from `queues`.
+///
+/// Queues are tried in the order given, which lets a worker express
+/// preference. With `wait`, the server holds the request open until a job
+/// arrives or the wait runs out (long polling), then answers with whatever
+/// it has, possibly nothing.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LeaseRequest {
+    /// Who is asking.
+    pub worker: WorkerId,
+    /// Where to look, in order of preference.
+    pub queues: Vec<QueueName>,
+    /// At most this many jobs; default 1.
+    pub max_jobs: u32,
+    /// Lease length; heartbeats extend it. Default 30s.
+    pub lease_for: Duration,
+    /// Long-poll for up to this long when nothing is ready.
+    pub wait: Option<Duration>,
+}
+
+impl LeaseRequest {
+    /// One job at a time with the default lease, no waiting.
+    #[must_use]
+    pub fn new(worker: WorkerId, queues: Vec<QueueName>) -> LeaseRequest {
+        LeaseRequest {
+            worker,
+            queues,
+            max_jobs: 1,
+            lease_for: DEFAULT_LEASE,
+            wait: None,
+        }
+    }
+
+    /// Sets the batch size.
+    #[must_use]
+    pub fn max_jobs(mut self, n: u32) -> LeaseRequest {
+        self.max_jobs = n;
+        self
+    }
+
+    /// Sets the lease length.
+    #[must_use]
+    pub fn lease_for(mut self, d: Duration) -> LeaseRequest {
+        self.lease_for = d;
+        self
+    }
+
+    /// Enables long polling.
+    #[must_use]
+    pub fn wait(mut self, d: Duration) -> LeaseRequest {
+        self.wait = Some(d);
+        self
+    }
+}
+
+impl ToJson for LeaseRequest {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("worker", &self.worker)
+            .field("queues", &self.queues)
+            .field("max_jobs", self.max_jobs)
+            .duration("lease_for", self.lease_for)
+            .opt_duration("wait", self.wait)
+            .build()
+    }
+}
+
+impl FromJson for LeaseRequest {
+    fn from_json(value: &Value) -> Result<LeaseRequest, FromJsonError> {
+        let r = ObjectReader::new(value, "LeaseRequest")?;
+        let req = LeaseRequest {
+            worker: r.req("worker")?,
+            queues: r.req("queues")?,
+            max_jobs: r.or("max_jobs", 1)?,
+            lease_for: r.duration_or("lease_for", DEFAULT_LEASE)?,
+            wait: r.opt_duration("wait")?,
+        };
+        r.deny_unknown_fields()?;
+        Ok(req)
+    }
+}
+
+impl Validate for LeaseRequest {
+    fn validate_into(&self, v: &mut Validator) {
+        if self.queues.is_empty() {
+            v.report("queues", "must name at least one queue");
+        } else if self.queues.len() > MAX_LEASE_QUEUES {
+            v.report(
+                "queues",
+                format!(
+                    "at most {MAX_LEASE_QUEUES} queues, got {}",
+                    self.queues.len()
+                ),
+            );
+        }
+        for (i, q) in self.queues.iter().enumerate() {
+            if self.queues[..i].contains(q) {
+                v.at_index("queues", i, |v| {
+                    v.report_here(format!("duplicate queue {q}"))
+                });
+            }
+        }
+        v.check_range("max_jobs", self.max_jobs, 1, MAX_LEASE_JOBS);
+        v.check_duration("lease_for", self.lease_for, MIN_LEASE, MAX_LEASE);
+        if let Some(wait) = self.wait {
+            v.check_duration("wait", wait, Duration::ZERO, MAX_LEASE_WAIT);
+        }
+    }
+}
+
+/// A job handed to a worker, with the token for later calls.
+#[derive(Clone, Debug, PartialEq)]
+pub struct LeasedJob {
+    /// The job, in state `running`.
+    pub job: Job,
+    /// Present this in heartbeat, complete and fail calls.
+    pub token: LeaseToken,
+}
+
+impl ToJson for LeasedJob {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("job", &self.job)
+            .field("token", self.token)
+            .build()
+    }
+}
+
+impl FromJson for LeasedJob {
+    fn from_json(value: &Value) -> Result<LeasedJob, FromJsonError> {
+        let r = ObjectReader::new(value, "LeasedJob")?;
+        Ok(LeasedJob {
+            job: r.req("job")?,
+            token: r.req("token")?,
+        })
+    }
+}
+
+/// `POST /v1/lease` response; empty when nothing was ready in time.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LeaseResponse {
+    /// The leased jobs.
+    pub jobs: Vec<LeasedJob>,
+}
+
+impl ToJson for LeaseResponse {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new().field("jobs", &self.jobs).build()
+    }
+}
+
+impl FromJson for LeaseResponse {
+    fn from_json(value: &Value) -> Result<LeaseResponse, FromJsonError> {
+        let r = ObjectReader::new(value, "LeaseResponse")?;
+        Ok(LeaseResponse {
+            jobs: r.or_default("jobs")?,
+        })
+    }
+}
+
+/// `POST /v1/jobs/:id/heartbeat` body: I am still working on it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeartbeatRequest {
+    /// The lease token.
+    pub token: LeaseToken,
+    /// New lease length from now; `None` renews for the original lease
+    /// length. A heartbeat never shortens a lease.
+    pub extend_by: Option<Duration>,
+    /// Progress to record.
+    pub progress: Option<Progress>,
+}
