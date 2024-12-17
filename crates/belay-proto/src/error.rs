@@ -162,3 +162,64 @@ impl From<belay_json::Error> for Error {
         Error::Json(e)
     }
 }
+
+impl From<FromJsonError> for Error {
+    fn from(e: FromJsonError) -> Error {
+        Error::Json(belay_json::Error::Convert(e))
+    }
+}
+
+impl From<Violations> for Error {
+    fn from(e: Violations) -> Error {
+        Error::Invalid(e)
+    }
+}
+
+impl From<TransitionError> for Error {
+    fn from(e: TransitionError) -> Error {
+        Error::Transition(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn unknown_names_suggest_the_closest_known_one() {
+        const STATES: &[&str] = &["ready", "running", "dead"];
+        let e = ParseError::unknown("job state", "redy", STATES);
+        assert_eq!(
+            e.to_string(),
+            r#"unknown job state "redy", did you mean "ready"?"#
+        );
+        let e = ParseError::unknown("job state", "zzz", STATES);
+        assert_eq!(
+            e.to_string(),
+            r#"unknown job state "zzz", expected one of: ready, running, dead"#
+        );
+        assert_eq!(e.what(), "job state");
+        assert_eq!(e.input(), "zzz");
+    }
+
+    #[test]
+    fn long_inputs_are_shortened_and_control_characters_escaped() {
+        let long = "q".repeat(500);
+        let e = ParseError::invalid("queue name", &long, "too long");
+        let text = e.to_string();
+        assert!(text.len() < 120, "{text}");
+        assert!(text.contains("qqq...\""));
+        // The full input stays available to callers.
+        assert_eq!(e.input().len(), 500);
+        let e = ParseError::invalid("tag", "a\nb", "bad");
+        assert_eq!(e.to_string(), r#"invalid tag "a\nb": bad"#);
+    }
+
+    #[test]
+    fn crate_error_is_transparent() {
+        let e: Error = ParseError::invalid("cursor", "x", "not base32").into();
+        assert_eq!(e.to_string(), r#"invalid cursor "x": not base32"#);
+        let e: Error = FromJsonError::new("bad").at_key("queue").into();
+        assert_eq!(e.to_string(), "$.queue: bad");
+    }
+}
