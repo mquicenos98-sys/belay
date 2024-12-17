@@ -32,11 +32,8 @@
 //! [redacted](crate::Job::redacted); only lease responses carry tokens.
 
 mod error;
-
 mod filter;
-
 mod info;
-
 mod jobs;
 
 pub use error::{ApiError, ErrorCode};
@@ -71,4 +68,51 @@ pub fn decode_request<T: FromJson + Validate>(body: &[u8]) -> Result<T, ApiError
     let value: T = belay_json::from_bytes(body)?;
     value.validate()?;
     Ok(value)
+}
+
+/// Serializes a body as compact JSON.
+#[must_use]
+pub fn encode_body<T: ToJson + ?Sized>(value: &T) -> Vec<u8> {
+    belay_json::to_string_of(value).into_bytes()
+}
+
+/// Reads an error response: the [`ApiError`] body if there is one,
+/// otherwise a best guess from the status and raw body.
+#[must_use]
+pub fn decode_error(status: u16, body: &[u8]) -> ApiError {
+    belay_json::from_bytes::<ApiError>(body)
+        .unwrap_or_else(|_| ApiError::from_http_status(status, &String::from_utf8_lossy(body)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job::JobSpec;
+
+    #[test]
+    fn decode_request_reports_parse_shape_and_rule_errors() {
+        let err = decode_request::<EnqueueRequest>(b"{\"queue\": ").unwrap_err();
+        assert!(err.message.starts_with("invalid JSON: "), "{}", err.message);
+        let err = decode_request::<EnqueueRequest>(br#"{"queue": "q", "kind": 5}"#).unwrap_err();
+        assert_eq!(err.message, "$.kind: expected string, found 5");
+        let err = decode_request::<EnqueueRequest>(
+            br#"{"jobs": [{"queue": "q", "kind": "k", "priority": 1001}]}"#,
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.message,
+            "$.jobs[0].priority: must be between -1000 and 1000, got 1001"
+        );
+        let ok = decode_request::<EnqueueRequest>(br#"{"queue": "q", "kind": "k"}"#).unwrap();
+        assert_eq!(ok, EnqueueRequest::One(JobSpec::new("q", "k")));
+    }
+
+    #[test]
+    fn error_bodies_decode_or_fall_back_to_the_status() {
+        let err = ApiError::lease_lost("01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().unwrap());
+        assert_eq!(decode_error(409, &encode_body(&err)), err);
+        let fallback = decode_error(503, b"upstream down");
+        assert_eq!(fallback.code, ErrorCode::Unavailable);
+        assert_eq!(fallback.message, "HTTP 503: upstream down");
+    }
 }
