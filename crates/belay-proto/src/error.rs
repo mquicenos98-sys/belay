@@ -74,3 +74,55 @@ impl ParseError {
         &self.input
     }
 }
+
+impl fmt::Display for ParseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let shown = echo(&self.input);
+        match &self.reason {
+            // belay-json already knows how to phrase "did you mean"; reuse it
+            // so enum errors read the same in JSON and on the command line.
+            Reason::Unknown(known) => {
+                let e = FromJsonError::unknown_variant(&shown, self.what, known);
+                f.write_str(e.message())
+            }
+            Reason::Invalid(reason) => {
+                write!(f, "invalid {} {}: {reason}", self.what, quote(&shown))
+            }
+        }
+    }
+}
+
+impl std::error::Error for ParseError {}
+
+/// Shortens long inputs for messages.
+fn echo(input: &str) -> String {
+    if input.chars().count() <= MAX_ECHOED_CHARS {
+        input.to_owned()
+    } else {
+        let head: String = input.chars().take(MAX_ECHOED_CHARS - 3).collect();
+        head + "..."
+    }
+}
+
+/// Quotes a string as JSON does, so control characters stay visible and the
+/// quoting matches belay-json's decoding errors.
+pub(crate) fn quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    // Writing into a String cannot fail.
+    let _ = belay_json::write_string(&mut out, s);
+    out
+}
+
+/// Anything that can go wrong in this crate.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum Error {
+    /// A text form was rejected.
+    Parse(ParseError),
+    /// A JSON document failed to parse or did not have the expected shape.
+    Json(belay_json::Error),
+    /// A value decoded but broke one or more rules.
+    Invalid(Violations),
+    /// A job state change that the state machine does not allow.
+    Transition(TransitionError),
+}
