@@ -126,3 +126,39 @@ pub enum Error {
     /// A job state change that the state machine does not allow.
     Transition(TransitionError),
 }
+
+/// `Result` defaulting to this crate's [`Error`].
+pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Parse(e) => e.fmt(f),
+            Error::Json(e) => e.fmt(f),
+            Error::Invalid(e) => e.fmt(f),
+            Error::Transition(e) => e.fmt(f),
+        }
+    }
+}
+
+/// Transparent like `Display`: the source is the wrapped error's source.
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Json(e) => std::error::Error::source(e),
+            Error::Parse(_) | Error::Invalid(_) | Error::Transition(_) => None,
+        }
+    }
+}
+
+impl From<ParseError> for Error {
+    fn from(e: ParseError) -> Error {
+        Error::Parse(e)
+    }
+}
+
+impl From<belay_json::Error> for Error {
+    fn from(e: belay_json::Error) -> Error {
+        Error::Json(e)
+    }
+}
