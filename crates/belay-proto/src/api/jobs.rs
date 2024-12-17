@@ -476,3 +476,308 @@ impl Validate for CompleteRequest {
         }
     }
 }
+
+/// `POST /v1/jobs/:id/fail` body: this attempt failed.
+///
+/// The message is never rejected for its length (a worker must always be
+/// able to report a failure); it is truncated when recorded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FailRequest {
+    /// The lease token.
+    pub token: LeaseToken,
+    /// What went wrong.
+    pub error: String,
+    /// Machine-readable class, e.g. `timeout`.
+    pub kind: Option<String>,
+    /// Whether another attempt may help; default true.
+    pub retryable: bool,
+    /// Retry after exactly this long instead of the backoff policy's delay
+    /// (e.g. from a `Retry-After` header).
+    pub retry_in: Option<Duration>,
+}
+
+impl FailRequest {
+    /// A retryable failure.
+    #[must_use]
+    pub fn new(token: LeaseToken, error: impl Into<String>) -> FailRequest {
+        FailRequest {
+            token,
+            error: error.into(),
+            kind: None,
+            retryable: true,
+            retry_in: None,
+        }
+    }
+
+    /// The error-history entry this failure records.
+    #[must_use]
+    pub fn to_job_error(&self, at: Timestamp, attempt: u32, worker: Option<WorkerId>) -> JobError {
+        JobError {
+            kind: self.kind.clone(),
+            worker,
+            ..JobError::new(at, attempt, self.error.as_str()).retryable(self.retryable)
+        }
+    }
+}
+
+impl ToJson for FailRequest {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("token", self.token)
+            .field("error", &self.error)
+            .opt_field("kind", &self.kind)
+            .field("retryable", self.retryable)
+            .opt_duration("retry_in", self.retry_in)
+            .build()
+    }
+}
+
+impl FromJson for FailRequest {
+    fn from_json(value: &Value) -> Result<FailRequest, FromJsonError> {
+        let r = ObjectReader::new(value, "FailRequest")?;
+        let req = FailRequest {
+            token: r.req("token")?,
+            error: r.req("error")?,
+            kind: r.opt("kind")?,
+            retryable: r.or("retryable", true)?,
+            retry_in: r.opt_duration("retry_in")?,
+        };
+        r.deny_unknown_fields()?;
+        Ok(req)
+    }
+}
+
+impl Validate for FailRequest {
+    fn validate_into(&self, v: &mut Validator) {
+        if let Some(kind) = &self.kind {
+            validate_error_kind(v, kind);
+        }
+        if let Some(d) = self.retry_in {
+            v.check_duration("retry_in", d, Duration::ZERO, MAX_DELAY);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::limits::MAX_ERROR_MESSAGE_BYTES;
+    use belay_json::json;
+
+    fn token() -> LeaseToken {
+        LeaseToken::new(0xa1)
+    }
+
+    fn lines(r: Result<(), crate::Violations>) -> Vec<String> {
+        match r {
+            Ok(()) => Vec::new(),
+            Err(e) => e.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn enqueue_request_keeps_its_wire_form() {
+        let one = EnqueueRequest::from(JobSpec::new("q", "k"));
+        assert_eq!(
+            one.to_json(),
+            json!({"queue": "q", "kind": "k", "priority": 0})
+        );
+        let batch = EnqueueRequest::from(vec![JobSpec::new("q", "a"), JobSpec::new("q", "b")]);
+        assert_eq!(batch.to_json()["jobs"][1]["kind"], "b");
+        for req in [one, batch] {
+            assert_eq!(EnqueueRequest::from_json(&req.to_json()), Ok(req));
+        }
+    }
+
+    #[test]
+    fn enqueue_paths_follow_the_body_shape() {
+        let err = EnqueueRequest::from_json(&json!({"queue": "q", "kind": "k", "priorty": 1}))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$: unknown field "priorty" in JobSpec, did you mean "priority"?"#
+        );
+        let err = EnqueueRequest::from_json(
+            &json!({"jobs": [{"queue": "q", "kind": "k"}, {"queue": "q"}]}),
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$.jobs[1]: missing required field "kind" in JobSpec"#
+        );
+        let err = EnqueueRequest::from_json(&json!({"jobs": [], "queue": "q"})).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$: unknown field "queue" in EnqueueRequest, expected one of: jobs"#
+        );
+
+        let one = EnqueueRequest::One(JobSpec::new("q", "k").priority(5000));
+        assert_eq!(
+            lines(one.validate()),
+            ["$.priority: must be between -1000 and 1000, got 5000"]
+        );
+        let batch = EnqueueRequest::Batch(vec![
+            JobSpec::new("q", "k"),
+            JobSpec::new("q", "k").priority(5000),
+        ]);
+        assert_eq!(
+            lines(batch.validate()),
+            ["$.jobs[1].priority: must be between -1000 and 1000, got 5000"]
+        );
+        assert_eq!(
+            lines(EnqueueRequest::Batch(vec![]).validate()),
+            ["$.jobs: must contain at least one job"]
+        );
+    }
+
+    #[test]
+    fn enqueue_response_round_trips() {
+        let resp = EnqueueResponse {
+            results: vec![EnqueueResult {
+                id: "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().unwrap(),
+                status: EnqueueStatus::Duplicate,
+                state: JobState::Running,
+            }],
+        };
+        assert_eq!(
+            resp.to_json(),
+            json!({"results": [{"id": "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z", "status": "duplicate", "state": "running"}]})
+        );
+        assert_eq!(EnqueueResponse::from_json(&resp.to_json()), Ok(resp));
+    }
+
+    #[test]
+    fn lease_request_defaults_and_limits() {
+        let req = LeaseRequest::from_json(&json!({"worker": "w1", "queues": ["emails"]})).unwrap();
+        assert_eq!(
+            req,
+            LeaseRequest::new(
+                WorkerId::from_static("w1"),
+                vec![QueueName::from_static("emails")]
+            )
+        );
+        assert_eq!(
+            req.to_json(),
+            json!({"worker": "w1", "queues": ["emails"], "max_jobs": 1, "lease_for": "30s"})
+        );
+        let full = req
+            .clone()
+            .max_jobs(10)
+            .lease_for(Duration::from_secs(120))
+            .wait(Duration::from_secs(20));
+        assert_eq!(LeaseRequest::from_json(&full.to_json()), Ok(full.clone()));
+        assert!(full.validate().is_ok());
+
+        let mut bad = LeaseRequest::new(WorkerId::from_static("w1"), vec![])
+            .max_jobs(0)
+            .lease_for(Duration::from_millis(100))
+            .wait(Duration::from_secs(600));
+        assert_eq!(
+            lines(bad.validate()),
+            [
+                "$.queues: must name at least one queue",
+                "$.max_jobs: must be between 1 and 100, got 0",
+                "$.lease_for: must be between 1s and 1h, got 100ms",
+                "$.wait: must be at most 1m, got 10m",
+            ]
+        );
+        bad = LeaseRequest::new(
+            WorkerId::from_static("w1"),
+            vec![QueueName::from_static("a"), QueueName::from_static("a")],
+        );
+        assert_eq!(lines(bad.validate()), ["$.queues[1]: duplicate queue a"]);
+    }
+
+    #[test]
+    fn heartbeat_round_trips_and_validates_progress() {
+        let req = HeartbeatRequest {
+            token: token(),
+            extend_by: Some(Duration::from_secs(60)),
+            progress: Some(Progress::percent(10.0)),
+        };
+        let v = req.to_json();
+        assert_eq!(
+            v,
+            json!({"token": "00000000000000a1", "extend_by": "1m", "progress": {"percent": 10.0}})
+        );
+        assert_eq!(HeartbeatRequest::from_json(&v), Ok(req));
+        let bad = HeartbeatRequest {
+            progress: Some(Progress::percent(-1.0)),
+            ..HeartbeatRequest::new(token())
+        };
+        assert_eq!(
+            lines(bad.validate()),
+            ["$.progress.percent: must be between 0 and 100, got -1"]
+        );
+        let err = HeartbeatRequest::from_json(&json!({"token": "zz"})).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$.token: invalid lease token "zz": expected 16 hex digits"#
+        );
+        let resp = HeartbeatResponse {
+            expires_at: Timestamp::from_millis(60_000),
+            cancel_requested: true,
+        };
+        assert_eq!(HeartbeatResponse::from_json(&resp.to_json()), Ok(resp));
+    }
+
+    #[test]
+    fn complete_keeps_null_results_apart_from_missing_ones() {
+        let with_null =
+            CompleteRequest::from_json(&json!({"token": "00000000000000a1", "result": null}))
+                .unwrap();
+        assert_eq!(with_null.result, Some(Value::Null));
+        assert_eq!(with_null.to_json()["result"], Value::Null);
+        let without = CompleteRequest::from_json(&json!({"token": "00000000000000a1"})).unwrap();
+        assert_eq!(without, CompleteRequest::new(token()));
+        assert!(without.to_json().get("result").is_none());
+        let big = CompleteRequest {
+            result: Some(json!("x".repeat(MAX_RESULT_BYTES))),
+            ..without
+        };
+        assert_eq!(
+            lines(big.validate()),
+            ["$.result: is 1048578 bytes as JSON; the limit is 1048576"]
+        );
+    }
+
+    #[test]
+    fn fail_request_defaults_to_retryable_and_builds_the_error_record() {
+        let req =
+            FailRequest::from_json(&json!({"token": "00000000000000a1", "error": "boom"})).unwrap();
+        assert_eq!(req, FailRequest::new(token(), "boom"));
+        let full = FailRequest {
+            kind: Some("http_503".into()),
+            retryable: false,
+            retry_in: Some(Duration::from_secs(90)),
+            ..req
+        };
+        assert_eq!(FailRequest::from_json(&full.to_json()), Ok(full.clone()));
+        let worker = WorkerId::from_static("w1");
+        let e = full.to_job_error(Timestamp::from_millis(5), 2, Some(worker.clone()));
+        assert_eq!(
+            (e.attempt, e.kind.as_deref(), e.retryable, e.worker),
+            (2, Some("http_503"), false, Some(worker))
+        );
+        let huge = FailRequest::new(token(), "e".repeat(MAX_ERROR_MESSAGE_BYTES * 2));
+        assert!(
+            huge.validate().is_ok(),
+            "long messages are truncated, not rejected"
+        );
+        assert!(
+            huge.to_job_error(Timestamp::EPOCH, 1, None).message.len() <= MAX_ERROR_MESSAGE_BYTES
+        );
+        let bad = FailRequest {
+            kind: Some("not ok".into()),
+            retry_in: Some(Duration::from_secs(400 * 86_400)),
+            ..FailRequest::new(token(), "x")
+        };
+        assert_eq!(
+            lines(bad.validate()),
+            [
+                "$.kind: ' ' at position 3 is not allowed (use letters, digits, '_', '.', ':', '/' or '-')",
+                "$.retry_in: must be at most 365d, got 400d",
+            ]
+        );
+    }
+}
