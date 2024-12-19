@@ -268,3 +268,147 @@ impl ReaderExt for ObjectReader<'_> {
         self.opt_with(key, backoff_from_json)
     }
 }
+
+/// Field writers for [`ObjectBuilder`] covering the belay-common types.
+/// `opt_*` variants omit the field when the value is `None`.
+pub trait BuilderExt: Sized {
+    /// Writes an RFC 3339 timestamp.
+    fn timestamp(self, key: &str, ts: Timestamp) -> Self;
+    /// Writes a timestamp if present.
+    fn opt_timestamp(self, key: &str, ts: Option<Timestamp>) -> Self;
+    /// Writes a compact duration.
+    fn duration(self, key: &str, d: Duration) -> Self;
+    /// Writes a duration if present.
+    fn opt_duration(self, key: &str, d: Option<Duration>) -> Self;
+    /// Writes a backoff policy if present.
+    fn opt_backoff(self, key: &str, policy: Option<&BackoffPolicy>) -> Self;
+}
+
+impl BuilderExt for ObjectBuilder {
+    fn timestamp(self, key: &str, ts: Timestamp) -> Self {
+        self.raw(key, timestamp_to_json(ts))
+    }
+
+    fn opt_timestamp(self, key: &str, ts: Option<Timestamp>) -> Self {
+        match ts {
+            Some(ts) => self.timestamp(key, ts),
+            None => self,
+        }
+    }
+
+    fn duration(self, key: &str, d: Duration) -> Self {
+        self.raw(key, duration_to_json(d))
+    }
+
+    fn opt_duration(self, key: &str, d: Option<Duration>) -> Self {
+        match d {
+            Some(d) => self.duration(key, d),
+            None => self,
+        }
+    }
+
+    fn opt_backoff(self, key: &str, policy: Option<&BackoffPolicy>) -> Self {
+        match policy {
+            Some(p) => self.raw(key, backoff_to_json(p)),
+            None => self,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::json;
+
+    #[test]
+    fn timestamps_normalise_offsets_and_reject_numbers() {
+        let t = timestamp_from_json(&json!("2024-02-29T23:30:00-01:30")).unwrap();
+        assert_eq!(timestamp_to_json(t), json!("2024-03-01T01:00:00.000Z"));
+        let err = timestamp_from_json(&json!("2023-02-29T00:00:00Z")).unwrap_err();
+        assert_eq!(
+            err.message(),
+            r#"invalid timestamp "2023-02-29T00:00:00Z": day 29 is out of range (1-28)"#
+        );
+        let err = timestamp_from_json(&json!("yesterday")).unwrap_err();
+        assert_eq!(
+            err.message(),
+            r#"invalid timestamp "yesterday": expected 4-digit year at byte 0"#
+        );
+    }
+
+    #[test]
+    fn durations_round_trip_and_explain_numbers() {
+        for d in [
+            Duration::ZERO,
+            Duration::from_millis(250),
+            Duration::from_secs(5_400),
+            Duration::from_micros(1_500),
+        ] {
+            assert_eq!(duration_from_json(&duration_to_json(d)), Ok(d));
+        }
+        assert_eq!(duration_to_json(Duration::from_secs(5_400)), json!("1h30m"));
+        // A unitless string is seconds, as everywhere else in belay.
+        assert_eq!(
+            duration_from_json(&json!("90")),
+            Ok(Duration::from_secs(90))
+        );
+        let err = duration_from_json(&json!("-5s")).unwrap_err();
+        assert_eq!(
+            err.message(),
+            r#"invalid duration "-5s": negative durations are not allowed"#
+        );
+        assert!(duration_from_json(&json!(1.5)).is_err());
+    }
+
+    #[test]
+    fn backoff_uses_the_text_form() {
+        let p = backoff_from_json(&json!("exp:1s*2..10m~full")).unwrap();
+        assert_eq!(backoff_to_json(&p), json!("exp:1s*2..10m~full"));
+        let err = backoff_from_json(&json!("fib:1s")).unwrap_err();
+        assert!(err.message().starts_with(r#"invalid backoff "fib:1s""#));
+        let err = backoff_from_json(&json!({"kind": "exp"})).unwrap_err();
+        assert_eq!(
+            err.message(),
+            r#"expected backoff string such as "exp:1s*2..10m", found object"#
+        );
+    }
+
+    #[test]
+    fn reader_and_builder_extensions_agree() {
+        let t = Timestamp::from_millis(1_700_000_000_123);
+        let v = ObjectBuilder::new()
+            .timestamp("at", t)
+            .opt_timestamp("never", None)
+            .duration("d", Duration::from_secs(30))
+            .opt_duration("none", None)
+            .opt_backoff(
+                "retry",
+                Some(&BackoffPolicy::constant(Duration::from_secs(5))),
+            )
+            .build();
+        assert_eq!(
+            v,
+            json!({"at": "2023-11-14T22:13:20.123Z", "d": "30s", "retry": "const:5s"})
+        );
+        let r = ObjectReader::new(&v, "T").unwrap();
+        assert_eq!(r.req_timestamp("at"), Ok(t));
+        assert_eq!(r.opt_timestamp("never"), Ok(None));
+        assert_eq!(r.req_duration("d"), Ok(Duration::from_secs(30)));
+        assert_eq!(
+            r.duration_or("none", Duration::from_secs(1)),
+            Ok(Duration::from_secs(1))
+        );
+        assert!(r.opt_backoff("retry").unwrap().is_some());
+        let err = r.req_timestamp("d").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$.d: invalid timestamp "30s": expected 4-digit year at byte 2"#
+        );
+    }
+
+    #[test]
+    fn encoded_len_matches_the_serializer() {
+        let v = json!({"s": "é\u{1}\"", "n": [1.5, -3, null], "o": {}});
+        assert_eq!(encoded_len(&v), belay_json::to_string(&v).len());
+    }
+}
