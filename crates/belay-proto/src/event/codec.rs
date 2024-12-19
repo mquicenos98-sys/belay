@@ -300,3 +300,18 @@ impl ToJson for EventKind {
         self.write(ObjectBuilder::new()).build()
     }
 }
+
+impl FromJson for EventKind {
+    fn from_json(value: &Value) -> Result<EventKind, FromJsonError> {
+        EventKind::read(&ObjectReader::new(value, "EventKind")?)
+    }
+}
+
+impl ToJson for Event {
+    fn to_json(&self) -> Value {
+        let b = ObjectBuilder::new()
+            .field("seq", self.seq)
+            .timestamp("at", self.at);
+        self.kind.write(b).build()
+    }
+}
