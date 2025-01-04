@@ -326,3 +326,78 @@ impl FromJson for Event {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::samples;
+    use super::*;
+    use belay_common::Timestamp;
+    use belay_json::json;
+
+    fn event(seq: u64, kind: EventKind) -> Event {
+        Event {
+            seq,
+            at: Timestamp::from_millis(1_741_064_767_089),
+            kind,
+        }
+    }
+
+    #[test]
+    fn every_kind_round_trips_as_an_event() {
+        for (i, kind) in samples::all().into_iter().enumerate() {
+            let e = event(i as u64 + 1, kind);
+            let text = belay_json::to_string_of(&e);
+            let back: Event =
+                belay_json::from_str(&text).unwrap_or_else(|err| panic!("{text}: {err}"));
+            assert_eq!(back, e);
+            assert_eq!(EventKind::from_json(&e.kind.to_json()), Ok(e.kind.clone()));
+        }
+    }
+
+    #[test]
+    fn events_are_flat_objects_with_type_after_seq_and_at() {
+        let kinds = samples::all();
+        let e = event(42, kinds[3].clone());
+        assert_eq!(
+            belay_json::to_string_of(&e),
+            concat!(
+                r#"{"seq":42,"at":"2025-03-04T05:06:07.089Z","type":"job.succeeded","#,
+                r#""job":"01HQ3K9Z8N6V2T4R5S7W0X1Y2Z","queue":"emails","attempt":1,"runtime":"1s250ms"}"#
+            )
+        );
+        let purged = event(7, kinds[24].clone()).to_json();
+        assert_eq!(purged["state"], "dead");
+        assert_eq!(purged["count"], 12);
+    }
+
+    #[test]
+    fn decoding_tolerates_new_fields_but_not_new_types() {
+        let v = json!({
+            "seq": 1, "at": "2025-01-01T00:00:00Z", "type": "queue.paused",
+            "queue": "emails", "by": "ops"
+        });
+        let e = Event::from_json(&v).unwrap();
+        assert_eq!(e.type_name(), "queue.paused");
+        let v =
+            json!({"seq": 1, "at": "2025-01-01T00:00:00Z", "type": "queue.pauzed", "queue": "q"});
+        assert_eq!(
+            Event::from_json(&v).unwrap_err().to_string(),
+            r#"$.type: unknown event type "queue.pauzed", did you mean "queue.paused"?"#
+        );
+    }
+
+    #[test]
+    fn missing_fields_are_reported_against_the_event() {
+        let v = json!({"seq": 1, "at": "2025-01-01T00:00:00Z", "type": "job.started", "job": "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z", "queue": "q", "attempt": 1});
+        assert_eq!(
+            Event::from_json(&v).unwrap_err().to_string(),
+            r#"$: missing required field "worker" in Event"#
+        );
+        let v =
+            json!({"seq": -1, "at": "2025-01-01T00:00:00Z", "type": "queue.paused", "queue": "q"});
+        assert_eq!(
+            Event::from_json(&v).unwrap_err().to_string(),
+            "$.seq: expected integer in range 0..=18446744073709551615, found -1"
+        );
+    }
+}
