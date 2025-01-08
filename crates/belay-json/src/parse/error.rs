@@ -127,7 +127,7 @@ impl ParseError {
         let before = &src[..offset];
         let line = before.bytes().filter(|&b| b == b'\n').count() + 1;
         let line_start = before.rfind('\n').map_or(0, |i| i + 1);
-        let column = before[line_start..].len() + 1;
+        let column = before[line_start..].chars().count() + 1;
         ParseError {
             kind,
             offset,
@@ -176,6 +176,15 @@ impl std::error::Error for ParseError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn position_counts_lines_and_characters() {
+        let src = "{\n  \"é\": x\n}";
+        let offset = src.find('x').unwrap();
+        let err = ParseError::at(ParseErrorKind::TrailingCharacters, src, offset);
+        assert_eq!((err.line(), err.column()), (2, 8));
+        assert_eq!(err.offset(), offset);
+    }
 
     #[test]
     fn position_clamps_to_char_boundary() {
