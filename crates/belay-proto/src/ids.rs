@@ -99,3 +99,31 @@ pub(crate) const SLUG_RULE: NameRule = NameRule {
     rest: |b| lower_or_digit(b) || matches!(b, b'_' | b'.' | b'-'),
     allowed: "a-z, 0-9, '_', '.' or '-'",
 };
+
+/// Workflow step names: `[a-z0-9][a-z0-9_-]{0,63}`. No dots, because step
+/// names appear in `{{steps.<name>.result}}` placeholders.
+pub(crate) const STEP_RULE: NameRule = NameRule {
+    max: 64,
+    first: lower_or_digit,
+    first_desc: "a lowercase letter or digit",
+    rest: |b| lower_or_digit(b) || matches!(b, b'_' | b'-'),
+    allowed: "a-z, 0-9, '_' or '-'",
+};
+
+/// Free-form labels (job kinds, tags, meta keys, workflow names, error
+/// kinds); the length limit is set per use with [`NameRule::max`].
+pub(crate) const LABEL_RULE: NameRule = NameRule {
+    max: 64,
+    first: alnum,
+    first_desc: "a letter or digit",
+    rest: |b| alnum(b) || matches!(b, b'_' | b'.' | b':' | b'/' | b'-'),
+    allowed: "letters, digits, '_', '.', ':', '/' or '-'",
+};
+
+const WORKER_RULE: NameRule = NameRule {
+    max: 128,
+    first: alnum,
+    first_desc: "a letter or digit",
+    rest: |b| alnum(b) || matches!(b, b'_' | b'.' | b':' | b'@' | b'/' | b'-'),
+    allowed: "letters, digits, '_', '.', ':', '@', '/' or '-'",
+};
