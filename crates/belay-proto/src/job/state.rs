@@ -170,3 +170,84 @@ impl fmt::Display for TransitionError {
         }
     }
 }
+
+impl std::error::Error for TransitionError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::{json, FromJson, ToJson};
+
+    #[test]
+    fn every_state_is_reachable_from_ready() {
+        let mut seen = vec![Ready];
+        let mut frontier = vec![Ready];
+        while let Some(s) = frontier.pop() {
+            for &next in s.successors() {
+                if !seen.contains(&next) {
+                    seen.push(next);
+                    frontier.push(next);
+                }
+            }
+        }
+        // Scheduled is an entry state only: nothing moves back into it.
+        assert_eq!(seen.len(), 6);
+        assert!(!seen.contains(&Scheduled));
+    }
+
+    #[test]
+    fn terminal_states_only_leave_through_an_explicit_retry() {
+        for s in JobState::ALL {
+            if s.is_terminal() {
+                assert!(s.successors().iter().all(|n| *n == Ready), "{s}");
+            }
+        }
+        assert!(Succeeded.successors().is_empty());
+    }
+
+    #[test]
+    fn classification_helpers() {
+        let waiting: Vec<JobState> = JobState::ALL
+            .into_iter()
+            .filter(|s| s.is_waiting())
+            .collect();
+        assert_eq!(waiting, [Scheduled, Retrying]);
+        let terminal: Vec<JobState> = JobState::ALL
+            .into_iter()
+            .filter(|s| s.is_terminal())
+            .collect();
+        assert_eq!(terminal, [Succeeded, Dead, Cancelled]);
+        assert!(Running.is_pending() && !Dead.is_pending());
+    }
+
+    #[test]
+    fn names_round_trip_and_reject_other_cases() {
+        for s in JobState::ALL {
+            assert_eq!(s.to_string().parse::<JobState>(), Ok(s));
+            assert_eq!(JobState::from_json(&s.to_json()), Ok(s));
+        }
+        assert_eq!(
+            "Ready".parse::<JobState>().unwrap_err().to_string(),
+            r#"unknown job state "Ready", did you mean "ready"?"#
+        );
+        assert_eq!(
+            JobState::from_json(&json!("canceled"))
+                .unwrap_err()
+                .to_string(),
+            r#"$: unknown job state "canceled", did you mean "cancelled"?"#
+        );
+        assert_eq!(format!("[{:<9}]", Ready), "[ready    ]");
+    }
+
+    #[test]
+    fn transition_errors_read_naturally() {
+        assert_eq!(
+            Succeeded.check_transition(Running).unwrap_err().to_string(),
+            "cannot move job from succeeded to running"
+        );
+        assert_eq!(
+            Running.check_transition(Running).unwrap_err().to_string(),
+            "job is already running"
+        );
+    }
+}
