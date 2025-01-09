@@ -482,3 +482,151 @@ impl IntoQueueName for QueueName {
         self
     }
 }
+
+impl IntoQueueName for &QueueName {
+    fn into_queue_name(self) -> QueueName {
+        self.clone()
+    }
+}
+
+impl IntoQueueName for &'static str {
+    fn into_queue_name(self) -> QueueName {
+        QueueName::from_static(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::{json, FromJson, ToJson};
+    use std::collections::HashMap;
+
+    fn queue_err(s: &str) -> String {
+        s.parse::<QueueName>().unwrap_err().to_string()
+    }
+
+    #[test]
+    fn queue_names_follow_the_documented_charset() {
+        for ok in [
+            "emails",
+            "0",
+            "billing:invoices",
+            "a.b_c-d",
+            &"q".repeat(64),
+        ] {
+            assert!(ok.parse::<QueueName>().is_ok(), "{ok}");
+        }
+        assert_eq!(queue_err(""), r#"invalid queue name "": must not be empty"#);
+        assert_eq!(
+            queue_err(&"q".repeat(71)),
+            format!(
+                r#"invalid queue name "{}...": must be 1-64 characters, got 71"#,
+                "q".repeat(61)
+            )
+        );
+        assert_eq!(
+            queue_err("-emails"),
+            r#"invalid queue name "-emails": must start with a lowercase letter or digit, got '-'"#
+        );
+        assert_eq!(
+            queue_err("em ails"),
+            r#"invalid queue name "em ails": ' ' at position 2 is not allowed (use a-z, 0-9, '_', '.', ':' or '-')"#
+        );
+        assert!(queue_err("emAils").contains("'A' at position 2"));
+        assert!(queue_err("emé").contains("'é' at position 2"));
+    }
+
+    #[test]
+    fn rejects_queue_names_with_uppercase() {
+        assert!("Emails".parse::<QueueName>().is_err());
+        assert!("emails".parse::<QueueName>().is_ok());
+    }
+
+    #[test]
+    fn schedule_ids_disallow_colons_but_worker_ids_allow_hosts() {
+        assert!("nightly.report-v2".parse::<ScheduleId>().is_ok());
+        assert!("nightly:report".parse::<ScheduleId>().is_err());
+        assert!("web-7f9c:4121".parse::<WorkerId>().is_ok());
+        assert!("svc@Host.example/7".parse::<WorkerId>().is_ok());
+        assert!("worker 1".parse::<WorkerId>().is_err());
+        assert!("Acme_Corp".parse::<TenantId>().is_ok());
+        assert!("acme/corp".parse::<TenantId>().is_err());
+    }
+
+    #[test]
+    fn name_ids_behave_like_strings() {
+        let q = QueueName::from_static("emails");
+        assert_eq!(q.as_str(), "emails");
+        assert_eq!(format!("[{q:>8}]"), "[  emails]");
+        assert_eq!(format!("{q:?}"), r#"QueueName("emails")"#);
+        let mut depth: HashMap<QueueName, u32> = HashMap::new();
+        depth.insert(q.clone(), 3);
+        assert_eq!(depth.get("emails"), Some(&3));
+        assert_eq!(String::from(q.clone()), "emails");
+        assert_eq!(QueueName::try_from("emails".to_owned()), Ok(q));
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid queue name \"Bad\"")]
+    fn from_static_panics_on_invalid_literals() {
+        let _ = QueueName::from_static("Bad");
+    }
+
+    #[test]
+    fn ulid_ids_round_trip_and_explain_errors() {
+        let id: JobId = "01ARYZ6S41TSV4RRFFQ69G5FAV".parse().unwrap();
+        assert_eq!(id.to_string(), "01ARYZ6S41TSV4RRFFQ69G5FAV");
+        assert_eq!(format!("{id:?}"), "JobId(01ARYZ6S41TSV4RRFFQ69G5FAV)");
+        assert_eq!(id.timestamp().to_rfc3339(), "2016-07-30T22:36:16.385Z");
+        assert_eq!(JobId::from_json(&id.to_json()), Ok(id));
+        assert_eq!(
+            "nope".parse::<JobId>().unwrap_err().to_string(),
+            r#"invalid job id "nope": expected 26 characters, got 4"#
+        );
+        let err = WorkflowId::from_json(&json!(42)).unwrap_err();
+        assert_eq!(err.to_string(), "$: expected workflow id string, found 42");
+        assert!(JobId::generate() < JobId::generate());
+    }
+
+    #[test]
+    fn lease_tokens_are_sixteen_hex_digits() {
+        let t = LeaseToken::new(0xdead_beef);
+        assert_eq!(t.to_string(), "00000000deadbeef");
+        assert_eq!("00000000DEADBEEF".parse::<LeaseToken>(), Ok(t));
+        assert_eq!(t.to_json(), json!("00000000deadbeef"));
+        assert_eq!(
+            "deadbeef".parse::<LeaseToken>().unwrap_err().to_string(),
+            r#"invalid lease token "deadbeef": expected 16 hex digits"#
+        );
+        assert!("+000000000000001".parse::<LeaseToken>().is_err());
+        assert!(LeaseToken::REDACTED.is_redacted());
+    }
+
+    #[test]
+    fn fresh_lease_tokens_are_never_redacted() {
+        let mut rng = Rng::seed_from_u64(7);
+        for _ in 0..1000 {
+            assert!(!LeaseToken::generate(&mut rng).is_redacted());
+        }
+    }
+
+    #[test]
+    fn into_queue_name_accepts_names_and_literals() {
+        fn take(q: impl IntoQueueName) -> QueueName {
+            q.into_queue_name()
+        }
+        let q = QueueName::from_static("a");
+        assert_eq!(take(&q), q);
+        assert_eq!(take("a"), q);
+        assert_eq!(take(q.clone()), q);
+    }
+
+    #[test]
+    fn json_errors_carry_the_parse_message() {
+        let err = TenantId::from_json(&json!("")).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$: invalid tenant id "": must not be empty"#
+        );
+    }
+}
