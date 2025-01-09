@@ -137,3 +137,36 @@ impl fmt::Display for JobState {
         f.pad(self.as_str())
     }
 }
+
+impl FromStr for JobState {
+    type Err = ParseError;
+
+    /// Accepts the lowercase names only; `"Ready"` is rejected with a hint.
+    fn from_str(s: &str) -> Result<JobState, ParseError> {
+        JobState::ALL
+            .into_iter()
+            .find(|state| state.as_str() == s)
+            .ok_or_else(|| ParseError::unknown("job state", s, NAMES))
+    }
+}
+
+text_json!(JobState, "job state");
+
+/// A state change the state machine forbids.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransitionError {
+    /// The current state.
+    pub from: JobState,
+    /// The requested state.
+    pub to: JobState,
+}
+
+impl fmt::Display for TransitionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.from == self.to {
+            write!(f, "job is already {}", self.from)
+        } else {
+            write!(f, "cannot move job from {} to {}", self.from, self.to)
+        }
+    }
+}
