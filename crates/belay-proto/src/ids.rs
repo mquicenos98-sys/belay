@@ -458,3 +458,27 @@ impl FromStr for LeaseToken {
 }
 
 text_json!(LeaseToken, "lease token");
+
+mod sealed {
+    pub trait Sealed {}
+    impl Sealed for crate::QueueName {}
+    impl Sealed for &crate::QueueName {}
+    impl Sealed for &'static str {}
+}
+
+/// Arguments accepted where a queue name is expected in builders:
+/// a [`QueueName`], a reference to one, or a string literal.
+///
+/// String literals are checked when converted and panic if invalid, like
+/// [`QueueName::from_static`]. Only `&'static str` is accepted so that names
+/// read at runtime go through `parse` and get a proper error.
+pub trait IntoQueueName: sealed::Sealed {
+    /// Performs the conversion.
+    fn into_queue_name(self) -> QueueName;
+}
+
+impl IntoQueueName for QueueName {
+    fn into_queue_name(self) -> QueueName {
+        self
+    }
+}
