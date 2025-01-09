@@ -136,3 +136,23 @@ impl fmt::Display for Violations {
         }
     }
 }
+
+impl std::error::Error for Violations {}
+
+impl From<FromJsonError> for Violations {
+    fn from(e: FromJsonError) -> Violations {
+        Violations {
+            list: vec![e.into()],
+            omitted: 0,
+        }
+    }
+}
+
+impl<'a> IntoIterator for &'a Violations {
+    type Item = &'a Violation;
+    type IntoIter = std::slice::Iter<'a, Violation>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.list.iter()
+    }
+}
