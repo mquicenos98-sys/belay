@@ -57,3 +57,83 @@ const NAMES: &[&str] = &[
     "dead",
     "cancelled",
 ];
+
+impl JobState {
+    /// Every state, in lifecycle order.
+    pub const ALL: [JobState; 7] = [
+        Scheduled, Ready, Running, Retrying, Succeeded, Dead, Cancelled,
+    ];
+
+    /// The lowercase name used in JSON, query strings and the CLI.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Scheduled => "scheduled",
+            Ready => "ready",
+            Running => "running",
+            Retrying => "retrying",
+            Succeeded => "succeeded",
+            Dead => "dead",
+            Cancelled => "cancelled",
+        }
+    }
+
+    /// Whether the job is finished: nothing will happen to it without an
+    /// explicit retry. Terminal jobs are subject to retention and may be
+    /// deleted.
+    #[must_use]
+    pub const fn is_terminal(self) -> bool {
+        matches!(self, Succeeded | Dead | Cancelled)
+    }
+
+    /// Whether the job is waiting on a timer (`scheduled` or `retrying`).
+    #[must_use]
+    pub const fn is_waiting(self) -> bool {
+        matches!(self, Scheduled | Retrying)
+    }
+
+    /// Whether the job still has work ahead of it: not terminal.
+    #[must_use]
+    pub const fn is_pending(self) -> bool {
+        !self.is_terminal()
+    }
+
+    /// The states this one may move to.
+    #[must_use]
+    pub const fn successors(self) -> &'static [JobState] {
+        match self {
+            Scheduled => &[Ready, Cancelled],
+            Ready => &[Running, Cancelled],
+            Running => &[Succeeded, Retrying, Dead, Cancelled],
+            Retrying => &[Ready, Running, Cancelled],
+            Succeeded => &[],
+            Dead | Cancelled => &[Ready],
+        }
+    }
+
+    /// Whether moving from `self` to `next` is allowed. Staying in the same
+    /// state is not a transition and is never allowed.
+    #[must_use]
+    pub fn can_transition_to(self, next: JobState) -> bool {
+        self.successors().contains(&next)
+    }
+
+    /// Like [`can_transition_to`](Self::can_transition_to) with an error
+    /// suitable for returning to a caller.
+    pub fn check_transition(self, next: JobState) -> Result<(), TransitionError> {
+        if self.can_transition_to(next) {
+            Ok(())
+        } else {
+            Err(TransitionError {
+                from: self,
+                to: next,
+            })
+        }
+    }
+}
+
+impl fmt::Display for JobState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
+}
