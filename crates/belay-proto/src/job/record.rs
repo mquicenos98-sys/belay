@@ -233,3 +233,173 @@ impl ToJson for Job {
             .build()
     }
 }
+
+impl FromJson for Job {
+    fn from_json(value: &Value) -> Result<Job, FromJsonError> {
+        let r = ObjectReader::new(value, "Job")?;
+        Ok(Job {
+            id: r.req("id")?,
+            state: r.req("state")?,
+            attempt: r.or("attempt", 0)?,
+            spec: r.req("spec")?,
+            created_at: r.req_timestamp("created_at")?,
+            updated_at: r.req_timestamp("updated_at")?,
+            run_at: r.req_timestamp("run_at")?,
+            started_at: r.opt_timestamp("started_at")?,
+            finished_at: r.opt_timestamp("finished_at")?,
+            lease: r.opt("lease")?,
+            cancel_requested: r.or_default("cancel_requested")?,
+            errors: r.or_default("errors")?,
+            // `result: null` is a real result (the handler returned null)
+            // and must survive a round trip, so read the raw value.
+            result: r.value("result").cloned(),
+            progress: r.opt("progress")?,
+        })
+    }
+}
+
+/// One failed attempt.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct JobError {
+    /// When the failure was recorded.
+    pub at: Timestamp,
+    /// Which attempt failed (1-based).
+    pub attempt: u32,
+    /// What went wrong, truncated to
+    /// [`MAX_ERROR_MESSAGE_BYTES`](crate::limits::MAX_ERROR_MESSAGE_BYTES).
+    pub message: String,
+    /// A machine-readable class such as `timeout` or `http_503`.
+    pub kind: Option<String>,
+    /// Whether the handler considered it worth retrying.
+    pub retryable: bool,
+    /// The worker that reported it, if any (lease expiry has none).
+    pub worker: Option<WorkerId>,
+}
+
+impl JobError {
+    /// A retryable error, truncating `message` on a character boundary.
+    #[must_use]
+    pub fn new(at: Timestamp, attempt: u32, message: impl Into<String>) -> JobError {
+        JobError {
+            at,
+            attempt,
+            message: truncate(message.into(), MAX_ERROR_MESSAGE_BYTES),
+            kind: None,
+            retryable: true,
+            worker: None,
+        }
+    }
+
+    /// Sets the kind.
+    #[must_use]
+    pub fn kind(mut self, kind: impl Into<String>) -> JobError {
+        self.kind = Some(kind.into());
+        self
+    }
+
+    /// Sets whether the error is retryable.
+    #[must_use]
+    pub fn retryable(mut self, retryable: bool) -> JobError {
+        self.retryable = retryable;
+        self
+    }
+
+    /// Sets the reporting worker.
+    #[must_use]
+    pub fn worker(mut self, worker: WorkerId) -> JobError {
+        self.worker = Some(worker);
+        self
+    }
+}
+
+/// Cuts `s` to at most `max` bytes without splitting a character, marking
+/// the cut with an ellipsis.
+fn truncate(mut s: String, max: usize) -> String {
+    const MARK: &str = "...";
+    if s.len() <= max {
+        return s;
+    }
+    let mut cut = max.saturating_sub(MARK.len());
+    while !s.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    s.truncate(cut);
+    s.push_str(MARK);
+    s
+}
+
+impl ToJson for JobError {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .timestamp("at", self.at)
+            .field("attempt", self.attempt)
+            .field("message", &self.message)
+            .opt_field("kind", &self.kind)
+            .field("retryable", self.retryable)
+            .opt_field("worker", &self.worker)
+            .build()
+    }
+}
+
+impl FromJson for JobError {
+    fn from_json(value: &Value) -> Result<JobError, FromJsonError> {
+        let r = ObjectReader::new(value, "JobError")?;
+        Ok(JobError {
+            at: r.req_timestamp("at")?,
+            attempt: r.req("attempt")?,
+            message: r.req("message")?,
+            kind: r.opt("kind")?,
+            retryable: r.or("retryable", true)?,
+            worker: r.opt("worker")?,
+        })
+    }
+}
+
+/// A worker's claim on a running job.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Lease {
+    /// Who holds it.
+    pub worker: WorkerId,
+    /// Proof of holding it.
+    pub token: LeaseToken,
+    /// When it was granted.
+    pub acquired_at: Timestamp,
+    /// When it lapses unless renewed.
+    pub expires_at: Timestamp,
+    /// When it was last renewed (initially `acquired_at`).
+    pub heartbeat_at: Timestamp,
+}
+
+impl Lease {
+    /// A lease granted at `now` for `duration`.
+    #[must_use]
+    pub fn new(worker: WorkerId, token: LeaseToken, now: Timestamp, duration: Duration) -> Lease {
+        Lease {
+            worker,
+            token,
+            acquired_at: now,
+            expires_at: now + duration,
+            heartbeat_at: now,
+        }
+    }
+
+    /// Whether it has lapsed at `now`. A lease is valid strictly before its
+    /// expiry instant.
+    #[must_use]
+    pub fn is_expired(&self, now: Timestamp) -> bool {
+        now >= self.expires_at
+    }
+
+    /// Time left before it lapses.
+    #[must_use]
+    pub fn remaining(&self, now: Timestamp) -> Duration {
+        self.expires_at.saturating_duration_since(now)
+    }
+
+    /// Renews at `now` so that it lapses `by` from now, but never earlier
+    /// than it already would (a short heartbeat does not shorten a lease).
+    pub fn renew(&mut self, now: Timestamp, by: Duration) {
+        self.heartbeat_at = now;
+        self.expires_at = self.expires_at.max(now + by);
+    }
+}
