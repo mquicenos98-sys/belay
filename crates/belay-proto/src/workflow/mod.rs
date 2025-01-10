@@ -358,3 +358,217 @@ pub struct Workflow {
     /// When it reached a terminal state.
     pub finished_at: Option<Timestamp>,
 }
+
+impl Workflow {
+    /// A new run with every step pending.
+    #[must_use]
+    pub fn new(id: WorkflowId, spec: WorkflowSpec, now: Timestamp) -> Workflow {
+        let steps = spec
+            .steps
+            .iter()
+            .map(|s| (s.name.clone(), StepStatus::pending()))
+            .collect();
+        Workflow {
+            id,
+            spec,
+            state: WorkflowState::Running,
+            steps,
+            created_at: now,
+            finished_at: None,
+        }
+    }
+
+    /// The state of step `name`.
+    #[must_use]
+    pub fn step_state(&self, name: &str) -> Option<StepState> {
+        self.steps.get(name).map(|s| s.state)
+    }
+
+    /// Final states of the dependencies of `step`, in `depends_on` order.
+    /// Unknown names are skipped.
+    #[must_use]
+    pub fn parent_states(&self, step: &StepSpec) -> Vec<StepState> {
+        step.depends_on
+            .iter()
+            .filter_map(|p| self.step_state(p))
+            .collect()
+    }
+
+    /// Pending steps whose dependencies have all finished, in declaration
+    /// order: the ones whose condition should be evaluated next.
+    #[must_use]
+    pub fn eligible_steps(&self) -> Vec<&StepSpec> {
+        self.spec
+            .steps
+            .iter()
+            .filter(|s| self.step_state(&s.name) == Some(StepState::Pending))
+            .filter(|s| self.parent_states(s).iter().all(|p| p.is_finished()))
+            .collect()
+    }
+
+    /// Whether every step has finished.
+    #[must_use]
+    pub fn all_steps_finished(&self) -> bool {
+        self.steps.values().all(|s| s.state.is_finished())
+    }
+}
+
+impl ToJson for Workflow {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("id", self.id)
+            .field("state", self.state)
+            .field("spec", &self.spec)
+            .field("steps", &self.steps)
+            .timestamp("created_at", self.created_at)
+            .opt_timestamp("finished_at", self.finished_at)
+            .build()
+    }
+}
+
+impl FromJson for Workflow {
+    fn from_json(value: &Value) -> Result<Workflow, FromJsonError> {
+        let r = ObjectReader::new(value, "Workflow")?;
+        Ok(Workflow {
+            id: r.req("id")?,
+            state: r.req("state")?,
+            spec: r.req("spec")?,
+            steps: r.or_default("steps")?,
+            created_at: r.req_timestamp("created_at")?,
+            finished_at: r.opt_timestamp("finished_at")?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::json;
+
+    fn diamond() -> WorkflowSpec {
+        WorkflowSpec::new("diamond")
+            .step(StepSpec::new("fetch", JobSpec::new("q", "fetch")))
+            .step(StepSpec::new("left", JobSpec::new("q", "l")).after("fetch"))
+            .step(
+                StepSpec::new("right", JobSpec::new("q", "r"))
+                    .after("fetch")
+                    .on_failure(StepFailurePolicy::Continue),
+            )
+            .step(
+                StepSpec::new("join", JobSpec::new("q", "j"))
+                    .after("left")
+                    .after("right")
+                    .when(Condition::Always),
+            )
+    }
+
+    #[test]
+    fn conditions_follow_parent_outcomes() {
+        use StepState::*;
+        let cases: [(Condition, &[StepState], bool); 10] = [
+            (Condition::AllSucceeded, &[Succeeded, Succeeded], true),
+            (Condition::AllSucceeded, &[Succeeded, Skipped], false),
+            (Condition::AnySucceeded, &[Failed, Succeeded], true),
+            (Condition::AnySucceeded, &[Failed, Skipped], false),
+            (Condition::AnyFailed, &[Succeeded, Cancelled], true),
+            (Condition::AnyFailed, &[Succeeded, Skipped], false),
+            (Condition::Always, &[Failed, Skipped], true),
+            (Condition::AllSucceeded, &[], true),
+            (Condition::AnyFailed, &[], true),
+            (Condition::AnySucceeded, &[], true),
+        ];
+        for (condition, parents, expected) in cases {
+            assert_eq!(
+                condition.is_satisfied(parents),
+                expected,
+                "{condition} with {parents:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_enums_round_trip_and_hint() {
+        for s in StepState::ALL {
+            assert_eq!(s.as_str().parse::<StepState>(), Ok(*s));
+        }
+        assert_eq!(
+            "skip_dependent"
+                .parse::<StepFailurePolicy>()
+                .unwrap_err()
+                .to_string(),
+            r#"unknown step failure policy "skip_dependent", did you mean "skip_dependents"?"#
+        );
+        assert!(WorkflowState::Failed.is_terminal() && !WorkflowState::Running.is_terminal());
+        assert!(StepState::Skipped.is_finished() && !StepState::Running.is_finished());
+    }
+
+    #[test]
+    fn spec_json_round_trips_and_omits_defaults() {
+        let spec = diamond();
+        let v = spec.to_json();
+        assert_eq!(
+            v["steps"][0],
+            json!({"name": "fetch", "job": {"queue": "q", "kind": "fetch", "priority": 0},
+                   "on_failure": "fail_workflow"})
+        );
+        assert_eq!(v["steps"][3]["when"], "always");
+        assert_eq!(WorkflowSpec::from_json(&v), Ok(spec));
+    }
+
+    #[test]
+    fn step_decode_errors_have_paths() {
+        let v = json!({"name": "w", "steps": [
+            {"name": "a", "job": {"queue": "q", "kind": "k"}},
+            {"name": "b", "job": {"queue": "q", "kind": "k"}, "when": "sometimes"}
+        ]});
+        assert_eq!(
+            WorkflowSpec::from_json(&v).unwrap_err().to_string(),
+            r#"$.steps[1].when: unknown step condition "sometimes", expected one of: all_succeeded, any_succeeded, any_failed, always"#
+        );
+        let v = json!({"name": "w", "steps": [{"name": "a", "job": {"queue": "q"}}]});
+        assert_eq!(
+            WorkflowSpec::from_json(&v).unwrap_err().to_string(),
+            r#"$.steps[0].job: missing required field "kind" in JobSpec"#
+        );
+    }
+
+    #[test]
+    fn eligible_steps_wait_for_every_parent() {
+        let now = Timestamp::from_millis(0);
+        let mut wf = Workflow::new(WorkflowId::generate(), diamond(), now);
+        let names = |wf: &Workflow| -> Vec<String> {
+            wf.eligible_steps().iter().map(|s| s.name.clone()).collect()
+        };
+        assert_eq!(names(&wf), ["fetch"]);
+        wf.steps.get_mut("fetch").unwrap().state = StepState::Succeeded;
+        assert_eq!(names(&wf), ["left", "right"]);
+        wf.steps.get_mut("left").unwrap().state = StepState::Running;
+        wf.steps.get_mut("right").unwrap().state = StepState::Failed;
+        assert!(names(&wf).is_empty(), "join waits for left");
+        wf.steps.get_mut("left").unwrap().state = StepState::Succeeded;
+        assert_eq!(names(&wf), ["join"]);
+        let join = wf.spec.get_step("join").unwrap();
+        assert_eq!(
+            wf.parent_states(join),
+            [StepState::Succeeded, StepState::Failed]
+        );
+        assert!(join.condition().is_satisfied(&wf.parent_states(join)));
+        assert!(!wf.all_steps_finished());
+    }
+
+    #[test]
+    fn workflow_record_round_trips() {
+        let now = Timestamp::from_millis(5_000);
+        let mut wf = Workflow::new(WorkflowId::generate(), diamond(), now);
+        let fetch = wf.steps.get_mut("fetch").unwrap();
+        fetch.state = StepState::Succeeded;
+        fetch.job = Some(JobId::generate());
+        fetch.started_at = Some(now);
+        fetch.finished_at = Some(now);
+        wf.state = WorkflowState::Failed;
+        wf.finished_at = Some(now);
+        let v = wf.to_json();
+        assert_eq!(v["steps"]["left"], json!({"state": "pending"}));
+        assert_eq!(Workflow::from_json(&v), Ok(wf));
+    }
+}
