@@ -156,3 +156,172 @@ impl<'a> IntoIterator for &'a Violations {
         self.list.iter()
     }
 }
+
+/// Collects violations while walking a value.
+///
+/// ```
+/// use belay_proto::validate::Validator;
+///
+/// let mut v = Validator::new();
+/// v.at_key("unique", |v| v.check(false, "key", || "must not be empty".to_owned()));
+/// v.at_index("tags", 3, |v| v.report_here("duplicate tag \"eu\""));
+/// let problems = v.finish().unwrap_err();
+/// let lines: Vec<String> = problems.iter().map(ToString::to_string).collect();
+/// assert_eq!(lines, [
+///     "$.unique.key: must not be empty",
+///     "$.tags[3]: duplicate tag \"eu\"",
+/// ]);
+/// ```
+#[derive(Debug, Default)]
+pub struct Validator {
+    path: Vec<PathSegment>,
+    found: Vec<Violation>,
+    omitted: usize,
+}
+
+impl Validator {
+    /// A validator at the document root.
+    #[must_use]
+    pub fn new() -> Validator {
+        Validator::default()
+    }
+
+    /// Runs `f` with `key` appended to the current path.
+    pub fn at_key<R>(&mut self, key: &str, f: impl FnOnce(&mut Validator) -> R) -> R {
+        self.path.push(PathSegment::Key(key.to_owned()));
+        let out = f(self);
+        self.path.pop();
+        out
+    }
+
+    /// Runs `f` at `key[index]`.
+    pub fn at_index<R>(
+        &mut self,
+        key: &str,
+        index: usize,
+        f: impl FnOnce(&mut Validator) -> R,
+    ) -> R {
+        self.at_key(key, |v| {
+            v.path.push(PathSegment::Index(index));
+            let out = f(v);
+            v.path.pop();
+            out
+        })
+    }
+
+    /// Records a problem at the current path.
+    pub fn report_here(&mut self, message: impl fmt::Display) {
+        if self.found.len() < MAX_REPORTED_VIOLATIONS {
+            self.found
+                .push(Violation::new(&self.path, message.to_string()));
+        } else {
+            self.omitted += 1;
+        }
+    }
+
+    /// Records a problem with the field `key` of the current value.
+    pub fn report(&mut self, key: &str, message: impl fmt::Display) {
+        self.at_key(key, |v| v.report_here(message));
+    }
+
+    /// Records the message produced by `message` unless `ok` holds. The
+    /// message is only built on failure.
+    pub fn check(&mut self, ok: bool, key: &str, message: impl FnOnce() -> String) {
+        if !ok {
+            self.report(key, message());
+        }
+    }
+
+    /// Validates a nested value under `key`.
+    pub fn nested<T: Validate + ?Sized>(&mut self, key: &str, value: &T) {
+        self.at_key(key, |v| value.validate_into(v));
+    }
+
+    /// Whether nothing has been reported so far.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.found.is_empty()
+    }
+
+    /// Number of problems reported so far.
+    #[must_use]
+    pub fn count(&self) -> usize {
+        self.found.len() + self.omitted
+    }
+
+    /// `Ok` if nothing was reported.
+    pub fn finish(self) -> Result<(), Violations> {
+        if self.found.is_empty() {
+            Ok(())
+        } else {
+            Err(Violations {
+                list: self.found,
+                omitted: self.omitted,
+            })
+        }
+    }
+}
+
+/// Checks shared by the `Validate` impls in this crate.
+impl Validator {
+    /// `key` must satisfy a name rule.
+    pub(crate) fn check_name(&mut self, key: &str, value: &str, rule: NameRule) {
+        if let Some(problem) = rule.problem(value) {
+            self.report(key, problem);
+        }
+    }
+
+    /// `key` must lie in `min..=max`.
+    pub(crate) fn check_duration(&mut self, key: &str, d: Duration, min: Duration, max: Duration) {
+        if d < min || d > max {
+            let message = if min.is_zero() {
+                format!(
+                    "must be at most {}, got {}",
+                    format_duration(max),
+                    format_duration(d)
+                )
+            } else {
+                format!(
+                    "must be between {} and {}, got {}",
+                    format_duration(min),
+                    format_duration(max),
+                    format_duration(d)
+                )
+            };
+            self.report(key, message);
+        }
+    }
+
+    /// `key` (a count, length or number) must lie in `min..=max`.
+    pub(crate) fn check_range<T>(&mut self, key: &str, value: T, min: T, max: T)
+    where
+        T: PartialOrd + fmt::Display,
+    {
+        if value < min || value > max {
+            self.report(key, format!("must be between {min} and {max}, got {value}"));
+        }
+    }
+
+    /// `key` may hold at most `max` bytes of text.
+    pub(crate) fn check_bytes(&mut self, key: &str, value: &str, max: usize) {
+        if value.len() > max {
+            self.report(
+                key,
+                format!("must be at most {max} bytes, got {}", value.len()),
+            );
+        }
+    }
+}
+
+/// Types with semantic rules beyond their JSON shape.
+pub trait Validate {
+    /// Reports every problem into `v`, relative to its current path.
+    fn validate_into(&self, v: &mut Validator);
+
+    /// Checks all rules, returning every problem found.
+    fn validate(&self) -> Result<(), Violations> {
+        let mut v = Validator::new();
+        self.validate_into(&mut v);
+        v.finish()
+    }
+}
