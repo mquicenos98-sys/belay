@@ -403,3 +403,38 @@ impl Lease {
         self.expires_at = self.expires_at.max(now + by);
     }
 }
+
+impl ToJson for Lease {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("worker", &self.worker)
+            .field_if(!self.token.is_redacted(), "token", self.token)
+            .timestamp("acquired_at", self.acquired_at)
+            .timestamp("expires_at", self.expires_at)
+            .timestamp("heartbeat_at", self.heartbeat_at)
+            .build()
+    }
+}
+
+impl FromJson for Lease {
+    fn from_json(value: &Value) -> Result<Lease, FromJsonError> {
+        let r = ObjectReader::new(value, "Lease")?;
+        let acquired_at = r.req_timestamp("acquired_at")?;
+        Ok(Lease {
+            worker: r.req("worker")?,
+            token: r.or("token", LeaseToken::REDACTED)?,
+            acquired_at,
+            expires_at: r.req_timestamp("expires_at")?,
+            heartbeat_at: r.opt_timestamp("heartbeat_at")?.unwrap_or(acquired_at),
+        })
+    }
+}
+
+/// How far a running attempt has got, as reported by its handler.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Progress {
+    /// Completion in percent, `0..=100`.
+    pub percent: Option<f32>,
+    /// A short human-readable status line.
+    pub message: Option<String>,
+}
