@@ -325,3 +325,99 @@ pub trait Validate {
         v.finish()
     }
 }
+
+impl<T: Validate + ?Sized> Validate for &T {
+    fn validate_into(&self, v: &mut Validator) {
+        (**self).validate_into(v);
+    }
+}
+
+impl<T: Validate> Validate for [T] {
+    fn validate_into(&self, v: &mut Validator) {
+        for (i, item) in self.iter().enumerate() {
+            v.path.push(PathSegment::Index(i));
+            item.validate_into(v);
+            v.path.pop();
+        }
+    }
+}
+
+impl<T: Validate> Validate for Vec<T> {
+    fn validate_into(&self, v: &mut Validator) {
+        self.as_slice().validate_into(v);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Range(i32);
+
+    impl Validate for Range {
+        fn validate_into(&self, v: &mut Validator) {
+            v.check((0..=10).contains(&self.0), "n", || {
+                format!("must be between 0 and 10, got {}", self.0)
+            });
+        }
+    }
+
+    #[test]
+    fn nested_paths_and_list_indices_compose() {
+        let items = vec![Range(1), Range(11), Range(-1)];
+        let mut v = Validator::new();
+        v.nested("items", &items);
+        assert_eq!(v.count(), 2);
+        let err = v.finish().unwrap_err();
+        let lines: Vec<String> = err.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            lines,
+            [
+                "$.items[1].n: must be between 0 and 10, got 11",
+                "$.items[2].n: must be between 0 and 10, got -1"
+            ]
+        );
+        assert_eq!(err.first().pointer(), "/items/1/n");
+        assert_eq!(err.first().path(), "$.items[1].n");
+        assert_eq!(err.first().message(), "must be between 0 and 10, got 11");
+        assert_eq!(
+            err.to_string(),
+            "$.items[1].n: must be between 0 and 10, got 11 (and 1 more problem)"
+        );
+    }
+
+    #[test]
+    fn keys_that_are_not_identifiers_are_quoted() {
+        let mut v = Validator::new();
+        v.at_key("meta", |v| v.report("belay.schedule", "reserved key"));
+        assert_eq!(
+            v.finish().unwrap_err().to_string(),
+            r#"$.meta["belay.schedule"]: reserved key"#
+        );
+    }
+
+    #[test]
+    fn report_count_is_capped_but_total_is_kept() {
+        let many: Vec<Range> = (0..250).map(|_| Range(99)).collect();
+        let err = many.validate().unwrap_err();
+        assert_eq!(err.iter().len(), MAX_REPORTED_VIOLATIONS);
+        assert_eq!(err.len(), 250);
+        assert!(err.to_string().ends_with("(and 249 more problems)"));
+    }
+
+    #[test]
+    fn clean_values_pass() {
+        assert!(Range(5).validate().is_ok());
+        assert!(Vec::<Range>::new().validate().is_ok());
+        let v = Validator::new();
+        assert!(v.is_clean());
+        assert!(v.finish().is_ok());
+    }
+
+    #[test]
+    fn single_builds_a_violation_outside_a_validator() {
+        let err = Violations::single(&[PathSegment::Key("limit".into())], "must be at least 1");
+        assert_eq!(err.to_string(), "$.limit: must be at least 1");
+        assert_eq!(err.len(), 1);
+    }
+}
