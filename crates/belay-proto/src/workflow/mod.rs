@@ -305,3 +305,56 @@ pub struct StepStatus {
     /// When it finished.
     pub finished_at: Option<Timestamp>,
 }
+
+impl StepStatus {
+    /// A step that has not started.
+    #[must_use]
+    pub const fn pending() -> StepStatus {
+        StepStatus {
+            state: StepState::Pending,
+            job: None,
+            started_at: None,
+            finished_at: None,
+        }
+    }
+}
+
+impl ToJson for StepStatus {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("state", self.state)
+            .opt_field("job", &self.job)
+            .opt_timestamp("started_at", self.started_at)
+            .opt_timestamp("finished_at", self.finished_at)
+            .build()
+    }
+}
+
+impl FromJson for StepStatus {
+    fn from_json(value: &Value) -> Result<StepStatus, FromJsonError> {
+        let r = ObjectReader::new(value, "StepStatus")?;
+        Ok(StepStatus {
+            state: r.req("state")?,
+            job: r.opt("job")?,
+            started_at: r.opt_timestamp("started_at")?,
+            finished_at: r.opt_timestamp("finished_at")?,
+        })
+    }
+}
+
+/// A workflow run.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Workflow {
+    /// The run's id.
+    pub id: WorkflowId,
+    /// What was submitted.
+    pub spec: WorkflowSpec,
+    /// Where the run is.
+    pub state: WorkflowState,
+    /// Per-step progress, keyed by step name.
+    pub steps: BTreeMap<String, StepStatus>,
+    /// When it was submitted.
+    pub created_at: Timestamp,
+    /// When it reached a terminal state.
+    pub finished_at: Option<Timestamp>,
+}
