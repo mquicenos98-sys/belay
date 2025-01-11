@@ -438,3 +438,295 @@ pub struct Progress {
     /// A short human-readable status line.
     pub message: Option<String>,
 }
+
+impl Progress {
+    /// Progress with a percentage.
+    #[must_use]
+    pub fn percent(percent: f32) -> Progress {
+        Progress {
+            percent: Some(percent),
+            message: None,
+        }
+    }
+
+    /// Adds a status message.
+    #[must_use]
+    pub fn with_message(mut self, message: impl Into<String>) -> Progress {
+        self.message = Some(message.into());
+        self
+    }
+}
+
+impl ToJson for Progress {
+    fn to_json(&self) -> Value {
+        // Widening 33.3f32 to f64 gives 33.29999923706055; going through the
+        // f32's shortest decimal form keeps "33.3" on the wire.
+        let percent = self
+            .percent
+            .map(|p| p.to_string().parse::<f64>().unwrap_or(f64::from(p)));
+        ObjectBuilder::new()
+            .opt_field("percent", &percent)
+            .opt_field("message", &self.message)
+            .build()
+    }
+}
+
+impl FromJson for Progress {
+    fn from_json(value: &Value) -> Result<Progress, FromJsonError> {
+        let r = ObjectReader::new(value, "Progress")?;
+        let progress = Progress {
+            percent: r.opt("percent")?,
+            message: r.opt("message")?,
+        };
+        r.deny_unknown_fields()?;
+        Ok(progress)
+    }
+}
+
+impl Validate for Progress {
+    fn validate_into(&self, v: &mut Validator) {
+        if let Some(p) = self.percent {
+            v.check((0.0..=100.0).contains(&p), "percent", || {
+                format!("must be between 0 and 100, got {p}")
+            });
+        }
+        if let Some(message) = &self.message {
+            v.check_bytes("message", message, MAX_PROGRESS_MESSAGE_BYTES);
+        }
+    }
+}
+
+/// Error kinds follow the label rule; shared by fail requests.
+pub(crate) fn validate_error_kind(v: &mut Validator, kind: &str) {
+    v.check_name("kind", kind, LABEL_RULE.max(MAX_ERROR_KIND_LEN));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job::UniqueScope;
+    use belay_json::json;
+
+    fn t(ms: i64) -> Timestamp {
+        Timestamp::from_millis(1_700_000_000_000 + ms)
+    }
+
+    fn worker() -> WorkerId {
+        WorkerId::from_static("w1")
+    }
+
+    fn running_job() -> Job {
+        let mut job = Job::new(
+            "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().unwrap(),
+            JobSpec::new("emails", "send").max_attempts(3),
+            t(0),
+        );
+        job.transition(JobState::Running, t(10)).unwrap();
+        job.attempt = 1;
+        job.started_at = Some(t(10));
+        job.lease = Some(Lease::new(
+            worker(),
+            LeaseToken::new(0xabc),
+            t(10),
+            Duration::from_secs(30),
+        ));
+        job
+    }
+
+    #[test]
+    fn new_jobs_start_scheduled_or_ready() {
+        let id = JobId::generate();
+        let now = t(0);
+        let ready = Job::new(id, JobSpec::new("q", "k"), now);
+        assert_eq!((ready.state, ready.run_at), (JobState::Ready, now));
+        let later = Job::new(
+            id,
+            JobSpec::new("q", "k").delay(Duration::from_secs(5)),
+            now,
+        );
+        assert_eq!(later.state, JobState::Scheduled);
+        assert_eq!(later.run_at, t(5_000));
+        let past = Job::new(id, JobSpec::new("q", "k").run_at(t(-1)), now);
+        assert_eq!(past.state, JobState::Ready);
+        assert_eq!(past.run_at, t(-1));
+    }
+
+    #[test]
+    fn lease_expires_at_its_instant() {
+        let job = running_job();
+        assert!(!job.lease_expired(t(30_009)));
+        assert!(job.lease_expired(t(30_010)));
+        let mut orphan = running_job();
+        orphan.lease = None;
+        assert!(orphan.lease_expired(t(0)));
+        let ready = Job::new(JobId::generate(), JobSpec::new("q", "k"), t(0));
+        assert!(!ready.lease_expired(t(1_000_000)));
+    }
+
+    #[test]
+    fn heartbeats_never_shorten_a_lease() {
+        let mut lease = Lease::new(worker(), LeaseToken::new(1), t(0), Duration::from_secs(60));
+        lease.renew(t(1_000), Duration::from_secs(10));
+        assert_eq!(lease.expires_at, t(60_000));
+        assert_eq!(lease.heartbeat_at, t(1_000));
+        lease.renew(t(55_000), Duration::from_secs(10));
+        assert_eq!(lease.expires_at, t(65_000));
+        assert_eq!(lease.remaining(t(60_000)), Duration::from_secs(5));
+        assert_eq!(lease.remaining(t(70_000)), Duration::ZERO);
+    }
+
+    #[test]
+    fn failure_outcome_depends_on_attempts_and_cancellation() {
+        let mut job = running_job();
+        assert_eq!(job.state_after_failure(true), JobState::Retrying);
+        assert_eq!(job.state_after_failure(false), JobState::Dead);
+        job.attempt = 3;
+        assert_eq!(job.attempts_left(), 0);
+        assert_eq!(job.state_after_failure(true), JobState::Dead);
+        job.cancel_requested = true;
+        assert_eq!(job.state_after_failure(true), JobState::Cancelled);
+    }
+
+    #[test]
+    fn retry_delay_prefers_the_jobs_policy() {
+        let mut job = running_job();
+        let queue_policy = BackoffPolicy::constant(Duration::from_secs(7));
+        let mut rng = Rng::seed_from_u64(1);
+        assert_eq!(
+            job.retry_delay(&queue_policy, &mut rng),
+            Duration::from_secs(7)
+        );
+        job.spec.retry = Some("exp:1s*2".parse().unwrap());
+        job.attempt = 3;
+        assert_eq!(
+            job.retry_delay(&queue_policy, &mut rng),
+            Duration::from_secs(4)
+        );
+    }
+
+    #[test]
+    fn transitions_keep_bookkeeping_consistent() {
+        let mut job = running_job();
+        job.progress = Some(Progress::percent(50.0));
+        job.cancel_requested = true;
+        job.transition(JobState::Retrying, t(20)).unwrap();
+        assert!(job.lease.is_none() && job.progress.is_none() && !job.cancel_requested);
+        assert_eq!(job.finished_at, None);
+        job.transition(JobState::Ready, t(30)).unwrap();
+        job.transition(JobState::Cancelled, t(40)).unwrap();
+        assert_eq!(job.finished_at, Some(t(40)));
+        job.transition(JobState::Ready, t(50)).unwrap();
+        assert_eq!((job.finished_at, job.updated_at), (None, t(50)));
+        let err = job.transition(JobState::Succeeded, t(60)).unwrap_err();
+        assert_eq!(err.to_string(), "cannot move job from ready to succeeded");
+        assert_eq!(
+            job.state,
+            JobState::Ready,
+            "a rejected transition changes nothing"
+        );
+        assert_eq!(job.updated_at, t(50));
+    }
+
+    #[test]
+    fn long_error_messages_are_truncated_on_char_boundaries() {
+        let long = "é".repeat(MAX_ERROR_MESSAGE_BYTES);
+        let e = JobError::new(t(0), 1, long);
+        assert!(e.message.len() <= MAX_ERROR_MESSAGE_BYTES);
+        assert!(e.message.ends_with("é..."));
+        assert_eq!(JobError::new(t(0), 1, "short").message, "short");
+    }
+
+    #[test]
+    fn job_json_round_trips_with_all_fields() {
+        let mut job = running_job();
+        job.spec = job
+            .spec
+            .clone()
+            .unique("k", UniqueScope::For(Duration::from_secs(60)));
+        job.progress = Some(Progress::percent(33.3).with_message("halfway-ish"));
+        job.cancel_requested = true;
+        job.record_error(
+            JobError::new(t(5), 1, "timeout")
+                .kind("timeout")
+                .retryable(false)
+                .worker(worker()),
+        );
+        job.result = Some(Value::Null);
+        let v = job.to_json();
+        assert_eq!(
+            v["progress"],
+            json!({"percent": 33.3, "message": "halfway-ish"})
+        );
+        assert_eq!(v["lease"]["token"], "0000000000000abc");
+        assert_eq!(v["result"], Value::Null);
+        assert_eq!(Job::from_json(&v), Ok(job));
+    }
+
+    #[test]
+    fn minimal_job_json_omits_empty_fields() {
+        let job = Job::new(
+            "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().unwrap(),
+            JobSpec::new("q", "k"),
+            Timestamp::from_millis(0),
+        );
+        assert_eq!(
+            job.to_json().to_string(),
+            concat!(
+                r#"{"id":"01HQ3K9Z8N6V2T4R5S7W0X1Y2Z","state":"ready","attempt":0,"#,
+                r#""spec":{"queue":"q","kind":"k","priority":0},"#,
+                r#""created_at":"1970-01-01T00:00:00.000Z","updated_at":"1970-01-01T00:00:00.000Z","#,
+                r#""run_at":"1970-01-01T00:00:00.000Z"}"#
+            )
+        );
+        assert_eq!(Job::from_json(&job.to_json()), Ok(job));
+    }
+
+    #[test]
+    fn redacted_jobs_hide_the_token_on_the_wire() {
+        let job = running_job().redacted();
+        let v = job.to_json();
+        assert!(v["lease"].get("token").is_none());
+        let back = Job::from_json(&v).unwrap();
+        assert_eq!(back.lease.map(|l| l.token), Some(LeaseToken::REDACTED));
+    }
+
+    #[test]
+    fn job_records_tolerate_unknown_fields_but_not_bad_ones() {
+        let mut v = running_job().to_json();
+        v.as_object_mut().unwrap().insert("shard", 3);
+        assert!(Job::from_json(&v).is_ok());
+        v.as_object_mut().unwrap().insert("state", "sleeping");
+        assert_eq!(
+            Job::from_json(&v).unwrap_err().to_string(),
+            r#"$.state: unknown job state "sleeping", expected one of: scheduled, ready, running, retrying, succeeded, dead, cancelled"#
+        );
+    }
+
+    #[test]
+    fn progress_validation_and_strictness() {
+        assert!(Progress::percent(100.0).validate().is_ok());
+        let err = Progress::percent(120.0).validate().unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "$.percent: must be between 0 and 100, got 120"
+        );
+        assert!(Progress::percent(f32::NAN).validate().is_err());
+        let err = Progress::from_json(&json!({"pct": 5})).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$: unknown field "pct" in Progress, expected one of: percent, message"#
+        );
+    }
+
+    #[test]
+    fn deadline_and_runtime() {
+        let mut job = running_job();
+        assert_eq!(job.deadline(), None);
+        job.spec.timeout = Some(Duration::from_secs(60));
+        assert_eq!(job.deadline(), Some(t(60_010)));
+        assert_eq!(job.runtime(), None);
+        job.transition(JobState::Succeeded, t(2_010)).unwrap();
+        assert_eq!(job.runtime(), Some(Duration::from_secs(2)));
+        assert_eq!(job.age(t(5_000)), Duration::from_secs(5));
+    }
+}
