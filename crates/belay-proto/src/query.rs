@@ -140,3 +140,62 @@ impl<'a> QueryReader<'a> {
         self.v.finish()
     }
 }
+
+/// Borrows `(String, String)` pairs as `(&str, &str)`.
+pub(crate) fn borrow_pairs(pairs: &[(String, String)]) -> impl Iterator<Item = (&str, &str)> {
+    pairs.iter().map(|(k, v)| (k.as_str(), v.as_str()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::JobState;
+
+    const KNOWN: &[&str] = &["state", "limit", "from"];
+
+    fn lines(r: QueryReader<'_>) -> Vec<String> {
+        match r.finish() {
+            Ok(()) => Vec::new(),
+            Err(e) => e.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn lists_merge_repeats_and_commas() {
+        let pairs = [
+            ("state", "ready, running"),
+            ("state", ""),
+            ("state", "dead"),
+        ];
+        let mut r = QueryReader::new(pairs, KNOWN);
+        let states: Vec<JobState> = r.list("state");
+        assert_eq!(states, [JobState::Ready, JobState::Running, JobState::Dead]);
+        assert!(lines(r).is_empty());
+    }
+
+    #[test]
+    fn scalars_reject_repeats_and_bad_numbers() {
+        let pairs = [("limit", "5"), ("limit", "6"), ("from", "-1")];
+        let mut r = QueryReader::new(pairs, KNOWN);
+        assert_eq!(r.number::<u32>("limit"), None);
+        assert_eq!(r.number::<u64>("from"), None);
+        assert_eq!(
+            lines(r),
+            [
+                "$.limit: may be given only once",
+                r#"$.from: invalid number "-1": invalid digit found in string"#
+            ]
+        );
+    }
+
+    #[test]
+    fn unknown_keys_are_reported_once_with_a_hint() {
+        let pairs = [("stat", "dead"), ("stat", "ready"), ("limit", "")];
+        let mut r = QueryReader::new(pairs, KNOWN);
+        assert_eq!(r.number::<u32>("limit"), None, "empty means absent");
+        assert_eq!(
+            lines(r),
+            [r#"$: unknown query parameter "stat", did you mean "state"?"#]
+        );
+    }
+}
