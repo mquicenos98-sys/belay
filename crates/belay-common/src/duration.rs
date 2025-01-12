@@ -66,6 +66,7 @@ pub fn parse_duration(s: &str) -> Result<Duration, ParseDurationError> {
     let mut previous_rank: Option<usize> = None;
 
     while pos < bytes.len() {
+        let number_start = pos;
         let number = parse_number(bytes, &mut pos).map_err(fail)?;
 
         let unit_start = pos;
@@ -77,11 +78,10 @@ pub fn parse_duration(s: &str) -> Result<Duration, ParseDurationError> {
         let unit = &s[unit_start..pos];
 
         if unit.is_empty() {
-            if pos == bytes.len() {
-                // A number at the end without a unit is seconds.
+            if number_start == 0 && pos == bytes.len() {
+                // A lone number is seconds.
                 total = number
                     .scaled(NANOS_PER_SEC)
-                    .and_then(|n| total.checked_add(n))
                     .ok_or_else(|| fail(DurationErrorKind::Overflow))?;
                 break;
             }
@@ -410,6 +410,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_and_unknown_units() {
+        assert_eq!(kind("1h30"), DurationErrorKind::MissingUnit { pos: 4 });
         assert_eq!(kind("5x"), DurationErrorKind::UnknownUnit("x".into()));
         assert_eq!(kind("5sec"), DurationErrorKind::UnknownUnit("sec".into()));
         assert_eq!(kind("5S"), DurationErrorKind::UnknownUnit("S".into()));
