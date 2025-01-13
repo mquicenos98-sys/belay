@@ -67,3 +67,141 @@ impl ToJson for QueueConfig {
             .build()
     }
 }
+
+impl FromJson for QueueConfig {
+    fn from_json(value: &Value) -> Result<QueueConfig, FromJsonError> {
+        let defaults = QueueConfig::default();
+        let r = ObjectReader::new(value, "QueueConfig")?;
+        let config = QueueConfig {
+            max_concurrency: r.opt("max_concurrency")?,
+            rate_limit: r.opt("rate_limit")?,
+            default_timeout: r.duration_or("default_timeout", defaults.default_timeout)?,
+            default_retry: r
+                .opt_with("default_retry", backoff_from_json)?
+                .unwrap_or(defaults.default_retry),
+            default_max_attempts: r.or("default_max_attempts", defaults.default_max_attempts)?,
+            retention: r.or_default("retention")?,
+        };
+        r.deny_unknown_fields()?;
+        Ok(config)
+    }
+}
+
+impl Validate for QueueConfig {
+    fn validate_into(&self, v: &mut Validator) {
+        if let Some(n) = self.max_concurrency {
+            v.check(n >= 1, "max_concurrency", || {
+                "must be at least 1; omit it for no limit".to_owned()
+            });
+        }
+        if let Some(rate) = &self.rate_limit {
+            v.nested("rate_limit", rate);
+        }
+        v.check_duration(
+            "default_timeout",
+            self.default_timeout,
+            MIN_TIMEOUT,
+            MAX_TIMEOUT,
+        );
+        v.check_range(
+            "default_max_attempts",
+            self.default_max_attempts,
+            1,
+            MAX_ATTEMPTS,
+        );
+        v.nested("retention", &self.retention);
+    }
+}
+
+/// A token bucket: `burst` tokens, refilled at `per_second`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RateLimit {
+    /// Sustained grants per second; may be fractional (`0.5` = one every
+    /// two seconds).
+    pub per_second: f64,
+    /// Bucket size: grants allowed at once after an idle period.
+    pub burst: u32,
+}
+
+impl RateLimit {
+    /// Largest `per_second` accepted.
+    pub const MAX_PER_SECOND: f64 = 1_000_000.0;
+
+    /// A limit of `per_second` with a bucket of `burst`.
+    #[must_use]
+    pub fn new(per_second: f64, burst: u32) -> RateLimit {
+        RateLimit { per_second, burst }
+    }
+
+    /// Time for one token to refill.
+    #[must_use]
+    pub fn interval(&self) -> Duration {
+        Duration::try_from_secs_f64(1.0 / self.per_second).unwrap_or(Duration::MAX)
+    }
+}
+
+impl ToJson for RateLimit {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("per_second", self.per_second)
+            .field("burst", self.burst)
+            .build()
+    }
+}
+
+impl FromJson for RateLimit {
+    fn from_json(value: &Value) -> Result<RateLimit, FromJsonError> {
+        let r = ObjectReader::new(value, "RateLimit")?;
+        let per_second: f64 = r.req("per_second")?;
+        // A burst below one would never let anything through; default to
+        // roughly one second's worth.
+        let default_burst = per_second.ceil().clamp(1.0, f64::from(u32::MAX)) as u32;
+        let limit = RateLimit {
+            per_second,
+            burst: r.or("burst", default_burst)?,
+        };
+        r.deny_unknown_fields()?;
+        Ok(limit)
+    }
+}
+
+impl Validate for RateLimit {
+    fn validate_into(&self, v: &mut Validator) {
+        let p = self.per_second;
+        v.check(
+            p > 0.0 && p <= RateLimit::MAX_PER_SECOND,
+            "per_second",
+            || {
+                format!(
+                    "must be above 0 and at most {}, got {p}",
+                    RateLimit::MAX_PER_SECOND
+                )
+            },
+        );
+        v.check(self.burst >= 1, "burst", || "must be at least 1".to_owned());
+    }
+}
+
+/// How long jobs are kept after finishing, per terminal state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retention {
+    /// Succeeded jobs; default one day.
+    pub succeeded: Duration,
+    /// Dead jobs; default seven days, since someone may want to retry them.
+    pub dead: Duration,
+    /// Cancelled jobs; default one day.
+    pub cancelled: Duration,
+}
+
+impl Retention {
+    /// The retention period of a terminal `state`; `None` for others.
+    #[must_use]
+    pub fn for_state(&self, state: JobState) -> Option<Duration> {
+        match state {
+            JobState::Succeeded => Some(self.succeeded),
+            JobState::Dead => Some(self.dead),
+            JobState::Cancelled => Some(self.cancelled),
+            _ => None,
+        }
+    }
+}
