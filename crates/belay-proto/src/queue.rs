@@ -139,3 +139,69 @@ impl RateLimit {
         Duration::try_from_secs_f64(1.0 / self.per_second).unwrap_or(Duration::MAX)
     }
 }
+
+impl ToJson for RateLimit {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("per_second", self.per_second)
+            .field("burst", self.burst)
+            .build()
+    }
+}
+
+impl FromJson for RateLimit {
+    fn from_json(value: &Value) -> Result<RateLimit, FromJsonError> {
+        let r = ObjectReader::new(value, "RateLimit")?;
+        let per_second: f64 = r.req("per_second")?;
+        // A burst below one would never let anything through; default to
+        // roughly one second's worth.
+        let default_burst = per_second.ceil().clamp(1.0, f64::from(u32::MAX)) as u32;
+        let limit = RateLimit {
+            per_second,
+            burst: r.or("burst", default_burst)?,
+        };
+        r.deny_unknown_fields()?;
+        Ok(limit)
+    }
+}
+
+impl Validate for RateLimit {
+    fn validate_into(&self, v: &mut Validator) {
+        let p = self.per_second;
+        v.check(
+            p > 0.0 && p <= RateLimit::MAX_PER_SECOND,
+            "per_second",
+            || {
+                format!(
+                    "must be above 0 and at most {}, got {p}",
+                    RateLimit::MAX_PER_SECOND
+                )
+            },
+        );
+        v.check(self.burst >= 1, "burst", || "must be at least 1".to_owned());
+    }
+}
+
+/// How long jobs are kept after finishing, per terminal state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Retention {
+    /// Succeeded jobs; default one day.
+    pub succeeded: Duration,
+    /// Dead jobs; default seven days, since someone may want to retry them.
+    pub dead: Duration,
+    /// Cancelled jobs; default one day.
+    pub cancelled: Duration,
+}
+
+impl Retention {
+    /// The retention period of a terminal `state`; `None` for others.
+    #[must_use]
+    pub fn for_state(&self, state: JobState) -> Option<Duration> {
+        match state {
+            JobState::Succeeded => Some(self.succeeded),
+            JobState::Dead => Some(self.dead),
+            JobState::Cancelled => Some(self.cancelled),
+            _ => None,
+        }
+    }
+}
