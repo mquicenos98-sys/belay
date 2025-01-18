@@ -266,3 +266,112 @@ pub struct StateCounts {
     /// Jobs in `cancelled`.
     pub cancelled: u64,
 }
+
+impl StateCounts {
+    /// The count for `state`.
+    #[must_use]
+    pub fn get(&self, state: JobState) -> u64 {
+        match state {
+            JobState::Scheduled => self.scheduled,
+            JobState::Ready => self.ready,
+            JobState::Running => self.running,
+            JobState::Retrying => self.retrying,
+            JobState::Succeeded => self.succeeded,
+            JobState::Dead => self.dead,
+            JobState::Cancelled => self.cancelled,
+        }
+    }
+
+    /// Mutable access to the count for `state`.
+    pub fn get_mut(&mut self, state: JobState) -> &mut u64 {
+        match state {
+            JobState::Scheduled => &mut self.scheduled,
+            JobState::Ready => &mut self.ready,
+            JobState::Running => &mut self.running,
+            JobState::Retrying => &mut self.retrying,
+            JobState::Succeeded => &mut self.succeeded,
+            JobState::Dead => &mut self.dead,
+            JobState::Cancelled => &mut self.cancelled,
+        }
+    }
+
+    /// Counts a new job in `state`.
+    pub fn increment(&mut self, state: JobState) {
+        *self.get_mut(state) += 1;
+    }
+
+    /// Stops counting a job in `state` (saturating at zero).
+    pub fn decrement(&mut self, state: JobState) {
+        let count = self.get_mut(state);
+        *count = count.saturating_sub(1);
+    }
+
+    /// Moves one job from `from` to `to`.
+    pub fn record_transition(&mut self, from: JobState, to: JobState) {
+        self.decrement(from);
+        self.increment(to);
+    }
+
+    /// Jobs in any state.
+    #[must_use]
+    pub fn total(&self) -> u64 {
+        JobState::ALL.iter().map(|s| self.get(*s)).sum()
+    }
+
+    /// Jobs not yet finished.
+    #[must_use]
+    pub fn pending(&self) -> u64 {
+        JobState::ALL
+            .iter()
+            .filter(|s| s.is_pending())
+            .map(|s| self.get(*s))
+            .sum()
+    }
+
+    /// `(state, count)` pairs in lifecycle order.
+    pub fn iter(&self) -> impl Iterator<Item = (JobState, u64)> + '_ {
+        JobState::ALL.into_iter().map(|s| (s, self.get(s)))
+    }
+}
+
+impl Add for StateCounts {
+    type Output = StateCounts;
+
+    fn add(mut self, rhs: StateCounts) -> StateCounts {
+        self += rhs;
+        self
+    }
+}
+
+impl AddAssign for StateCounts {
+    fn add_assign(&mut self, rhs: StateCounts) {
+        for state in JobState::ALL {
+            *self.get_mut(state) += rhs.get(state);
+        }
+    }
+}
+
+impl ToJson for StateCounts {
+    fn to_json(&self) -> Value {
+        let mut b = ObjectBuilder::with_capacity(JobState::ALL.len());
+        for (state, count) in self.iter() {
+            b.insert(state.as_str(), count);
+        }
+        b.build()
+    }
+}
+
+impl FromJson for StateCounts {
+    fn from_json(value: &Value) -> Result<StateCounts, FromJsonError> {
+        let r = ObjectReader::new(value, "StateCounts")?;
+        Ok(StateCounts {
+            scheduled: r.or_default("scheduled")?,
+            ready: r.or_default("ready")?,
+            running: r.or_default("running")?,
+            retrying: r.or_default("retrying")?,
+            succeeded: r.or_default("succeeded")?,
+            dead: r.or_default("dead")?,
+            cancelled: r.or_default("cancelled")?,
+        })
+    }
+}
