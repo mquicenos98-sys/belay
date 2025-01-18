@@ -205,3 +205,64 @@ impl Retention {
         }
     }
 }
+
+impl Default for Retention {
+    fn default() -> Retention {
+        Retention {
+            succeeded: DAY,
+            dead: 7 * DAY,
+            cancelled: DAY,
+        }
+    }
+}
+
+impl ToJson for Retention {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .duration("succeeded", self.succeeded)
+            .duration("dead", self.dead)
+            .duration("cancelled", self.cancelled)
+            .build()
+    }
+}
+
+impl FromJson for Retention {
+    fn from_json(value: &Value) -> Result<Retention, FromJsonError> {
+        let d = Retention::default();
+        let r = ObjectReader::new(value, "Retention")?;
+        let retention = Retention {
+            succeeded: r.duration_or("succeeded", d.succeeded)?,
+            dead: r.duration_or("dead", d.dead)?,
+            cancelled: r.duration_or("cancelled", d.cancelled)?,
+        };
+        r.deny_unknown_fields()?;
+        Ok(retention)
+    }
+}
+
+impl Validate for Retention {
+    fn validate_into(&self, v: &mut Validator) {
+        v.check_duration("succeeded", self.succeeded, Duration::ZERO, MAX_RETENTION);
+        v.check_duration("dead", self.dead, Duration::ZERO, MAX_RETENTION);
+        v.check_duration("cancelled", self.cancelled, Duration::ZERO, MAX_RETENTION);
+    }
+}
+
+/// Number of jobs in each state. JSON is an object with all seven states.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StateCounts {
+    /// Jobs in `scheduled`.
+    pub scheduled: u64,
+    /// Jobs in `ready`.
+    pub ready: u64,
+    /// Jobs in `running`.
+    pub running: u64,
+    /// Jobs in `retrying`.
+    pub retrying: u64,
+    /// Jobs in `succeeded`.
+    pub succeeded: u64,
+    /// Jobs in `dead`.
+    pub dead: u64,
+    /// Jobs in `cancelled`.
+    pub cancelled: u64,
+}
