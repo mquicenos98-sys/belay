@@ -375,3 +375,56 @@ impl FromJson for StateCounts {
         })
     }
 }
+
+/// Activity over a trailing window, e.g. the last minute.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Throughput {
+    /// Length of the window.
+    pub window: Duration,
+    /// Jobs enqueued.
+    pub enqueued: u64,
+    /// Jobs that succeeded.
+    pub succeeded: u64,
+    /// Attempts that failed (retried or not).
+    pub failed: u64,
+    /// Jobs that died.
+    pub dead: u64,
+}
+
+impl Throughput {
+    /// Successful completions per second over the window.
+    #[must_use]
+    pub fn succeeded_per_second(&self) -> f64 {
+        let secs = self.window.as_secs_f64();
+        if secs == 0.0 {
+            0.0
+        } else {
+            self.succeeded as f64 / secs
+        }
+    }
+}
+
+impl ToJson for Throughput {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .duration("window", self.window)
+            .field("enqueued", self.enqueued)
+            .field("succeeded", self.succeeded)
+            .field("failed", self.failed)
+            .field("dead", self.dead)
+            .build()
+    }
+}
+
+impl FromJson for Throughput {
+    fn from_json(value: &Value) -> Result<Throughput, FromJsonError> {
+        let r = ObjectReader::new(value, "Throughput")?;
+        Ok(Throughput {
+            window: r.req_duration("window")?,
+            enqueued: r.or_default("enqueued")?,
+            succeeded: r.or_default("succeeded")?,
+            failed: r.or_default("failed")?,
+            dead: r.or_default("dead")?,
+        })
+    }
+}
