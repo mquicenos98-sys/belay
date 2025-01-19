@@ -21,7 +21,6 @@ use crate::validate::{Validate, Validator};
 use crate::wire::{backoff_from_json, backoff_to_json, BuilderExt, ReaderExt};
 
 const DAY: Duration = Duration::from_secs(86_400);
-
 /// Retention may not exceed a year: terminal jobs live in memory.
 const MAX_RETENTION: Duration = Duration::from_secs(365 * 86_400);
 
@@ -426,5 +425,205 @@ impl FromJson for Throughput {
             failed: r.or_default("failed")?,
             dead: r.or_default("dead")?,
         })
+    }
+}
+
+/// A queue's status: configuration, depth and recent activity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueueInfo {
+    /// The queue.
+    pub name: QueueName,
+    /// Whether leasing is paused (enqueue still works).
+    pub paused: bool,
+    /// Current configuration.
+    pub config: QueueConfig,
+    /// Jobs per state.
+    pub counts: StateCounts,
+    /// How long the oldest ready job has been eligible; `None` when nothing
+    /// is ready. The best single signal that workers are falling behind.
+    pub oldest_ready_age: Option<Duration>,
+    /// Recent activity.
+    pub throughput: Throughput,
+}
+
+impl QueueInfo {
+    /// A queue with default configuration and no jobs.
+    #[must_use]
+    pub fn new(name: QueueName) -> QueueInfo {
+        QueueInfo {
+            name,
+            paused: false,
+            config: QueueConfig::default(),
+            counts: StateCounts::default(),
+            oldest_ready_age: None,
+            throughput: Throughput::default(),
+        }
+    }
+}
+
+impl ToJson for QueueInfo {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("name", &self.name)
+            .field("paused", self.paused)
+            .field("config", &self.config)
+            .field("counts", self.counts)
+            .opt_duration("oldest_ready_age", self.oldest_ready_age)
+            .field("throughput", self.throughput)
+            .build()
+    }
+}
+
+impl FromJson for QueueInfo {
+    fn from_json(value: &Value) -> Result<QueueInfo, FromJsonError> {
+        let r = ObjectReader::new(value, "QueueInfo")?;
+        Ok(QueueInfo {
+            name: r.req("name")?,
+            paused: r.or_default("paused")?,
+            config: r.or_default("config")?,
+            counts: r.or_default("counts")?,
+            oldest_ready_age: r.opt_duration("oldest_ready_age")?,
+            throughput: r.or_default("throughput")?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::json;
+
+    #[test]
+    fn empty_object_is_the_default_config() {
+        let config = QueueConfig::from_json(&json!({})).unwrap();
+        assert_eq!(config, QueueConfig::default());
+        assert_eq!(
+            config.to_json(),
+            json!({
+                "default_timeout": "30m",
+                "default_retry": "exp:1s*2..1h~10%",
+                "default_max_attempts": 25,
+                "retention": {"succeeded": "1d", "dead": "7d", "cancelled": "1d"}
+            })
+        );
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn full_config_round_trips() {
+        let config = QueueConfig {
+            max_concurrency: Some(8),
+            rate_limit: Some(RateLimit::new(2.5, 5)),
+            default_timeout: Duration::from_secs(90),
+            default_retry: "linear:1s+1s..1m".parse().unwrap(),
+            default_max_attempts: 3,
+            retention: Retention {
+                succeeded: Duration::from_secs(3600),
+                ..Retention::default()
+            },
+        };
+        let v = config.to_json();
+        assert_eq!(v["rate_limit"], json!({"per_second": 2.5, "burst": 5}));
+        assert_eq!(QueueConfig::from_json(&v), Ok(config));
+    }
+
+    #[test]
+    fn partial_retention_keeps_other_defaults() {
+        let config = QueueConfig::from_json(&json!({"retention": {"dead": "30d"}})).unwrap();
+        assert_eq!(config.retention.dead, Duration::from_secs(30 * 86_400));
+        assert_eq!(config.retention.succeeded, DAY);
+    }
+
+    #[test]
+    fn rate_limit_burst_defaults_to_one_seconds_worth() {
+        let r = RateLimit::from_json(&json!({"per_second": 2.5})).unwrap();
+        assert_eq!(r.burst, 3);
+        let r = RateLimit::from_json(&json!({"per_second": 0.1})).unwrap();
+        assert_eq!(r.burst, 1);
+        assert_eq!(r.interval(), Duration::from_secs(10));
+    }
+
+    #[test]
+    fn invalid_configs_report_every_problem() {
+        let v = json!({
+            "max_concurrency": 0,
+            "rate_limit": {"per_second": -1, "burst": 0},
+            "default_timeout": "10d",
+            "default_max_attempts": 0,
+        });
+        let config = QueueConfig::from_json(&v).unwrap();
+        let err = config.validate().unwrap_err();
+        let lines: Vec<String> = err.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            lines,
+            [
+                "$.max_concurrency: must be at least 1; omit it for no limit",
+                "$.rate_limit.per_second: must be above 0 and at most 1000000, got -1",
+                "$.rate_limit.burst: must be at least 1",
+                "$.default_timeout: must be between 1s and 7d, got 10d",
+                "$.default_max_attempts: must be between 1 and 1000, got 0",
+            ]
+        );
+    }
+
+    #[test]
+    fn config_rejects_unknown_fields_with_hints() {
+        let err = QueueConfig::from_json(&json!({"max_concurency": 3})).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$: unknown field "max_concurency" in QueueConfig, did you mean "max_concurrency"?"#
+        );
+        let err = QueueConfig::from_json(&json!({"default_timeout": 30})).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$.default_timeout: expected duration string such as "30s" or "1h30m", found 30"#
+        );
+    }
+
+    #[test]
+    fn state_counts_track_transitions() {
+        let mut c = StateCounts::default();
+        c.increment(JobState::Ready);
+        c.increment(JobState::Ready);
+        c.record_transition(JobState::Ready, JobState::Running);
+        c.record_transition(JobState::Running, JobState::Succeeded);
+        assert_eq!((c.ready, c.running, c.succeeded), (1, 0, 1));
+        assert_eq!((c.total(), c.pending()), (2, 1));
+        c.decrement(JobState::Dead);
+        assert_eq!(c.dead, 0, "removal saturates");
+        let sum = c + c;
+        assert_eq!(sum.total(), 4);
+        assert_eq!(
+            c.to_json(),
+            json!({"scheduled": 0, "ready": 1, "running": 0, "retrying": 0,
+                   "succeeded": 1, "dead": 0, "cancelled": 0})
+        );
+        assert_eq!(StateCounts::from_json(&c.to_json()), Ok(c));
+    }
+
+    #[test]
+    fn retention_applies_to_terminal_states_only() {
+        let r = Retention::default();
+        assert_eq!(r.for_state(JobState::Dead), Some(7 * DAY));
+        assert_eq!(r.for_state(JobState::Running), None);
+    }
+
+    #[test]
+    fn queue_info_round_trips() {
+        let mut info = QueueInfo::new(QueueName::from_static("emails"));
+        info.paused = true;
+        info.counts.ready = 12;
+        info.oldest_ready_age = Some(Duration::from_secs(95));
+        info.throughput = Throughput {
+            window: Duration::from_secs(60),
+            enqueued: 30,
+            succeeded: 120,
+            failed: 2,
+            dead: 0,
+        };
+        let v = info.to_json();
+        assert_eq!(v["oldest_ready_age"], "1m35s");
+        assert_eq!(QueueInfo::from_json(&v), Ok(info.clone()));
+        assert_eq!(info.throughput.succeeded_per_second(), 2.0);
     }
 }
