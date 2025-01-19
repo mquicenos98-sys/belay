@@ -171,3 +171,137 @@ impl fmt::Display for TimeOfDay {
         write!(f, "{:02}:{:02}", self.minutes / 60, self.minutes % 60)
     }
 }
+
+impl FromStr for TimeOfDay {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<TimeOfDay, ParseError> {
+        let b = s.as_bytes();
+        let shape_ok =
+            b.len() == 5 && b[2] == b':' && [0, 1, 3, 4].iter().all(|&i| b[i].is_ascii_digit());
+        if !shape_ok {
+            return Err(ParseError::invalid("time of day", s, "expected HH:MM"));
+        }
+        let hour = (b[0] - b'0') * 10 + (b[1] - b'0');
+        let minute = (b[3] - b'0') * 10 + (b[4] - b'0');
+        TimeOfDay::new(hour, minute)
+    }
+}
+
+text_json!(TimeOfDay, "time of day");
+
+/// A set of weekdays.
+///
+/// Text form: comma-separated days or ranges, `mon-fri`, `sat,sun`,
+/// `fri-mon` (ranges may wrap). Names are full or three-letter, any case.
+/// JSON: an array of lowercase three-letter names in ISO order (Monday
+/// first); on input the array items may themselves be ranges, and a single
+/// string is accepted too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct WeekdaySet(u8);
+
+impl WeekdaySet {
+    /// No days.
+    pub const EMPTY: WeekdaySet = WeekdaySet(0);
+    /// Every day.
+    pub const ALL: WeekdaySet = WeekdaySet(0x7F);
+
+    fn bit(day: Weekday) -> u8 {
+        1 << (day.number_from_monday() - 1)
+    }
+
+    /// Adds a day.
+    pub fn insert(&mut self, day: Weekday) {
+        self.0 |= WeekdaySet::bit(day);
+    }
+
+    /// Whether `day` is in the set.
+    #[must_use]
+    pub fn contains(self, day: Weekday) -> bool {
+        self.0 & WeekdaySet::bit(day) != 0
+    }
+
+    /// Whether the set has no days.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// Number of days in the set.
+    #[must_use]
+    pub fn len(self) -> usize {
+        self.0.count_ones() as usize
+    }
+
+    /// The days, Monday first.
+    pub fn iter(self) -> impl Iterator<Item = Weekday> {
+        Weekday::ALL.into_iter().filter(move |d| self.contains(*d))
+    }
+
+    fn parse_day(s: &str, whole: &str) -> Result<Weekday, ParseError> {
+        s.trim().parse::<Weekday>().map_err(|_| {
+            ParseError::invalid(
+                "weekday set",
+                whole,
+                format!(
+                    "{:?} is not a weekday (use mon, tue, ... or monday, ...)",
+                    s.trim()
+                ),
+            )
+        })
+    }
+
+    fn add_item(&mut self, item: &str, whole: &str) -> Result<(), ParseError> {
+        match item.split_once('-') {
+            Some((from, to)) => {
+                let (mut day, last) = (Self::parse_day(from, whole)?, Self::parse_day(to, whole)?);
+                self.insert(day);
+                while day != last {
+                    day = day.succ();
+                    self.insert(day);
+                }
+            }
+            None => self.insert(Self::parse_day(item, whole)?),
+        }
+        Ok(())
+    }
+}
+
+impl FromIterator<Weekday> for WeekdaySet {
+    fn from_iter<I: IntoIterator<Item = Weekday>>(days: I) -> WeekdaySet {
+        let mut set = WeekdaySet::EMPTY;
+        for day in days {
+            set.insert(day);
+        }
+        set
+    }
+}
+
+impl fmt::Display for WeekdaySet {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<String> = self.iter().map(short_name).collect();
+        f.write_str(&names.join(","))
+    }
+}
+
+impl FromStr for WeekdaySet {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<WeekdaySet, ParseError> {
+        let mut set = WeekdaySet::EMPTY;
+        for item in s.split(',') {
+            set.add_item(item, s)?;
+        }
+        Ok(set)
+    }
+}
+
+fn short_name(day: Weekday) -> String {
+    day.short_name().to_ascii_lowercase()
+}
+
+impl ToJson for WeekdaySet {
+    fn to_json(&self) -> Value {
+        Value::Array(self.iter().map(|d| Value::String(short_name(d))).collect())
+    }
+}
