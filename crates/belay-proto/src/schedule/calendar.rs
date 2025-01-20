@@ -305,3 +305,386 @@ impl ToJson for WeekdaySet {
         Value::Array(self.iter().map(|d| Value::String(short_name(d))).collect())
     }
 }
+
+impl FromJson for WeekdaySet {
+    fn from_json(value: &Value) -> Result<WeekdaySet, FromJsonError> {
+        let parse = |s: &str| {
+            s.parse::<WeekdaySet>()
+                .map_err(|e| FromJsonError::new(e.to_string()))
+        };
+        match value {
+            Value::String(s) => parse(s),
+            Value::Array(items) => {
+                let mut set = WeekdaySet::EMPTY;
+                for (i, item) in items.iter().enumerate() {
+                    let s = item.as_str().ok_or_else(|| {
+                        FromJsonError::expected("weekday string", item).at_index(i)
+                    })?;
+                    set.0 |= parse(s).map_err(|e| e.at_index(i))?.0;
+                }
+                Ok(set)
+            }
+            other => Err(FromJsonError::expected("array of weekdays", other)),
+        }
+    }
+}
+
+/// A daily time range on some weekdays, `[start, end)` in local time.
+///
+/// A window whose `end` is not after its `start` wraps past midnight:
+/// `22:00-06:00` on `fri` covers Friday 22:00 to Saturday 06:00. `days`
+/// always names the day the window *starts*; an empty set means every day.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TimeWindow {
+    /// The days the window starts on; empty for every day.
+    pub days: WeekdaySet,
+    /// Start, inclusive.
+    pub start: TimeOfDay,
+    /// End, exclusive.
+    pub end: TimeOfDay,
+}
+
+impl TimeWindow {
+    /// A window on `days` from `start` to `end`.
+    #[must_use]
+    pub fn new(days: WeekdaySet, start: TimeOfDay, end: TimeOfDay) -> TimeWindow {
+        TimeWindow { days, start, end }
+    }
+
+    fn starts_on(&self, day: Weekday) -> bool {
+        self.days.is_empty() || self.days.contains(day)
+    }
+
+    /// Whether local time `time` on `date` falls inside the window.
+    #[must_use]
+    pub fn contains(&self, date: CalendarDate, time: TimeOfDay) -> bool {
+        if self.start < self.end {
+            self.starts_on(date.weekday()) && self.start <= time && time < self.end
+        } else {
+            (self.starts_on(date.weekday()) && time >= self.start)
+                || (self.starts_on(date.weekday()) && time < self.end)
+        }
+    }
+}
+
+impl ToJson for TimeWindow {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field_if(!self.days.is_empty(), "days", self.days)
+            .field("start", self.start)
+            .field("end", self.end)
+            .build()
+    }
+}
+
+impl FromJson for TimeWindow {
+    fn from_json(value: &Value) -> Result<TimeWindow, FromJsonError> {
+        let r = ObjectReader::new(value, "TimeWindow")?;
+        let window = TimeWindow {
+            days: r.or_default("days")?,
+            start: r.req("start")?,
+            end: r.req("end")?,
+        };
+        r.deny_unknown_fields()?;
+        Ok(window)
+    }
+}
+
+impl Validate for TimeWindow {
+    fn validate_into(&self, v: &mut Validator) {
+        v.check(self.start != TimeOfDay::END_OF_DAY, "start", || {
+            "24:00 is only valid as an end time".to_owned()
+        });
+        v.check(self.start != self.end, "end", || {
+            "must differ from start; use 00:00-24:00 for the whole day".to_owned()
+        });
+    }
+}
+
+/// A named set of rules for when schedules may fire.
+///
+/// A local date and time is allowed when its date is not excluded, its
+/// weekday is not excluded, and it falls inside at least one window (or
+/// there are no windows).
+///
+/// ```
+/// use belay_proto::schedule::{CalendarDate, CalendarSpec, TimeOfDay};
+///
+/// let cal: CalendarSpec = belay_json::from_str(r#"{
+///     "name": "business-hours",
+///     "timezone": "America/Bogota",
+///     "exclude_dates": ["2025-12-25"],
+///     "windows": [{"days": ["mon-fri"], "start": "09:00", "end": "17:00"}]
+/// }"#).unwrap();
+/// let tuesday: CalendarDate = "2025-12-23".parse().unwrap();
+/// assert!(cal.allows(tuesday, "10:30".parse().unwrap()));
+/// assert!(!cal.allows(tuesday, "17:00".parse().unwrap()));
+/// assert!(!cal.allows("2025-12-25".parse().unwrap(), "10:30".parse().unwrap()));
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CalendarSpec {
+    /// The calendar's name, referenced by schedules.
+    pub name: String,
+    /// Zone of the local times the rules refer to; default `UTC`.
+    pub timezone: String,
+    /// Dates on which nothing fires.
+    pub exclude_dates: BTreeSet<CalendarDate>,
+    /// Weekdays on which nothing fires.
+    pub exclude_weekdays: WeekdaySet,
+    /// Allowed time ranges; empty for the whole day.
+    pub windows: Vec<TimeWindow>,
+    /// Free text for humans.
+    pub description: Option<String>,
+}
+
+impl CalendarSpec {
+    /// A calendar that allows everything, in UTC.
+    #[must_use]
+    pub fn new(name: impl Into<String>) -> CalendarSpec {
+        CalendarSpec {
+            name: name.into(),
+            timezone: "UTC".to_owned(),
+            exclude_dates: BTreeSet::new(),
+            exclude_weekdays: WeekdaySet::EMPTY,
+            windows: Vec::new(),
+            description: None,
+        }
+    }
+
+    /// Whether local time `time` on `date` is allowed.
+    #[must_use]
+    pub fn allows(&self, date: CalendarDate, time: TimeOfDay) -> bool {
+        !self.exclude_dates.contains(&date)
+            && !self.exclude_weekdays.contains(date.weekday())
+            && (self.windows.is_empty() || self.windows.iter().any(|w| w.contains(date, time)))
+    }
+}
+
+impl ToJson for CalendarSpec {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("name", &self.name)
+            .field("timezone", &self.timezone)
+            .field_if(
+                !self.exclude_dates.is_empty(),
+                "exclude_dates",
+                &self.exclude_dates,
+            )
+            .field_if(
+                !self.exclude_weekdays.is_empty(),
+                "exclude_weekdays",
+                self.exclude_weekdays,
+            )
+            .field_if(!self.windows.is_empty(), "windows", &self.windows)
+            .opt_field("description", &self.description)
+            .build()
+    }
+}
+
+impl FromJson for CalendarSpec {
+    fn from_json(value: &Value) -> Result<CalendarSpec, FromJsonError> {
+        let r = ObjectReader::new(value, "CalendarSpec")?;
+        let spec = CalendarSpec {
+            name: r.req("name")?,
+            timezone: r.or_else("timezone", || "UTC".to_owned())?,
+            exclude_dates: r.or_default("exclude_dates")?,
+            exclude_weekdays: r.or_default("exclude_weekdays")?,
+            windows: r.or_default("windows")?,
+            description: r.opt("description")?,
+        };
+        r.deny_unknown_fields()?;
+        Ok(spec)
+    }
+}
+
+impl Validate for CalendarSpec {
+    fn validate_into(&self, v: &mut Validator) {
+        v.check_name("name", &self.name, SLUG_RULE);
+        validate_timezone(v, &self.timezone);
+        v.check(
+            self.exclude_dates.len() <= MAX_CALENDAR_DATES,
+            "exclude_dates",
+            || {
+                format!(
+                    "at most {MAX_CALENDAR_DATES} dates are allowed, got {}",
+                    self.exclude_dates.len()
+                )
+            },
+        );
+        v.check(
+            self.exclude_weekdays != WeekdaySet::ALL,
+            "exclude_weekdays",
+            || "excludes every day, so nothing could ever fire".to_owned(),
+        );
+        v.check(
+            self.windows.len() <= MAX_CALENDAR_WINDOWS,
+            "windows",
+            || {
+                format!(
+                    "at most {MAX_CALENDAR_WINDOWS} windows are allowed, got {}",
+                    self.windows.len()
+                )
+            },
+        );
+        v.nested("windows", &self.windows);
+        if let Some(text) = &self.description {
+            v.check_bytes("description", text, MAX_DESCRIPTION_BYTES);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::json;
+
+    fn date(s: &str) -> CalendarDate {
+        s.parse().unwrap()
+    }
+
+    fn time(s: &str) -> TimeOfDay {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn dates_are_strict_and_know_their_weekday() {
+        assert_eq!(date("2024-02-29").weekday(), Weekday::Thursday);
+        assert_eq!(date("2025-03-01").pred(), date("2025-02-28"));
+        assert_eq!(date("2024-03-01").pred(), date("2024-02-29"));
+        assert_eq!(date("0000-01-01").pred(), date("0000-01-01"));
+        assert_eq!(date("2025-01-05").to_string(), "2025-01-05");
+        for (bad, reason) in [
+            ("2025-1-5", "expected YYYY-MM-DD"),
+            ("2025/01/05", "expected YYYY-MM-DD"),
+            ("2023-02-29", "day must be 01-28 in that month"),
+            ("2023-13-01", "month must be 01-12"),
+        ] {
+            assert_eq!(
+                bad.parse::<CalendarDate>().unwrap_err().to_string(),
+                format!("invalid date {bad:?}: {reason}")
+            );
+        }
+        assert!(date("2025-01-31") > date("2025-01-30"));
+    }
+
+    #[test]
+    fn times_of_day_allow_end_of_day_only_on_the_hour() {
+        assert_eq!(time("00:00"), TimeOfDay::MIDNIGHT);
+        assert_eq!(time("24:00"), TimeOfDay::END_OF_DAY);
+        assert_eq!(time("09:05").minutes(), 545);
+        assert_eq!(
+            "24:01".parse::<TimeOfDay>().unwrap_err().to_string(),
+            r#"invalid time of day "24:01": expected 00:00 through 24:00"#
+        );
+        assert!("9:00".parse::<TimeOfDay>().is_err());
+        assert!("09:60".parse::<TimeOfDay>().is_err());
+    }
+
+    #[test]
+    fn weekday_sets_parse_ranges_and_wraps() {
+        let weekdays: WeekdaySet = "mon-fri".parse().unwrap();
+        assert_eq!(weekdays.len(), 5);
+        assert_eq!(weekdays.to_string(), "mon,tue,wed,thu,fri");
+        let wrap: WeekdaySet = "fri-mon".parse().unwrap();
+        assert_eq!(wrap.to_string(), "mon,fri,sat,sun");
+        let named: WeekdaySet = "Saturday, SUN".parse().unwrap();
+        assert_eq!(named.to_json(), json!(["sat", "sun"]));
+        assert_eq!(
+            "mon-fry".parse::<WeekdaySet>().unwrap_err().to_string(),
+            r#"invalid weekday set "mon-fry": "fry" is not a weekday (use mon, tue, ... or monday, ...)"#
+        );
+    }
+
+    #[test]
+    fn weekday_set_json_accepts_arrays_of_ranges_and_strings() {
+        let a = WeekdaySet::from_json(&json!(["mon-wed", "fri"])).unwrap();
+        assert_eq!(a.to_string(), "mon,tue,wed,fri");
+        assert_eq!(WeekdaySet::from_json(&json!("sat,sun")).unwrap().len(), 2);
+        let err = WeekdaySet::from_json(&json!(["mon", 3])).unwrap_err();
+        assert_eq!(err.to_string(), "$[1]: expected weekday string, found 3");
+        let err = WeekdaySet::from_json(&json!(["mon", "xyz"])).unwrap_err();
+        assert!(err
+            .to_string()
+            .starts_with(r#"$[1]: invalid weekday set "xyz""#));
+    }
+
+    #[test]
+    fn calendars_combine_exclusions_and_windows() {
+        let mut cal = CalendarSpec::new("ops");
+        assert!(
+            cal.allows(date("2025-03-08"), time("03:00")),
+            "empty calendar allows all"
+        );
+        cal.exclude_weekdays = "sun".parse().unwrap();
+        cal.exclude_dates.insert(date("2025-03-10"));
+        cal.windows.push(TimeWindow::new(
+            WeekdaySet::EMPTY,
+            time("08:00"),
+            time("12:00"),
+        ));
+        assert!(cal.allows(date("2025-03-08"), time("08:00")));
+        assert!(
+            !cal.allows(date("2025-03-09"), time("09:00")),
+            "sunday excluded"
+        );
+        assert!(
+            !cal.allows(date("2025-03-10"), time("09:00")),
+            "date excluded"
+        );
+        assert!(
+            !cal.allows(date("2025-03-11"), time("12:00")),
+            "outside window"
+        );
+        let back = CalendarSpec::from_json(&cal.to_json()).unwrap();
+        assert_eq!(back, cal);
+        assert_eq!(
+            cal.to_json(),
+            json!({
+                "name": "ops", "timezone": "UTC", "exclude_dates": ["2025-03-10"],
+                "exclude_weekdays": ["sun"], "windows": [{"start": "08:00", "end": "12:00"}]
+            })
+        );
+    }
+
+    #[test]
+    fn calendar_validation_and_decode_errors() {
+        let mut cal = CalendarSpec::new("Ops Team");
+        cal.exclude_weekdays = WeekdaySet::ALL;
+        cal.windows.push(TimeWindow::new(
+            WeekdaySet::EMPTY,
+            time("24:00"),
+            time("24:00"),
+        ));
+        let lines: Vec<String> = cal
+            .validate()
+            .unwrap_err()
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            lines,
+            [
+                "$.name: must start with a lowercase letter or digit, got 'O'",
+                "$.exclude_weekdays: excludes every day, so nothing could ever fire",
+                "$.windows[0].start: 24:00 is only valid as an end time",
+                "$.windows[0].end: must differ from start; use 00:00-24:00 for the whole day",
+            ]
+        );
+        let err = CalendarSpec::from_json(&json!({
+            "name": "x", "exclude_dates": ["2025-01-01", "2025-02-30"]
+        }))
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$.exclude_dates[1]: invalid date "2025-02-30": day must be 01-28 in that month"#
+        );
+        let err = CalendarSpec::from_json(&json!({
+            "name": "x", "windows": [{"start": "9am", "end": "17:00"}]
+        }))
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            r#"$.windows[0].start: invalid time of day "9am": expected HH:MM"#
+        );
+    }
+}
