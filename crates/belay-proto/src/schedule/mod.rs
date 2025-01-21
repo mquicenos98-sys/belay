@@ -367,3 +367,268 @@ pub(crate) fn validate_timezone(v: &mut Validator, tz: &str) {
         v.report("timezone", problem);
     }
 }
+
+/// A schedule and its firing history.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Schedule {
+    /// What was submitted.
+    pub spec: ScheduleSpec,
+    /// The next time it will fire, before jitter; `None` if it never will
+    /// again (past `ends_at`, or an expression with no future match).
+    pub next_fire_at: Option<Timestamp>,
+    /// The nominal time of the latest fire.
+    pub last_fire_at: Option<Timestamp>,
+    /// The job enqueued by the latest fire.
+    pub last_job: Option<JobId>,
+    /// Fires so far.
+    pub fire_count: u64,
+    /// When it was created.
+    pub created_at: Timestamp,
+    /// When it last changed.
+    pub updated_at: Timestamp,
+}
+
+impl Schedule {
+    /// A schedule that has never fired.
+    #[must_use]
+    pub fn new(spec: ScheduleSpec, next_fire_at: Option<Timestamp>, now: Timestamp) -> Schedule {
+        Schedule {
+            spec,
+            next_fire_at,
+            last_fire_at: None,
+            last_job: None,
+            fire_count: 0,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// The schedule's id.
+    #[must_use]
+    pub fn id(&self) -> &ScheduleId {
+        &self.spec.id
+    }
+
+    /// Records a fire at nominal time `fire_time` that enqueued `job`.
+    pub fn record_fire(
+        &mut self,
+        fire_time: Timestamp,
+        job: JobId,
+        next_fire_at: Option<Timestamp>,
+        now: Timestamp,
+    ) {
+        self.last_fire_at = Some(fire_time);
+        self.last_job = Some(job);
+        self.fire_count += 1;
+        self.next_fire_at = next_fire_at;
+        self.updated_at = now;
+    }
+
+    /// Whether a fire at `t` may happen: not paused and within bounds.
+    #[must_use]
+    pub fn is_active_at(&self, t: Timestamp) -> bool {
+        !self.spec.paused && self.spec.within_bounds(t)
+    }
+}
+
+impl ToJson for Schedule {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("spec", &self.spec)
+            .opt_timestamp("next_fire_at", self.next_fire_at)
+            .opt_timestamp("last_fire_at", self.last_fire_at)
+            .opt_field("last_job", &self.last_job)
+            .field("fire_count", self.fire_count)
+            .timestamp("created_at", self.created_at)
+            .timestamp("updated_at", self.updated_at)
+            .build()
+    }
+}
+
+impl FromJson for Schedule {
+    fn from_json(value: &Value) -> Result<Schedule, FromJsonError> {
+        let r = ObjectReader::new(value, "Schedule")?;
+        Ok(Schedule {
+            spec: r.req("spec")?,
+            next_fire_at: r.opt_timestamp("next_fire_at")?,
+            last_fire_at: r.opt_timestamp("last_fire_at")?,
+            last_job: r.opt("last_job")?,
+            fire_count: r.or_default("fire_count")?,
+            created_at: r.req_timestamp("created_at")?,
+            updated_at: r.req_timestamp("updated_at")?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::json;
+
+    fn spec() -> ScheduleSpec {
+        ScheduleSpec::new(
+            ScheduleId::from_static("nightly-report"),
+            "0 2 * * *",
+            JobSpec::new("reports", "build"),
+        )
+    }
+
+    fn problems(spec: &ScheduleSpec) -> Vec<String> {
+        match spec.validate() {
+            Ok(()) => Vec::new(),
+            Err(e) => e.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn minimal_schedule_json_fills_defaults() {
+        let v = json!({
+            "id": "nightly-report",
+            "cron": "0 2 * * *",
+            "template": {"queue": "reports", "kind": "build"}
+        });
+        let parsed = ScheduleSpec::from_json(&v).unwrap();
+        assert_eq!(parsed, spec());
+        assert_eq!(
+            parsed.to_json(),
+            json!({
+                "id": "nightly-report", "cron": "0 2 * * *", "timezone": "UTC",
+                "template": {"queue": "reports", "kind": "build", "priority": 0},
+                "misfire": "fire_once", "overlap": "allow", "jitter": "0s", "paused": false
+            })
+        );
+    }
+
+    #[test]
+    fn full_schedule_round_trips() {
+        let s = spec()
+            .timezone("Europe/Berlin")
+            .misfire(MisfirePolicy::FireAll { max: 5 })
+            .overlap(OverlapPolicy::CancelPrevious)
+            .jitter(Duration::from_secs(30))
+            .between(
+                Some(Timestamp::from_millis(0)),
+                Some(Timestamp::from_millis(86_400_000)),
+            )
+            .calendar("workdays")
+            .description("daily numbers for finance");
+        let v = s.to_json();
+        assert_eq!(v["misfire"], "fire_all:5");
+        assert_eq!(ScheduleSpec::from_json(&v), Ok(s.clone()));
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn policy_text_forms() {
+        assert_eq!("fire_all".parse(), Ok(MisfirePolicy::FireAll { max: 100 }));
+        assert_eq!("fire_all:3".parse(), Ok(MisfirePolicy::FireAll { max: 3 }));
+        assert_eq!(
+            "fire_all:x"
+                .parse::<MisfirePolicy>()
+                .unwrap_err()
+                .to_string(),
+            r#"invalid misfire policy "fire_all:x": expected fire_all:<count>"#
+        );
+        assert_eq!(
+            "fire_onse"
+                .parse::<MisfirePolicy>()
+                .unwrap_err()
+                .to_string(),
+            r#"unknown misfire policy "fire_onse", did you mean "fire_once"?"#
+        );
+        for p in [
+            OverlapPolicy::Allow,
+            OverlapPolicy::Skip,
+            OverlapPolicy::CancelPrevious,
+        ] {
+            assert_eq!(p.to_string().parse(), Ok(p));
+        }
+    }
+
+    #[test]
+    fn rejects_templates_the_scheduler_must_control() {
+        let mut s = spec();
+        s.template = s
+            .template
+            .run_at(Timestamp::from_millis(5))
+            .unique("x", crate::UniqueScope::UntilFinished)
+            .meta(crate::job::META_SCHEDULE, "spoofed");
+        assert_eq!(
+            problems(&s),
+            [
+                "$.template.run_at: must not be set; each fire computes its own run time",
+                "$.template.unique: must not be set; the scheduler gives every fire its own key",
+                r#"$.template.meta["belay.schedule"]: keys starting with "belay." are set by belay"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn validation_catches_impossible_values() {
+        let mut s = spec()
+            .timezone("Europe/ Berlin")
+            .jitter(Duration::from_secs(7200));
+        s.cron = "0 2 *".into();
+        s.misfire = MisfirePolicy::FireAll { max: 0 };
+        s.starts_at = Some(Timestamp::from_millis(10));
+        s.ends_at = Some(Timestamp::from_millis(10));
+        s.calendar = Some("Work Days".into());
+        s.template.priority = 2000;
+        assert_eq!(
+            problems(&s),
+            [
+                "$.cron: must have 5, 6 or 7 fields, got 3",
+                "$.timezone: must not contain spaces or control characters",
+                "$.template.priority: must be between -1000 and 1000, got 2000",
+                "$.misfire: must be between 1 and 1000, got 0",
+                "$.jitter: must be at most 1h, got 2h",
+                "$.ends_at: must be after starts_at (1970-01-01T00:00:00.010Z)",
+                "$.calendar: must start with a lowercase letter or digit, got 'W'",
+            ]
+        );
+    }
+
+    #[test]
+    fn cron_nicknames_stand_alone() {
+        assert_eq!(cron_shape_problem("@daily"), None);
+        assert_eq!(cron_shape_problem(" 0 0 * * * * * "), None);
+        assert_eq!(
+            cron_shape_problem("@daily 5"),
+            Some("a nickname such as @daily stands alone, got 2 fields".to_owned())
+        );
+        assert_eq!(
+            cron_shape_problem("  "),
+            Some("must not be empty".to_owned())
+        );
+    }
+
+    #[test]
+    fn bounds_are_half_open() {
+        let s = spec().between(
+            Some(Timestamp::from_millis(100)),
+            Some(Timestamp::from_millis(200)),
+        );
+        assert!(!s.within_bounds(Timestamp::from_millis(99)));
+        assert!(s.within_bounds(Timestamp::from_millis(100)));
+        assert!(!s.within_bounds(Timestamp::from_millis(200)));
+    }
+
+    #[test]
+    fn schedule_records_fires_and_round_trips() {
+        let now = Timestamp::from_millis(1_000);
+        let mut sched = Schedule::new(spec(), Some(Timestamp::from_millis(7_200_000)), now);
+        assert!(sched.is_active_at(now));
+        let job = JobId::generate();
+        sched.record_fire(
+            Timestamp::from_millis(7_200_000),
+            job,
+            Some(Timestamp::from_millis(93_600_000)),
+            Timestamp::from_millis(7_200_050),
+        );
+        assert_eq!((sched.fire_count, sched.last_job), (1, Some(job)));
+        assert_eq!(Schedule::from_json(&sched.to_json()), Ok(sched.clone()));
+        sched.spec.paused = true;
+        assert!(!sched.is_active_at(now));
+        assert_eq!(sched.id().as_str(), "nightly-report");
+    }
+}
