@@ -323,3 +323,47 @@ impl Validate for ScheduleSpec {
         }
     }
 }
+
+/// Rejects expressions no cron dialect accepts; belay-cron does the rest.
+fn cron_shape_problem(cron: &str) -> Option<String> {
+    let trimmed = cron.trim();
+    if trimmed.is_empty() {
+        return Some("must not be empty".to_owned());
+    }
+    if cron.len() > MAX_CRON_LEN {
+        return Some(format!(
+            "must be at most {MAX_CRON_LEN} bytes, got {}",
+            cron.len()
+        ));
+    }
+    if cron.chars().any(char::is_control) {
+        return Some("must not contain control characters".to_owned());
+    }
+    let fields = trimmed.split_whitespace().count();
+    if trimmed.starts_with('@') {
+        (fields != 1)
+            .then(|| format!("a nickname such as @daily stands alone, got {fields} fields"))
+    } else {
+        (!(5..=7).contains(&fields)).then(|| format!("must have 5, 6 or 7 fields, got {fields}"))
+    }
+}
+
+/// Time zone strings: non-empty, short, printable, no spaces. Whether the
+/// zone exists is checked by the scheduler, which owns the zone table.
+pub(crate) fn validate_timezone(v: &mut Validator, tz: &str) {
+    let problem = if tz.is_empty() {
+        Some("must not be empty".to_owned())
+    } else if tz.len() > MAX_TIMEZONE_LEN {
+        Some(format!(
+            "must be at most {MAX_TIMEZONE_LEN} bytes, got {}",
+            tz.len()
+        ))
+    } else if tz.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        Some("must not contain spaces or control characters".to_owned())
+    } else {
+        None
+    };
+    if let Some(problem) = problem {
+        v.report("timezone", problem);
+    }
+}
