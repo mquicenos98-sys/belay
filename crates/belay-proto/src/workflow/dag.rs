@@ -318,3 +318,169 @@ impl Validate for WorkflowSpec {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::StepSpec;
+    use super::*;
+    use crate::job::JobSpec;
+    use belay_json::json;
+
+    fn step(name: &str, deps: &[&str]) -> StepSpec {
+        deps.iter()
+            .fold(StepSpec::new(name, JobSpec::new("q", "k")), |s, d| {
+                s.after(*d)
+            })
+    }
+
+    fn workflow(steps: Vec<StepSpec>) -> WorkflowSpec {
+        steps
+            .into_iter()
+            .fold(WorkflowSpec::new("wf"), WorkflowSpec::step)
+    }
+
+    fn problems(wf: &WorkflowSpec) -> Vec<String> {
+        match wf.validate() {
+            Ok(()) => Vec::new(),
+            Err(e) => e.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn topological_order_prefers_declaration_order() {
+        let wf = workflow(vec![
+            step("report", &["merge"]),
+            step("b", &[]),
+            step("merge", &["a", "b"]),
+            step("a", &[]),
+        ]);
+        assert_eq!(
+            wf.topological_order().unwrap(),
+            ["b", "a", "merge", "report"]
+        );
+        assert_eq!(
+            wf.roots().map(|s| s.name.as_str()).collect::<Vec<_>>(),
+            ["b", "a"]
+        );
+        assert_eq!(wf.dependents("b"), ["merge"]);
+    }
+
+    #[test]
+    fn reachability_is_transitive() {
+        let wf = workflow(vec![
+            step("a", &[]),
+            step("b", &["a"]),
+            step("c", &["b"]),
+            step("d", &["a"]),
+            step("e", &[]),
+        ]);
+        let set = |items: &[&'static str]| items.iter().copied().collect::<BTreeSet<&str>>();
+        assert_eq!(wf.ancestors("c"), set(&["a", "b"]));
+        assert_eq!(wf.descendants("a"), set(&["b", "c", "d"]));
+        assert!(wf.descendants("e").is_empty());
+        assert!(wf.ancestors("missing").is_empty());
+    }
+
+    #[test]
+    fn acyclic_diamonds_are_not_cycles() {
+        let wf = workflow(vec![
+            step("top", &[]),
+            step("l", &["top"]),
+            step("r", &["top"]),
+            step("bottom", &["l", "r"]),
+        ]);
+        assert_eq!(wf.find_cycle(), None);
+        assert!(wf.validate().is_ok());
+    }
+
+    #[test]
+    fn reference_problems_are_reported_per_dependency() {
+        let wf = workflow(vec![
+            step("fetch", &[]),
+            step("parse", &["fetch", "fetchh", "fetch"]),
+            step("fetch", &[]),
+            step("loop", &["loop"]),
+            step("Bad.Name", &[]),
+        ]);
+        assert_eq!(
+            problems(&wf),
+            [
+                r#"$.steps[1].depends_on[1]: unknown step "fetchh", did you mean "fetch"?"#,
+                r#"$.steps[1].depends_on[2]: duplicate dependency "fetch""#,
+                r#"$.steps[2].name: duplicate step name "fetch" (also steps[0])"#,
+                r#"$.steps[3].depends_on[0]: step "loop" cannot depend on itself"#,
+                "$.steps[4].name: must start with a lowercase letter or digit, got 'B'",
+            ]
+        );
+    }
+
+    #[test]
+    fn step_jobs_are_validated_in_place() {
+        let mut wf = workflow(vec![step("a", &[])]);
+        wf.steps[0].job.priority = 9999;
+        wf.steps[0].job.workflow = Some(crate::WorkflowRef {
+            id: crate::WorkflowId::generate(),
+            step: "a".into(),
+        });
+        assert_eq!(
+            problems(&wf),
+            [
+                "$.steps[0].job.priority: must be between -1000 and 1000, got 9999",
+                "$.steps[0].job.workflow: must not be set; the workflow engine links each step to its run",
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_and_oversized_workflows() {
+        assert_eq!(
+            problems(&WorkflowSpec::new("wf")),
+            ["$.steps: must contain at least one step"]
+        );
+        let big = workflow((0..300).map(|i| step(&format!("s{i}"), &[])).collect());
+        assert_eq!(
+            problems(&big),
+            ["$.steps: at most 256 steps are allowed, got 300"]
+        );
+        let mut named = workflow(vec![step("a", &[])]);
+        named.name = String::new();
+        assert_eq!(problems(&named), ["$.name: must not be empty"]);
+    }
+
+    #[test]
+    fn placeholders_must_name_ancestors() {
+        let mut wf = workflow(vec![
+            step("fetch", &[]),
+            step("side", &[]),
+            step("store", &["fetch"]),
+        ]);
+        wf.steps[2].job.payload = json!({
+            "url": "{{steps.fetch.result.url}}",
+            "extra": ["{{steps.side.result}}", "{{steps.ghost.result}}"],
+        });
+        assert_eq!(
+            problems(&wf),
+            [
+                r#"$.steps[2].job.payload: placeholder refers to unknown step "ghost""#,
+                r#"$.steps[2].job.payload: placeholder refers to step "side", which "store" does not depend on"#,
+            ]
+        );
+        wf.steps[2].depends_on.push("side".into());
+        wf.steps[2].job.payload = json!("{{steps.fetch.result}} and {{ steps.side.result.n }}");
+        assert!(wf.validate().is_ok());
+    }
+
+    #[test]
+    fn placeholder_scanning_ignores_malformed_markers() {
+        let v = json!([
+            "{{steps.}}",
+            "{{steps",
+            "text {{ step.x }}",
+            "{{steps.a}}{{steps.b.c}}"
+        ]);
+        assert_eq!(
+            referenced_steps(&v).into_iter().collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+    }
+}
