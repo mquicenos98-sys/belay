@@ -197,3 +197,124 @@ pub fn referenced_steps(payload: &Value) -> BTreeSet<&str> {
     collect_references(payload, &mut found);
     found
 }
+
+fn collect_references<'a>(value: &'a Value, found: &mut BTreeSet<&'a str>) {
+    match value {
+        Value::String(s) => {
+            let mut rest = s.as_str();
+            while let Some(open) = rest.find("{{") {
+                let after = &rest[open + 2..];
+                let Some(close) = after.find("}}") else { break };
+                let inner = after[..close].trim();
+                if let Some(path) = inner.strip_prefix("steps.") {
+                    let name = path.split('.').next().unwrap_or(path);
+                    if !name.is_empty() {
+                        found.insert(name);
+                    }
+                }
+                rest = &after[close + 2..];
+            }
+        }
+        Value::Array(items) => items.iter().for_each(|v| collect_references(v, found)),
+        Value::Object(map) => map.values().for_each(|v| collect_references(v, found)),
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
+    }
+}
+
+impl Validate for WorkflowSpec {
+    fn validate_into(&self, v: &mut Validator) {
+        v.check_name("name", &self.name, LABEL_RULE.max(MAX_STEP_NAME_LEN));
+        validate_meta(v, &self.meta);
+        if self.steps.is_empty() {
+            v.report("steps", "must contain at least one step");
+            return;
+        }
+        if self.steps.len() > MAX_WORKFLOW_STEPS {
+            v.report(
+                "steps",
+                format!(
+                    "at most {MAX_WORKFLOW_STEPS} steps are allowed, got {}",
+                    self.steps.len()
+                ),
+            );
+            return;
+        }
+
+        let positions = self.positions();
+        let known: Vec<&str> = self.steps.iter().map(|s| s.name.as_str()).collect();
+        // Graph checks only make sense once every edge points somewhere.
+        let mut graph_ok = true;
+        for (i, step) in self.steps.iter().enumerate() {
+            v.at_index("steps", i, |v| {
+                v.check_name("name", &step.name, STEP_RULE);
+                let first = positions[step.name.as_str()];
+                if first != i {
+                    graph_ok = false;
+                    v.report(
+                        "name",
+                        format!(
+                            "duplicate step name {} (also steps[{first}])",
+                            quote(&step.name)
+                        ),
+                    );
+                }
+                for (k, dep) in step.depends_on.iter().enumerate() {
+                    let problem = if *dep == step.name {
+                        Some(format!("step {} cannot depend on itself", quote(dep)))
+                    } else if !positions.contains_key(dep.as_str()) {
+                        let e = FromJsonError::unknown_variant(dep, "step", &known);
+                        Some(e.message().to_owned())
+                    } else if step.depends_on[..k].contains(dep) {
+                        Some(format!("duplicate dependency {}", quote(dep)))
+                    } else {
+                        None
+                    };
+                    if let Some(problem) = problem {
+                        graph_ok = false;
+                        v.at_index("depends_on", k, |v| v.report_here(problem));
+                    }
+                }
+                v.nested("job", &step.job);
+                v.at_key("job", |v| {
+                    v.check(step.job.workflow.is_none(), "workflow", || {
+                        "must not be set; the workflow engine links each step to its run".to_owned()
+                    });
+                });
+            });
+        }
+        if !graph_ok {
+            return;
+        }
+        if let Some(cycle) = self.find_cycle() {
+            v.report(
+                "steps",
+                format!(
+                    "dependency cycle: {} (each step depends on the next)",
+                    cycle.join(" -> ")
+                ),
+            );
+            return;
+        }
+        for (i, step) in self.steps.iter().enumerate() {
+            let refs = referenced_steps(&step.job.payload);
+            if refs.is_empty() {
+                continue;
+            }
+            let ancestors = self.ancestors(&step.name);
+            for name in refs.into_iter().filter(|r| !ancestors.contains(r)) {
+                let message = if positions.contains_key(name) {
+                    format!(
+                        "placeholder refers to step {}, which {} does not depend on",
+                        quote(name),
+                        quote(&step.name)
+                    )
+                } else {
+                    format!("placeholder refers to unknown step {}", quote(name))
+                };
+                v.at_index("steps", i, |v| {
+                    v.at_key("job", |v| v.report("payload", message))
+                });
+            }
+        }
+    }
+}
