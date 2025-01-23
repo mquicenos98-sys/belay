@@ -44,3 +44,37 @@ impl EventPattern {
             .collect()
     }
 }
+
+impl fmt::Display for EventPattern {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            EventPattern::All => f.write_str("*"),
+            EventPattern::Category(c) => write!(f, "{c}.*"),
+            EventPattern::Type(t) => f.write_str(t),
+        }
+    }
+}
+
+impl FromStr for EventPattern {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<EventPattern, ParseError> {
+        if s == "*" {
+            return Ok(EventPattern::All);
+        }
+        if let Some(category) = s.strip_suffix(".*") {
+            return CATEGORIES
+                .iter()
+                .find(|c| **c == category)
+                .map(|c| EventPattern::Category(c))
+                .ok_or_else(|| ParseError::unknown("event category", category, CATEGORIES));
+        }
+        EventKind::TYPES
+            .iter()
+            .find(|t| **t == s)
+            .map(|t| EventPattern::Type(t))
+            .ok_or_else(|| ParseError::unknown("event type", s, EventKind::TYPES))
+    }
+}
+
+text_json!(EventPattern, "event pattern");
