@@ -78,3 +78,34 @@ impl FromStr for EventPattern {
 }
 
 text_json!(EventPattern, "event pattern");
+
+/// Which events a subscriber wants.
+///
+/// ```
+/// use belay_proto::event::EventFilter;
+///
+/// let pairs = vec![
+///     ("from".to_owned(), "120".to_owned()),
+///     ("types".to_owned(), "job.*,schedule.fired".to_owned()),
+/// ];
+/// let filter = EventFilter::from_query(&pairs).unwrap();
+/// assert_eq!(filter.from, Some(120));
+/// assert_eq!(filter.to_query(), pairs);
+///
+/// let bad = vec![("types".to_owned(), "job.succeded".to_owned())];
+/// assert_eq!(
+///     EventFilter::from_query(&bad).unwrap_err().to_string(),
+///     r#"$.types: unknown event type "job.succeded", did you mean "job.succeeded"?"#
+/// );
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EventFilter {
+    /// First sequence number to deliver (inclusive). A client resuming
+    /// after `Last-Event-ID: n` asks for `from = n + 1`.
+    pub from: Option<u64>,
+    /// Types to deliver; empty for all.
+    pub types: Vec<EventPattern>,
+    /// Only events about this queue. Events that concern no queue
+    /// (schedules, workflows, workers) are then excluded.
+    pub queue: Option<QueueName>,
+}
