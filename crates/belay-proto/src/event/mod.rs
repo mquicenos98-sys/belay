@@ -34,3 +34,32 @@ use crate::job::{JobState, Progress};
 use crate::schedule::MisfirePolicy;
 use crate::wire::text_enum;
 use crate::workflow::{StepState, WorkflowState};
+
+/// An event as delivered to subscribers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Event {
+    /// Position in the stream, increasing by one per event.
+    pub seq: u64,
+    /// When it happened.
+    pub at: Timestamp,
+    /// What happened.
+    pub kind: EventKind,
+}
+
+impl Event {
+    /// The event's type name, e.g. `job.succeeded`.
+    #[must_use]
+    pub fn type_name(&self) -> &'static str {
+        self.kind.type_name()
+    }
+}
+
+text_enum! {
+    /// Why a schedule did not fire at one of its times.
+    SkipReason, "skip reason" {
+        /// The previous job was still running under the `skip` overlap policy.
+        Overlap = "overlap",
+        /// The time fell outside the schedule's calendar.
+        Calendar = "calendar",
+    }
+}
