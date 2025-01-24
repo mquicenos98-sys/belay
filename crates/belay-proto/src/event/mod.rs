@@ -20,7 +20,6 @@
 //! older client, which should skip events it cannot decode.
 
 mod codec;
-
 mod filter;
 
 pub use filter::{EventFilter, EventPattern};
@@ -205,4 +204,344 @@ pub enum EventKind {
         worker: WorkerId,
         last_seen: Timestamp,
     },
+}
+
+/// Event categories, the part of a type name before the dot.
+pub const CATEGORIES: &[&str] = &["job", "schedule", "workflow", "queue", "worker"];
+
+impl EventKind {
+    /// Every type name, grouped by category.
+    pub const TYPES: &'static [&'static str] = &[
+        "job.enqueued",
+        "job.started",
+        "job.progress",
+        "job.succeeded",
+        "job.failed",
+        "job.dead",
+        "job.cancelled",
+        "job.expired",
+        "job.retried",
+        "job.promoted",
+        "job.deleted",
+        "schedule.created",
+        "schedule.updated",
+        "schedule.deleted",
+        "schedule.paused",
+        "schedule.resumed",
+        "schedule.fired",
+        "schedule.misfired",
+        "schedule.skipped",
+        "workflow.started",
+        "workflow.step",
+        "workflow.finished",
+        "queue.paused",
+        "queue.resumed",
+        "queue.purged",
+        "queue.configured",
+        "queue.deleted",
+        "worker.seen",
+        "worker.lost",
+    ];
+
+    /// The stable type name, e.g. `job.succeeded`.
+    #[must_use]
+    pub fn type_name(&self) -> &'static str {
+        use EventKind::*;
+        match self {
+            JobEnqueued { .. } => "job.enqueued",
+            JobStarted { .. } => "job.started",
+            JobProgress { .. } => "job.progress",
+            JobSucceeded { .. } => "job.succeeded",
+            JobFailed { .. } => "job.failed",
+            JobDead { .. } => "job.dead",
+            JobCancelled { .. } => "job.cancelled",
+            JobExpired { .. } => "job.expired",
+            JobRetried { .. } => "job.retried",
+            JobPromoted { .. } => "job.promoted",
+            JobDeleted { .. } => "job.deleted",
+            ScheduleCreated { .. } => "schedule.created",
+            ScheduleUpdated { .. } => "schedule.updated",
+            ScheduleDeleted { .. } => "schedule.deleted",
+            SchedulePaused { .. } => "schedule.paused",
+            ScheduleResumed { .. } => "schedule.resumed",
+            ScheduleFired { .. } => "schedule.fired",
+            ScheduleMisfired { .. } => "schedule.misfired",
+            ScheduleSkipped { .. } => "schedule.skipped",
+            WorkflowStarted { .. } => "workflow.started",
+            WorkflowStep { .. } => "workflow.step",
+            WorkflowFinished { .. } => "workflow.finished",
+            QueuePaused { .. } => "queue.paused",
+            QueueResumed { .. } => "queue.resumed",
+            QueuePurged { .. } => "queue.purged",
+            QueueConfigured { .. } => "queue.configured",
+            QueueDeleted { .. } => "queue.deleted",
+            WorkerSeen { .. } => "worker.seen",
+            WorkerLost { .. } => "worker.lost",
+        }
+    }
+
+    /// The category: `job`, `schedule`, `workflow`, `queue` or `worker`.
+    #[must_use]
+    pub fn category(&self) -> &'static str {
+        let name = self.type_name();
+        name.split_once('.').map_or(name, |(category, _)| category)
+    }
+
+    /// The job concerned, if any.
+    #[must_use]
+    pub fn job(&self) -> Option<JobId> {
+        use EventKind::*;
+        match self {
+            JobEnqueued { job, .. }
+            | JobStarted { job, .. }
+            | JobProgress { job, .. }
+            | JobSucceeded { job, .. }
+            | JobFailed { job, .. }
+            | JobDead { job, .. }
+            | JobCancelled { job, .. }
+            | JobExpired { job, .. }
+            | JobRetried { job, .. }
+            | JobPromoted { job, .. }
+            | JobDeleted { job, .. }
+            | ScheduleFired { job, .. } => Some(*job),
+            WorkflowStep { job, .. } => *job,
+            _ => None,
+        }
+    }
+
+    /// The queue concerned, if any.
+    #[must_use]
+    pub fn queue(&self) -> Option<&QueueName> {
+        use EventKind::*;
+        match self {
+            JobEnqueued { queue, .. }
+            | JobStarted { queue, .. }
+            | JobProgress { queue, .. }
+            | JobSucceeded { queue, .. }
+            | JobFailed { queue, .. }
+            | JobDead { queue, .. }
+            | JobCancelled { queue, .. }
+            | JobExpired { queue, .. }
+            | JobRetried { queue, .. }
+            | JobPromoted { queue, .. }
+            | JobDeleted { queue, .. }
+            | QueuePaused { queue }
+            | QueueResumed { queue }
+            | QueuePurged { queue, .. }
+            | QueueConfigured { queue }
+            | QueueDeleted { queue } => Some(queue),
+            _ => None,
+        }
+    }
+
+    /// The schedule concerned, if any.
+    #[must_use]
+    pub fn schedule(&self) -> Option<&ScheduleId> {
+        use EventKind::*;
+        match self {
+            ScheduleCreated { schedule }
+            | ScheduleUpdated { schedule }
+            | ScheduleDeleted { schedule }
+            | SchedulePaused { schedule }
+            | ScheduleResumed { schedule }
+            | ScheduleFired { schedule, .. }
+            | ScheduleMisfired { schedule, .. }
+            | ScheduleSkipped { schedule, .. } => Some(schedule),
+            _ => None,
+        }
+    }
+
+    /// The workflow run concerned, if any.
+    #[must_use]
+    pub fn workflow(&self) -> Option<WorkflowId> {
+        use EventKind::*;
+        match self {
+            WorkflowStarted { workflow, .. }
+            | WorkflowStep { workflow, .. }
+            | WorkflowFinished { workflow, .. } => Some(*workflow),
+            _ => None,
+        }
+    }
+
+    /// The worker concerned, if any.
+    #[must_use]
+    pub fn worker(&self) -> Option<&WorkerId> {
+        use EventKind::*;
+        match self {
+            JobStarted { worker, .. }
+            | JobExpired { worker, .. }
+            | WorkerSeen { worker, .. }
+            | WorkerLost { worker, .. } => Some(worker),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod samples {
+    //! One value of every kind, shared by the codec and filter tests.
+
+    use super::*;
+
+    pub(crate) fn all() -> Vec<EventKind> {
+        let job: JobId = "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().unwrap();
+        let queue = QueueName::from_static("emails");
+        let worker = WorkerId::from_static("web-1:4121");
+        let schedule = ScheduleId::from_static("nightly");
+        let workflow: WorkflowId = "01HQ3K9Z8N6V2T4R5S7W0X1Y30".parse().unwrap();
+        let at = Timestamp::from_millis(1_741_064_767_089);
+        let q = || queue.clone();
+        use EventKind::*;
+        vec![
+            JobEnqueued {
+                job,
+                queue: q(),
+                kind: "send".into(),
+                run_at: at,
+            },
+            JobStarted {
+                job,
+                queue: q(),
+                worker: worker.clone(),
+                attempt: 1,
+            },
+            JobProgress {
+                job,
+                queue: q(),
+                progress: Progress::percent(50.0).with_message("half"),
+            },
+            JobSucceeded {
+                job,
+                queue: q(),
+                attempt: 1,
+                runtime: Duration::from_millis(1_250),
+            },
+            JobFailed {
+                job,
+                queue: q(),
+                attempt: 2,
+                error: "smtp 451".into(),
+                retry_at: at,
+            },
+            JobDead {
+                job,
+                queue: q(),
+                attempt: 25,
+                error: "bounced".into(),
+            },
+            JobCancelled { job, queue: q() },
+            JobExpired {
+                job,
+                queue: q(),
+                worker: worker.clone(),
+                attempt: 3,
+            },
+            JobRetried { job, queue: q() },
+            JobPromoted { job, queue: q() },
+            JobDeleted { job, queue: q() },
+            ScheduleCreated {
+                schedule: schedule.clone(),
+            },
+            ScheduleUpdated {
+                schedule: schedule.clone(),
+            },
+            ScheduleDeleted {
+                schedule: schedule.clone(),
+            },
+            SchedulePaused {
+                schedule: schedule.clone(),
+            },
+            ScheduleResumed {
+                schedule: schedule.clone(),
+            },
+            ScheduleFired {
+                schedule: schedule.clone(),
+                job,
+                fire_time: at,
+            },
+            ScheduleMisfired {
+                schedule: schedule.clone(),
+                fire_time: at,
+                missed: 4,
+                policy: MisfirePolicy::FireAll { max: 10 },
+            },
+            ScheduleSkipped {
+                schedule,
+                fire_time: at,
+                reason: SkipReason::Overlap,
+            },
+            WorkflowStarted {
+                workflow,
+                name: "etl".into(),
+            },
+            WorkflowStep {
+                workflow,
+                step: "load".into(),
+                state: StepState::Running,
+                job: Some(job),
+            },
+            WorkflowFinished {
+                workflow,
+                name: "etl".into(),
+                state: WorkflowState::Succeeded,
+            },
+            QueuePaused { queue: q() },
+            QueueResumed { queue: q() },
+            QueuePurged {
+                queue: q(),
+                state: Some(JobState::Dead),
+                count: 12,
+            },
+            QueueConfigured { queue: q() },
+            QueueDeleted { queue: q() },
+            WorkerSeen {
+                worker: worker.clone(),
+                queues: vec![q()],
+            },
+            WorkerLost {
+                worker,
+                last_seen: at,
+            },
+        ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_kind_has_a_listed_unique_type_name() {
+        let kinds = samples::all();
+        let names: Vec<&str> = kinds.iter().map(EventKind::type_name).collect();
+        assert_eq!(
+            names,
+            EventKind::TYPES,
+            "samples cover every type, in order"
+        );
+        for name in EventKind::TYPES {
+            let (category, what) = name.split_once('.').expect("dotted name");
+            assert!(CATEGORIES.contains(&category), "{name}");
+            assert!(what.bytes().all(|b| b.is_ascii_lowercase() || b == b'_'));
+        }
+    }
+
+    #[test]
+    fn accessors_name_the_entities_concerned() {
+        let kinds = samples::all();
+        let started = &kinds[1];
+        assert_eq!(started.category(), "job");
+        assert_eq!(started.queue().map(QueueName::as_str), Some("emails"));
+        assert_eq!(started.worker().map(WorkerId::as_str), Some("web-1:4121"));
+        let fired = &kinds[16];
+        assert_eq!(fired.schedule().map(ScheduleId::as_str), Some("nightly"));
+        assert!(fired.job().is_some() && fired.queue().is_none());
+        let step = &kinds[20];
+        assert!(step.workflow().is_some() && step.job().is_some());
+        for kind in &kinds {
+            let has_queue = kind.queue().is_some();
+            let expected = matches!(kind.category(), "job" | "queue");
+            assert_eq!(has_queue, expected, "{}", kind.type_name());
+        }
+    }
 }
