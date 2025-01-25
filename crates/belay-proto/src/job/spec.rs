@@ -352,3 +352,40 @@ pub(crate) fn validate_meta(v: &mut Validator, meta: &BTreeMap<String, String>) 
         }
     });
 }
+
+/// How long a uniqueness key stays claimed by the job that holds it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum UniqueScope {
+    /// Until the job first starts running. Text form `until_started`.
+    UntilStarted,
+    /// Until the job reaches a terminal state. Text form `until_finished`;
+    /// the default.
+    #[default]
+    UntilFinished,
+    /// For a fixed period after enqueue, whatever happens to the job. Text
+    /// form `for:<duration>`, e.g. `for:1h`.
+    For(Duration),
+}
+
+impl UniqueScope {
+    /// Whether a job in `state`, created at `created_at`, still holds its key
+    /// at `now`.
+    #[must_use]
+    pub fn holds(&self, state: JobState, created_at: Timestamp, now: Timestamp) -> bool {
+        match *self {
+            UniqueScope::UntilStarted => matches!(state, JobState::Scheduled | JobState::Ready),
+            UniqueScope::UntilFinished => !state.is_terminal(),
+            UniqueScope::For(period) => now <= created_at + period,
+        }
+    }
+}
+
+impl fmt::Display for UniqueScope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            UniqueScope::UntilStarted => f.write_str("until_started"),
+            UniqueScope::UntilFinished => f.write_str("until_finished"),
+            UniqueScope::For(period) => write!(f, "for:{}", format_duration(*period)),
+        }
+    }
+}
