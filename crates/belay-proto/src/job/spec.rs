@@ -284,3 +284,71 @@ impl FromJson for JobSpec {
         Ok(spec)
     }
 }
+
+impl Validate for JobSpec {
+    fn validate_into(&self, v: &mut Validator) {
+        v.check_name("kind", &self.kind, LABEL_RULE.max(MAX_KIND_LEN));
+        let size = encoded_len(&self.payload);
+        v.check(size <= MAX_PAYLOAD_BYTES, "payload", || {
+            format!(
+                "is {} as JSON; the limit is {}",
+                humanize_bytes(size as u64),
+                humanize_bytes(MAX_PAYLOAD_BYTES as u64)
+            )
+        });
+        v.check_range("priority", self.priority, MIN_PRIORITY, MAX_PRIORITY);
+        if let Some(delay) = self.delay {
+            v.check(self.run_at.is_none(), "delay", || {
+                "cannot be combined with run_at; set one or the other".to_owned()
+            });
+            v.check_duration("delay", delay, Duration::ZERO, MAX_DELAY);
+        }
+        if let Some(n) = self.max_attempts {
+            v.check_range("max_attempts", n, 1, MAX_ATTEMPTS);
+        }
+        if let Some(timeout) = self.timeout {
+            v.check_duration("timeout", timeout, MIN_TIMEOUT, MAX_TIMEOUT);
+        }
+        if let Some(unique) = &self.unique {
+            v.nested("unique", unique);
+        }
+        validate_tags(v, &self.tags);
+        validate_meta(v, &self.meta);
+        if let Some(wf) = &self.workflow {
+            v.at_key("workflow", |v| v.check_name("step", &wf.step, STEP_RULE));
+        }
+    }
+}
+
+fn validate_tags(v: &mut Validator, tags: &[String]) {
+    v.check(tags.len() <= MAX_TAGS, "tags", || {
+        format!("at most {MAX_TAGS} tags are allowed, got {}", tags.len())
+    });
+    for (i, tag) in tags.iter().enumerate() {
+        if let Some(problem) = LABEL_RULE.max(MAX_TAG_LEN).problem(tag) {
+            v.at_index("tags", i, |v| v.report_here(problem));
+        } else if tags[..i].contains(tag) {
+            v.at_index("tags", i, |v| {
+                v.report_here(format!("duplicate tag {}", crate::error::quote(tag)))
+            });
+        }
+    }
+}
+
+/// Shared with workflows, whose `meta` follows the same rules.
+pub(crate) fn validate_meta(v: &mut Validator, meta: &BTreeMap<String, String>) {
+    v.check(meta.len() <= MAX_META_ENTRIES, "meta", || {
+        format!(
+            "at most {MAX_META_ENTRIES} entries are allowed, got {}",
+            meta.len()
+        )
+    });
+    v.at_key("meta", |v| {
+        for (key, value) in meta {
+            if let Some(problem) = LABEL_RULE.max(MAX_META_KEY_LEN).problem(key) {
+                v.report(key, format!("invalid key: {problem}"));
+            }
+            v.check_bytes(key, value, MAX_META_VALUE_BYTES);
+        }
+    });
+}
