@@ -389,3 +389,75 @@ impl fmt::Display for UniqueScope {
         }
     }
 }
+
+impl FromStr for UniqueScope {
+    type Err = ParseError;
+
+    fn from_str(s: &str) -> Result<UniqueScope, ParseError> {
+        const NAMES: &[&str] = &["until_started", "until_finished", "for:<duration>"];
+        match s {
+            "until_started" => Ok(UniqueScope::UntilStarted),
+            "until_finished" => Ok(UniqueScope::UntilFinished),
+            _ => match s.strip_prefix("for:") {
+                Some(period) => parse_duration(period)
+                    .map(UniqueScope::For)
+                    .map_err(|e| ParseError::invalid("unique scope", s, e)),
+                None => Err(ParseError::unknown("unique scope", s, NAMES)),
+            },
+        }
+    }
+}
+
+text_json!(UniqueScope, "unique scope");
+
+text_enum! {
+    /// What an enqueue does when its uniqueness key is already held.
+    #[derive(Default)]
+    OnConflict, "conflict policy" {
+        /// Fail with `already_exists`.
+        Reject = "reject",
+        /// Succeed without enqueueing, returning the holder's id with status
+        /// `duplicate`. The default, because it makes enqueue idempotent.
+        #[default]
+        ReturnExisting = "return_existing",
+        /// Cancel the holder if it has not started yet and enqueue the new
+        /// job (status `replaced`); behaves like `return_existing` if the
+        /// holder is already running.
+        Replace = "replace",
+    }
+}
+
+/// A deduplication rule: at most one job per queue holds `key` at a time.
+///
+/// In JSON it is an object, or just the key as a string when the defaults
+/// (`until_finished`, `return_existing`) are wanted:
+/// `"unique": "user:42"`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Unique {
+    /// The deduplication key, e.g. `user:42`.
+    pub key: String,
+    /// How long the key stays claimed.
+    pub scope: UniqueScope,
+    /// What a conflicting enqueue does.
+    pub on_conflict: OnConflict,
+}
+
+impl Unique {
+    /// A rule for `key` within `scope` that returns the existing job on
+    /// conflict.
+    #[must_use]
+    pub fn new(key: impl Into<String>, scope: UniqueScope) -> Unique {
+        Unique {
+            key: key.into(),
+            scope,
+            on_conflict: OnConflict::default(),
+        }
+    }
+
+    /// Sets the conflict behaviour.
+    #[must_use]
+    pub fn on_conflict(mut self, on_conflict: OnConflict) -> Unique {
+        self.on_conflict = on_conflict;
+        self
+    }
+}
