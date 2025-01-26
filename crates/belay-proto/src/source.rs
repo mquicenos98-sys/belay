@@ -141,3 +141,52 @@ impl NoopSink {
 pub struct CollectingSink {
     events: Mutex<Vec<EventKind>>,
 }
+
+impl CollectingSink {
+    /// An empty sink.
+    #[must_use]
+    pub fn new() -> CollectingSink {
+        CollectingSink::default()
+    }
+
+    /// Removes and returns everything collected so far.
+    pub fn take(&self) -> Vec<EventKind> {
+        std::mem::take(&mut *lock(&self.events))
+    }
+
+    /// A copy of everything collected so far.
+    #[must_use]
+    pub fn events(&self) -> Vec<EventKind> {
+        lock(&self.events).clone()
+    }
+
+    /// Type names of everything collected so far, in order.
+    #[must_use]
+    pub fn type_names(&self) -> Vec<&'static str> {
+        lock(&self.events)
+            .iter()
+            .map(EventKind::type_name)
+            .collect()
+    }
+
+    /// Number of events collected.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        lock(&self.events).len()
+    }
+
+    /// Whether nothing has been collected.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+impl EventSink for CollectingSink {
+    fn emit(&self, kind: EventKind) {
+        lock(&self.events).push(kind);
+    }
+}
+
+/// Adapts a closure into an [`EventSink`].
+pub struct FnSink<F>(pub F);
