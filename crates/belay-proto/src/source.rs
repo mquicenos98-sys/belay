@@ -190,3 +190,108 @@ impl EventSink for CollectingSink {
 
 /// Adapts a closure into an [`EventSink`].
 pub struct FnSink<F>(pub F);
+
+impl<F> fmt::Debug for FnSink<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FnSink(..)")
+    }
+}
+
+impl<F: Fn(EventKind) + Send + Sync> EventSink for FnSink<F> {
+    fn emit(&self, kind: EventKind) {
+        (self.0)(kind);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::ErrorCode;
+    use crate::ids::{LeaseToken, QueueName};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct Refusing;
+
+    impl JobSource for Refusing {
+        fn lease(&self, _: &LeaseRequest) -> Result<Vec<LeasedJob>, ApiError> {
+            Err(ApiError::unavailable("draining"))
+        }
+
+        fn heartbeat(
+            &self,
+            id: &JobId,
+            _: &HeartbeatRequest,
+        ) -> Result<HeartbeatResponse, ApiError> {
+            Err(ApiError::lease_lost(*id))
+        }
+
+        fn complete(&self, id: &JobId, _: &CompleteRequest) -> Result<(), ApiError> {
+            Err(ApiError::lease_lost(*id))
+        }
+
+        fn fail(&self, id: &JobId, _: &FailRequest) -> Result<(), ApiError> {
+            Err(ApiError::lease_lost(*id))
+        }
+    }
+
+    fn paused(name: &'static str) -> EventKind {
+        EventKind::QueuePaused {
+            queue: QueueName::from_static(name),
+        }
+    }
+
+    #[test]
+    fn job_sources_work_through_smart_pointers() {
+        let shared: Arc<dyn JobSource> = Arc::new(Refusing);
+        let boxed: Box<dyn JobSource> = Box::new(Refusing);
+        let id = JobId::generate();
+        let token = LeaseToken::new(1);
+        let req = LeaseRequest::new("w1".parse().unwrap(), vec![QueueName::from_static("q")]);
+        assert_eq!(shared.lease(&req).unwrap_err().code, ErrorCode::Unavailable);
+        assert!(boxed
+            .complete(&id, &CompleteRequest::new(token))
+            .unwrap_err()
+            .is(ErrorCode::LeaseLost));
+        let by_ref: &dyn JobSource = &Refusing;
+        assert!(by_ref
+            .heartbeat(&id, &HeartbeatRequest::new(token))
+            .is_err());
+        assert!(shared.fail(&id, &FailRequest::new(token, "x")).is_err());
+    }
+
+    #[test]
+    fn sinks_collect_forward_and_discard() {
+        let collecting = Arc::new(CollectingSink::new());
+        let as_dyn: Arc<dyn EventSink> = collecting.clone();
+        as_dyn.emit(paused("a"));
+        (&*collecting).emit(paused("b"));
+        assert_eq!(collecting.len(), 2);
+        assert_eq!(collecting.events()[1], paused("b"));
+        assert_eq!(collecting.take().len(), 2);
+        assert!(collecting.is_empty());
+
+        let count = Arc::new(AtomicUsize::new(0));
+        let seen = count.clone();
+        let sink = FnSink(move |_: EventKind| {
+            seen.fetch_add(1, Ordering::SeqCst);
+        });
+        sink.emit(paused("c"));
+        Box::new(sink).emit(paused("d"));
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+
+        NoopSink::shared().emit(paused("e"));
+    }
+
+    #[test]
+    fn collecting_sink_survives_a_poisoned_lock() {
+        let sink = Arc::new(CollectingSink::new());
+        let clone = sink.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = clone.events.lock();
+            panic!("poison the lock");
+        })
+        .join();
+        sink.emit(paused("q"));
+        assert_eq!(sink.len(), 1);
+    }
+}
