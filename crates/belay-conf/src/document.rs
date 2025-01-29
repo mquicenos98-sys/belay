@@ -304,3 +304,52 @@ impl Document {
         Ok(previous)
     }
 }
+
+/// Walks `path` from `root`, creating missing tables (recorded in
+/// `created`), and stores `value` at the end.
+fn set_in(
+    root: &mut Value,
+    path: &KeyPath,
+    value: Value,
+    created: &mut Vec<KeyPath>,
+) -> std::result::Result<Option<Value>, String> {
+    let (last, parents) = path
+        .segments()
+        .split_last()
+        .ok_or("cannot replace the root table")?;
+    let mut walked = KeyPath::root();
+    let mut cur = root;
+    for seg in parents {
+        if let (Value::Table(t), Segment::Key(k)) = (&mut *cur, seg) {
+            if !t.contains_key(k) {
+                t.insert(k.clone(), Table::new());
+                created.push(walked.key(k));
+            }
+        }
+        let (ty, len) = (cur.type_name(), cur.as_array().map_or(0, <[Value]>::len));
+        cur = match step_mut(cur, seg) {
+            Some(next) => next,
+            None => return Err(no_slot(&walked, seg, ty, len)),
+        };
+        walked.push(seg.clone());
+    }
+    let (ty, len) = (cur.type_name(), cur.as_array().map_or(0, <[Value]>::len));
+    match (cur, last) {
+        (Value::Table(t), Segment::Key(k)) => Ok(t.insert(k.clone(), value)),
+        (Value::Array(items), Segment::Index(i)) if *i < len => {
+            Ok(Some(std::mem::replace(&mut items[*i], value)))
+        }
+        _ => Err(no_slot(&walked, last, ty, len)),
+    }
+}
+
+fn no_slot(parent: &KeyPath, seg: &Segment, type_name: &str, len: usize) -> String {
+    match seg {
+        Segment::Index(i) if type_name == "array" => {
+            let plural = if len == 1 { "" } else { "s" };
+            format!("index {i} is out of bounds; `{parent}` has {len} element{plural}")
+        }
+        Segment::Index(_) => format!("`{parent}` is {}, not an array", with_article(type_name)),
+        Segment::Key(_) => format!("`{parent}` is {}, not a table", with_article(type_name)),
+    }
+}
