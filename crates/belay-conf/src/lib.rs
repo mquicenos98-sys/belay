@@ -79,3 +79,11 @@ mod document;
 mod error;
 
 mod overlay;
+
+pub(crate) mod parse;
+
+mod path;
+
+mod reader;
+
+mod ser;
