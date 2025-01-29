@@ -77,3 +77,51 @@ impl From<String> for ConvertError {
         ConvertError::invalid(message)
     }
 }
+
+impl From<&str> for ConvertError {
+    fn from(message: &str) -> ConvertError {
+        ConvertError::invalid(message)
+    }
+}
+
+/// Types that can be extracted from a [`Value`].
+///
+/// Implement it for your own configuration types to read them with
+/// [`Reader::req`](crate::Reader::req) and friends:
+///
+/// ```
+/// use belay_conf::{ConvertError, FromValue, Value};
+///
+/// enum Format { Logfmt, Json }
+///
+/// impl FromValue for Format {
+///     fn from_value(v: &Value) -> Result<Format, ConvertError> {
+///         match v.as_str() {
+///             Some("logfmt") => Ok(Format::Logfmt),
+///             Some("json") => Ok(Format::Json),
+///             Some(other) => Err(format!("expected `logfmt` or `json`, got `{other}`").into()),
+///             None => Err(ConvertError::mismatch("string", v)),
+///         }
+///     }
+/// }
+/// ```
+pub trait FromValue: Sized {
+    /// Converts `value`, or explains why it cannot be.
+    fn from_value(value: &Value) -> Result<Self, ConvertError>;
+}
+
+impl FromValue for Value {
+    fn from_value(value: &Value) -> Result<Value, ConvertError> {
+        Ok(value.clone())
+    }
+}
+
+/// Unquoted date-times are accepted too: they are strings to the consumer.
+impl FromValue for String {
+    fn from_value(value: &Value) -> Result<String, ConvertError> {
+        match value {
+            Value::String(s) | Value::Datetime(s) => Ok(s.clone()),
+            other => Err(ConvertError::mismatch("string", other)),
+        }
+    }
+}
