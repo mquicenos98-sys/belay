@@ -361,3 +361,52 @@ impl FromStr for Document {
         Document::parse(s)
     }
 }
+
+/// Renders the document as TOML text, like [`Document::to_toml`].
+impl fmt::Display for Document {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_toml())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SRC: &str =
+        "[server]\nlisten = \"0.0.0.0:7700\"\nthreads = 8\n\n[[schedules]]\nid = \"x\"\n";
+
+    #[test]
+    fn typed_getters_report_type_and_location() {
+        let doc = Document::parse_named("belay.toml", SRC).unwrap();
+        assert_eq!(doc.get_float("server.threads").unwrap(), 8.0);
+        let err = doc.get_bool("server.threads").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "error: expected boolean at server.threads, found integer\n \
+             --> belay.toml:3:11\n  |\n3 | threads = 8\n  |           ^"
+        );
+    }
+
+    #[test]
+    fn missing_keys_point_at_their_table() {
+        let doc = Document::parse(SRC).unwrap();
+        let err = doc.get_str("schedules[0].cron").unwrap_err();
+        assert_eq!(err.message(), "missing required key `schedules[0].cron`");
+        assert_eq!(err.line_col(), Some((5, 1)));
+        assert_eq!(doc.get_str("storage.dir").unwrap_err().line_col(), None);
+    }
+
+    #[test]
+    fn stepping_through_a_scalar_is_a_type_error() {
+        let doc = Document::parse(SRC).unwrap();
+        let err = doc.get_str("server.threads.count").unwrap_err();
+        assert_eq!(
+            err.message(),
+            "expected table at server.threads, found integer"
+        );
+        let err = doc.get_str("server[0]").unwrap_err();
+        assert_eq!(err.message(), "expected array at server, found table");
+        assert!(doc.get("server..x").is_none());
+    }
+}
