@@ -29,3 +29,41 @@ fn normalize(s: &str) -> Vec<char> {
         })
         .collect()
 }
+
+/// The candidate closest to `name`, allowing roughly one edit per three
+/// characters. Ties go to the alphabetically first candidate so the result
+/// does not depend on iteration order.
+pub(crate) fn closest<'c, I>(name: &str, candidates: I) -> Option<&'c str>
+where
+    I: IntoIterator<Item = &'c str>,
+{
+    let target = normalize(name);
+    let limit = (target.len() / 3).max(1);
+    candidates
+        .into_iter()
+        .filter(|c| *c != name)
+        .map(|c| (distance(&target, &normalize(c)), c))
+        .filter(|&(d, _)| d <= limit)
+        .min()
+        .map(|(_, c)| c)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn suggests_plausible_typos_only() {
+        let known = ["listen", "threads", "max_body"];
+        assert_eq!(closest("lsiten", known), Some("listen"));
+        assert_eq!(closest("thread", known), Some("threads"));
+        assert_eq!(closest("Max-Body", known), Some("max_body"));
+        assert_eq!(closest("storage", known), None);
+        assert_eq!(closest("ab", ["ac", "xy"]), Some("ac"));
+    }
+
+    #[test]
+    fn ties_are_broken_alphabetically() {
+        assert_eq!(closest("cat", ["cut", "bat", "cot"]), Some("bat"));
+    }
+}
