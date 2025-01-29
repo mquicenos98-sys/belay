@@ -48,3 +48,135 @@ pub struct Applied {
     /// The value it replaced, if any.
     pub previous: Option<Value>,
 }
+
+impl Overlay {
+    /// An overlay for variables named `{prefix}_...`.
+    pub fn new(prefix: &str) -> Overlay {
+        Overlay {
+            prefix: format!("{prefix}_"),
+            top_level: false,
+        }
+    }
+
+    /// Also apply single-segment variables (`{prefix}_NAME` sets `name`).
+    #[must_use]
+    pub fn allow_top_level(mut self, allow: bool) -> Overlay {
+        self.top_level = allow;
+        self
+    }
+
+    /// The path a variable maps to, or `None` if the overlay ignores it.
+    pub fn path_for(&self, var: &str) -> Option<KeyPath> {
+        self.map_var(var).ok().flatten()
+    }
+
+    fn map_var(&self, var: &str) -> std::result::Result<Option<KeyPath>, String> {
+        let Some(rest) = var.strip_prefix(&self.prefix) else {
+            return Ok(None);
+        };
+        if rest.is_empty() || (!self.top_level && !rest.contains("__")) {
+            return Ok(None);
+        }
+        let mut path = KeyPath::root();
+        for (i, seg) in rest.split("__").enumerate() {
+            if seg.is_empty() {
+                return Err("empty key segment in variable name".into());
+            }
+            match seg.parse::<usize>() {
+                Ok(n) if i > 0 => path.push(Segment::Index(n)),
+                _ => path.push(Segment::Key(seg.to_ascii_lowercase())),
+            }
+        }
+        Ok(Some(path))
+    }
+
+    /// Applies matching variables from the process environment.
+    pub fn apply_env(&self, doc: &mut Document) -> Result<Vec<Applied>> {
+        let mut vars = Vec::new();
+        for (name, value) in std::env::vars_os() {
+            let Ok(name) = name.into_string() else {
+                continue;
+            };
+            if !name.starts_with(&self.prefix) {
+                continue;
+            }
+            let value = value.into_string().map_err(|_| Error::Env {
+                var: name.clone(),
+                message: "value is not valid UTF-8".into(),
+            })?;
+            vars.push((name, value));
+        }
+        self.apply(doc, vars)
+    }
+
+    /// Applies matching `(name, value)` pairs; others are ignored.
+    ///
+    /// Variables are applied in name order, so conflicting ones
+    /// (`BELAY_A__B` and `BELAY_A__B__C`) fail the same way on every run
+    /// regardless of environment order.
+    pub fn apply<I, K, V>(&self, doc: &mut Document, vars: I) -> Result<Vec<Applied>>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut matched = Vec::new();
+        for (name, raw) in vars {
+            let var = name.as_ref().to_owned();
+            match self.map_var(&var) {
+                Ok(Some(path)) => matched.push((var, path, raw.as_ref().to_owned())),
+                Ok(None) => {}
+                Err(message) => return Err(Error::Env { var, message }),
+            }
+        }
+        matched.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut applied = Vec::with_capacity(matched.len());
+        for (var, path, raw) in matched {
+            match apply_one(doc, &var, &path, &raw) {
+                Ok(previous) => applied.push(Applied {
+                    var,
+                    path,
+                    previous,
+                }),
+                Err(message) => return Err(Error::Env { var, message }),
+            }
+        }
+        Ok(applied)
+    }
+}
+
+fn apply_one(
+    doc: &mut Document,
+    var: &str,
+    path: &KeyPath,
+    raw: &str,
+) -> std::result::Result<Option<Value>, String> {
+    let existing = doc.lookup(path).map_err(|e| e.message())?;
+    let value = infer(raw, existing);
+    if matches!(existing, Some(Value::Table(_))) && !matches!(value, Value::Table(_)) {
+        return Err(format!(
+            "`{path}` is a table; only an inline table (`{{ ... }}`) can replace it"
+        ));
+    }
+    doc.set_at(path, value, Some(Loc::Env(var.to_owned())))
+}
+
+/// Where the document already holds a string, unquoted text stays a
+/// string, so `BELAY_SERVER__LISTEN=7700` cannot turn an address into an
+/// integer. Otherwise see [`infer_value`].
+fn infer(raw: &str, existing: Option<&Value>) -> Value {
+    if raw.trim_start().starts_with(['[', '{', '"', '\'']) {
+        if let Ok(value) = crate::parse_value(raw) {
+            return value;
+        }
+    }
+    if matches!(existing, Some(Value::String(_))) {
+        return Value::String(raw.to_owned());
+    }
+    match classify_scalar(raw) {
+        // `inf` and `nan` are far more likely meant as words.
+        Ok(Value::Float(f)) if !f.is_finite() => Value::String(raw.to_owned()),
+        Ok(value) => value,
+        Err(_) => Value::String(raw.to_owned()),
+    }
+}
