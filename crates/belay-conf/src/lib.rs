@@ -73,9 +73,36 @@
 #![warn(missing_docs)]
 
 mod convert;
-
 mod document;
-
 mod error;
-
 mod overlay;
+pub(crate) mod parse;
+mod path;
+mod reader;
+mod ser;
+mod source;
+mod suggest;
+mod value;
+
+pub use convert::{ConvertError, ConvertErrorKind, FromValue};
+pub use document::Document;
+pub use error::{Error, Origin, Result, Snippet, UnusedKey};
+pub use overlay::{infer_value, Applied, Overlay};
+pub use path::{KeyPath, Segment};
+pub use reader::Reader;
+pub use ser::to_string;
+pub use value::{Iter, Table, Value};
+
+/// Parses a single TOML value, such as the right-hand side of a
+/// `--set server.threads=16` override.
+///
+/// ```
+/// use belay_conf::{parse_value, Value};
+///
+/// assert_eq!(parse_value("[1, 2]")?, Value::from(vec![1, 2]));
+/// assert!(parse_value("[1, 2").is_err());
+/// # Ok::<(), belay_conf::Error>(())
+/// ```
+pub fn parse_value(src: &str) -> Result<Value> {
+    parse::parse_value(src).map_err(|d| d.into_error(src, &source::LineIndex::new(src), None))
+}
