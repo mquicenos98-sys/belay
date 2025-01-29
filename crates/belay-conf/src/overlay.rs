@@ -180,3 +180,142 @@ fn infer(raw: &str, existing: Option<&Value>) -> Value {
         Err(_) => Value::String(raw.to_owned()),
     }
 }
+
+/// Infers a value from environment or command-line text, as [`Overlay`]
+/// does for keys the document does not have yet: text that parses as a
+/// TOML array, inline table or quoted string is that value; `true`/`false`,
+/// integers, floats and date-times in TOML syntax are recognised; anything
+/// else (including `[::1]:7700`) is a string.
+///
+/// ```
+/// use belay_conf::{infer_value, Value};
+///
+/// assert_eq!(infer_value("16"), Value::Integer(16));
+/// assert_eq!(infer_value("[::1]:7700"), Value::from("[::1]:7700"));
+/// assert_eq!(infer_value("[\"a\", \"b\"]"), Value::from(vec!["a", "b"]));
+/// ```
+pub fn infer_value(raw: &str) -> Value {
+    infer(raw, None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SRC: &str =
+        "[server]\nlisten = \"127.0.0.1:7700\"\nmax_body = 1024\n[[schedules]]\nid = \"a\"\n";
+
+    fn overlay(doc: &mut Document, vars: &[(&str, &str)]) -> Result<Vec<Applied>> {
+        Overlay::new("BELAY").apply(doc, vars.iter().copied())
+    }
+
+    #[test]
+    fn maps_variable_names_to_paths() {
+        let o = Overlay::new("BELAY");
+        let path = |v: &str| o.path_for(v).map(|p| p.to_string());
+        let queues = path("BELAY_QUEUES__EMAILS__MAX_CONCURRENCY");
+        assert_eq!(queues.as_deref(), Some("queues.emails.max_concurrency"));
+        let schedule = path("BELAY_SCHEDULES__2__PAUSED");
+        assert_eq!(schedule.as_deref(), Some("schedules[2].paused"));
+        assert_eq!(path("BELAY_URL"), None);
+        assert_eq!(path("OTHER_SERVER__LISTEN"), None);
+        let top = o.clone().allow_top_level(true).path_for("BELAY_URL");
+        assert_eq!(top.map(|p| p.to_string()).as_deref(), Some("url"));
+    }
+
+    #[test]
+    fn infers_types_but_keeps_existing_strings_as_strings() {
+        let mut doc = Document::parse(SRC).unwrap();
+        let vars = [
+            ("BELAY_SERVER__LISTEN", "7700"),
+            ("BELAY_SERVER__THREADS", "8"),
+            ("BELAY_STORAGE__IN_MEMORY", "true"),
+            (
+                "BELAY_CLUSTER__SEEDS",
+                "[\"10.0.0.1:7946\", \"10.0.0.2:7946\"]",
+            ),
+            ("BELAY_METRICS__LABEL", "\"123\""),
+        ];
+        overlay(&mut doc, &vars).unwrap();
+        assert_eq!(doc.get("server.listen"), Some(&Value::from("7700")));
+        assert_eq!(doc.get("server.threads"), Some(&Value::Integer(8)));
+        assert_eq!(doc.get("storage.in_memory"), Some(&Value::Boolean(true)));
+        assert_eq!(doc.get_array("cluster.seeds").unwrap().len(), 2);
+        assert_eq!(doc.get("metrics.label"), Some(&Value::from("123")));
+    }
+
+    #[test]
+    fn records_the_variable_as_origin_and_reports_previous_values() {
+        let mut doc = Document::parse(SRC).unwrap();
+        let vars = [
+            ("BELAY_SERVER__MAX_BODY", "2048"),
+            ("BELAY_SCHEDULES__0__ID", "b"),
+        ];
+        let applied = overlay(&mut doc, &vars).unwrap();
+        assert_eq!(applied[0].path.to_string(), "schedules[0].id");
+        assert_eq!(applied[1].previous, Some(Value::Integer(1024)));
+        let err = doc.get_bool("server.max_body").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "error: expected boolean at server.max_body, found integer\n \
+             --> environment variable BELAY_SERVER__MAX_BODY"
+        );
+    }
+
+    #[test]
+    fn rejects_conflicting_and_malformed_variables() {
+        let cases: [(&[(&str, &str)], &str); 4] = [
+            (
+                &[("BELAY_A__B", "1"), ("BELAY_A__B__C", "2")],
+                "BELAY_A__B__C: expected table at a.b, found integer",
+            ),
+            (
+                &[("BELAY_SERVER____LISTEN", "x")],
+                "BELAY_SERVER____LISTEN: empty key segment in variable name",
+            ),
+            (
+                &[("BELAY_SCHEDULES__0", "x")],
+                "BELAY_SCHEDULES__0: `schedules[0]` is a table; only an inline table (`{ ... }`) can replace it",
+            ),
+            (
+                &[("BELAY_SCHEDULES__5__ID", "x")],
+                "BELAY_SCHEDULES__5__ID: index 5 is out of bounds; `schedules` has 1 element",
+            ),
+        ];
+        for (vars, message) in cases {
+            let mut doc = Document::parse(SRC).unwrap();
+            let err = overlay(&mut doc, vars).unwrap_err();
+            assert_eq!(
+                err.message(),
+                format!("cannot apply environment variable {message}")
+            );
+        }
+    }
+
+    #[test]
+    fn infer_value_rules() {
+        let cases = [
+            ("false", Value::Boolean(false)),
+            ("1_000", Value::Integer(1000)),
+            ("-2.5", Value::Float(-2.5)),
+            ("007", Value::from("007")),
+            ("nan", Value::from("nan")),
+            ("30s", Value::from("30s")),
+            ("\"42\"", Value::from("42")),
+            ("[1,", Value::from("[1,")),
+            ("{ a = 1 }", Value::Table([("a", 1)].into_iter().collect())),
+            ("2025-01-01", Value::Datetime("2025-01-01".into())),
+        ];
+        for (raw, value) in cases {
+            assert_eq!(infer_value(raw), value, "{raw}");
+        }
+    }
+
+    // Regression: bracketed IPv6 listen addresses were rejected as malformed arrays.
+    #[test]
+    fn bracketed_addresses_stay_strings() {
+        let mut doc = Document::parse(SRC).unwrap();
+        overlay(&mut doc, &[("BELAY_SERVER__ADMIN", "[::1]:7701")]).unwrap();
+        assert_eq!(doc.get_str("server.admin").unwrap(), "[::1]:7701");
+    }
+}
