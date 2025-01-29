@@ -353,3 +353,11 @@ fn no_slot(parent: &KeyPath, seg: &Segment, type_name: &str, len: usize) -> Stri
         Segment::Key(_) => format!("`{parent}` is {}, not a table", with_article(type_name)),
     }
 }
+
+impl FromStr for Document {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Document> {
+        Document::parse(s)
+    }
+}
