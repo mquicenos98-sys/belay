@@ -33,3 +33,19 @@ impl Diag {
 }
 
 pub(crate) type PResult<T> = Result<T, Diag>;
+
+/// One segment of a (possibly dotted) key, with its span in the source.
+#[derive(Debug, Clone)]
+pub(crate) struct KeySeg {
+    pub(crate) name: String,
+    pub(crate) span: Span,
+}
+
+pub(crate) fn is_bare_key_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_' || c == '-'
+}
+
+/// Control characters TOML forbids in comments and strings (tab is allowed).
+fn is_forbidden_control(c: char) -> bool {
+    (c < ' ' && c != '\t') || c == '\u{7f}'
+}
