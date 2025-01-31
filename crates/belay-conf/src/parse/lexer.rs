@@ -395,3 +395,18 @@ impl<'s> Cursor<'s> {
         classify_scalar(&self.src[start..end]).map_err(|m| Diag::new(Span::new(start, end), m))
     }
 }
+
+fn unterminated(start: usize, width: usize) -> Diag {
+    Diag::new(Span::new(start, start + width), "unterminated string")
+}
+
+fn token_len(s: &str) -> usize {
+    s.bytes()
+        .take_while(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'+' | b'-' | b'.' | b':'))
+        .count()
+}
+
+fn is_date_prefix(tok: &str) -> bool {
+    let b = tok.as_bytes();
+    b.len() == 10 && b[..4].iter().all(u8::is_ascii_digit) && b[4] == b'-'
+}
