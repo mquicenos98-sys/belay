@@ -112,3 +112,20 @@ fn table_label(path: &KeyPath) -> String {
 fn written(segs: &[KeySeg]) -> KeyPath {
     segs.iter().map(|s| s.name.as_str()).collect()
 }
+
+/// Location of something named by a key.
+fn keyed(key: Span, value: Span) -> Loc {
+    Loc::Source {
+        key: Some(key),
+        value,
+    }
+}
+
+/// Span of the first definition of `path`, for "first defined on line N".
+fn def_span(locs: &HashMap<KeyPath, Loc>, path: &KeyPath, prefer_key: bool) -> Option<Span> {
+    match locs.get(path)? {
+        Loc::Source { key, value } if prefer_key => Some(key.unwrap_or(*value)),
+        Loc::Source { value, .. } => Some(*value),
+        Loc::Env(_) => None,
+    }
+}
