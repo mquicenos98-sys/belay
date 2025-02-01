@@ -410,3 +410,336 @@ fn is_date_prefix(tok: &str) -> bool {
     let b = tok.as_bytes();
     b.len() == 10 && b[..4].iter().all(u8::is_ascii_digit) && b[4] == b'-'
 }
+
+fn looks_like_datetime(tok: &str) -> bool {
+    let b = tok.as_bytes();
+    (b.len() >= 5 && b[..4].iter().all(u8::is_ascii_digit) && b[4] == b'-')
+        || (b.len() >= 3 && b[..2].iter().all(u8::is_ascii_digit) && b[2] == b':')
+}
+
+/// Classifies a bare (unquoted) value token.
+pub(crate) fn classify_scalar(tok: &str) -> Result<Value, String> {
+    match tok {
+        "true" => return Ok(Value::Boolean(true)),
+        "false" => return Ok(Value::Boolean(false)),
+        "inf" | "+inf" => return Ok(Value::Float(f64::INFINITY)),
+        "-inf" => return Ok(Value::Float(f64::NEG_INFINITY)),
+        "nan" | "+nan" | "-nan" => return Ok(Value::Float(f64::NAN)),
+        _ => {}
+    }
+    if looks_like_datetime(tok) {
+        return validate_datetime(tok).map(|()| Value::Datetime(tok.to_owned()));
+    }
+    if tok.starts_with(|c: char| c.is_ascii_digit() || c == '+' || c == '-') {
+        return parse_number(tok);
+    }
+    Err(format!(
+        "expected a value, found `{tok}` (strings must be quoted)"
+    ))
+}
+
+/// Removes digit-separating underscores, checking that every character is a
+/// digit of the radix and every underscore sits between two digits.
+fn strip_underscores(digits: &str, radix: u32) -> Result<String, &'static str> {
+    if digits.is_empty() {
+        return Err("missing digits");
+    }
+    let chars: Vec<char> = digits.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '_' {
+            let between = i > 0
+                && i + 1 < chars.len()
+                && chars[i - 1].is_digit(radix)
+                && chars[i + 1].is_digit(radix);
+            if !between {
+                return Err("underscores must sit between digits");
+            }
+        } else if !c.is_digit(radix) {
+            return Err("unexpected character");
+        }
+    }
+    Ok(digits.replace('_', ""))
+}
+
+/// Parses a TOML integer or float (not `inf`/`nan`).
+pub(crate) fn parse_number(tok: &str) -> Result<Value, String> {
+    let bad = |why: &str| format!("invalid number `{tok}`: {why}");
+    let (sign, body) = match tok.as_bytes().first() {
+        Some(b'+') => ("", &tok[1..]),
+        Some(b'-') => ("-", &tok[1..]),
+        _ => ("", tok),
+    };
+    for (prefix, radix) in [("0x", 16), ("0o", 8), ("0b", 2)] {
+        if let Some(digits) = body.strip_prefix(prefix) {
+            if body.len() != tok.len() {
+                return Err(bad("only decimal integers may have a sign"));
+            }
+            let clean = strip_underscores(digits, radix).map_err(bad)?;
+            return i64::from_str_radix(&clean, radix)
+                .map(Value::Integer)
+                .map_err(|_| format!("integer `{tok}` does not fit in 64 bits"));
+        }
+    }
+    let no_leading_zero = |digits: &str| -> Result<(), String> {
+        if digits.len() > 1 && digits.starts_with('0') {
+            Err(bad("leading zeros are not allowed"))
+        } else {
+            Ok(())
+        }
+    };
+    if !body.contains(['.', 'e', 'E']) {
+        let clean = strip_underscores(body, 10).map_err(bad)?;
+        no_leading_zero(&clean)?;
+        return format!("{sign}{clean}")
+            .parse()
+            .map(Value::Integer)
+            .map_err(|_| format!("integer `{tok}` does not fit in 64 bits"));
+    }
+    let (mantissa, exponent) = match body.find(['e', 'E']) {
+        Some(i) => (&body[..i], Some(&body[i + 1..])),
+        None => (body, None),
+    };
+    let (int_part, fraction) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, Some(f)),
+        None => (mantissa, None),
+    };
+    let int_digits = strip_underscores(int_part, 10).map_err(bad)?;
+    no_leading_zero(&int_digits)?;
+    let mut text = format!("{sign}{int_digits}");
+    if let Some(fraction) = fraction {
+        text.push('.');
+        text.push_str(&strip_underscores(fraction, 10).map_err(bad)?);
+    }
+    if let Some(exponent) = exponent {
+        let (esign, edigits) = match exponent.as_bytes().first() {
+            Some(b'+') | Some(b'-') => exponent.split_at(1),
+            _ => ("", exponent),
+        };
+        text.push('e');
+        text.push_str(esign);
+        text.push_str(&strip_underscores(edigits, 10).map_err(bad)?);
+    }
+    match text.parse::<f64>() {
+        Ok(f) if f.is_finite() => Ok(Value::Float(f)),
+        Ok(_) => Err(format!("float `{tok}` is out of range")),
+        Err(_) => Err(bad("malformed float")),
+    }
+}
+
+/// Validates an offset date-time, local date-time, local date or local time
+/// (RFC 3339 as profiled by TOML). The text itself is kept as written.
+pub(crate) fn validate_datetime(tok: &str) -> Result<(), String> {
+    let bad = |why: String| format!("invalid date-time `{tok}`: {why}");
+    let b = tok.as_bytes();
+    if b.len() >= 3 && b[2] == b':' {
+        return match time(tok).map_err(bad)? {
+            "" => Ok(()),
+            rest => Err(bad(format!("unexpected `{rest}` after local time"))),
+        };
+    }
+    let date = tok
+        .get(..10)
+        .ok_or_else(|| bad("expected YYYY-MM-DD".into()))?;
+    let (y, m, d) = match (num(date, 0, 4), num(date, 5, 2), num(date, 8, 2)) {
+        (Some(y), Some(m), Some(d)) if &date[7..8] == "-" => (y, m, d),
+        _ => return Err(bad("expected YYYY-MM-DD".into())),
+    };
+    if !(1..=12).contains(&m) {
+        return Err(bad(format!("month {m} is out of range")));
+    }
+    if d < 1 || d > days_in_month(y, m) {
+        return Err(bad(format!("day {d} is out of range for {y:04}-{m:02}")));
+    }
+    let rest = &tok[10..];
+    let Some(sep) = rest.chars().next() else {
+        return Ok(());
+    };
+    if !matches!(sep, 'T' | 't' | ' ') {
+        return Err(bad(format!("unexpected `{rest}` after date")));
+    }
+    match time(&rest[1..]).map_err(bad)? {
+        "" | "Z" | "z" => Ok(()),
+        offset => {
+            let b = offset.as_bytes();
+            let valid = b.len() == 6
+                && matches!(b[0], b'+' | b'-')
+                && b[3] == b':'
+                && num(offset, 1, 2).is_some_and(|h| h <= 23)
+                && num(offset, 4, 2).is_some_and(|m| m <= 59);
+            if valid {
+                Ok(())
+            } else {
+                Err(bad(format!("invalid offset `{offset}`")))
+            }
+        }
+    }
+}
+
+/// Checks `HH:MM:SS[.fraction]` at the start of `s`; returns what follows.
+fn time(s: &str) -> Result<&str, String> {
+    let (h, m, sec) = match (num(s, 0, 2), num(s, 3, 2), num(s, 6, 2)) {
+        (Some(h), Some(m), Some(sec)) if &s[2..3] == ":" && &s[5..6] == ":" => (h, m, sec),
+        _ => return Err("expected HH:MM:SS".into()),
+    };
+    // 60 is a leap second, which RFC 3339 allows.
+    if h > 23 || m > 59 || sec > 60 {
+        return Err(format!("time {h:02}:{m:02}:{sec:02} is out of range"));
+    }
+    let rest = &s[8..];
+    match rest.strip_prefix('.') {
+        Some(frac) => {
+            let digits = frac.bytes().take_while(u8::is_ascii_digit).count();
+            if digits == 0 {
+                return Err("expected digits after the decimal point".into());
+            }
+            Ok(&frac[digits..])
+        }
+        None => Ok(rest),
+    }
+}
+
+fn num(s: &str, at: usize, len: usize) -> Option<u32> {
+    let digits = s.get(at..at + len)?;
+    if digits.bytes().all(|b| b.is_ascii_digit()) {
+        digits.parse().ok()
+    } else {
+        None
+    }
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        2 if year % 4 == 0 && (year % 100 != 0 || year % 400 == 0) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn string(src: &str) -> PResult<String> {
+        Cursor::new(src).string()
+    }
+
+    fn scalar(src: &str) -> Result<Value, String> {
+        Cursor::new(src).scalar().map_err(|d| d.message)
+    }
+
+    #[test]
+    fn rejects_bad_escapes_and_control_characters() {
+        let cases = [
+            (r#""\x41""#, "invalid escape sequence `\\x`"),
+            (r#""\u12G4""#, "expected 4 hex digits after `\\u`"),
+            (r#""\uD800""#, "U+D800 is not a valid unicode scalar value"),
+            (
+                "\"bell\u{7}\"",
+                "control character U+0007 must be escaped in strings",
+            ),
+            ("\"open\nx\"", "unterminated string"),
+            (
+                "'''x''''''",
+                "too many quotes at the end of a multi-line string",
+            ),
+        ];
+        for (src, message) in cases {
+            assert_eq!(string(src).unwrap_err().message, message, "{src}");
+        }
+    }
+
+    #[test]
+    fn numbers_in_all_radixes_and_forms() {
+        let cases = [
+            ("1_000_000", Value::Integer(1_000_000)),
+            ("+0", Value::Integer(0)),
+            ("0xDEAD_beef", Value::Integer(0xdead_beef)),
+            ("0o755", Value::Integer(0o755)),
+            ("0b1101", Value::Integer(13)),
+            ("-9223372036854775808", Value::Integer(i64::MIN)),
+            ("-0.5e-3", Value::Float(-0.0005)),
+            ("1e1_0", Value::Float(1e10)),
+            ("6.626E+34", Value::Float(6.626e34)),
+            ("-inf", Value::Float(f64::NEG_INFINITY)),
+        ];
+        for (src, value) in cases {
+            assert_eq!(scalar(src), Ok(value), "{src}");
+        }
+        assert!(matches!(scalar("nan"), Ok(Value::Float(f)) if f.is_nan()));
+    }
+
+    #[test]
+    fn rejects_malformed_numbers() {
+        let cases = [
+            ("0123", "leading zeros are not allowed"),
+            ("03.1", "leading zeros are not allowed"),
+            ("1__0", "underscores must sit between digits"),
+            ("1_", "underscores must sit between digits"),
+            ("-0x10", "only decimal integers may have a sign"),
+            ("0b102", "unexpected character"),
+            ("12ms", "unexpected character"),
+            ("1.", "missing digits"),
+            ("1e", "missing digits"),
+        ];
+        for (src, why) in cases {
+            assert_eq!(
+                scalar(src).unwrap_err(),
+                format!("invalid number `{src}`: {why}")
+            );
+        }
+        let big = "9223372036854775808";
+        assert_eq!(
+            scalar(big).unwrap_err(),
+            format!("integer `{big}` does not fit in 64 bits")
+        );
+        assert_eq!(
+            scalar("1e999").unwrap_err(),
+            "float `1e999` is out of range"
+        );
+    }
+
+    #[test]
+    fn date_times_are_validated_and_kept_verbatim() {
+        for ok in [
+            "1979-05-27T07:32:00Z",
+            "1979-05-27 07:32:00.999999-07:00",
+            "1979-05-27t07:32:00z",
+            "2024-02-29",
+            "00:32:00.5",
+            "2016-12-31T23:59:60Z",
+        ] {
+            assert_eq!(scalar(ok), Ok(Value::Datetime(ok.to_owned())), "{ok}");
+        }
+        let cases = [
+            ("2023-02-29", "day 29 is out of range for 2023-02"),
+            ("2023-13-01", "month 13 is out of range"),
+            ("2023-01-01T25:00:00", "time 25:00:00 is out of range"),
+            ("2023-01-01T10:00", "expected HH:MM:SS"),
+            ("2023-01-01T10:00:00+5:00", "invalid offset `+5:00`"),
+            ("10:00:00Z", "unexpected `Z` after local time"),
+        ];
+        for (src, why) in cases {
+            let message = format!("invalid date-time `{src}`: {why}");
+            assert_eq!(scalar(src).unwrap_err(), message);
+        }
+    }
+
+    #[test]
+    fn bare_words_are_not_values() {
+        for word in ["yes", "True", "_1", ".5"] {
+            let message = format!("expected a value, found `{word}` (strings must be quoted)");
+            assert_eq!(scalar(word).unwrap_err(), message);
+        }
+        assert_eq!(scalar(",").unwrap_err(), "expected a value, found `,`");
+    }
+
+    #[test]
+    fn dotted_keys_with_whitespace_and_quotes() {
+        let mut c = Cursor::new("a . \"b.c\" .'d' = 1");
+        let names: Vec<String> = c.key().unwrap().into_iter().map(|s| s.name).collect();
+        assert_eq!(names, ["a", "b.c", "d"]);
+        assert_eq!(c.peek(), Some('='));
+        assert!(Cursor::new("\"\"\"k\"\"\" = 1").key().is_err());
+    }
+}
