@@ -129,3 +129,119 @@ fn def_span(locs: &HashMap<KeyPath, Loc>, path: &KeyPath, prefer_key: bool) -> O
         Loc::Env(_) => None,
     }
 }
+
+/// A table under construction plus the [`Kind`] of every table in it.
+/// Paths are relative to `root`, which is the document root or, while an
+/// inline table is being parsed, that inline table.
+struct Tree {
+    root: Table,
+    kinds: HashMap<KeyPath, Kind>,
+}
+
+impl Tree {
+    fn new() -> Tree {
+        let kinds = HashMap::from([(KeyPath::root(), Kind::Header)]);
+        Tree {
+            root: Table::new(),
+            kinds,
+        }
+    }
+
+    fn table_mut(&mut self, path: &KeyPath) -> &mut Table {
+        if path.is_root() {
+            return &mut self.root;
+        }
+        self.root
+            .lookup_mut(path)
+            .and_then(Value::as_table_mut)
+            .expect("the parser only records paths of tables it created")
+    }
+
+    /// The type name of the existing entry `key` in the table at `path`,
+    /// plus its length when it is an array.
+    fn existing(&mut self, path: &KeyPath, key: &str) -> Option<(&'static str, usize)> {
+        let v = self.table_mut(path).get(key)?;
+        Some((v.type_name(), v.as_array().map_or(0, <[Value]>::len)))
+    }
+
+    fn kind(&self, path: &KeyPath) -> Option<Kind> {
+        self.kinds.get(path).copied()
+    }
+
+    /// Inserts `key = value` into the table at `at`, creating tables for
+    /// the dotted prefix. `base` is the absolute path of this tree's root,
+    /// used for locations and messages.
+    fn insert(
+        &mut self,
+        at: &KeyPath,
+        base: &KeyPath,
+        key: &[KeySeg],
+        (value, span): (Value, Span),
+        locs: &mut HashMap<KeyPath, Loc>,
+    ) -> PResult<()> {
+        let (last, parents) = key.split_last().expect("keys have at least one segment");
+        let mut path = at.clone();
+        for seg in parents {
+            let child = path.key(&seg.name);
+            let abs = base.join(&child);
+            match self.existing(&path, &seg.name) {
+                None => {
+                    self.table_mut(&path).insert(seg.name.clone(), Table::new());
+                    self.kinds.insert(child.clone(), Kind::Dotted);
+                    let loc = keyed(seg.span, seg.span);
+                    locs.insert(abs, loc);
+                }
+                Some(("table", _)) => match self.kind(&child) {
+                    Some(Kind::Dotted) | Some(Kind::Header) => {}
+                    Some(Kind::Implicit) => {
+                        self.kinds.insert(child.clone(), Kind::Dotted);
+                    }
+                    _ => {
+                        let first = def_span(locs, &abs, false);
+                        return Err(Diag::new(
+                            seg.span,
+                            format!("cannot extend inline table `{abs}`"),
+                        )
+                        .related("defined", first));
+                    }
+                },
+                Some((ty, _)) => {
+                    let msg = format!(
+                        "cannot use `{abs}` as a table; it is already {}",
+                        with_article(ty)
+                    );
+                    return Err(
+                        Diag::new(seg.span, msg).related("defined", def_span(locs, &abs, true))
+                    );
+                }
+            }
+            path = child;
+        }
+        let full = path.key(&last.name);
+        let abs = base.join(&full);
+        if self.table_mut(&path).contains_key(&last.name) {
+            let msg = format!(
+                "duplicate key `{}` in {}",
+                last.name,
+                table_label(&base.join(&path))
+            );
+            let first = def_span(locs, &abs, true);
+            return Err(Diag::new(last.span, msg).related("first defined", first));
+        }
+        if matches!(value, Value::Table(_) | Value::Array(_)) {
+            self.kinds.insert(full, Kind::Frozen);
+        }
+        self.table_mut(&path).insert(last.name.clone(), value);
+        let loc = keyed(last.span, span);
+        locs.insert(abs, loc);
+        Ok(())
+    }
+}
+
+struct Parser<'s> {
+    cur: Cursor<'s>,
+    tree: Tree,
+    locs: HashMap<KeyPath, Loc>,
+    /// The table that key/value lines go into: the latest header's table.
+    current: KeyPath,
+}
