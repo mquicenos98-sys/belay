@@ -34,3 +34,38 @@ struct Tracking {
     /// These are the candidates for "did you mean".
     requested: HashMap<KeyPath, BTreeSet<String>>,
 }
+
+/// Reads typed values out of a [`Document`] and remembers what was read.
+///
+/// ```
+/// use belay_conf::{Document, Reader};
+///
+/// let doc = Document::parse(r#"
+///     [server]
+///     listen = "0.0.0.0:7700"
+///     treads = 8
+///
+///     [queues.emails]
+///     max_concurrency = 4
+/// "#)?;
+/// let r = Reader::new(&doc);
+/// let listen = r.string_or("server.listen", "127.0.0.1:7700")?;
+/// let threads: Option<u32> = r.opt("server.threads")?;
+/// let mut queues = Vec::new();
+/// for (name, q) in r.tables("queues")? {
+///     queues.push((name, q.or("max_concurrency", 1u32)?));
+/// }
+/// assert_eq!((listen.as_str(), threads), ("0.0.0.0:7700", None));
+/// assert_eq!(queues, [("emails".to_string(), 4)]);
+///
+/// let unused = r.unused_keys();
+/// assert_eq!(unused[0].path, "server.treads");
+/// assert_eq!(unused[0].suggestion.as_deref(), Some("server.threads"));
+/// # Ok::<(), belay_conf::Error>(())
+/// ```
+#[derive(Clone)]
+pub struct Reader<'a> {
+    doc: &'a Document,
+    base: KeyPath,
+    track: Rc<RefCell<Tracking>>,
+}
