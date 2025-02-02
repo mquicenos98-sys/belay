@@ -245,3 +245,401 @@ struct Parser<'s> {
     /// The table that key/value lines go into: the latest header's table.
     current: KeyPath,
 }
+
+impl<'s> Parser<'s> {
+    fn new(src: &'s str) -> Parser<'s> {
+        Parser {
+            cur: Cursor::new(src),
+            tree: Tree::new(),
+            locs: HashMap::new(),
+            current: KeyPath::root(),
+        }
+    }
+
+    fn header(&mut self) -> PResult<()> {
+        let start = self.cur.pos();
+        let array = self.cur.eat_str("[[");
+        if !array {
+            self.cur.bump();
+        }
+        self.cur.skip_ws();
+        let segs = self.cur.key()?;
+        let close = if array { "]]" } else { "]" };
+        if !self.cur.eat_str(close) {
+            let found = self.cur.describe_next();
+            return Err(self.cur.error_here(format!(
+                "expected `{close}` to close the table header, found {found}"
+            )));
+        }
+        let span = Span::new(start, self.cur.pos());
+        if array {
+            self.open_array_table(&segs, span)?;
+        } else {
+            self.open_table(&segs, span)?;
+        }
+        self.cur.end_of_line("table header")
+    }
+
+    /// Walks the parent segments of a header, creating implicit tables and
+    /// stepping into the last element of arrays of tables.
+    fn descend(&mut self, segs: &[KeySeg]) -> PResult<KeyPath> {
+        let mut path = KeyPath::root();
+        for seg in segs {
+            let child = path.key(&seg.name);
+            path = match self.tree.existing(&path, &seg.name) {
+                None => {
+                    self.tree
+                        .table_mut(&path)
+                        .insert(seg.name.clone(), Table::new());
+                    self.tree.kinds.insert(child.clone(), Kind::Implicit);
+                    let loc = keyed(seg.span, seg.span);
+                    self.locs.insert(child.clone(), loc);
+                    child
+                }
+                Some(("table", _)) if self.tree.kind(&child) == Some(Kind::Frozen) => {
+                    let first = def_span(&self.locs, &child, false);
+                    return Err(Diag::new(
+                        seg.span,
+                        format!("cannot extend inline table `{child}`"),
+                    )
+                    .related("defined", first));
+                }
+                Some(("table", _)) => child,
+                Some(("array", len)) if self.tree.kind(&child) == Some(Kind::ArrayOfTables) => {
+                    child.index(len - 1)
+                }
+                Some((ty, _)) => {
+                    let msg = format!(
+                        "cannot use `{child}` as a table; it is already {}",
+                        with_article(ty)
+                    );
+                    let first = def_span(&self.locs, &child, true);
+                    return Err(Diag::new(seg.span, msg).related("defined", first));
+                }
+            };
+        }
+        Ok(path)
+    }
+
+    fn open_table(&mut self, segs: &[KeySeg], span: Span) -> PResult<()> {
+        let (last, parents) = segs.split_last().expect("keys have at least one segment");
+        let parent = self.descend(parents)?;
+        let full = parent.key(&last.name);
+        let name = written(segs);
+        let first = def_span(&self.locs, &full, false);
+        let conflict = match self.tree.existing(&parent, &last.name) {
+            None => {
+                self.tree
+                    .table_mut(&parent)
+                    .insert(last.name.clone(), Table::new());
+                None
+            }
+            Some(("table", _)) => match self.tree.kind(&full) {
+                Some(Kind::Implicit) => None,
+                Some(Kind::Header) => Some(("first defined", "is defined more than once".into())),
+                Some(Kind::Dotted) => {
+                    Some(("defined", "was already created by dotted keys".into()))
+                }
+                _ => {
+                    let msg = format!("cannot extend inline table `{name}`");
+                    return Err(Diag::new(span, msg).related("defined", first));
+                }
+            },
+            Some(("array", _)) if self.tree.kind(&full) == Some(Kind::ArrayOfTables) => {
+                Some(("defined", "is already an array of tables".into()))
+            }
+            Some((ty, _)) => Some(("defined", format!("is already {}", with_article(ty)))),
+        };
+        if let Some((label, why)) = conflict {
+            let msg = format!("table [{name}] {why}");
+            return Err(Diag::new(span, msg).related(label, first));
+        }
+        self.tree.kinds.insert(full.clone(), Kind::Header);
+        let loc = keyed(last.span, span);
+        self.locs.insert(full.clone(), loc);
+        self.current = full;
+        Ok(())
+    }
+
+    fn open_array_table(&mut self, segs: &[KeySeg], span: Span) -> PResult<()> {
+        let (last, parents) = segs.split_last().expect("keys have at least one segment");
+        let parent = self.descend(parents)?;
+        let full = parent.key(&last.name);
+        let name = written(segs);
+        let index = match self.tree.existing(&parent, &last.name) {
+            None => {
+                let array = Value::Array(Vec::new());
+                self.tree
+                    .table_mut(&parent)
+                    .insert(last.name.clone(), array);
+                self.tree.kinds.insert(full.clone(), Kind::ArrayOfTables);
+                let loc = keyed(last.span, span);
+                self.locs.insert(full.clone(), loc);
+                0
+            }
+            Some(("array", len)) if self.tree.kind(&full) == Some(Kind::ArrayOfTables) => len,
+            Some((ty, _)) => {
+                let msg = if ty == "array" {
+                    format!("cannot append to static array `{name}` with [[{name}]]")
+                } else {
+                    format!(
+                        "cannot define array of tables [[{name}]]; `{name}` is already {}",
+                        with_article(ty)
+                    )
+                };
+                let first = def_span(&self.locs, &full, true);
+                return Err(Diag::new(span, msg).related("defined", first));
+            }
+        };
+        self.tree
+            .table_mut(&parent)
+            .get_mut(&last.name)
+            .and_then(Value::as_array_mut)
+            .expect("checked to be an array of tables above")
+            .push(Value::Table(Table::new()));
+        let element = full.index(index);
+        self.tree.kinds.insert(element.clone(), Kind::Header);
+        let loc = keyed(last.span, span);
+        self.locs.insert(element.clone(), loc);
+        self.current = element;
+        Ok(())
+    }
+
+    fn key_value(&mut self) -> PResult<()> {
+        let key = self.cur.key()?;
+        self.expect_equals()?;
+        let path = self.current.join(&written(&key));
+        let value = self.value(&path, 0)?;
+        let current = self.current.clone();
+        self.tree
+            .insert(&current, &KeyPath::root(), &key, value, &mut self.locs)?;
+        self.cur.end_of_line("value")
+    }
+
+    fn expect_equals(&mut self) -> PResult<()> {
+        self.cur.skip_ws();
+        if !self.cur.eat('=') {
+            let found = self.cur.describe_next();
+            return Err(self
+                .cur
+                .error_here(format!("expected `=` after key, found {found}")));
+        }
+        self.cur.skip_ws();
+        Ok(())
+    }
+
+    /// Parses the value at the cursor; `path` is its absolute location, used
+    /// to record spans of nested elements and keys.
+    fn value(&mut self, path: &KeyPath, depth: usize) -> PResult<(Value, Span)> {
+        let start = self.cur.pos();
+        let value = match self.cur.peek() {
+            Some('"') | Some('\'') => Value::String(self.cur.string()?),
+            Some('[') => self.array(path, depth + 1)?,
+            Some('{') => self.inline_table(path, depth + 1)?,
+            _ => self.cur.scalar()?,
+        };
+        Ok((value, Span::new(start, self.cur.pos())))
+    }
+
+    fn check_depth(&self, depth: usize) -> PResult<()> {
+        if depth > MAX_DEPTH {
+            return Err(self.cur.error_here(format!(
+                "values are nested too deeply (the limit is {MAX_DEPTH} levels)"
+            )));
+        }
+        Ok(())
+    }
+
+    fn array(&mut self, path: &KeyPath, depth: usize) -> PResult<Value> {
+        self.check_depth(depth)?;
+        let open = self.cur.pos();
+        self.cur.bump();
+        let mut items = Vec::new();
+        loop {
+            self.cur.skip_trivia()?;
+            if self.cur.eat(']') {
+                return Ok(Value::Array(items));
+            }
+            if self.cur.peek().is_none() {
+                return Err(Diag::new(Span::new(open, open + 1), "unclosed array"));
+            }
+            let element = path.index(items.len());
+            let (value, span) = self.value(&element, depth)?;
+            self.locs.insert(
+                element,
+                Loc::Source {
+                    key: None,
+                    value: span,
+                },
+            );
+            items.push(value);
+            self.cur.skip_trivia()?;
+            if self.cur.eat(']') {
+                return Ok(Value::Array(items));
+            }
+            if !self.cur.eat(',') {
+                if self.cur.peek().is_none() {
+                    return Err(Diag::new(Span::new(open, open + 1), "unclosed array"));
+                }
+                let found = self.cur.describe_next();
+                return Err(self
+                    .cur
+                    .error_here(format!("expected `,` or `]` in array, found {found}")));
+            }
+        }
+    }
+
+    fn inline_table(&mut self, path: &KeyPath, depth: usize) -> PResult<Value> {
+        self.check_depth(depth)?;
+        let open = self.cur.pos();
+        self.cur.bump();
+        let mut tree = Tree::new();
+        self.cur.skip_ws();
+        if self.cur.eat('}') {
+            return Ok(Value::Table(tree.root));
+        }
+        loop {
+            self.cur.skip_ws();
+            self.inline_line_check(open)?;
+            let key = self.cur.key()?;
+            self.expect_equals()?;
+            let value = self.value(&path.join(&written(&key)), depth)?;
+            tree.insert(&KeyPath::root(), path, &key, value, &mut self.locs)?;
+            self.cur.skip_ws();
+            if self.cur.eat('}') {
+                return Ok(Value::Table(tree.root));
+            }
+            if self.cur.eat(',') {
+                self.cur.skip_ws();
+                if self.cur.peek() == Some('}') {
+                    return Err(self
+                        .cur
+                        .error_here("trailing comma is not allowed in an inline table"));
+                }
+                continue;
+            }
+            self.inline_line_check(open)?;
+            let found = self.cur.describe_next();
+            return Err(self.cur.error_here(format!(
+                "expected `,` or `}}` in inline table, found {found}"
+            )));
+        }
+    }
+
+    /// TOML 1.0 inline tables live on a single line.
+    fn inline_line_check(&self, open: usize) -> PResult<()> {
+        match self.cur.peek() {
+            None => Err(Diag::new(
+                Span::new(open, open + 1),
+                "unclosed inline table",
+            )),
+            Some('\n') | Some('\r') | Some('#') => Err(self.cur.error_here(
+                "inline tables must be on a single line; use a [table] section for longer ones",
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(src: &str) -> Table {
+        match parse_document(src) {
+            Ok(p) => p.root,
+            Err(d) => panic!("unexpected error: {}", d.message),
+        }
+    }
+
+    fn fails(src: &str) -> String {
+        match parse_document(src) {
+            Ok(p) => panic!("expected an error, parsed {:?}", p.root),
+            Err(d) => d.message,
+        }
+    }
+
+    fn get<'t>(t: &'t Table, path: &str) -> &'t Value {
+        t.lookup(&KeyPath::parse(path).unwrap())
+            .unwrap_or_else(|| panic!("{path} not found"))
+    }
+
+    #[test]
+    fn tables_dotted_keys_and_arrays_of_tables() {
+        let t = parse(
+            "title = 'x'\n[a.b]\nc = 1\n[a]\nd.e = 2\n[[q]]\nn = 1\n[q.sub]\nm = 2\n[[q]]\nn = 3\n",
+        );
+        assert_eq!(get(&t, "a.b.c"), &Value::Integer(1));
+        assert_eq!(get(&t, "a.d.e"), &Value::Integer(2));
+        assert_eq!(get(&t, "q[0].sub.m"), &Value::Integer(2));
+        assert_eq!(get(&t, "q[1].n"), &Value::Integer(3));
+        assert_eq!(get(&t, "q").as_array().map(<[Value]>::len), Some(2));
+    }
+
+    #[test]
+    fn arrays_span_lines_with_comments_and_trailing_commas() {
+        let t =
+            parse("seeds = [\n  \"a:1\", # first\n  \"b:2\",\n]\nnested = [[1, 2], ['x'], []]\n");
+        assert_eq!(get(&t, "seeds"), &Value::from(vec!["a:1", "b:2"]));
+        assert_eq!(get(&t, "nested[0][1]"), &Value::Integer(2));
+        assert_eq!(get(&t, "nested[2]"), &Value::Array(vec![]));
+    }
+
+    #[test]
+    fn inline_tables_with_dotted_keys() {
+        let t =
+            parse("tok = { name = \"ci\", scopes = [\"work\"], meta.team = \"ops\" }\ne = {}\n");
+        assert_eq!(get(&t, "tok.meta.team"), &Value::from("ops"));
+        assert_eq!(get(&t, "e"), &Value::Table(Table::new()));
+    }
+
+    #[test]
+    fn subtables_may_be_added_to_dotted_tables() {
+        let t = parse("[fruit]\napple.color = 'red'\n[fruit.apple.texture]\nsmooth = true\n");
+        assert_eq!(get(&t, "fruit.apple.texture.smooth"), &Value::Boolean(true));
+    }
+
+    #[test]
+    fn nesting_depth_is_bounded() {
+        let deep = format!("a = {}{}", "[".repeat(200), "]".repeat(200));
+        assert_eq!(
+            fails(&deep),
+            "values are nested too deeply (the limit is 128 levels)"
+        );
+        let ok = format!("a = {}{}", "[".repeat(100), "]".repeat(100));
+        parse(&ok);
+    }
+
+    #[test]
+    fn records_key_and_value_spans() {
+        let src = "[server]\nlisten = \"x\"\n[[s]]\nports = [1, 22]\n";
+        let p = parse_document(src).unwrap();
+        let at = |path: &str| match p.locs.get(&KeyPath::parse(path).unwrap()) {
+            Some(Loc::Source { key, value }) => (
+                key.map(|k| &src[k.start..k.end]),
+                &src[value.start..value.end],
+            ),
+            other => panic!("{path}: {other:?}"),
+        };
+        assert_eq!(at("server"), (Some("server"), "[server]"));
+        assert_eq!(at("server.listen"), (Some("listen"), "\"x\""));
+        assert_eq!(at("s[0]"), (Some("s"), "[[s]]"));
+        assert_eq!(at("s[0].ports[1]"), (None, "22"));
+    }
+
+    #[test]
+    fn parses_lone_values() {
+        assert_eq!(
+            parse_value(" [1, 'a'] ").unwrap(),
+            Value::from(vec![Value::Integer(1), Value::from("a")])
+        );
+        assert_eq!(
+            parse_value("x").unwrap_err().message,
+            "expected a value, found `x` (strings must be quoted)"
+        );
+        assert_eq!(
+            parse_value("1 2").unwrap_err().message,
+            "unexpected `2` after value"
+        );
+    }
+}
