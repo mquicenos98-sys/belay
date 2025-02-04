@@ -428,3 +428,120 @@ where
     text.parse()
         .map_err(|e: T::Err| ConvertError::invalid(e.to_string()))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::net::IpAddr;
+
+    fn doc(src: &str) -> Document {
+        Document::parse(src).unwrap()
+    }
+
+    fn unused(r: &Reader<'_>) -> Vec<(String, Option<String>)> {
+        let unused = r.unused_keys().into_iter();
+        unused.map(|u| (u.path, u.suggestion)).collect()
+    }
+
+    #[test]
+    fn untouched_tables_are_reported_once_with_a_suggestion() {
+        let d = doc("[sever]\nlisten = 'x'\nthreads = 2\n[server]\nthreads = 4\n");
+        let r = Reader::new(&d);
+        assert_eq!(r.opt_string("server.listen").unwrap(), None);
+        assert_eq!(r.or("server.threads", 1u32).unwrap(), 4);
+        let expected = [("sever".to_owned(), Some("server".to_owned()))];
+        assert_eq!(unused(&r), expected);
+        let text = r.unused_keys()[0].to_string();
+        assert!(text.contains("1 | [sever]\n  |  ^^^^^"), "{text}");
+    }
+
+    #[test]
+    fn whole_values_count_as_read() {
+        let d = doc("[cluster]\nseeds = ['a']\nmeta = { zone = 'eu', rack = '4' }\nextra = 1\n");
+        let r = Reader::new(&d);
+        let seeds: Vec<String> = r.req("cluster.seeds").unwrap();
+        let meta: BTreeMap<String, String> = r.req("cluster.meta").unwrap();
+        assert_eq!((seeds.len(), meta.len()), (1, 2));
+        assert_eq!(unused(&r), [("cluster.extra".to_owned(), None)]);
+        assert!(r.value("cluster.extra").unwrap().is_some());
+        r.deny_unused().unwrap();
+    }
+
+    #[test]
+    fn type_errors_carry_path_and_location() {
+        let d = doc("[server]\nthreads = \"8\"\nports = [1, 'x']\n");
+        let r = Reader::new(&d);
+        let errors = [
+            r.opt_int("server.threads").unwrap_err(),
+            r.req::<Vec<u16>>("server.ports").unwrap_err(),
+            r.tables("server").unwrap_err(),
+            r.req::<String>("server.threads.x").unwrap_err(),
+        ];
+        let got: Vec<_> = errors.iter().map(|e| (e.message(), e.line_col())).collect();
+        let at_threads = Some((2, 11));
+        assert_eq!(
+            got,
+            [
+                (
+                    "expected integer at server.threads, found string".into(),
+                    at_threads
+                ),
+                (
+                    "expected integer at server.ports[1], found string".into(),
+                    Some((3, 13))
+                ),
+                (
+                    "expected table at server.threads, found string".into(),
+                    at_threads
+                ),
+                (
+                    "expected table at server.threads, found string".into(),
+                    at_threads
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn parsed_values_accept_strings_and_numbers() {
+        let d = doc("a = '8'\nb = 8\nc = 2.5\nd = true\ne = 'x'\n");
+        let r = Reader::new(&d);
+        assert_eq!(r.parsed::<u64>("a").unwrap(), 8);
+        assert_eq!(r.parsed::<u64>("b").unwrap(), 8);
+        assert_eq!(r.parsed::<f32>("c").unwrap(), 2.5);
+        let err = r.parsed::<u64>("d").unwrap_err();
+        assert_eq!(err.message(), "expected string at d, found boolean");
+        let err = r.parsed::<u64>("e").unwrap_err();
+        assert_eq!(
+            err.message(),
+            "invalid value for e: invalid digit found in string"
+        );
+        assert!(r.opt_parsed::<IpAddr>("zzz").unwrap().is_none());
+    }
+
+    #[test]
+    fn scoped_readers_resolve_relative_paths() {
+        let d = doc("[storage]\ndir = '/var/lib/belay'\n[storage.wal]\nsegment_bytes = 1024\n");
+        let r = Reader::new(&d);
+        let storage = r.table("storage").unwrap().unwrap();
+        assert_eq!(storage.path().to_string(), "storage");
+        assert_eq!(storage.keys(), ["dir", "wal"]);
+        assert_eq!(storage.string("dir").unwrap(), "/var/lib/belay");
+        let wal = storage.table("wal").unwrap().unwrap();
+        assert_eq!(wal.req::<u64>("segment_bytes").unwrap(), 1024);
+        assert!(r.table("nothing").unwrap().is_none());
+        assert!(r.tables("nothing").unwrap().is_empty());
+        assert!(r.unused_keys().is_empty());
+        let err = storage.req::<String>("missing").unwrap_err();
+        assert_eq!(err.message(), "missing required key `storage.missing`");
+    }
+
+    #[test]
+    fn malformed_paths_are_errors_not_panics() {
+        let d = doc("a = 1");
+        let r = Reader::new(&d);
+        assert!(matches!(r.opt_int("a..b"), Err(Error::Path { .. })));
+        assert!(matches!(r.invalid("[", "x"), Error::Path { .. }));
+    }
+}
