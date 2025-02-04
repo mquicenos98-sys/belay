@@ -83,3 +83,114 @@ fn write_header(out: &mut String, path: &[&str], array: bool) {
     }
     out.push_str(if array { "]]\n" } else { "]\n" });
 }
+
+/// Appends `value` in inline syntax.
+pub(crate) fn write_inline(out: &mut String, value: &Value) {
+    match value {
+        Value::String(s) => write_basic_string(out, s),
+        Value::Integer(i) => out.push_str(&i.to_string()),
+        Value::Float(f) => write_float(out, *f),
+        Value::Boolean(b) => out.push_str(if *b { "true" } else { "false" }),
+        Value::Datetime(s) => out.push_str(s),
+        Value::Array(items) => {
+            out.push('[');
+            for (i, item) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_inline(out, item);
+            }
+            out.push(']');
+        }
+        Value::Table(t) if t.is_empty() => out.push_str("{}"),
+        Value::Table(t) => {
+            out.push_str("{ ");
+            for (i, (key, item)) in t.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write_key(out, key);
+                out.push_str(" = ");
+                write_inline(out, item);
+            }
+            out.push_str(" }");
+        }
+    }
+}
+
+fn write_float(out: &mut String, f: f64) {
+    if f.is_nan() {
+        out.push_str("nan");
+    } else if f.is_infinite() {
+        out.push_str(if f > 0.0 { "inf" } else { "-inf" });
+    } else {
+        // Debug formatting is the shortest text that round-trips and always
+        // has a `.` or an exponent (`1.0`, `1e-7`, `1e300`), which TOML
+        // needs to tell a float from an integer.
+        out.push_str(&format!("{f:?}"));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Document;
+
+    fn round_trip(src: &str) -> String {
+        let doc = Document::parse(src).unwrap();
+        let text = doc.to_toml();
+        let again = Document::parse(&text).unwrap_or_else(|e| panic!("{e}\n---\n{text}"));
+        assert_eq!(again.root(), doc.root(), "\n{text}");
+        text
+    }
+
+    #[test]
+    fn plain_keys_precede_sections_and_order_is_stable() {
+        let text = round_trip("[a]\nsub = { x = 1 }\nz = 2\ny = 'q'\n[b]\nk = true\n");
+        assert_eq!(
+            text,
+            "[a]\nz = 2\ny = \"q\"\n\n[a.sub]\nx = 1\n\n[b]\nk = true\n"
+        );
+    }
+
+    #[test]
+    fn arrays_of_tables_with_nested_sections() {
+        let src =
+            "[[s]]\nid = 'a'\n[s.template]\nqueue = 'q'\n[[s.hooks]]\nurl = 'h'\n[[s]]\nid = 'b'\n";
+        let text = round_trip(src);
+        assert_eq!(
+            text,
+            "[[s]]\nid = \"a\"\n\n[s.template]\nqueue = \"q\"\n\n[[s.hooks]]\nurl = \"h\"\n\n[[s]]\nid = \"b\"\n"
+        );
+    }
+
+    #[test]
+    fn scalars_and_escapes_survive() {
+        round_trip(concat!(
+            "s = \"quote \\\" backslash \\\\ nl \\n tab \\t bell \\u0007 é\"\n",
+            "f = [1.0, -0.5, 1e-7, 6.02e23, inf, -inf, 0.1]\n",
+            "i = [-9223372036854775808, 0, 42]\n",
+            "d = [1979-05-27T07:32:00Z, 1979-05-27, 07:32:00.5]\n",
+            "\"key with spaces\" = { \"\" = 1, nested = { deep = [] } }\n",
+            "mixed = [1, 'two', { three = 3 }, [4]]\n",
+            "empty = {}\n",
+            "[empty_section]\n",
+        ));
+    }
+
+    #[test]
+    fn tables_with_only_subtables_get_no_header() {
+        let text = round_trip("[queues.emails]\nmax_concurrency = 4\n[queues.reports]\n");
+        assert_eq!(
+            text,
+            "[queues.emails]\nmax_concurrency = 4\n\n[queues.reports]\n"
+        );
+    }
+
+    #[test]
+    fn nan_is_written_as_toml_nan() {
+        let mut t = Table::new();
+        t.insert("x", f64::NAN);
+        assert_eq!(to_string(&t), "x = nan\n");
+    }
+}
