@@ -133,3 +133,47 @@ fn step<'v>(v: &'v Value, seg: &Segment) -> Option<&'v Value> {
         _ => None,
     }
 }
+
+pub(crate) fn step_mut<'v>(v: &'v mut Value, seg: &Segment) -> Option<&'v mut Value> {
+    match (v, seg) {
+        (Value::Table(t), Segment::Key(k)) => t.get_mut(k),
+        (Value::Array(items), Segment::Index(i)) => items.get_mut(*i),
+        _ => None,
+    }
+}
+
+/// Renders the value in TOML inline syntax (`"text"`, `[1, 2]`, `{ a = 1 }`).
+impl fmt::Display for Value {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut out = String::new();
+        crate::ser::write_inline(&mut out, self);
+        f.write_str(&out)
+    }
+}
+
+macro_rules! value_from {
+    ($($t:ty => $variant:ident($conv:expr)),* $(,)?) => {$(
+        impl From<$t> for Value {
+            fn from(v: $t) -> Value {
+                Value::$variant($conv(v))
+            }
+        }
+    )*};
+}
+
+value_from! {
+    &str => String(str::to_owned),
+    String => String(String::from),
+    i64 => Integer(i64::from),
+    i32 => Integer(i64::from),
+    u32 => Integer(i64::from),
+    f64 => Float(f64::from),
+    bool => Boolean(bool::from),
+    Table => Table(Table::from),
+}
+
+impl<T: Into<Value>> From<Vec<T>> for Value {
+    fn from(items: Vec<T>) -> Value {
+        Value::Array(items.into_iter().map(Into::into).collect())
+    }
+}
