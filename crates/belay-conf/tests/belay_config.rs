@@ -86,3 +86,30 @@ struct Queue {
     rate_limit: Option<(f64, u32)>,
     default_timeout: Option<String>,
 }
+
+#[derive(Debug, PartialEq)]
+struct Schedule {
+    id: String,
+    cron: String,
+    timezone: String,
+    starts_at: Option<String>,
+    queue: String,
+    kind: String,
+    meta: BTreeMap<String, String>,
+}
+
+#[derive(Debug)]
+struct Config {
+    listen: SocketAddr,
+    threads: u32,
+    max_body: u64,
+    dir: String,
+    sync: String,
+    checkpoint_bytes: u64,
+    tokens: Vec<Token>,
+    log_level: String,
+    queues: Vec<Queue>,
+    schedules: Vec<Schedule>,
+    seeds: Vec<String>,
+    metrics: bool,
+}
