@@ -177,3 +177,131 @@ impl<T: Into<Value>> From<Vec<T>> for Value {
         Value::Array(items.into_iter().map(Into::into).collect())
     }
 }
+
+/// A map from keys to values that remembers insertion order.
+///
+/// Iteration and serialization follow insertion order, so printed
+/// configuration reads like the file it came from. Equality ignores order,
+/// matching TOML's semantics where tables are unordered.
+#[derive(Clone, Default)]
+pub struct Table {
+    entries: Vec<(String, Value)>,
+    index: HashMap<String, usize>,
+}
+
+impl Table {
+    /// An empty table.
+    pub fn new() -> Table {
+        Table::default()
+    }
+
+    /// Number of entries.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the table has no entries.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// The value for `key`.
+    pub fn get(&self, key: &str) -> Option<&Value> {
+        self.index.get(key).map(|&i| &self.entries[i].1)
+    }
+
+    /// Mutable access to the value for `key`.
+    pub fn get_mut(&mut self, key: &str) -> Option<&mut Value> {
+        let i = *self.index.get(key)?;
+        Some(&mut self.entries[i].1)
+    }
+
+    /// Whether `key` is present.
+    pub fn contains_key(&self, key: &str) -> bool {
+        self.index.contains_key(key)
+    }
+
+    /// Inserts or replaces a value. A replaced key keeps its position.
+    pub fn insert(&mut self, key: impl Into<String>, value: impl Into<Value>) -> Option<Value> {
+        let key = key.into();
+        let value = value.into();
+        if let Some(&i) = self.index.get(&key) {
+            return Some(std::mem::replace(&mut self.entries[i].1, value));
+        }
+        self.index.insert(key.clone(), self.entries.len());
+        self.entries.push((key, value));
+        None
+    }
+
+    /// Removes a key, preserving the order of the remaining entries.
+    pub fn remove(&mut self, key: &str) -> Option<Value> {
+        let i = self.index.remove(key)?;
+        let (_, value) = self.entries.remove(i);
+        for (k, _) in &self.entries[i..] {
+            if let Some(slot) = self.index.get_mut(k) {
+                *slot -= 1;
+            }
+        }
+        Some(value)
+    }
+
+    /// Entries in insertion order.
+    pub fn iter(&self) -> Iter<'_> {
+        Iter(self.entries.iter())
+    }
+
+    /// Keys in insertion order.
+    pub fn keys(&self) -> impl Iterator<Item = &str> + '_ {
+        self.entries.iter().map(|(k, _)| k.as_str())
+    }
+
+    /// Follows `path` from this table; the root path yields `None` because
+    /// the table itself is not a [`Value`].
+    pub fn lookup(&self, path: &KeyPath) -> Option<&Value> {
+        let (first, rest) = path.segments().split_first()?;
+        let Segment::Key(k) = first else { return None };
+        rest.iter().try_fold(self.get(k)?, step)
+    }
+
+    /// Mutable variant of [`Table::lookup`].
+    pub fn lookup_mut(&mut self, path: &KeyPath) -> Option<&mut Value> {
+        let (first, rest) = path.segments().split_first()?;
+        let Segment::Key(k) = first else { return None };
+        rest.iter().try_fold(self.get_mut(k)?, step_mut)
+    }
+}
+
+impl PartialEq for Table {
+    fn eq(&self, other: &Table) -> bool {
+        self.len() == other.len() && self.iter().all(|(k, v)| other.get(k) == Some(v))
+    }
+}
+
+impl fmt::Debug for Table {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+impl<K: Into<String>, V: Into<Value>> FromIterator<(K, V)> for Table {
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Table {
+        let mut t = Table::new();
+        for (k, v) in iter {
+            t.insert(k, v);
+        }
+        t
+    }
+}
+
+impl<'a> IntoIterator for &'a Table {
+    type Item = (&'a str, &'a Value);
+    type IntoIter = Iter<'a>;
+
+    fn into_iter(self) -> Iter<'a> {
+        self.iter()
+    }
+}
+
+/// Iterator over a [`Table`]'s entries in insertion order.
+#[derive(Debug, Clone)]
+pub struct Iter<'a>(std::slice::Iter<'a, (String, Value)>);
