@@ -232,3 +232,23 @@ fn value_syntax_errors() {
         ),
     ]);
 }
+
+#[test]
+fn deep_nesting_is_an_error_not_a_crash() {
+    let src = format!("a = {}", "[".repeat(10_000));
+    let err = parse_error(&src);
+    assert_eq!(
+        err.message(),
+        "values are nested too deeply (the limit is 128 levels)"
+    );
+    assert_eq!(err.line_col(), Some((1, 133)));
+}
+
+#[test]
+fn lone_value_errors_render_against_the_value_text() {
+    let err = belay_conf::parse_value("[1, 2").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "error: unclosed array\n --> line 1, column 1\n  |\n1 | [1, 2\n  | ^"
+    );
+}
