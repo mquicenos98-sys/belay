@@ -305,3 +305,74 @@ impl<'a> IntoIterator for &'a Table {
 /// Iterator over a [`Table`]'s entries in insertion order.
 #[derive(Debug, Clone)]
 pub struct Iter<'a>(std::slice::Iter<'a, (String, Value)>);
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = (&'a str, &'a Value);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next().map(|(k, v)| (k.as_str(), v))
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+}
+
+impl ExactSizeIterator for Iter<'_> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn keys(t: &Table) -> Vec<&str> {
+        t.keys().collect()
+    }
+
+    #[test]
+    fn keeps_insertion_order_through_replace_and_remove() {
+        let mut t: Table = [("b", 1), ("a", 2), ("c", 3)].into_iter().collect();
+        assert_eq!(t.insert("a", 20), Some(Value::Integer(2)));
+        assert_eq!(keys(&t), ["b", "a", "c"]);
+        assert_eq!(t.remove("b"), Some(Value::Integer(1)));
+        assert_eq!(t.remove("b"), None);
+        t.insert("d", 4);
+        assert_eq!(keys(&t), ["a", "c", "d"]);
+        assert_eq!(t.get("c"), Some(&Value::Integer(3)));
+    }
+
+    #[test]
+    fn equality_ignores_order() {
+        let a: Table = [("x", 1), ("y", 2)].into_iter().collect();
+        let b: Table = [("y", 2), ("x", 1)].into_iter().collect();
+        let c: Table = [("y", 2), ("x", 3)].into_iter().collect();
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+    }
+
+    #[test]
+    fn lookup_walks_tables_and_arrays() {
+        let inner: Table = [("cron", "0 * * * *")].into_iter().collect();
+        let mut root = Table::new();
+        root.insert("schedules", Value::Array(vec![Value::Table(inner)]));
+        let path = |p: &str| KeyPath::parse(p).unwrap();
+        let cron = root.lookup(&path("schedules[0].cron"));
+        assert_eq!(cron.and_then(Value::as_str), Some("0 * * * *"));
+        assert_eq!(root.lookup(&path("schedules[1].cron")), None);
+        assert_eq!(root.lookup(&path("schedules.cron")), None);
+        *root.lookup_mut(&path("schedules[0].cron")).unwrap() = Value::from("@daily");
+        assert_eq!(
+            root.lookup(&path("schedules[0].cron")),
+            Some(&Value::from("@daily"))
+        );
+    }
+
+    #[test]
+    fn display_uses_inline_toml() {
+        let t: Table = [("a", Value::from(vec![1, 2])), ("b c", Value::from("x\"y"))]
+            .into_iter()
+            .collect();
+        let text = Value::Table(t).to_string();
+        assert_eq!(text, r#"{ a = [1, 2], "b c" = "x\"y" }"#);
+        assert_eq!(Value::Float(2.0).to_string(), "2.0");
+    }
+}
