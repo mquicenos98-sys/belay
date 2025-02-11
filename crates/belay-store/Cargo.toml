@@ -1,0 +1,16 @@
+[package]
+name = "belay-store"
+description = "Log-structured key-value store for belay: write-ahead log with group commit, snapshots, crash recovery and an in-memory backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "belay_store"
+path = "src/lib.rs"
+
+[dependencies]
+belay-common = { path = "../belay-common" }
