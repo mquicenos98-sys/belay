@@ -168,3 +168,85 @@ impl std::error::Error for StoreError {
         }
     }
 }
+
+impl From<LockError> for StoreError {
+    fn from(e: LockError) -> StoreError {
+        match e {
+            LockError::Held { path, pid } => StoreError::Locked { path, pid },
+            LockError::Io { path, source } => StoreError::io("locking", path, source),
+            // `LockError` is non-exhaustive; keep whatever it says.
+            other => StoreError::Io {
+                op: "locking",
+                path: PathBuf::new(),
+                source: io::Error::new(io::ErrorKind::Other, other.to_string()),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn io_errors_name_the_operation_and_file() {
+        let e = StoreError::io(
+            "syncing",
+            "/data/wal-00000000000000000001.log",
+            io::Error::new(io::ErrorKind::Other, "disk on fire"),
+        );
+        assert_eq!(
+            e.to_string(),
+            "syncing /data/wal-00000000000000000001.log: disk on fire"
+        );
+        assert!(e.source().is_some());
+        assert_eq!(
+            e.path(),
+            Some(Path::new("/data/wal-00000000000000000001.log"))
+        );
+        assert!(!e.is_corruption());
+    }
+
+    #[test]
+    fn corruption_reports_offset_and_reason() {
+        let e = StoreError::corrupt("snap.db", 4096, "checksum mismatch");
+        assert_eq!(
+            e.to_string(),
+            "corrupt snap.db at offset 4096: checksum mismatch"
+        );
+        assert!(e.is_corruption());
+        assert!(e.source().is_none());
+    }
+
+    #[test]
+    fn size_and_state_errors_read_naturally() {
+        let e = StoreError::TooLarge {
+            what: "key",
+            len: 70_000,
+            max: 65_536,
+        };
+        assert_eq!(e.to_string(), "key is 70000 bytes, limit is 65536");
+        assert_eq!(StoreError::Closed.to_string(), "store is closed");
+        let e = StoreError::Failed {
+            reason: "no space left".into(),
+        };
+        assert!(e.to_string().contains("reopen it to recover"), "{e}");
+        assert_eq!(e.path(), None);
+    }
+
+    #[test]
+    fn lock_errors_convert() {
+        let e = StoreError::from(LockError::Held {
+            path: PathBuf::from("LOCK"),
+            pid: Some(42),
+        });
+        assert!(matches!(e, StoreError::Locked { pid: Some(42), .. }));
+        assert!(e.to_string().contains("process 42"), "{e}");
+        let e = StoreError::from(LockError::Io {
+            path: PathBuf::from("LOCK"),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        });
+        assert!(e.to_string().starts_with("locking LOCK: "), "{e}");
+    }
+}
