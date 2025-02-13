@@ -69,3 +69,102 @@ pub enum StoreError {
 
 /// Conventional alias, so downstream code can write `belay_store::Error`.
 pub type Error = StoreError;
+
+/// `Result` defaulting to [`StoreError`].
+pub type Result<T, E = StoreError> = std::result::Result<T, E>;
+
+impl StoreError {
+    /// An [`Io`](StoreError::Io) error.
+    pub fn io(op: &'static str, path: impl Into<PathBuf>, source: io::Error) -> StoreError {
+        StoreError::Io {
+            op,
+            path: path.into(),
+            source,
+        }
+    }
+
+    /// A [`Corrupt`](StoreError::Corrupt) error.
+    pub fn corrupt(file: impl Into<PathBuf>, offset: u64, reason: impl Into<String>) -> StoreError {
+        StoreError::Corrupt {
+            file: file.into(),
+            offset,
+            reason: reason.into(),
+        }
+    }
+
+    /// Whether this error reports damaged files rather than an operational
+    /// problem; callers may offer `RecoveryMode::SkipCorrupt` in response.
+    #[must_use]
+    pub fn is_corruption(&self) -> bool {
+        matches!(self, StoreError::Corrupt { .. })
+    }
+
+    /// The file this error is about, if any.
+    #[must_use]
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            StoreError::Io { path, .. } | StoreError::Locked { path, .. } => Some(path),
+            StoreError::Corrupt { file, .. } => Some(file),
+            StoreError::NotFound { dir } => Some(dir),
+            _ => None,
+        }
+    }
+}
+
+/// Builds a closure that wraps an `io::Error` with an operation and path,
+/// for use with `map_err`.
+pub(crate) fn io_err<'a>(
+    op: &'static str,
+    path: &'a Path,
+) -> impl FnOnce(io::Error) -> StoreError + 'a {
+    move |source| StoreError::io(op, path, source)
+}
+
+impl fmt::Display for StoreError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            StoreError::Io { op, path, source } => {
+                write!(f, "{op} {}: {source}", path.display())
+            }
+            StoreError::Corrupt {
+                file,
+                offset,
+                reason,
+            } => write!(f, "corrupt {} at offset {offset}: {reason}", file.display()),
+            StoreError::Locked {
+                path,
+                pid: Some(pid),
+            } => write!(
+                f,
+                "store is locked by process {pid} ({}); if that process is gone, delete the file",
+                path.display()
+            ),
+            StoreError::Locked { path, pid: None } => write!(
+                f,
+                "store is locked by another process or handle ({})",
+                path.display()
+            ),
+            StoreError::Closed => f.write_str("store is closed"),
+            StoreError::Failed { reason } => write!(
+                f,
+                "store stopped accepting writes after a failure ({reason}); reopen it to recover"
+            ),
+            StoreError::TooLarge { what, len, max } => {
+                write!(f, "{what} is {len} bytes, limit is {max}")
+            }
+            StoreError::InvalidOptions(message) => write!(f, "invalid store options: {message}"),
+            StoreError::NotFound { dir } => {
+                write!(f, "store directory {} does not exist", dir.display())
+            }
+        }
+    }
+}
+
+impl std::error::Error for StoreError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            StoreError::Io { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
