@@ -233,3 +233,10 @@ impl<'a> KeyReader<'a> {
         self.fixed().map(Ulid::from_bytes)
     }
 }
+
+/// A key that does not match the layout it is read with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyError {
+    offset: usize,
+    kind: KeyErrorKind,
+}
