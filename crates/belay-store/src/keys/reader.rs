@@ -284,3 +284,23 @@ pub enum KeyErrorKind {
     /// Bytes remained after the last expected element.
     TrailingBytes(usize),
 }
+
+impl fmt::Display for KeyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "invalid key at offset {}: ", self.offset)?;
+        match &self.kind {
+            KeyErrorKind::UnexpectedEnd { needed, available } => write!(
+                f,
+                "key ends early (needed {needed} bytes, {available} available)"
+            ),
+            KeyErrorKind::Unterminated => f.write_str("unterminated byte string"),
+            KeyErrorKind::BadEscape(b) => write!(f, "invalid escape byte {b:#04x}"),
+            KeyErrorKind::BadLength(n) => write!(f, "varint length {n} exceeds 8"),
+            KeyErrorKind::NonMinimal => f.write_str("varint is not minimally encoded"),
+            KeyErrorKind::InvalidBool(b) => write!(f, "invalid boolean byte {b:#04x}"),
+            KeyErrorKind::InvalidUtf8 => f.write_str("string is not valid UTF-8"),
+            KeyErrorKind::OutOfRange(what) => write!(f, "{what} out of range"),
+            KeyErrorKind::TrailingBytes(n) => write!(f, "{n} unexpected trailing bytes"),
+        }
+    }
+}
