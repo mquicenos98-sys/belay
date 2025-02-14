@@ -240,3 +240,47 @@ pub struct KeyError {
     offset: usize,
     kind: KeyErrorKind,
 }
+
+impl KeyError {
+    /// Offset in the key where the offending element starts.
+    #[must_use]
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// What went wrong.
+    #[must_use]
+    pub fn kind(&self) -> &KeyErrorKind {
+        &self.kind
+    }
+}
+
+/// The reason a key failed to decode.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum KeyErrorKind {
+    /// The key ended inside a fixed-width element.
+    UnexpectedEnd {
+        /// Bytes the element needs.
+        needed: usize,
+        /// Bytes that were left.
+        available: usize,
+    },
+    /// A byte string has no terminator.
+    Unterminated,
+    /// A zero byte inside a byte string is followed by something other than
+    /// an escape or the terminator.
+    BadEscape(u8),
+    /// A varint length byte above 8.
+    BadLength(u8),
+    /// A varint with a leading zero byte.
+    NonMinimal,
+    /// A boolean byte other than 0 or 1.
+    InvalidBool(u8),
+    /// A string element is not UTF-8.
+    InvalidUtf8,
+    /// A value outside its type's range.
+    OutOfRange(&'static str),
+    /// Bytes remained after the last expected element.
+    TrailingBytes(usize),
+}
