@@ -304,3 +304,134 @@ impl fmt::Display for KeyError {
         }
     }
 }
+
+impl std::error::Error for KeyError {}
+
+#[cfg(test)]
+mod tests {
+    use super::super::KeyBuf;
+    use super::*;
+
+    fn err_kind<T: fmt::Debug>(r: Result<T, KeyError>) -> (usize, KeyErrorKind) {
+        let e = r.expect_err("decoding should fail");
+        (e.offset(), e.kind().clone())
+    }
+
+    #[test]
+    fn round_trips_every_element_kind() {
+        let ts = Timestamp::from_millis(1_700_000_000_123);
+        let id = Ulid::from_parts(1_700_000_000_000, 0xABCD);
+        let key = KeyBuf::new()
+            .u8(7)
+            .u16(513)
+            .u32(70_000)
+            .u64(u64::MAX)
+            .u64_desc(5)
+            .i32(-3)
+            .i64(i64::MIN)
+            .uvarint(300)
+            .bool(true)
+            .bytes(&[0, 0xFF, 0])
+            .str("héllo")
+            .timestamp(ts)
+            .ulid(id)
+            .fixed(&[9, 9])
+            .into_vec();
+        let mut r = KeyReader::new(&key);
+        assert_eq!(r.u8(), Ok(7));
+        assert_eq!(r.u16(), Ok(513));
+        assert_eq!(r.u32(), Ok(70_000));
+        assert_eq!(r.u64(), Ok(u64::MAX));
+        assert_eq!(r.u64_desc(), Ok(5));
+        assert_eq!(r.i32(), Ok(-3));
+        assert_eq!(r.i64(), Ok(i64::MIN));
+        assert_eq!(r.uvarint(), Ok(300));
+        assert_eq!(r.bool(), Ok(true));
+        assert_eq!(r.bytes(), Ok(vec![0, 0xFF, 0]));
+        assert_eq!(r.str().as_deref(), Ok("héllo"));
+        assert_eq!(r.timestamp(), Ok(ts));
+        assert_eq!(r.ulid(), Ok(id));
+        assert_eq!(r.fixed::<2>(), Ok([9, 9]));
+        r.expect_end().expect("consumed");
+    }
+
+    #[test]
+    fn after_prefix_skips_a_namespace() {
+        let key = KeyBuf::new().str("job").u64(4).into_vec();
+        let prefix = KeyBuf::new().str("job").into_vec();
+        let mut r = KeyReader::after_prefix(&key, &prefix).expect("has prefix");
+        assert_eq!(r.u64(), Ok(4));
+        assert!(KeyReader::after_prefix(&key, b"x").is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_byte_strings() {
+        assert_eq!(
+            err_kind(KeyReader::new(b"abc").bytes()),
+            (0, KeyErrorKind::Unterminated)
+        );
+        assert_eq!(
+            err_kind(KeyReader::new(&[b'a', 0]).bytes()),
+            (0, KeyErrorKind::Unterminated)
+        );
+        assert_eq!(
+            err_kind(KeyReader::new(&[b'a', 0, 7]).bytes()),
+            (2, KeyErrorKind::BadEscape(7))
+        );
+        let mut r = KeyReader::new(&[0xC3, 0x28, 0, 1]);
+        assert_eq!(err_kind(r.str()), (0, KeyErrorKind::InvalidUtf8));
+        assert_eq!(r.position(), 0, "failed reads do not advance");
+    }
+
+    #[test]
+    fn rejects_bad_fixed_width_and_varint_elements() {
+        let mut r = KeyReader::new(&[1, 2, 3]);
+        assert_eq!(
+            err_kind(r.u32()),
+            (
+                0,
+                KeyErrorKind::UnexpectedEnd {
+                    needed: 4,
+                    available: 3
+                }
+            )
+        );
+        assert_eq!(r.rest(), &[1, 2, 3]);
+        assert_eq!(
+            err_kind(KeyReader::new(&[9]).uvarint()),
+            (0, KeyErrorKind::BadLength(9))
+        );
+        assert_eq!(
+            err_kind(KeyReader::new(&[2, 0, 5]).uvarint()),
+            (0, KeyErrorKind::NonMinimal)
+        );
+        let mut r = KeyReader::new(&[3, 1]);
+        assert!(r.uvarint().is_err());
+        assert_eq!(r.position(), 0);
+        assert_eq!(
+            err_kind(KeyReader::new(&[2]).bool()),
+            (0, KeyErrorKind::InvalidBool(2))
+        );
+        let far_future = KeyBuf::new().i64(i64::MAX).into_vec();
+        assert_eq!(
+            err_kind(KeyReader::new(&far_future).timestamp()),
+            (0, KeyErrorKind::OutOfRange("timestamp"))
+        );
+    }
+
+    #[test]
+    fn errors_render_with_offsets() {
+        let mut r = KeyReader::new(&[0, 1, 0xAA]);
+        assert_eq!(r.bytes(), Ok(Vec::new()));
+        let e = r.expect_end().unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "invalid key at offset 2: 1 unexpected trailing bytes"
+        );
+        let e = KeyReader::new(&[b'x', 0, 3]).bytes().unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "invalid key at offset 2: invalid escape byte 0x03"
+        );
+    }
+}
