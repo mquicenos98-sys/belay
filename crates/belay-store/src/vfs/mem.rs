@@ -366,3 +366,51 @@ struct MemFile {
     generation: u64,
     path: PathBuf,
 }
+
+impl fmt::Debug for MemFile {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemFile").field("path", &self.path).finish()
+    }
+}
+
+impl Write for MemFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let mut state = lock(&self.state);
+        state.check_generation(self.generation)?;
+        state.charge()?;
+        state.stats.writes += 1;
+        state.stats.bytes_written += buf.len() as u64;
+        state
+            .files
+            .get_mut(&self.id)
+            .expect("open handles keep their file")
+            .data
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl VfsFile for MemFile {
+    fn sync(&mut self) -> io::Result<()> {
+        let mut state = lock(&self.state);
+        state.check_generation(self.generation)?;
+        if state.fail_syncs {
+            return Err(io::Error::new(
+                io::ErrorKind::Other,
+                "simulated sync failure",
+            ));
+        }
+        state.charge()?;
+        state.stats.file_syncs += 1;
+        let file = state
+            .files
+            .get_mut(&self.id)
+            .expect("open handles keep their file");
+        file.synced = file.data.len();
+        Ok(())
+    }
+}
