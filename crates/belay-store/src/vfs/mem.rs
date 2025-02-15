@@ -94,3 +94,155 @@ fn not_found(path: &Path) -> io::Error {
 fn parent(path: &Path) -> &Path {
     path.parent().unwrap_or_else(|| Path::new(""))
 }
+
+impl State {
+    /// Charges one mutating operation against the failure budget.
+    fn charge(&mut self) -> io::Result<()> {
+        match &mut self.op_budget {
+            Some(0) => Err(io::Error::new(
+                io::ErrorKind::Other,
+                "simulated i/o failure (operation budget exhausted)",
+            )),
+            Some(n) => {
+                *n -= 1;
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
+    fn dir_exists(&self, dir: &Path) -> bool {
+        dir.as_os_str().is_empty() || self.dirs.contains(dir)
+    }
+
+    fn require_parent(&self, path: &Path) -> io::Result<()> {
+        let dir = parent(path);
+        if self.dir_exists(dir) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{}: no such directory", dir.display()),
+            ))
+        }
+    }
+
+    fn file_id(&self, path: &Path) -> io::Result<FileId> {
+        self.entries
+            .get(path)
+            .copied()
+            .ok_or_else(|| not_found(path))
+    }
+
+    fn file(&self, path: &Path) -> io::Result<&FileData> {
+        let id = self.file_id(path)?;
+        Ok(&self.files[&id])
+    }
+
+    fn check_generation(&self, generation: u64) -> io::Result<()> {
+        if generation == self.generation {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::Other,
+                "file handle belongs to a process that crashed",
+            ))
+        }
+    }
+
+    /// The state a crash of kind `crash` leaves behind.
+    fn after_crash(&self, crash: &Crash) -> State {
+        let entries = match crash {
+            Crash::ProcessExit => self.entries.clone(),
+            Crash::PowerLoss | Crash::TornWrite { .. } => self.durable_entries.clone(),
+        };
+        let mut files = HashMap::new();
+        for (path, id) in &entries {
+            let file = &self.files[id];
+            let keep = match crash {
+                Crash::ProcessExit => file.data.len(),
+                Crash::PowerLoss => file.synced,
+                Crash::TornWrite { path: torn, keep } if torn == path => {
+                    file.synced.saturating_add(*keep).min(file.data.len())
+                }
+                Crash::TornWrite { .. } => file.synced,
+            };
+            files.insert(
+                *id,
+                FileData {
+                    data: file.data[..keep].to_vec(),
+                    synced: keep,
+                },
+            );
+        }
+        State {
+            generation: self.generation + 1,
+            dirs: self.dirs.clone(),
+            durable_entries: entries.clone(),
+            entries,
+            files,
+            next_id: self.next_id,
+            locks: BTreeSet::new(),
+            fail_syncs: false,
+            op_budget: None,
+            stats: self.stats,
+        }
+    }
+}
+
+/// In-memory [`Vfs`] with crash simulation and fault injection.
+///
+/// Clones share the same file system. Each file keeps its contents and
+/// the length known to be synced; directory entries are tracked as
+/// visible and as of their directory's last sync. A simulated power loss
+/// ([`Crash`]) keeps only synced data and synced entries, so a file created
+/// or deleted without a directory sync disappears or comes back. Faults
+/// can be injected with [`fail_syncs`](MemFs::fail_syncs) and
+/// [`fail_after_ops`](MemFs::fail_after_ops).
+///
+/// ```
+/// use belay_store::vfs::{Crash, MemFs, Vfs};
+/// use std::io::Write;
+/// use std::path::Path;
+///
+/// let fs = MemFs::new();
+/// fs.create_dir_all(Path::new("db")).unwrap();
+/// let path = Path::new("db").join("log");
+/// let mut f = fs.create(&path).unwrap();
+/// f.write_all(b"durable").unwrap();
+/// f.sync().unwrap();
+/// f.write_all(b" and not").unwrap();
+/// fs.sync_dir(Path::new("db")).unwrap();
+///
+/// let after = fs.crash_copy(&Crash::PowerLoss);
+/// assert_eq!(after.read(&path).unwrap(), b"durable");
+/// let torn = fs.crash_copy(&Crash::TornWrite { path: path.clone(), keep: 4 });
+/// assert_eq!(torn.read(&path).unwrap(), b"durable and");
+/// ```
+///
+/// # Crashing in place
+///
+/// [`crash`](MemFs::crash) models the death of the process using the file
+/// system. Clones taken before it (the ones handed to a store through
+/// [`Options::fs`](crate::Options::fs)) belong to that process: from then
+/// on their file handles, locks and mutating operations fail, the way a
+/// dead process can no longer touch the disk. Handles made with
+/// [`new`](MemFs::new), [`crash_copy`](MemFs::crash_copy) and
+/// [`deep_copy`](MemFs::deep_copy), and clones taken after the crash, keep
+/// working, so a test can inspect the aftermath and open the store again.
+#[derive(Default)]
+pub struct MemFs {
+    state: Arc<Mutex<State>>,
+    /// The generation this clone was taken in, or `None` for the test's own
+    /// handles, which never go stale.
+    process: Option<u64>,
+}
+
+impl Clone for MemFs {
+    fn clone(&self) -> MemFs {
+        MemFs {
+            state: Arc::clone(&self.state),
+            process: Some(lock(&self.state).generation),
+        }
+    }
+}
