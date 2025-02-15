@@ -246,3 +246,123 @@ impl Clone for MemFs {
         }
     }
 }
+
+impl MemFs {
+    /// An empty file system.
+    #[must_use]
+    pub fn new() -> MemFs {
+        MemFs::default()
+    }
+
+    fn from_state(state: State) -> MemFs {
+        MemFs {
+            state: Arc::new(Mutex::new(state)),
+            process: None,
+        }
+    }
+
+    /// Locks the state for a mutating operation, failing if this handle
+    /// belongs to a process that crashed.
+    fn mutable_state(&self) -> io::Result<MutexGuard<'_, State>> {
+        let state = lock(&self.state);
+        if let Some(generation) = self.process {
+            state.check_generation(generation)?;
+        }
+        Ok(state)
+    }
+
+    /// Simulates a crash in place: the files shrink to what survives, and
+    /// file handles, locks and clones from before the crash stop working.
+    pub fn crash(&self, crash: &Crash) {
+        let mut state = lock(&self.state);
+        let mut next = state.after_crash(crash);
+        next.stats.crashes += 1;
+        *state = next;
+    }
+
+    /// An independent copy of the state a crash would leave, without
+    /// disturbing this file system. Useful to try many crash points
+    /// against the same history.
+    #[must_use]
+    pub fn crash_copy(&self, crash: &Crash) -> MemFs {
+        MemFs::from_state(lock(&self.state).after_crash(crash))
+    }
+
+    /// An independent copy of the current state, unsynced data included
+    /// (and still unsynced). Locks are not copied.
+    #[must_use]
+    pub fn deep_copy(&self) -> MemFs {
+        let mut state = lock(&self.state).clone();
+        state.locks.clear();
+        state.generation += 1;
+        MemFs::from_state(state)
+    }
+
+    /// How many leading bytes of the file at `path` are durable.
+    pub fn synced_len(&self, path: &Path) -> io::Result<u64> {
+        Ok(lock(&self.state).file(path)?.synced as u64)
+    }
+
+    /// Overwrites bytes of the file at `path` in place, synced region
+    /// included, the way bit rot or a misdirected write would. Extends the
+    /// file if needed.
+    pub fn overwrite(&self, path: &Path, offset: usize, bytes: &[u8]) -> io::Result<()> {
+        let mut state = lock(&self.state);
+        let id = state.file_id(path)?;
+        let file = state.files.get_mut(&id).expect("entries point at files");
+        let end = offset + bytes.len();
+        if file.data.len() < end {
+            file.data.resize(end, 0);
+        }
+        file.data[offset..end].copy_from_slice(bytes);
+        Ok(())
+    }
+
+    /// Makes every file sync fail (as after an I/O error on the device)
+    /// until turned off.
+    pub fn fail_syncs(&self, fail: bool) {
+        lock(&self.state).fail_syncs = fail;
+    }
+
+    /// Lets `ops` more mutating operations (writes, syncs, creates,
+    /// renames, removals, truncations, directory syncs) succeed, then fails
+    /// all of them. `None` removes the limit.
+    pub fn fail_after_ops(&self, ops: Option<u64>) {
+        lock(&self.state).op_budget = ops;
+    }
+
+    /// Mutating operations left before injected failures begin, if limited.
+    #[must_use]
+    pub fn remaining_ops(&self) -> Option<u64> {
+        lock(&self.state).op_budget
+    }
+
+    /// Operation counters.
+    #[must_use]
+    pub fn stats(&self) -> MemFsStats {
+        lock(&self.state).stats
+    }
+
+    /// Every file path currently visible, sorted.
+    #[must_use]
+    pub fn paths(&self) -> Vec<PathBuf> {
+        lock(&self.state).entries.keys().cloned().collect()
+    }
+}
+
+impl fmt::Debug for MemFs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = lock(&self.state);
+        f.debug_struct("MemFs")
+            .field("files", &state.entries.len())
+            .field("generation", &state.generation)
+            .finish()
+    }
+}
+
+struct MemFile {
+    state: Arc<Mutex<State>>,
+    id: FileId,
+    generation: u64,
+    path: PathBuf,
+}
