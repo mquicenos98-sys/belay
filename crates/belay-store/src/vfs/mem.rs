@@ -414,3 +414,29 @@ impl VfsFile for MemFile {
         Ok(())
     }
 }
+
+struct MemLock {
+    state: Weak<Mutex<State>>,
+    generation: u64,
+    path: PathBuf,
+}
+
+impl fmt::Debug for MemLock {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MemLock").field("path", &self.path).finish()
+    }
+}
+
+impl VfsLock for MemLock {}
+
+impl Drop for MemLock {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.upgrade() {
+            let mut state = lock(&state);
+            // A crash already released every lock of the old generation.
+            if state.generation == self.generation {
+                state.locks.remove(&self.path);
+            }
+        }
+    }
+}
