@@ -21,7 +21,6 @@
 //!   handles sharing the same file system (for `MemFs`).
 
 mod mem;
-
 mod os;
 
 use std::fmt;
@@ -127,5 +126,72 @@ impl<T: Vfs + ?Sized> Vfs for std::sync::Arc<T> {
     }
     fn lock(&self, path: &Path) -> Result<Box<dyn VfsLock>> {
         (**self).lock(path)
+    }
+}
+
+/// Buffers small writes to a [`VfsFile`] so that streaming a snapshot does
+/// not issue one write call per entry.
+pub(crate) struct BufferedFile {
+    file: Box<dyn VfsFile>,
+    buf: Vec<u8>,
+    written: u64,
+}
+
+impl BufferedFile {
+    const CAPACITY: usize = 64 * 1024;
+
+    pub(crate) fn new(file: Box<dyn VfsFile>) -> BufferedFile {
+        BufferedFile {
+            file,
+            buf: Vec::with_capacity(Self::CAPACITY),
+            written: 0,
+        }
+    }
+
+    pub(crate) fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if bytes.len() >= Self::CAPACITY {
+            // Too big to be worth copying into the buffer.
+            self.file.write_all(bytes)?;
+        } else {
+            if self.buf.len() + bytes.len() > Self::CAPACITY {
+                self.flush_buf()?;
+            }
+            self.buf.extend_from_slice(bytes);
+        }
+        self.written += bytes.len() as u64;
+        Ok(())
+    }
+
+    fn flush_buf(&mut self) -> io::Result<()> {
+        if !self.buf.is_empty() {
+            self.file.write_all(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+
+    /// Total bytes accepted so far.
+    pub(crate) fn written(&self) -> u64 {
+        self.written
+    }
+
+    /// Writes out the buffer and syncs the file.
+    pub(crate) fn finish(mut self) -> io::Result<()> {
+        self.flush_buf()?;
+        self.file.flush()?;
+        self.file.sync()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arc_of_a_vfs_is_a_vfs() {
+        let fs: std::sync::Arc<dyn Vfs> = std::sync::Arc::new(MemFs::new());
+        fs.create_dir_all(Path::new("x")).expect("mkdir");
+        assert!(fs.exists(Path::new("x")).expect("exists"));
+        assert!(fs.list(Path::new("x")).expect("list").is_empty());
     }
 }
