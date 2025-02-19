@@ -440,3 +440,369 @@ impl Drop for MemLock {
         }
     }
 }
+
+impl MemFs {
+    fn handle(&self, state: &State, id: FileId, path: &Path) -> Box<dyn VfsFile> {
+        Box::new(MemFile {
+            state: Arc::clone(&self.state),
+            id,
+            generation: state.generation,
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl Vfs for MemFs {
+    fn create_dir_all(&self, dir: &Path) -> io::Result<()> {
+        let mut state = self.mutable_state()?;
+        state.charge()?;
+        for ancestor in dir.ancestors() {
+            if !ancestor.as_os_str().is_empty() {
+                state.dirs.insert(ancestor.to_path_buf());
+            }
+        }
+        Ok(())
+    }
+
+    fn list(&self, dir: &Path) -> io::Result<Vec<String>> {
+        let state = lock(&self.state);
+        if !state.dir_exists(dir) {
+            return Err(not_found(dir));
+        }
+        Ok(state
+            .entries
+            .keys()
+            .filter(|p| parent(p) == dir)
+            .filter_map(|p| p.file_name()?.to_str().map(str::to_owned))
+            .collect())
+    }
+
+    fn exists(&self, path: &Path) -> io::Result<bool> {
+        let state = lock(&self.state);
+        Ok(state.entries.contains_key(path) || state.dirs.contains(path))
+    }
+
+    fn file_len(&self, path: &Path) -> io::Result<u64> {
+        Ok(lock(&self.state).file(path)?.data.len() as u64)
+    }
+
+    fn read(&self, path: &Path) -> io::Result<Vec<u8>> {
+        Ok(lock(&self.state).file(path)?.data.clone())
+    }
+
+    fn create(&self, path: &Path) -> io::Result<Box<dyn VfsFile>> {
+        let mut state = self.mutable_state()?;
+        state.require_parent(path)?;
+        state.charge()?;
+        let id = state.next_id;
+        state.next_id += 1;
+        state.files.insert(id, FileData::default());
+        state.entries.insert(path.to_path_buf(), id);
+        Ok(self.handle(&state, id, path))
+    }
+
+    fn open_append(&self, path: &Path) -> io::Result<Box<dyn VfsFile>> {
+        let state = self.mutable_state()?;
+        let id = state.file_id(path)?;
+        Ok(self.handle(&state, id, path))
+    }
+
+    fn truncate(&self, path: &Path, len: u64) -> io::Result<()> {
+        let mut state = self.mutable_state()?;
+        let id = state.file_id(path)?;
+        state.charge()?;
+        let len = usize::try_from(len)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "length too large"))?;
+        let file = state.files.get_mut(&id).expect("entries point at files");
+        file.data.resize(len, 0);
+        file.synced = len;
+        Ok(())
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> io::Result<()> {
+        let mut state = self.mutable_state()?;
+        let id = state.file_id(from)?;
+        state.require_parent(to)?;
+        state.charge()?;
+        state.entries.remove(from);
+        state.entries.insert(to.to_path_buf(), id);
+        Ok(())
+    }
+
+    fn remove(&self, path: &Path) -> io::Result<()> {
+        let mut state = self.mutable_state()?;
+        state.file_id(path)?;
+        state.charge()?;
+        state.entries.remove(path);
+        Ok(())
+    }
+
+    fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        let mut state = self.mutable_state()?;
+        if !state.dir_exists(dir) {
+            return Err(not_found(dir));
+        }
+        state.charge()?;
+        state.stats.dir_syncs += 1;
+        let State {
+            entries,
+            durable_entries,
+            ..
+        } = &mut *state;
+        durable_entries.retain(|p, _| parent(p) != dir);
+        for (p, id) in entries.iter() {
+            if parent(p) == dir {
+                durable_entries.insert(p.clone(), *id);
+            }
+        }
+        Ok(())
+    }
+
+    fn lock(&self, path: &Path) -> Result<Box<dyn VfsLock>> {
+        let mut state = self
+            .mutable_state()
+            .map_err(|e| StoreError::io("locking", path, e))?;
+        if !state.locks.insert(path.to_path_buf()) {
+            return Err(StoreError::Locked {
+                path: path.to_path_buf(),
+                pid: None,
+            });
+        }
+        Ok(Box::new(MemLock {
+            state: Arc::downgrade(&self.state),
+            generation: state.generation,
+            path: path.to_path_buf(),
+        }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup() -> (MemFs, PathBuf) {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("db")).expect("mkdir");
+        (fs, PathBuf::from("db"))
+    }
+
+    fn write_file(fs: &MemFs, path: &Path, synced: &[u8], unsynced: &[u8]) {
+        let mut f = fs.create(path).expect("create");
+        f.write_all(synced).expect("write");
+        f.sync().expect("sync");
+        f.write_all(unsynced).expect("write");
+    }
+
+    #[test]
+    fn power_loss_keeps_only_synced_data_and_entries() {
+        let (fs, dir) = setup();
+        let a = dir.join("a");
+        let b = dir.join("b");
+        write_file(&fs, &a, b"abc", b"def");
+        fs.sync_dir(&dir).expect("sync dir");
+        // `b` is never made durable in the directory.
+        write_file(&fs, &b, b"123", b"");
+        let after = fs.crash_copy(&Crash::PowerLoss);
+        assert_eq!(after.read(&a).expect("read"), b"abc");
+        assert!(!after.exists(&b).expect("exists"));
+        assert_eq!(after.list(&dir).expect("list"), vec!["a"]);
+        // The original is untouched.
+        assert_eq!(fs.read(&a).expect("read"), b"abcdef");
+    }
+
+    #[test]
+    fn process_exit_keeps_everything_written() {
+        let (fs, dir) = setup();
+        let a = dir.join("a");
+        write_file(&fs, &a, b"x", b"yz");
+        let after = fs.crash_copy(&Crash::ProcessExit);
+        assert_eq!(after.read(&a).expect("read"), b"xyz");
+        assert_eq!(after.synced_len(&a).expect("synced"), 3);
+    }
+
+    #[test]
+    fn torn_write_keeps_a_prefix_of_the_unsynced_tail() {
+        let (fs, dir) = setup();
+        let a = dir.join("a");
+        let b = dir.join("b");
+        write_file(&fs, &a, b"head", b"tail");
+        write_file(&fs, &b, b"B", b"unsynced");
+        fs.sync_dir(&dir).expect("sync dir");
+        for keep in 0..=6 {
+            let after = fs.crash_copy(&Crash::TornWrite {
+                path: a.clone(),
+                keep,
+            });
+            let expected = &b"headtail"[..4 + keep.min(4)];
+            assert_eq!(after.read(&a).expect("read"), expected, "keep={keep}");
+            // Other files lose their unsynced tails as in a power loss.
+            assert_eq!(after.read(&b).expect("read"), b"B");
+        }
+    }
+
+    #[test]
+    fn renames_and_removals_need_a_directory_sync() {
+        let (fs, dir) = setup();
+        let tmp = dir.join("snap.tmp");
+        let fin = dir.join("snap");
+        let old = dir.join("old");
+        write_file(&fs, &old, b"old", b"");
+        fs.sync_dir(&dir).expect("sync dir");
+        write_file(&fs, &tmp, b"new", b"");
+        fs.rename(&tmp, &fin).expect("rename");
+        fs.remove(&old).expect("remove");
+        let lost = fs.crash_copy(&Crash::PowerLoss);
+        assert_eq!(lost.list(&dir).expect("list"), vec!["old"]);
+        fs.sync_dir(&dir).expect("sync dir");
+        let kept = fs.crash_copy(&Crash::PowerLoss);
+        assert_eq!(kept.list(&dir).expect("list"), vec!["snap"]);
+        assert_eq!(kept.read(&fin).expect("read"), b"new");
+    }
+
+    #[test]
+    fn in_place_crash_invalidates_handles_and_locks() {
+        let (fs, dir) = setup();
+        let a = dir.join("a");
+        let mut f = fs.create(&a).expect("create");
+        f.write_all(b"1").expect("write");
+        let guard = fs.lock(&dir.join("LOCK")).expect("lock");
+        assert!(matches!(
+            fs.lock(&dir.join("LOCK")),
+            Err(StoreError::Locked { pid: None, .. })
+        ));
+        fs.crash(&Crash::ProcessExit);
+        assert!(f.write_all(b"2").is_err());
+        assert!(f.sync().is_err());
+        // The lock died with the process; the new holder keeps it even when
+        // the stale guard is dropped.
+        let fresh = fs.lock(&dir.join("LOCK")).expect("lock after crash");
+        drop(guard);
+        assert!(fs.lock(&dir.join("LOCK")).is_err());
+        drop(fresh);
+        assert!(fs.lock(&dir.join("LOCK")).is_ok());
+        assert_eq!(fs.read(&a).expect("read"), b"1");
+        assert_eq!(fs.stats().crashes, 1);
+    }
+
+    #[test]
+    fn clones_from_before_a_crash_belong_to_the_dead_process() {
+        let (fs, dir) = setup();
+        let process = fs.clone();
+        drop(process.create(&dir.join("a")).expect("create"));
+        fs.crash(&Crash::ProcessExit);
+        // The crashed process can no longer change anything...
+        assert!(process.create(&dir.join("b")).is_err());
+        assert!(process.remove(&dir.join("a")).is_err());
+        assert!(process.sync_dir(&dir).is_err());
+        assert!(process.lock(&dir.join("LOCK")).is_err());
+        // ...though reading is harmless.
+        assert!(process.exists(&dir.join("a")).expect("exists"));
+        // The test's handle and fresh clones keep working.
+        let restarted = fs.clone();
+        drop(restarted.create(&dir.join("b")).expect("create"));
+        fs.remove(&dir.join("a")).expect("remove");
+        assert_eq!(fs.list(&dir).expect("list"), vec!["b"]);
+    }
+
+    #[test]
+    fn injected_failures() {
+        let (fs, dir) = setup();
+        let a = dir.join("a");
+        let mut f = fs.create(&a).expect("create");
+        fs.fail_syncs(true);
+        f.write_all(b"data").expect("writes still work");
+        assert!(f.sync().is_err());
+        fs.fail_syncs(false);
+        f.sync().expect("sync works again");
+
+        fs.fail_after_ops(Some(2));
+        f.write_all(b"1").expect("first op");
+        f.sync().expect("second op");
+        assert_eq!(fs.remaining_ops(), Some(0));
+        assert!(f.write_all(b"2").is_err());
+        assert!(fs.create(&dir.join("b")).is_err());
+        assert!(fs.sync_dir(&dir).is_err());
+        fs.fail_after_ops(None);
+        f.write_all(b"3").expect("unlimited again");
+        assert_eq!(fs.read(&a).expect("read"), b"data13");
+    }
+
+    #[test]
+    fn overwrite_damages_durable_bytes() {
+        let (fs, dir) = setup();
+        let a = dir.join("a");
+        write_file(&fs, &a, b"abcdef", b"");
+        fs.sync_dir(&dir).expect("sync dir");
+        fs.overwrite(&a, 2, b"XY").expect("overwrite");
+        let after = fs.crash_copy(&Crash::PowerLoss);
+        assert_eq!(after.read(&a).expect("read"), b"abXYef");
+    }
+
+    #[test]
+    fn truncate_is_durable_and_can_extend() {
+        let (fs, dir) = setup();
+        let a = dir.join("a");
+        write_file(&fs, &a, b"", b"abcdef");
+        fs.sync_dir(&dir).expect("sync dir");
+        fs.truncate(&a, 4).expect("truncate");
+        assert_eq!(fs.synced_len(&a).expect("synced"), 4);
+        let after = fs.crash_copy(&Crash::PowerLoss);
+        assert_eq!(after.read(&a).expect("read"), b"abcd");
+        fs.truncate(&a, 6).expect("extend");
+        assert_eq!(fs.read(&a).expect("read"), b"abcd\0\0");
+    }
+
+    #[test]
+    fn operations_on_missing_things_fail_with_not_found() {
+        let fs = MemFs::new();
+        let missing = Path::new("nope").join("f");
+        assert_eq!(
+            fs.create(&missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs.read(&missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs.open_append(&missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs.list(Path::new("nope")).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        assert_eq!(
+            fs.remove(&missing).unwrap_err().kind(),
+            io::ErrorKind::NotFound
+        );
+        // Files at the root of a relative namespace need no directory.
+        drop(fs.create(Path::new("top")).expect("create at root"));
+        assert!(fs.exists(Path::new("top")).expect("exists"));
+    }
+
+    #[test]
+    fn deep_copy_is_independent_and_keeps_unsynced_data() {
+        let (fs, dir) = setup();
+        let a = dir.join("a");
+        write_file(&fs, &a, b"s", b"u");
+        let copy = fs.deep_copy();
+        let mut f = fs.open_append(&a).expect("append");
+        f.write_all(b"more").expect("write");
+        assert_eq!(copy.read(&a).expect("read"), b"su");
+        assert_eq!(copy.synced_len(&a).expect("synced"), 1);
+        assert_eq!(fs.paths(), vec![a.clone()]);
+    }
+
+    #[test]
+    fn stats_count_writes_and_syncs() {
+        let (fs, dir) = setup();
+        write_file(&fs, &dir.join("a"), b"12", b"345");
+        fs.sync_dir(&dir).expect("sync dir");
+        let stats = fs.stats();
+        assert_eq!(stats.writes, 2);
+        assert_eq!(stats.bytes_written, 5);
+        assert_eq!(stats.file_syncs, 1);
+        assert_eq!(stats.dir_syncs, 1);
+    }
+}
