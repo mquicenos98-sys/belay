@@ -30,3 +30,24 @@ impl OsFs {
 struct OsFile {
     file: File,
 }
+
+impl Write for OsFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.file.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
+}
+
+impl VfsFile for OsFile {
+    fn sync(&mut self) -> io::Result<()> {
+        self.file.sync_data()
+    }
+}
+
+#[derive(Debug)]
+struct OsLock {
+    _file: LockFile,
+}
