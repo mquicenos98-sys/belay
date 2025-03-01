@@ -96,3 +96,26 @@ impl FromStr for SyncPolicy {
         }
     }
 }
+
+/// How recovery treats damage that cannot be explained by a crash.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RecoveryMode {
+    /// Refuse to open: report [`StoreError::Corrupt`] with the file and
+    /// offset. A torn log tail is still truncated, since it is the normal
+    /// result of a crash.
+    #[default]
+    Strict,
+    /// Skip damaged records, log gaps and unreadable snapshots with a
+    /// warning and recover everything else. After such a recovery the
+    /// store writes a fresh checkpoint so the damage is not met again.
+    SkipCorrupt,
+}
+
+impl fmt::Display for RecoveryMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            RecoveryMode::Strict => "strict",
+            RecoveryMode::SkipCorrupt => "skip-corrupt",
+        })
+    }
+}
