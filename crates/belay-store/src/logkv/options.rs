@@ -55,3 +55,44 @@ pub struct ParseOptionError {
     input: String,
     expected: &'static str,
 }
+
+impl fmt::Display for ParseOptionError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "invalid {} {:?} (expected {})",
+            self.what, self.input, self.expected
+        )
+    }
+}
+
+impl std::error::Error for ParseOptionError {}
+
+impl FromStr for SyncPolicy {
+    type Err = ParseOptionError;
+
+    /// Parses `always`, `never` or `interval:<duration>` (e.g.
+    /// `interval:10ms`), case-insensitively.
+    fn from_str(s: &str) -> Result<SyncPolicy, ParseOptionError> {
+        let err = || ParseOptionError {
+            what: "sync policy",
+            input: s.to_string(),
+            expected: "always, never or interval:<duration> such as interval:10ms",
+        };
+        let lower = s.trim().to_ascii_lowercase();
+        match lower.as_str() {
+            "always" => Ok(SyncPolicy::Always),
+            "never" => Ok(SyncPolicy::Never),
+            other => {
+                let d = other
+                    .strip_prefix("interval:")
+                    .and_then(|d| parse_duration(d).ok())
+                    .ok_or_else(err)?;
+                if d.is_zero() {
+                    return Err(err());
+                }
+                Ok(SyncPolicy::Interval(d))
+            }
+        }
+    }
+}
