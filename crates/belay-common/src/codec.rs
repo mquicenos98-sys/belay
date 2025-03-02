@@ -314,6 +314,10 @@ impl<'a> Decoder<'a> {
                     available: i,
                 }));
             };
+            // The tenth byte holds only the top bit of a u64.
+            if i == MAX_VARINT_LEN - 1 && byte > 1 {
+                return Err(self.error_here(DecodeErrorKind::VarintOverflow));
+            }
             value |= u64::from(byte & 0x7F) << (7 * i);
             if byte & 0x80 == 0 {
                 if byte == 0 && i > 0 {
@@ -323,7 +327,7 @@ impl<'a> Decoder<'a> {
                 return Ok(value);
             }
         }
-        // Ten bytes, each with its continuation bit set.
+        // Ten bytes with continuation bits set: the tenth is > 1, handled above.
         Err(self.error_here(DecodeErrorKind::VarintOverflow))
     }
 
@@ -543,6 +547,11 @@ mod tests {
         assert_eq!(
             kind_of(Decoder::new(&[0xFF, 0x80, 0x00]).get_uvarint()),
             (0, DecodeErrorKind::NonMinimalVarint)
+        );
+        let too_big = [0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02];
+        assert_eq!(
+            kind_of(Decoder::new(&too_big).get_uvarint()),
+            (0, DecodeErrorKind::VarintOverflow)
         );
         let too_long = [0x80; 11];
         assert_eq!(
