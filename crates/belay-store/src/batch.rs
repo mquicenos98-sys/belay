@@ -10,21 +10,16 @@ use crate::keys::prefix_end;
 
 /// Largest accepted key, in bytes.
 pub const MAX_KEY_LEN: usize = 64 * 1024;
-
 /// Largest accepted value, in bytes.
 pub const MAX_VALUE_LEN: usize = 32 * 1024 * 1024;
-
 /// Largest accepted encoded batch, in bytes. This also bounds the length
 /// of a log record, which lets recovery reject absurd lengths read from a
 /// damaged header without trying to allocate them.
 pub const MAX_BATCH_LEN: usize = 128 * 1024 * 1024;
 
 const TAG_PUT: u8 = 1;
-
 const TAG_DELETE: u8 = 2;
-
 const TAG_DELETE_RANGE: u8 = 3;
-
 const TAG_DELETE_FROM: u8 = 4;
 
 /// One write in a [`WriteBatch`].
@@ -324,5 +319,180 @@ impl FromIterator<Op> for WriteBatch {
             batch.push(op);
         }
         batch
+    }
+}
+
+impl IntoIterator for WriteBatch {
+    type Item = Op;
+    type IntoIter = std::vec::IntoIter<Op>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.ops.into_iter()
+    }
+}
+
+impl<'a> IntoIterator for &'a WriteBatch {
+    type Item = &'a Op;
+    type IntoIter = std::slice::Iter<'a, Op>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.ops.iter()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_common::Rng;
+
+    #[test]
+    fn builder_methods_record_ops_in_order() {
+        let mut b = WriteBatch::new();
+        b.put("a", "1")
+            .delete(&b"b"[..])
+            .delete_range("c", "d")
+            .delete_from(vec![9u8])
+            .delete_prefix("p/");
+        assert_eq!(b.len(), 5);
+        assert_eq!(
+            b.ops()[4],
+            Op::DeleteRange {
+                start: b"p/".to_vec(),
+                end: Some(b"p0".to_vec())
+            }
+        );
+        let keys: Vec<&[u8]> = b.iter().map(Op::key).collect();
+        assert_eq!(keys, vec![&b"a"[..], b"b", b"c", &[9], b"p/"]);
+        assert!(b.approx_size() > 0);
+        b.clear();
+        assert!(b.is_empty());
+        assert_eq!(b.approx_size(), 0);
+    }
+
+    #[test]
+    fn encoding_matches_the_documented_layout() {
+        let mut b = WriteBatch::new();
+        b.put("k", "vv")
+            .delete("x")
+            .delete_range("a", "b")
+            .delete_from("z");
+        assert_eq!(
+            b.encode(),
+            vec![
+                4, // count
+                1, 1, b'k', 2, b'v', b'v', // put
+                2, 1, b'x', // delete
+                3, 1, b'a', 1, b'b', // delete range
+                4, 1, b'z', // delete from
+            ]
+        );
+    }
+
+    #[test]
+    fn random_batches_round_trip() {
+        let mut rng = Rng::seed_from_u64(7);
+        for _ in 0..200 {
+            let mut b = WriteBatch::new();
+            for _ in 0..rng.gen_range(0..8usize) {
+                let mut key = vec![0u8; rng.gen_range(0..20usize)];
+                rng.fill_bytes(&mut key);
+                match rng.gen_range(0..4u8) {
+                    0 | 1 => {
+                        let mut value = vec![0u8; rng.gen_range(0..300usize)];
+                        rng.fill_bytes(&mut value);
+                        b.put(key, value);
+                    }
+                    2 => {
+                        b.delete(key);
+                    }
+                    _ => {
+                        b.delete_prefix(key);
+                    }
+                }
+            }
+            let encoded = b.encode();
+            assert!(encoded.len() <= b.approx_size() + 5);
+            assert_eq!(WriteBatch::decode(&encoded).expect("decodes"), b);
+        }
+    }
+
+    #[test]
+    fn decode_rejects_damage() {
+        let mut b = WriteBatch::new();
+        b.put("key", "value");
+        let good = b.encode();
+        for cut in 0..good.len() {
+            assert!(WriteBatch::decode(&good[..cut]).is_err(), "cut at {cut}");
+        }
+        let mut trailing = good.clone();
+        trailing.push(0);
+        assert!(WriteBatch::decode(&trailing).is_err());
+        let mut bad_tag = good;
+        bad_tag[1] = 9;
+        let e = WriteBatch::decode(&bad_tag).unwrap_err();
+        assert_eq!(e.offset(), 1);
+        assert!(e.to_string().contains("unknown batch operation 9"), "{e}");
+    }
+
+    #[test]
+    fn validate_enforces_limits() {
+        let mut b = WriteBatch::new();
+        b.put(vec![0u8; MAX_KEY_LEN], "ok");
+        b.validate().expect("key at the limit is fine");
+        b.put(vec![0u8; MAX_KEY_LEN + 1], "");
+        assert!(matches!(
+            b.validate(),
+            Err(StoreError::TooLarge { what: "key", .. })
+        ));
+        let mut b = WriteBatch::new();
+        b.put("k", vec![0u8; MAX_VALUE_LEN + 1]);
+        assert!(matches!(
+            b.validate(),
+            Err(StoreError::TooLarge { what: "value", .. })
+        ));
+        let mut b = WriteBatch::new();
+        for _ in 0..5 {
+            b.put("k", vec![0u8; MAX_VALUE_LEN]);
+        }
+        assert!(matches!(
+            b.validate(),
+            Err(StoreError::TooLarge { what: "batch", .. })
+        ));
+    }
+
+    #[test]
+    fn range_bounds_ignore_empty_ranges() {
+        let op = Op::DeleteRange {
+            start: b"b".to_vec(),
+            end: Some(b"a".to_vec()),
+        };
+        assert!(op.range_bounds().is_none());
+        let op = Op::DeleteRange {
+            start: b"a".to_vec(),
+            end: None,
+        };
+        assert_eq!(
+            op.range_bounds(),
+            Some((Bound::Included(&b"a"[..]), Bound::Unbounded))
+        );
+        assert!(Op::Delete { key: vec![] }.range_bounds().is_none());
+    }
+
+    #[test]
+    fn collections_convert() {
+        let ops = vec![
+            Op::Put {
+                key: b"a".to_vec(),
+                value: vec![],
+            },
+            Op::Delete { key: b"a".to_vec() },
+        ];
+        let b = WriteBatch::from(ops.clone());
+        assert_eq!((&b).into_iter().count(), 2);
+        let mut c = WriteBatch::new();
+        c.append(b.clone()).append(b);
+        assert_eq!(c.len(), 4);
+        assert_eq!(c.clone().into_ops()[..2], ops[..]);
+        assert_eq!(c.into_iter().count(), 4);
     }
 }
