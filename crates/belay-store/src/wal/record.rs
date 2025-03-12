@@ -42,3 +42,60 @@ impl Record<'_> {
         self.offset + RECORD_HEADER_LEN + self.payload.len()
     }
 }
+
+fn u32_at(buf: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(buf[at..at + 4].try_into().expect("4-byte slice"))
+}
+
+fn u64_at(buf: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(buf[at..at + 8].try_into().expect("8-byte slice"))
+}
+
+/// Parses and verifies the record at `offset`, or explains why there is
+/// no valid record there.
+pub(crate) fn parse_record(buf: &[u8], offset: usize) -> Result<Record<'_>, String> {
+    let rest = buf.len().saturating_sub(offset);
+    if rest < RECORD_HEADER_LEN {
+        return Err(format!(
+            "incomplete record header ({rest} of {RECORD_HEADER_LEN} bytes)"
+        ));
+    }
+    let h = &buf[offset..offset + RECORD_HEADER_LEN];
+    let len = u32_at(h, 4) as usize;
+    if len > MAX_BATCH_LEN {
+        return Err(format!("record length {len} exceeds the limit"));
+    }
+    let end = offset + RECORD_HEADER_LEN + len;
+    if end > buf.len() {
+        return Err(format!(
+            "record of {len} bytes extends {} bytes past the end of the file",
+            end - buf.len()
+        ));
+    }
+    let stored = crc32c_unmask(u32_at(h, 0));
+    let actual = crc32c(&buf[offset + 4..end]);
+    if stored != actual {
+        return Err(format!(
+            "checksum mismatch (stored {stored:08x}, computed {actual:08x})"
+        ));
+    }
+    // The checksum passed, so the remaining checks catch writer bugs or
+    // foreign data rather than damage.
+    let kind = h[24];
+    if kind != KIND_BATCH {
+        return Err(format!("unknown record kind {kind}"));
+    }
+    let synced_to = u64_at(h, 16);
+    if synced_to > offset as u64 {
+        return Err(format!(
+            "record claims the file was synced to {synced_to}, beyond its own offset"
+        ));
+    }
+    Ok(Record {
+        offset,
+        seq: u64_at(h, 8),
+        synced_to,
+        kind,
+        payload: &buf[offset + RECORD_HEADER_LEN..end],
+    })
+}
