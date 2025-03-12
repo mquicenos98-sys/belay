@@ -83,3 +83,70 @@ impl Table {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_common::Rng;
+
+    fn batch(f: impl FnOnce(&mut WriteBatch)) -> WriteBatch {
+        let mut b = WriteBatch::new();
+        f(&mut b);
+        b
+    }
+
+    #[test]
+    fn later_ops_on_the_same_key_win() {
+        let mut t = Table::new();
+        t.apply(batch(|b| {
+            b.put("k", "1").put("k", "22").delete("k").put("k", "333");
+        }));
+        assert_eq!(t.get(b"k").map(Vec::as_slice), Some(&b"333"[..]));
+        assert_eq!(t.live_bytes(), 4);
+    }
+
+    #[test]
+    fn range_deletes_respect_bounds() {
+        let mut t = Table::new();
+        t.apply(batch(|b| {
+            for k in ["a", "b", "ba", "c", "d"] {
+                b.put(k, "x");
+            }
+        }));
+        t.apply(batch(|b| {
+            b.delete_range("b", "c").delete_range("z", "a");
+        }));
+        let keys: Vec<&[u8]> = t.map().keys().map(Vec::as_slice).collect();
+        assert_eq!(keys, vec![&b"a"[..], b"c", b"d"]);
+        t.apply(batch(|b| {
+            b.delete_from("c");
+        }));
+        assert_eq!(t.len(), 1);
+        assert_eq!(t.live_bytes(), 2);
+    }
+
+    #[test]
+    fn live_bytes_track_a_random_workload() {
+        let mut rng = Rng::seed_from_u64(3);
+        let mut t = Table::new();
+        for _ in 0..500 {
+            let key = vec![rng.gen_range(0..20u8)];
+            let b = match rng.gen_range(0..5u8) {
+                0 => batch(|b| {
+                    b.delete(key);
+                }),
+                1 => batch(|b| {
+                    b.delete_range(key, vec![rng.gen_range(0..20u8)]);
+                }),
+                _ => batch(|b| {
+                    b.put(key, vec![1u8; rng.gen_range(0..10usize)]);
+                }),
+            };
+            t.apply(b);
+            assert_eq!(
+                Table::from_map(t.map().clone()).live_bytes(),
+                t.live_bytes()
+            );
+        }
+    }
+}
