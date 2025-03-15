@@ -162,3 +162,40 @@ pub enum ProblemKind {
     /// A snapshot that fails validation.
     BadSnapshot,
 }
+
+impl fmt::Display for ProblemKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            ProblemKind::TornTail => "torn tail",
+            ProblemKind::Corrupt => "corrupt",
+            ProblemKind::Gap => "gap",
+            ProblemKind::BadSnapshot => "bad snapshot",
+        })
+    }
+}
+
+/// One finding of [`verify`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Problem {
+    /// Its kind.
+    pub kind: ProblemKind,
+    /// The file.
+    pub file: PathBuf,
+    /// Byte offset within the file.
+    pub offset: u64,
+    /// Description.
+    pub detail: String,
+}
+
+impl fmt::Display for Problem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: {} at offset {}: {}",
+            self.kind,
+            self.file.display(),
+            self.offset,
+            self.detail
+        )
+    }
+}
