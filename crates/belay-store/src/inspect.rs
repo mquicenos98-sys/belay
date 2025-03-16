@@ -267,3 +267,74 @@ pub struct SegmentDump {
     /// Damage found, classified as if this were the last segment.
     pub problems: Vec<Problem>,
 }
+
+/// Reads and decodes the segment at `path`. Damage is classified as it
+/// would be in the last segment when `is_last` is set (torn tail or
+/// corruption), and as corruption otherwise.
+pub fn read_segment(fs: &dyn Vfs, path: &Path, is_last: bool) -> Result<SegmentDump> {
+    let buf = fs.read(path).map_err(io_err("reading", path))?;
+    let mut dump = SegmentDump {
+        header_seq: None,
+        records: Vec::new(),
+        problems: Vec::new(),
+    };
+    let mut start = SEGMENT_HEADER_LEN;
+    let problem = |kind, offset: usize, detail: String| Problem {
+        kind,
+        file: path.to_path_buf(),
+        offset: offset as u64,
+        detail,
+    };
+    let classify = |proven: bool| {
+        if is_last && !proven {
+            ProblemKind::TornTail
+        } else {
+            ProblemKind::Corrupt
+        }
+    };
+    match parse_segment_header(&buf) {
+        Ok(seq) => dump.header_seq = Some(seq),
+        Err(reason) => {
+            let damage = RecordReader::new(&buf, 0, 0).damage_at(0, reason);
+            dump.problems
+                .push(problem(classify(damage.proven), 0, damage.reason.clone()));
+            start = damage.resume.unwrap_or(buf.len());
+        }
+    }
+    let before = dump.header_seq.map_or(0, |s| s.saturating_sub(1));
+    for event in RecordReader::new(&buf, start, before) {
+        match event {
+            Event::Record(rec) => dump.records.push(RecordInfo {
+                offset: rec.offset as u64,
+                seq: rec.seq,
+                synced_to: rec.synced_to,
+                len: (rec.end() - rec.offset) as u64,
+                batch: WriteBatch::decode(rec.payload).ok(),
+            }),
+            Event::Damage(d) => {
+                let detail = format!("{} ({} bytes)", d.reason, d.len_in(buf.len()));
+                dump.problems
+                    .push(problem(classify(d.proven), d.offset, detail));
+            }
+        }
+    }
+    Ok(dump)
+}
+
+/// The decoded contents of a snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotDump {
+    /// Sequence number covered.
+    pub seq: u64,
+    /// Entries in key order.
+    pub entries: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// Reads and validates the snapshot at `path`.
+pub fn read_snapshot(fs: &dyn Vfs, path: &Path) -> Result<SnapshotDump> {
+    let snap = snapshot::read(fs, path)?;
+    Ok(SnapshotDump {
+        seq: snap.seq,
+        entries: snap.map.into_iter().collect(),
+    })
+}
