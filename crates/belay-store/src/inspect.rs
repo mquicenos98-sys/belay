@@ -199,3 +199,71 @@ impl fmt::Display for Problem {
         )
     }
 }
+
+/// One record of a log segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RecordInfo {
+    /// Offset of the record header.
+    pub offset: u64,
+    /// Sequence number.
+    pub seq: u64,
+    /// The writer's known-synced offset when it wrote the record.
+    pub synced_to: u64,
+    /// Total size, header included.
+    pub len: u64,
+    /// The decoded batch; `None` if the payload does not decode.
+    pub batch: Option<WriteBatch>,
+}
+
+impl RecordInfo {
+    /// Offset just past this record.
+    #[must_use]
+    pub fn end(&self) -> u64 {
+        self.offset + self.len
+    }
+}
+
+impl fmt::Display for RecordInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "seq {} at {} ({} bytes, synced to {})",
+            self.seq, self.offset, self.len, self.synced_to
+        )?;
+        let Some(batch) = &self.batch else {
+            return f.write_str(": payload does not decode");
+        };
+        for op in batch.ops() {
+            match op {
+                Op::Put { key, value } => {
+                    write!(f, "\n  put \"{}\" ({} bytes)", Printable(key), value.len())?
+                }
+                Op::Delete { key } => write!(f, "\n  delete \"{}\"", Printable(key))?,
+                Op::DeleteRange {
+                    start,
+                    end: Some(end),
+                } => write!(
+                    f,
+                    "\n  delete [\"{}\", \"{}\")",
+                    Printable(start),
+                    Printable(end)
+                )?,
+                Op::DeleteRange { start, end: None } => {
+                    write!(f, "\n  delete [\"{}\", end)", Printable(start))?
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// The decoded contents of one segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentDump {
+    /// First sequence number from the header, if the header is valid.
+    pub header_seq: Option<u64>,
+    /// Valid records in file order.
+    pub records: Vec<RecordInfo>,
+    /// Damage found, classified as if this were the last segment.
+    pub problems: Vec<Problem>,
+}
