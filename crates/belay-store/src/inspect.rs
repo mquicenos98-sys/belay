@@ -338,3 +338,60 @@ pub fn read_snapshot(fs: &dyn Vfs, path: &Path) -> Result<SnapshotDump> {
         entries: snap.map.into_iter().collect(),
     })
 }
+
+/// Result of checking one snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SnapshotCheck {
+    /// The file.
+    pub file: FileInfo,
+    /// Number of entries, if it validated.
+    pub keys: Option<u64>,
+}
+
+/// Result of checking one segment.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SegmentCheck {
+    /// The file.
+    pub file: FileInfo,
+    /// Valid records.
+    pub records: u64,
+    /// Sequence numbers of the first and last valid record.
+    pub seqs: Option<(u64, u64)>,
+    /// Whether the newest valid snapshot covers the whole segment, so that
+    /// opening the store would delete it.
+    pub covered: bool,
+}
+
+/// Everything [`verify`] found.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifyReport {
+    /// The files examined.
+    pub files: StoreFiles,
+    /// Every snapshot, oldest first.
+    pub snapshots: Vec<SnapshotCheck>,
+    /// Every segment, oldest first.
+    pub segments: Vec<SegmentCheck>,
+    /// Problems, in the order found.
+    pub problems: Vec<Problem>,
+    /// Sequence number of the newest valid snapshot (0 if none).
+    pub snapshot_seq: u64,
+    /// Last sequence number reachable from it through the log without a
+    /// gap: what opening the store would recover if nothing were corrupt.
+    pub last_seq: u64,
+}
+
+impl VerifyReport {
+    /// Whether the store would open in strict mode without losing data: no
+    /// problems other than a torn tail.
+    #[must_use]
+    pub fn is_ok(&self) -> bool {
+        self.problems
+            .iter()
+            .all(|p| p.kind == ProblemKind::TornTail)
+    }
+
+    /// Problems of the given kind.
+    pub fn problems_of(&self, kind: ProblemKind) -> impl Iterator<Item = &Problem> {
+        self.problems.iter().filter(move |p| p.kind == kind)
+    }
+}
