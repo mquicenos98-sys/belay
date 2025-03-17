@@ -1,8 +1,11 @@
 //! "Did you mean" support: finds the requested key closest to a key nobody
 //! read, if it is close enough to be a plausible typo.
 
-/// Levenshtein distance over chars, with two rolling rows.
+/// Optimal string alignment distance: Levenshtein plus transposition of
+/// adjacent characters, the most common typo (`lsiten` for `listen`).
 fn distance(a: &[char], b: &[char]) -> usize {
+    // Three rolling rows: the transposition step looks two rows back.
+    let mut prev2 = vec![0; b.len() + 1];
     let mut prev: Vec<usize> = (0..=b.len()).collect();
     let mut cur = vec![0; b.len() + 1];
     for i in 1..=a.len() {
@@ -10,7 +13,11 @@ fn distance(a: &[char], b: &[char]) -> usize {
         for j in 1..=b.len() {
             let cost = usize::from(a[i - 1] != b[j - 1]);
             cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
+            if i > 1 && j > 1 && a[i - 1] == b[j - 2] && a[i - 2] == b[j - 1] {
+                cur[j] = cur[j].min(prev2[j - 2] + 1);
+            }
         }
+        std::mem::swap(&mut prev2, &mut prev);
         std::mem::swap(&mut prev, &mut cur);
     }
     prev[b.len()]
@@ -51,6 +58,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn dist(a: &str, b: &str) -> usize {
+        distance(
+            &a.chars().collect::<Vec<_>>(),
+            &b.chars().collect::<Vec<_>>(),
+        )
+    }
+
+    #[test]
+    fn distance_counts_edits_and_transpositions() {
+        assert_eq!(dist("", ""), 0);
+        assert_eq!(dist("abc", ""), 3);
+        assert_eq!(dist("sever", "server"), 1);
+        assert_eq!(dist("lsiten", "listen"), 1);
+        assert_eq!(dist("kitten", "sitting"), 3);
+        assert_eq!(dist("héllo", "hello"), 1);
+    }
 
     #[test]
     fn suggests_plausible_typos_only() {
