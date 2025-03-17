@@ -395,3 +395,286 @@ impl VerifyReport {
         self.problems.iter().filter(move |p| p.kind == kind)
     }
 }
+
+/// Checks every snapshot and segment in `dir`: checksums, headers,
+/// sequence continuity and batch encoding, without modifying anything.
+pub fn verify(fs: &dyn Vfs, dir: &Path) -> Result<VerifyReport> {
+    let files = list_files(fs, dir)?;
+    let mut problems = Vec::new();
+
+    let mut snapshots = Vec::new();
+    let mut snapshot_seq = 0;
+    for file in &files.snapshots {
+        let keys = match snapshot::read(fs, &file.path) {
+            Ok(snap) if snap.seq == file.seq => {
+                snapshot_seq = snapshot_seq.max(snap.seq);
+                Some(snap.map.len() as u64)
+            }
+            Ok(snap) => {
+                problems.push(Problem {
+                    kind: ProblemKind::BadSnapshot,
+                    file: file.path.clone(),
+                    offset: 12,
+                    detail: format!("header says seq {}, file name says {}", snap.seq, file.seq),
+                });
+                None
+            }
+            Err(e) if e.is_corruption() => {
+                problems.push(Problem {
+                    kind: ProblemKind::BadSnapshot,
+                    file: file.path.clone(),
+                    offset: 0,
+                    detail: e.to_string(),
+                });
+                None
+            }
+            Err(e) => return Err(e),
+        };
+        snapshots.push(SnapshotCheck {
+            file: file.clone(),
+            keys,
+        });
+    }
+
+    let start = files
+        .segments
+        .iter()
+        .rposition(|s| s.seq <= snapshot_seq + 1)
+        .unwrap_or(0);
+    let mut expected = snapshot_seq + 1;
+    let mut segments = Vec::new();
+    let count = files.segments.len();
+    for (i, file) in files.segments.iter().enumerate() {
+        let covered = i < start;
+        let dump = read_segment(fs, &file.path, i + 1 == count)?;
+        problems.extend(dump.problems.iter().cloned());
+        if let Some(seq) = dump.header_seq.filter(|s| *s != file.seq) {
+            problems.push(Problem {
+                kind: ProblemKind::Corrupt,
+                file: file.path.clone(),
+                offset: 12,
+                detail: format!("header says first seq {seq}, file name says {}", file.seq),
+            });
+        }
+        if !covered && file.seq > expected {
+            problems.push(Problem {
+                kind: ProblemKind::Gap,
+                file: file.path.clone(),
+                offset: 0,
+                detail: format!("batches {expected} to {} are missing", file.seq - 1),
+            });
+            expected = file.seq;
+        }
+        for rec in &dump.records {
+            if rec.batch.is_none() {
+                problems.push(Problem {
+                    kind: ProblemKind::Corrupt,
+                    file: file.path.clone(),
+                    offset: rec.offset,
+                    detail: format!("batch {} does not decode", rec.seq),
+                });
+            }
+            if covered || rec.seq <= snapshot_seq {
+                continue;
+            }
+            if rec.seq != expected {
+                problems.push(Problem {
+                    kind: ProblemKind::Gap,
+                    file: file.path.clone(),
+                    offset: rec.offset,
+                    detail: format!("expected batch {expected}, found {}", rec.seq),
+                });
+            }
+            expected = rec.seq.max(expected) + 1;
+        }
+        segments.push(SegmentCheck {
+            file: file.clone(),
+            records: dump.records.len() as u64,
+            seqs: dump
+                .records
+                .first()
+                .zip(dump.records.last())
+                .map(|(a, b)| (a.seq, b.seq)),
+            covered,
+        });
+    }
+
+    Ok(VerifyReport {
+        files,
+        snapshots,
+        segments,
+        problems,
+        snapshot_seq,
+        last_seq: expected - 1,
+    })
+}
+
+impl fmt::Display for VerifyReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut table = Table::new(["FILE", "SEQS", "ENTRIES", "SIZE", "NOTE"])
+            .align(2, Align::Right)
+            .align(3, Align::Right);
+        for s in &self.snapshots {
+            let (entries, note) = match s.keys {
+                Some(n) => (n.to_string(), ""),
+                None => (String::new(), "invalid"),
+            };
+            table.push_row([
+                s.file.name.clone(),
+                format!("..={}", s.file.seq),
+                entries,
+                humanize_bytes(s.file.size),
+                note.to_string(),
+            ]);
+        }
+        for s in &self.segments {
+            let seqs = s
+                .seqs
+                .map_or_else(String::new, |(a, b)| format!("{a}..={b}"));
+            let note = if s.covered { "covered by snapshot" } else { "" };
+            table.push_row([
+                s.file.name.clone(),
+                seqs,
+                s.records.to_string(),
+                humanize_bytes(s.file.size),
+                note.to_string(),
+            ]);
+        }
+        write!(f, "{table}")?;
+        writeln!(
+            f,
+            "snapshot seq {}, recoverable through seq {}",
+            self.snapshot_seq, self.last_seq
+        )?;
+        if self.problems.is_empty() {
+            writeln!(f, "no problems found")
+        } else {
+            for p in &self.problems {
+                writeln!(f, "{p}")?;
+            }
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kv::Kv;
+    use crate::logkv::{LogKv, Options};
+    use crate::vfs::MemFs;
+
+    fn populated() -> (MemFs, PathBuf) {
+        let fs = MemFs::new();
+        let dir = PathBuf::from("db");
+        let kv = LogKv::open(
+            &dir,
+            Options::new()
+                .fs(fs.clone())
+                .segment_size(256)
+                .manual_checkpoints(),
+        )
+        .expect("open");
+        for i in 0..30u32 {
+            let mut b = WriteBatch::new();
+            b.put(format!("k{i:02}"), vec![b'v'; 20]).delete("gone");
+            kv.write(b).expect("write");
+            if i == 9 {
+                kv.checkpoint().expect("checkpoint");
+            }
+        }
+        kv.close().expect("close");
+        (fs, dir)
+    }
+
+    #[test]
+    fn lists_files_by_kind() {
+        let (fs, dir) = populated();
+        let files = list_files(&fs, &dir).expect("list");
+        assert_eq!(files.snapshots.len(), 1);
+        assert_eq!(files.snapshots[0].seq, 10);
+        assert!(files.segments.len() > 1);
+        assert!(files.segments.iter().all(|s| s.seq > 10));
+        assert!(!files.locked);
+        assert_eq!(
+            files.wal_bytes(),
+            files.segments.iter().map(|s| s.size).sum()
+        );
+        let text = files.to_string();
+        assert!(text.starts_with("FILE"), "{text}");
+        assert!(text.contains("snapshot"), "{text}");
+    }
+
+    #[test]
+    fn dumps_records_with_their_operations() {
+        let (fs, dir) = populated();
+        let files = list_files(&fs, &dir).expect("list");
+        let first = &files.segments[0];
+        let dump = read_segment(&fs, &first.path, false).expect("dump");
+        assert_eq!(dump.header_seq, Some(first.seq));
+        assert!(dump.problems.is_empty());
+        let rec = &dump.records[0];
+        assert_eq!(rec.seq, first.seq);
+        assert_eq!(rec.offset, SEGMENT_HEADER_LEN as u64);
+        assert_eq!(rec.batch.as_ref().map(WriteBatch::len), Some(2));
+        let text = rec.to_string();
+        assert!(text.contains("put \"k10\" (20 bytes)"), "{text}");
+        assert!(text.contains("delete \"gone\""), "{text}");
+        let snap = read_snapshot(&fs, &files.snapshots[0].path).expect("snapshot");
+        assert_eq!(snap.seq, 10);
+        assert_eq!(snap.entries.len(), 10);
+    }
+
+    #[test]
+    fn verify_reports_a_healthy_store() {
+        let (fs, dir) = populated();
+        let report = verify(&fs, &dir).expect("verify");
+        assert!(report.is_ok(), "{report}");
+        assert_eq!(report.snapshot_seq, 10);
+        assert_eq!(report.last_seq, 30);
+        assert!(report.to_string().contains("no problems found"));
+    }
+
+    #[test]
+    fn verify_classifies_torn_tails_corruption_and_gaps() {
+        let (fs, dir) = populated();
+        let files = list_files(&fs, &dir).expect("list");
+        let last = files.segments.last().expect("segments");
+        let mut f = fs.open_append(&last.path).expect("append");
+        std::io::Write::write_all(&mut f, &[0xAB; 30]).expect("garbage tail");
+        let report = verify(&fs, &dir).expect("verify");
+        assert!(report.is_ok(), "a torn tail alone is fine: {report}");
+        assert_eq!(report.problems_of(ProblemKind::TornTail).count(), 1);
+
+        // Damage inside a sealed segment is corruption.
+        let sealed = &files.segments[0];
+        fs.overwrite(&sealed.path, SEGMENT_HEADER_LEN + 30, b"\xFF\xFF")
+            .expect("damage");
+        let report = verify(&fs, &dir).expect("verify");
+        assert!(!report.is_ok());
+        assert_eq!(report.problems_of(ProblemKind::Corrupt).count(), 1);
+
+        // A missing middle segment is a gap.
+        fs.remove(&files.segments[1].path).expect("remove");
+        let report = verify(&fs, &dir).expect("verify");
+        assert!(
+            report.problems_of(ProblemKind::Gap).count() >= 1,
+            "{report}"
+        );
+        assert!(report.to_string().contains("gap: "), "{report}");
+    }
+
+    #[test]
+    fn verify_flags_bad_snapshots() {
+        let (fs, dir) = populated();
+        let files = list_files(&fs, &dir).expect("list");
+        fs.overwrite(&files.snapshots[0].path, 30, b"??")
+            .expect("damage");
+        let report = verify(&fs, &dir).expect("verify");
+        assert_eq!(report.problems_of(ProblemKind::BadSnapshot).count(), 1);
+        assert_eq!(report.snapshots[0].keys, None);
+        // Without the snapshot the log cannot reach back to batch 1.
+        assert_eq!(report.snapshot_seq, 0);
+        assert!(report.problems_of(ProblemKind::Gap).count() >= 1);
+    }
+}
