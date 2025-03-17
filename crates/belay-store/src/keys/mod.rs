@@ -240,3 +240,26 @@ impl KeyBuf {
         KeyRange::prefix(&self.buf)
     }
 }
+
+fn escape_into(out: &mut Vec<u8>, v: &[u8]) {
+    out.reserve(v.len() + 2);
+    for &b in v {
+        if b == ESCAPE {
+            out.extend_from_slice(&[ESCAPE, ESCAPED_ZERO]);
+        } else {
+            out.push(b);
+        }
+    }
+}
+
+impl AsRef<[u8]> for KeyBuf {
+    fn as_ref(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+impl From<KeyBuf> for Vec<u8> {
+    fn from(k: KeyBuf) -> Vec<u8> {
+        k.buf
+    }
+}
