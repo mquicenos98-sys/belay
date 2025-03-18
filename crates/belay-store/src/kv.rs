@@ -113,3 +113,71 @@ impl<T: Kv + ?Sized> Kv for Arc<T> {
         (**self).last_seq()
     }
 }
+
+/// Store statistics. Counters marked "since open" restart at zero when the
+/// store is reopened.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct KvStats {
+    /// Number of keys.
+    pub keys: u64,
+    /// Sum of key and value lengths.
+    pub live_bytes: u64,
+    /// Sequence number of the latest visible write.
+    pub last_seq: u64,
+    /// Highest sequence number known to be on stable storage (always 0 for
+    /// [`MemKv`](crate::MemKv)).
+    pub durable_seq: u64,
+    /// Batches written since open.
+    pub batches: u64,
+    /// Operations in those batches.
+    pub ops: u64,
+    /// Group commits since open: log writes that carried one or more
+    /// batches. `batches / commit_groups` is the average group size.
+    pub commit_groups: u64,
+    /// Log syncs since open.
+    pub wal_syncs: u64,
+    /// Bytes appended to the log since open.
+    pub wal_bytes_written: u64,
+    /// Log segment files on disk.
+    pub wal_segments: u64,
+    /// Total size of those segment files.
+    pub wal_bytes: u64,
+    /// Checkpoints written since open.
+    pub checkpoints: u64,
+    /// Sequence number covered by the newest snapshot (0 if none).
+    pub checkpoint_seq: u64,
+    /// Size of the newest snapshot file.
+    pub snapshot_bytes: u64,
+    /// What happened when the store was opened.
+    pub recovery: RecoveryStats,
+}
+
+/// What recovery found and did when a store was opened.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RecoveryStats {
+    /// Sequence number of the snapshot recovery started from (0 if none).
+    pub snapshot_seq: u64,
+    /// Keys loaded from that snapshot.
+    pub snapshot_keys: u64,
+    /// Snapshots passed over because they failed validation.
+    pub bad_snapshots: u64,
+    /// Log segments read.
+    pub segments_replayed: u64,
+    /// Batches applied from the log.
+    pub batches_replayed: u64,
+    /// Torn log tails that were truncated (0 or 1).
+    pub torn_tails: u64,
+    /// Bytes removed by that truncation.
+    pub torn_bytes: u64,
+    /// Damaged log regions skipped under `RecoveryMode::SkipCorrupt`.
+    pub skipped_regions: u64,
+    /// Bytes in those regions.
+    pub skipped_bytes: u64,
+    /// Leftover files deleted: temporary snapshots, superseded snapshots
+    /// and log segments covered by the snapshot.
+    pub removed_files: u64,
+    /// Wall-clock time recovery took.
+    pub duration: Duration,
+}
