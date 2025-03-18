@@ -215,3 +215,159 @@ impl Default for KeyRange {
         KeyRange::all()
     }
 }
+
+impl fmt::Display for KeyRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.start {
+            Bound::Included(s) => write!(f, "[\"{}\"", Printable(s))?,
+            Bound::Excluded(s) => write!(f, "(\"{}\"", Printable(s))?,
+            Bound::Unbounded => f.write_str("(-inf")?,
+        }
+        match &self.end {
+            Bound::Included(e) => write!(f, ", \"{}\"]", Printable(e))?,
+            Bound::Excluded(e) => write!(f, ", \"{}\")", Printable(e))?,
+            Bound::Unbounded => f.write_str(", +inf)")?,
+        }
+        if let Some(limit) = self.limit {
+            write!(f, " limit {limit}")?;
+        }
+        if self.reverse {
+            f.write_str(" reverse")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for KeyRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "KeyRange({self})")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_common::Rng;
+
+    fn map(keys: &[&[u8]]) -> BTreeMap<Vec<u8>, Vec<u8>> {
+        keys.iter()
+            .map(|k| (k.to_vec(), [b"v:", *k].concat()))
+            .collect()
+    }
+
+    fn keys_of(entries: Vec<(Vec<u8>, Vec<u8>)>) -> Vec<Vec<u8>> {
+        entries.into_iter().map(|(k, _)| k).collect()
+    }
+
+    fn v(keys: &[&[u8]]) -> Vec<Vec<u8>> {
+        keys.iter().map(|k| k.to_vec()).collect()
+    }
+
+    #[test]
+    fn prefix_ranges_stop_at_the_prefix_end() {
+        let m = map(&[b"job", b"job/1", b"job/2", b"job0", b"jobs", b"a"]);
+        let got = keys_of(KeyRange::prefix(b"job/").scan_map(&m));
+        assert_eq!(got, v(&[b"job/1", b"job/2"]));
+        let all_ff = map(&[&[0xFF], &[0xFF, 0xFF, 1], &[0xFE]]);
+        let got = keys_of(KeyRange::prefix([0xFF]).scan_map(&all_ff));
+        assert_eq!(got, vec![vec![0xFF], vec![0xFF, 0xFF, 1]]);
+        assert_eq!(KeyRange::prefix(b"").scan_map(&m).len(), 6);
+    }
+
+    #[test]
+    fn bounded_ranges_limit_and_reverse() {
+        let m = map(&[b"a", b"b", b"c", b"d", b"e"]);
+        let r = KeyRange::new(&b"b"[..]..&b"e"[..]);
+        assert_eq!(keys_of(r.scan_map(&m)), v(&[b"b", b"c", b"d"]));
+        assert_eq!(
+            keys_of(KeyRange::new(&b"b"[..]..=&b"e"[..]).scan_map(&m)),
+            v(&[b"b", b"c", b"d", b"e"])
+        );
+        assert_eq!(keys_of(r.clone().limit(2).scan_map(&m)), v(&[b"b", b"c"]));
+        assert_eq!(
+            keys_of(r.clone().reverse().limit(2).scan_map(&m)),
+            v(&[b"d", b"c"])
+        );
+        assert!(r.clone().limit(0).scan_map(&m).is_empty());
+        assert_eq!(
+            keys_of(KeyRange::new("c"..).scan_map(&m)),
+            v(&[b"c", b"d", b"e"])
+        );
+        assert_eq!(r.count_map(&m), 3);
+        assert_eq!(r.clone().limit(1).count_map(&m), 1);
+        assert_eq!(r.scan_map_keys(&m), v(&[b"b", b"c", b"d"]));
+    }
+
+    #[test]
+    fn inverted_and_degenerate_ranges_are_empty_instead_of_panicking() {
+        let m = map(&[b"a", b"b"]);
+        for r in [
+            KeyRange::new(&b"b"[..]..&b"a"[..]),
+            KeyRange::new(&b"a"[..]..&b"a"[..]),
+            KeyRange::from_bounds(
+                Bound::Excluded(b"a".to_vec()),
+                Bound::Excluded(b"a".to_vec()),
+            ),
+            KeyRange::from_bounds(
+                Bound::Excluded(b"a".to_vec()),
+                Bound::Excluded(b"a\0".to_vec()),
+            ),
+        ] {
+            assert!(r.is_empty(), "{r}");
+            assert!(r.scan_map(&m).is_empty(), "{r}");
+            assert_eq!(r.count_map(&m), 0);
+        }
+        assert!(!KeyRange::new(&b"a"[..]..=&b"a"[..]).is_empty());
+        assert!(!KeyRange::from_bounds(
+            Bound::Excluded(b"a".to_vec()),
+            Bound::Excluded(b"a\0\0".to_vec())
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn display_shows_bounds_limit_and_direction() {
+        assert_eq!(KeyRange::all().to_string(), "(-inf, +inf)");
+        assert_eq!(
+            KeyRange::prefix(b"q\x01").limit(5).reverse().to_string(),
+            r#"["q\x01", "q\x02") limit 5 reverse"#
+        );
+        assert_eq!(
+            format!("{:?}", KeyRange::new("a"..="b")),
+            r#"KeyRange(["a", "b"])"#
+        );
+        assert_eq!(KeyRange::default(), KeyRange::all());
+    }
+
+    #[test]
+    fn contains_agrees_with_scans() {
+        let mut rng = Rng::seed_from_u64(99);
+        let keys: Vec<Vec<u8>> = (0..200)
+            .map(|_| {
+                (0..rng.gen_range(0..3usize))
+                    .map(|_| rng.gen_range(0..4u8))
+                    .collect()
+            })
+            .collect();
+        let m: BTreeMap<Vec<u8>, Vec<u8>> = keys.iter().map(|k| (k.clone(), vec![])).collect();
+        let bound = |rng: &mut Rng| -> Bound<Vec<u8>> {
+            let k: Vec<u8> = (0..rng.gen_range(0..3usize))
+                .map(|_| rng.gen_range(0..4u8))
+                .collect();
+            match rng.gen_range(0..3u8) {
+                0 => Bound::Included(k),
+                1 => Bound::Excluded(k),
+                _ => Bound::Unbounded,
+            }
+        };
+        for _ in 0..500 {
+            let r = KeyRange::from_bounds(bound(&mut rng), bound(&mut rng));
+            let expected: Vec<Vec<u8>> = m.keys().filter(|k| r.contains(k)).cloned().collect();
+            assert_eq!(r.scan_map_keys(&m), expected, "{r}");
+            // `is_empty` may only claim emptiness when nothing can match.
+            if r.is_empty() {
+                assert!(expected.is_empty(), "{r}");
+            }
+        }
+    }
+}
