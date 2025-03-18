@@ -181,3 +181,95 @@ pub struct RecoveryStats {
     /// Wall-clock time recovery took.
     pub duration: Duration,
 }
+
+impl RecoveryStats {
+    /// Whether recovery had to discard or skip anything.
+    #[must_use]
+    pub fn lost_data(&self) -> bool {
+        self.torn_tails > 0 || self.skipped_regions > 0 || self.bad_snapshots > 0
+    }
+}
+
+/// Outcome of [`Kv::checkpoint`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct CheckpointInfo {
+    /// Sequence number the snapshot covers.
+    pub seq: u64,
+    /// Keys in the snapshot.
+    pub keys: u64,
+    /// Snapshot file size.
+    pub snapshot_bytes: u64,
+    /// Log segments deleted because the snapshot covers them.
+    pub segments_removed: u64,
+    /// Whether a snapshot was written; `false` when nothing changed since
+    /// the previous checkpoint or the store has no durable state.
+    pub written: bool,
+}
+
+impl fmt::Display for CheckpointInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.written {
+            write!(
+                f,
+                "checkpoint at seq {}: {} keys, {} snapshot bytes, {} log segments removed",
+                self.seq, self.keys, self.snapshot_bytes, self.segments_removed
+            )
+        } else {
+            write!(f, "no checkpoint needed at seq {}", self.seq)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::MemKv;
+
+    #[test]
+    fn provided_methods_work_through_an_arc() {
+        let kv: Arc<dyn Kv> = Arc::new(MemKv::new());
+        assert_eq!(kv.put(b"a", b"1").expect("put"), 1);
+        assert_eq!(kv.put(b"b", b"2").expect("put"), 2);
+        assert!(kv.contains(b"a").expect("contains"));
+        assert_eq!(kv.count(KeyRange::all()).expect("count"), 2);
+        assert_eq!(kv.delete(b"a").expect("delete"), 3);
+        assert_eq!(
+            kv.scan_keys(KeyRange::all()).expect("keys"),
+            vec![b"b".to_vec()]
+        );
+        assert_eq!(kv.last_seq(), 3);
+        let shared = Arc::new(Arc::clone(&kv));
+        assert_eq!(shared.get(b"b").expect("get"), Some(b"2".to_vec()));
+    }
+
+    #[test]
+    fn checkpoint_info_describes_itself() {
+        let info = CheckpointInfo {
+            seq: 9,
+            keys: 3,
+            snapshot_bytes: 120,
+            segments_removed: 2,
+            written: true,
+        };
+        assert_eq!(
+            info.to_string(),
+            "checkpoint at seq 9: 3 keys, 120 snapshot bytes, 2 log segments removed"
+        );
+        let skipped = CheckpointInfo {
+            seq: 9,
+            ..CheckpointInfo::default()
+        };
+        assert_eq!(skipped.to_string(), "no checkpoint needed at seq 9");
+    }
+
+    #[test]
+    fn recovery_stats_flag_data_loss() {
+        assert!(!RecoveryStats::default().lost_data());
+        let torn = RecoveryStats {
+            torn_tails: 1,
+            ..RecoveryStats::default()
+        };
+        assert!(torn.lost_data());
+    }
+}
