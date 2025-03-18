@@ -35,3 +35,11 @@ fn owned(bound: Bound<&impl AsRef<[u8]>>) -> Bound<Vec<u8>> {
         Bound::Unbounded => Bound::Unbounded,
     }
 }
+
+fn borrowed(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+    match bound {
+        Bound::Included(k) => Bound::Included(k),
+        Bound::Excluded(k) => Bound::Excluded(k),
+        Bound::Unbounded => Bound::Unbounded,
+    }
+}
