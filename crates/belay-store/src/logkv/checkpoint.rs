@@ -160,3 +160,56 @@ impl Inner {
         }
     }
 }
+
+/// Body of the background thread: interval syncs and automatic
+/// checkpoints, until the store closes.
+pub(super) fn run_background(inner: Arc<Inner>) {
+    let interval = match inner.sync {
+        SyncPolicy::Interval(d) => Some(d),
+        SyncPolicy::Always | SyncPolicy::Never => None,
+    };
+    let mut next_sync = interval.map(|d| Instant::now() + d);
+    loop {
+        let checkpoint_due = {
+            let mut bg = lock(&inner.bg);
+            loop {
+                if bg.stop {
+                    return;
+                }
+                if bg.checkpoint_requested {
+                    break;
+                }
+                let Some(deadline) = next_sync else {
+                    bg = wait(&inner.bg_signal, bg);
+                    continue;
+                };
+                let now = Instant::now();
+                if now >= deadline {
+                    break;
+                }
+                bg = wait_timeout(&inner.bg_signal, bg, deadline - now).0;
+            }
+            let due = mem::take(&mut bg.checkpoint_requested);
+            bg.checkpoint_running = due;
+            due
+        };
+
+        if let (Some(period), Some(deadline)) = (interval, next_sync) {
+            let now = Instant::now();
+            if now >= deadline {
+                // Failures put the store into the failed state and are
+                // logged there; nothing more to do here.
+                let _ = inner.sync_wal();
+                next_sync = Some(now + period);
+            }
+        }
+
+        if checkpoint_due {
+            match inner.checkpoint(false) {
+                Ok(_) | Err(StoreError::Closed) | Err(StoreError::Failed { .. }) => {}
+                Err(e) => warn!("automatic checkpoint failed"; error = %e),
+            }
+            lock(&inner.bg).checkpoint_running = false;
+        }
+    }
+}
