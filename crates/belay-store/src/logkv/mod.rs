@@ -22,3 +22,48 @@ mod checkpoint;
 mod commit;
 
 mod options;
+
+mod recovery;
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::thread::{self, JoinHandle};
+
+use belay_common::sync::{lock, read, wait};
+use belay_common::{debug, info, warn};
+
+use self::checkpoint::{run_background, Background};
+use self::commit::CommitState;
+use crate::batch::WriteBatch;
+use crate::error::{io_err, Result, StoreError};
+use crate::files::LOCK_NAME;
+use crate::kv::{CheckpointInfo, Kv, KvStats, RecoveryStats};
+use crate::range::KeyRange;
+use crate::table::Table;
+use crate::vfs::{Vfs, VfsLock};
+use crate::wal::SegmentWriter;
+
+pub use options::{Options, ParseOptionError, RecoveryMode, SyncPolicy};
+
+/// The table as readers see it.
+struct Visible {
+    table: Table,
+    /// Sequence number of the last batch applied.
+    seq: u64,
+}
+
+/// The log files, guarded by the `wal` lock.
+struct Wal {
+    /// Where batches are appended; `None` once closed.
+    active: Option<SegmentWriter>,
+    /// Older segments still on disk: first sequence number to size.
+    sealed: BTreeMap<u64, u64>,
+    /// Sum of the sizes in `sealed`, kept so that the per-commit
+    /// checkpoint check does not walk the map.
+    sealed_bytes: u64,
+    /// Sequence number of the last record appended.
+    written_seq: u64,
+}
