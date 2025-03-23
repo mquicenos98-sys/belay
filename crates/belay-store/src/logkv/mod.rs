@@ -149,3 +149,187 @@ struct Inner {
     closed: AtomicBool,
     dir_lock: Mutex<Option<Box<dyn VfsLock>>>,
 }
+
+impl Inner {
+    fn ensure_open(&self) -> Result<()> {
+        if self.closed.load(Ordering::SeqCst) {
+            Err(StoreError::Closed)
+        } else {
+            Ok(())
+        }
+    }
+}
+
+/// A durable [`Kv`] backed by a directory of log segments and snapshots.
+///
+/// Reads are served from memory. Writes are appended to the log with group
+/// commit and become visible when [`write`](Kv::write) returns; see
+/// [`SyncPolicy`] for when they are durable. [`checkpoint`](Kv::checkpoint)
+/// (or the automatic one, see [`Options::checkpoint_every`]) snapshots the
+/// state and deletes the log it covers.
+///
+/// Opening recovers from the newest valid snapshot plus the log after it.
+/// A torn log tail left by a crash is truncated with a warning and
+/// counted in [`RecoveryStats`]; other damage is reported as
+/// [`StoreError::Corrupt`] unless [`RecoveryMode::SkipCorrupt`] is set.
+/// A `LOCK` file keeps a second process (or handle) from opening the same
+/// directory.
+///
+/// ```
+/// use belay_store::vfs::MemFs;
+/// use belay_store::{KeyRange, Kv, LogKv, Options, WriteBatch};
+///
+/// let fs = MemFs::new();
+/// let kv = LogKv::open("data", Options::new().fs(fs.clone())).unwrap();
+/// let mut batch = WriteBatch::new();
+/// batch.put("job/1", "ready").put("job/2", "running");
+/// assert_eq!(kv.write(batch).unwrap(), 1);
+/// kv.close().unwrap();
+///
+/// let kv = LogKv::open("data", Options::new().fs(fs)).unwrap();
+/// assert_eq!(kv.scan(KeyRange::prefix("job/")).unwrap().len(), 2);
+/// assert_eq!(kv.last_seq(), 1);
+/// ```
+pub struct LogKv {
+    inner: Arc<Inner>,
+    background: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl LogKv {
+    /// Opens (creating if needed) the store in `dir`, recovering its state.
+    pub fn open(dir: impl AsRef<Path>, options: Options) -> Result<LogKv> {
+        options.validate()?;
+        let dir = dir.as_ref().to_path_buf();
+        let fs = Arc::clone(&options.fs);
+        if !fs.exists(&dir).map_err(io_err("checking", &dir))? {
+            if !options.create_if_missing {
+                return Err(StoreError::NotFound { dir });
+            }
+            fs.create_dir_all(&dir).map_err(io_err("creating", &dir))?;
+        }
+        let dir_lock = fs.lock(&dir.join(LOCK_NAME))?;
+        let recovered = recovery::recover(&*fs, &dir, options.recovery)?;
+
+        let next_seq = recovered.last_seq + 1;
+        let active = SegmentWriter::create(&*fs, &dir, next_seq)?;
+        let mut sealed = recovered.segments;
+        // A leftover segment of that name held no batches; `create` has
+        // just replaced it.
+        sealed.remove(&next_seq);
+        let retire_damage =
+            recovered.stats.skipped_regions > 0 || recovered.stats.bad_snapshots > 0;
+
+        let inner = Arc::new(Inner {
+            dir,
+            fs,
+            sync: options.sync,
+            segment_size: options.segment_size,
+            checkpoint_bytes: options.checkpoint_bytes,
+            visible: RwLock::new(Visible {
+                table: recovered.table,
+                seq: recovered.last_seq,
+            }),
+            commit: Mutex::new(CommitState::recovered(recovered.last_seq)),
+            committed: Condvar::new(),
+            wal: Mutex::new(Wal::new(active, sealed, recovered.last_seq)),
+            checkpoint_lock: Mutex::new(()),
+            checkpoint_seq: AtomicU64::new(recovered.snapshot_seq),
+            snapshot_bytes: AtomicU64::new(recovered.snapshot_bytes),
+            bg: Mutex::new(Background::default()),
+            bg_signal: Condvar::new(),
+            counters: Counters::default(),
+            recovery: recovered.stats,
+            closed: AtomicBool::new(false),
+            dir_lock: Mutex::new(Some(dir_lock)),
+        });
+
+        let needs_thread =
+            matches!(inner.sync, SyncPolicy::Interval(_)) || inner.checkpoint_bytes.is_some();
+        let background = if needs_thread {
+            let shared = Arc::clone(&inner);
+            let handle = thread::Builder::new()
+                .name("belay-store".into())
+                .spawn(move || run_background(shared))
+                .map_err(io_err("starting the background thread for", &inner.dir))?;
+            Some(handle)
+        } else {
+            None
+        };
+        let kv = LogKv {
+            inner,
+            background: Mutex::new(background),
+        };
+        if retire_damage {
+            // A fresh snapshot covers everything recovered, so the damaged
+            // files are deleted or set aside and not met again.
+            info!("writing a checkpoint to retire damaged store files");
+            kv.inner.checkpoint(true)?;
+        }
+        Ok(kv)
+    }
+
+    /// The store directory.
+    #[must_use]
+    pub fn dir(&self) -> &Path {
+        &self.inner.dir
+    }
+
+    /// The sync policy in effect.
+    #[must_use]
+    pub fn sync_policy(&self) -> SyncPolicy {
+        self.inner.sync
+    }
+
+    /// What recovery did when the store was opened.
+    #[must_use]
+    pub fn recovery(&self) -> &RecoveryStats {
+        &self.inner.recovery
+    }
+
+    /// Whether [`close`](Self::close) has been called.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.inner.closed.load(Ordering::SeqCst)
+    }
+
+    /// Flushes the log and releases the directory lock. Writes that were
+    /// already queued are completed first; later calls on this handle fail
+    /// with [`StoreError::Closed`]. Closing twice is a no-op. Dropping the
+    /// handle closes it too, but cannot report errors.
+    pub fn close(&self) -> Result<()> {
+        let inner = &self.inner;
+        if inner.closed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        lock(&inner.bg).stop = true;
+        inner.bg_signal.notify_all();
+        if let Some(handle) = lock(&self.background).take() {
+            if handle.join().is_err() {
+                warn!("store background thread panicked");
+            }
+        }
+        {
+            let mut st = lock(&inner.commit);
+            while st.leader || (!st.queue.is_empty() && st.failure.is_none()) {
+                st = wait(&inner.committed, st);
+            }
+        }
+        let _no_checkpoint = lock(&inner.checkpoint_lock);
+        let failed = inner.failure().is_err();
+        let result = {
+            let mut wal = lock(&inner.wal);
+            let seq = wal.written_seq;
+            match wal.active.take() {
+                Some(mut active) if !failed => active.sync().map(|_| seq),
+                _ => Ok(0),
+            }
+        };
+        match &result {
+            Ok(seq) => inner.mark_durable(*seq),
+            Err(e) => inner.fail(e),
+        }
+        lock(&inner.dir_lock).take();
+        debug!("closed store in {}", inner.dir.display());
+        result.map(|_| ())
+    }
+}
