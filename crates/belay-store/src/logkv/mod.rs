@@ -67,3 +67,85 @@ struct Wal {
     /// Sequence number of the last record appended.
     written_seq: u64,
 }
+
+impl Wal {
+    fn new(active: SegmentWriter, sealed: BTreeMap<u64, u64>, written_seq: u64) -> Wal {
+        let sealed_bytes = sealed.values().sum();
+        Wal {
+            active: Some(active),
+            sealed,
+            sealed_bytes,
+            written_seq,
+        }
+    }
+
+    fn seal(&mut self, first_seq: u64, size: u64) {
+        if let Some(old) = self.sealed.insert(first_seq, size) {
+            self.sealed_bytes -= old;
+        }
+        self.sealed_bytes += size;
+    }
+
+    fn forget(&mut self, first_seq: u64) {
+        if let Some(size) = self.sealed.remove(&first_seq) {
+            self.sealed_bytes -= size;
+        }
+    }
+
+    fn live_bytes(&self) -> u64 {
+        self.sealed_bytes
+    }
+
+    fn segment_count(&self) -> u64 {
+        self.sealed.len() as u64 + u64::from(self.active.is_some())
+    }
+}
+
+/// Monotonic counters for [`KvStats`].
+#[derive(Debug, Default)]
+struct Counters {
+    batches: AtomicU64,
+    ops: AtomicU64,
+    groups: AtomicU64,
+    syncs: AtomicU64,
+    bytes: AtomicU64,
+    checkpoints: AtomicU64,
+}
+
+impl Counters {
+    fn add(&self, counter: &AtomicU64, n: u64) {
+        counter.fetch_add(n, Ordering::Relaxed);
+    }
+
+    fn get(counter: &AtomicU64) -> u64 {
+        counter.load(Ordering::Relaxed)
+    }
+}
+
+/// State shared between the handle and the background thread.
+struct Inner {
+    dir: PathBuf,
+    fs: Arc<dyn Vfs>,
+    sync: SyncPolicy,
+    segment_size: u64,
+    checkpoint_bytes: Option<u64>,
+
+    visible: RwLock<Visible>,
+    commit: Mutex<CommitState>,
+    /// Signalled when a group finishes, durability advances or the store
+    /// fails.
+    committed: Condvar,
+    wal: Mutex<Wal>,
+    checkpoint_lock: Mutex<()>,
+    /// Sequence number of the newest snapshot.
+    checkpoint_seq: AtomicU64,
+    /// Its size; 0 while there is none.
+    snapshot_bytes: AtomicU64,
+    bg: Mutex<Background>,
+    bg_signal: Condvar,
+
+    counters: Counters,
+    recovery: RecoveryStats,
+    closed: AtomicBool,
+    dir_lock: Mutex<Option<Box<dyn VfsLock>>>,
+}
