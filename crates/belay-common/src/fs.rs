@@ -33,8 +33,8 @@ fn with_path_context(err: io::Error, action: &str, path: &Path) -> io::Error {
 /// full.
 ///
 /// Writes a temporary file in the same directory, fsyncs it, renames it over
-/// `path` and fsyncs the directory (see [`sync_dir`]). On error `path` is
-/// untouched.
+/// `path` and fsyncs the directory (see [`sync_dir`]). On error the
+/// temporary file is removed and `path` is untouched.
 ///
 /// ```
 /// use belay_common::fs::{atomic_write, TempDir};
@@ -81,6 +81,10 @@ where
         fs::rename(&tmp, path)?;
         sync_dir(dir)
     })();
+    if result.is_err() {
+        // Usually still there; already gone if the rename succeeded.
+        let _ = fs::remove_file(&tmp);
+    }
     result.map_err(|e| with_path_context(e, "writing", path))
 }
 
@@ -390,6 +394,22 @@ mod tests {
         atomic_write(&path, b"second, longer").expect("second write");
         assert_eq!(fs::read(&path).expect("read back"), b"second, longer");
         assert_eq!(entries(dir.path()), vec!["data.bin"]);
+    }
+
+    #[test]
+    fn failed_writer_leaves_target_untouched() {
+        let dir = temp();
+        let path = dir.join("keep.txt");
+        atomic_write(&path, b"original").expect("initial write");
+        let err = atomic_write_with(&path, |f| {
+            f.write_all(b"partial")?;
+            Err(io::Error::new(io::ErrorKind::Other, "generator failed"))
+        })
+        .unwrap_err();
+        assert!(err.to_string().contains("generator failed"), "{err}");
+        assert!(err.to_string().contains("keep.txt"), "{err}");
+        assert_eq!(fs::read(&path).expect("read back"), b"original");
+        assert_eq!(entries(dir.path()), vec!["keep.txt"]);
     }
 
     #[test]
