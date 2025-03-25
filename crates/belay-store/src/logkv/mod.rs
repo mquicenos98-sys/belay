@@ -18,11 +18,8 @@
 //! proceed while the log is being written and synced.
 
 mod checkpoint;
-
 mod commit;
-
 mod options;
-
 mod recovery;
 
 use std::collections::BTreeMap;
@@ -331,5 +328,98 @@ impl LogKv {
         lock(&inner.dir_lock).take();
         debug!("closed store in {}", inner.dir.display());
         result.map(|_| ())
+    }
+}
+
+impl Drop for LogKv {
+    fn drop(&mut self) {
+        if let Err(e) = self.close() {
+            warn!("closing store failed"; error = %e);
+        }
+    }
+}
+
+impl fmt::Debug for LogKv {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("LogKv")
+            .field("dir", &self.inner.dir)
+            .field("sync", &self.inner.sync)
+            .field("seq", &read(&self.inner.visible).seq)
+            .field("closed", &self.is_closed())
+            .finish()
+    }
+}
+
+impl Kv for LogKv {
+    fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        self.inner.ensure_open()?;
+        Ok(read(&self.inner.visible).table.get(key).cloned())
+    }
+
+    fn scan(&self, range: KeyRange) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.ensure_open()?;
+        Ok(range.scan_map(read(&self.inner.visible).table.map()))
+    }
+
+    fn scan_keys(&self, range: KeyRange) -> Result<Vec<Vec<u8>>> {
+        self.inner.ensure_open()?;
+        Ok(range.scan_map_keys(read(&self.inner.visible).table.map()))
+    }
+
+    fn count(&self, range: KeyRange) -> Result<usize> {
+        self.inner.ensure_open()?;
+        Ok(range.count_map(read(&self.inner.visible).table.map()))
+    }
+
+    fn write(&self, batch: WriteBatch) -> Result<u64> {
+        self.inner.commit(batch)
+    }
+
+    fn flush(&self) -> Result<()> {
+        self.inner.ensure_open()?;
+        self.inner.sync_wal()
+    }
+
+    fn stats(&self) -> KvStats {
+        let inner = &self.inner;
+        let (keys, live_bytes, last_seq) = {
+            let visible = read(&inner.visible);
+            (
+                visible.table.len() as u64,
+                visible.table.live_bytes(),
+                visible.seq,
+            )
+        };
+        let durable_seq = lock(&inner.commit).durable_seq;
+        let (wal_segments, wal_bytes) = {
+            let wal = lock(&inner.wal);
+            (wal.segment_count(), wal.live_bytes())
+        };
+        let c = &inner.counters;
+        KvStats {
+            keys,
+            live_bytes,
+            last_seq,
+            durable_seq,
+            batches: Counters::get(&c.batches),
+            ops: Counters::get(&c.ops),
+            commit_groups: Counters::get(&c.groups),
+            wal_syncs: Counters::get(&c.syncs),
+            wal_bytes_written: Counters::get(&c.bytes),
+            wal_segments,
+            wal_bytes,
+            checkpoints: Counters::get(&c.checkpoints),
+            checkpoint_seq: inner.checkpoint_seq.load(Ordering::Acquire),
+            snapshot_bytes: inner.snapshot_bytes.load(Ordering::Acquire),
+            recovery: inner.recovery.clone(),
+        }
+    }
+
+    fn checkpoint(&self) -> Result<CheckpointInfo> {
+        self.inner.checkpoint(false)
+    }
+
+    fn last_seq(&self) -> u64 {
+        read(&self.inner.visible).seq
     }
 }
