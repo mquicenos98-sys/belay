@@ -36,3 +36,9 @@ pub(super) struct Recovered {
     pub(super) segments: BTreeMap<u64, u64>,
     pub(super) stats: RecoveryStats,
 }
+
+struct Recovery<'a> {
+    fs: &'a dyn Vfs,
+    mode: RecoveryMode,
+    stats: RecoveryStats,
+}
