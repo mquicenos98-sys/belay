@@ -51,3 +51,38 @@ pub(super) struct CommitState {
     /// Set once a write or sync fails; the store then refuses writes.
     pub(super) failure: Option<String>,
 }
+
+impl CommitState {
+    /// State after recovering up to `last_seq`, all of which is durable.
+    pub(super) fn recovered(last_seq: u64) -> CommitState {
+        CommitState {
+            next_seq: last_seq + 1,
+            applied_seq: last_seq,
+            durable_seq: last_seq,
+            ..CommitState::default()
+        }
+    }
+
+    fn failed(&self) -> Result<()> {
+        match &self.failure {
+            Some(reason) => Err(StoreError::Failed {
+                reason: reason.clone(),
+            }),
+            None => Ok(()),
+        }
+    }
+
+    pub(super) fn set_failure(&mut self, err: &StoreError) {
+        if self.failure.is_none() {
+            belay_common::error!("store stopped accepting writes"; error = %err);
+            self.failure = Some(err.to_string());
+        }
+        // Queued writers learn about the failure when they wake up.
+        self.queue.clear();
+    }
+}
+
+struct GroupOutcome {
+    last: u64,
+    synced: bool,
+}
