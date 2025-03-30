@@ -171,3 +171,113 @@ fn any_damaged_byte_in_a_sealed_segment_is_reported() {
         assert_eq!(salvaged.last_seq(), 12, "later segments are still replayed");
     }
 }
+
+#[test]
+fn a_crash_after_any_io_operation_keeps_every_acknowledged_write() {
+    let states = states(14);
+    let mut finished = false;
+    for budget in 0..400 {
+        let fs = MemFs::new();
+        fs.fail_after_ops(Some(budget));
+        let mut acked = 0;
+        // Opening counts against the budget too, so crashes while the
+        // store is being created are covered.
+        let kv = LogKv::open(dir(), opts(&fs).segment_size(200)).ok();
+        if let Some(kv) = &kv {
+            for i in 1..=14 {
+                match kv.write(batch(i)) {
+                    Ok(seq) => {
+                        assert_eq!(seq, i);
+                        acked = i;
+                    }
+                    Err(_) => break,
+                }
+                if i == 7 && kv.checkpoint().is_err() {
+                    break;
+                }
+            }
+        }
+        for crash in [Crash::PowerLoss, Crash::ProcessExit] {
+            let after = fs.crash_copy(&crash);
+            let recovered = open(opts(&after).segment_size(200));
+            let seq = recovered.last_seq();
+            assert!(
+                seq >= acked,
+                "budget {budget} {crash:?}: lost acknowledged batches"
+            );
+            assert_eq!(
+                dump(&recovered),
+                states[seq as usize],
+                "budget {budget} {crash:?}"
+            );
+        }
+        if let Some(kv) = kv {
+            fs.crash(&Crash::PowerLoss);
+            drop_quietly(kv);
+        }
+        if acked == 14 {
+            finished = true;
+            break;
+        }
+    }
+    assert!(finished, "the whole workload fits in the operation budget");
+}
+
+#[test]
+fn concurrent_writers_interrupted_by_power_loss_recover_a_prefix() {
+    let fs = MemFs::new();
+    let kv = Arc::new(open(opts(&fs).segment_size(1024)));
+    let acked: Arc<Mutex<Vec<(u64, String)>>> = Arc::default();
+    let writers: Vec<_> = (0..4)
+        .map(|t| {
+            let kv = Arc::clone(&kv);
+            let acked = Arc::clone(&acked);
+            thread::spawn(move || {
+                for i in 0..20_000 {
+                    let key = format!("t{t}/{i:04}");
+                    let mut b = WriteBatch::new();
+                    b.put(key.clone(), "x");
+                    match kv.write(b) {
+                        Ok(seq) => lock(&acked).push((seq, key)),
+                        Err(_) => return,
+                    }
+                }
+            })
+        })
+        .collect();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    // Spin rather than sleep: a coarse sleep could let the writers finish
+    // before the crash.
+    while lock(&acked).len() < 200 {
+        assert!(Instant::now() < deadline, "writers made no progress");
+        thread::yield_now();
+    }
+    fs.crash(&Crash::PowerLoss);
+    for w in writers {
+        w.join().expect("writer");
+    }
+    let kv = Arc::try_unwrap(kv).expect("writers are done");
+    assert!(matches!(
+        kv.put(b"late", b"x"),
+        Err(StoreError::Failed { .. })
+    ));
+    drop_quietly(kv);
+
+    let recovered = open(opts(&fs));
+    let last = recovered.last_seq();
+    let acked = lock(&acked).clone();
+    assert!(acked.len() < 80_000, "the crash interrupted the writers");
+    for (seq, key) in &acked {
+        assert!(
+            *seq <= last,
+            "acknowledged batch {seq} lost (recovered through {last})"
+        );
+        assert!(recovered.contains(key.as_bytes()).expect("get"), "{key}");
+    }
+    // Every batch adds one distinct key, so exactly `last` keys means
+    // exactly batches 1..=last: a prefix with no holes.
+    assert_eq!(
+        recovered.count(KeyRange::all()).expect("count"),
+        last as usize
+    );
+}
