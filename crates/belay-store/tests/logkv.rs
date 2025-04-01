@@ -358,3 +358,119 @@ fn a_corrupt_snapshot_falls_back_when_the_log_still_covers_it() {
         "{files:?}"
     );
 }
+
+#[test]
+fn a_corrupt_snapshot_without_log_coverage_is_data_loss() {
+    let fs = MemFs::new();
+    let kv = open(opts(&fs));
+    write_batches(&kv, 1..=10);
+    kv.checkpoint().expect("checkpoint");
+    write_batches(&kv, 11..=12);
+    kv.close().expect("close");
+    let snap = inspect::list_files(&fs, &dir()).expect("list").snapshots[0].clone();
+    fs.overwrite(&snap.path, 40, b"\xFF").expect("damage");
+
+    let err = LogKv::open(dir(), opts(&fs)).expect_err("strict refuses");
+    assert!(err.is_corruption(), "{err}");
+    assert_eq!(err.path(), Some(snap.path.as_path()));
+
+    let kv = open(opts(&fs).recovery(RecoveryMode::SkipCorrupt));
+    let rec = kv.recovery().clone();
+    assert_eq!(rec.bad_snapshots, 1);
+    // Only what the log still holds: batches 11 and 12 on an empty base.
+    let mut expected = support::Model::new();
+    support::apply(&mut expected, &batch(11));
+    support::apply(&mut expected, &batch(12));
+    assert_eq!(dump(&kv), expected);
+}
+
+#[test]
+fn a_missing_segment_is_a_gap() {
+    let fs = MemFs::new();
+    let kv = open(opts(&fs).segment_size(256));
+    write_batches(&kv, 1..=40);
+    kv.close().expect("close");
+    let files = inspect::list_files(&fs, &dir()).expect("list");
+    assert!(files.segments.len() >= 3);
+    fs.remove(&files.segments[1].path).expect("remove");
+    let err = LogKv::open(dir(), opts(&fs)).expect_err("gap");
+    assert!(err.to_string().contains("log gap"), "{err}");
+    let kv = open(opts(&fs).recovery(RecoveryMode::SkipCorrupt));
+    assert_eq!(kv.last_seq(), 40);
+    assert!(kv.recovery().skipped_regions >= 1);
+}
+
+#[test]
+fn leftover_temporary_snapshots_are_deleted_on_open() {
+    let fs = MemFs::new();
+    let kv = open(opts(&fs));
+    write_batches(&kv, 1..=4);
+    kv.close().expect("close");
+    let tmp = dir().join("snap-00000000000000000004.db.tmp");
+    let mut f = fs.create(&tmp).expect("create");
+    f.write_all(b"BELAYSNP half a snapshot").expect("write");
+    drop(f);
+    let kv = open(opts(&fs));
+    assert_eq!(dump(&kv), states(4)[4]);
+    assert_eq!(kv.recovery().removed_files, 1);
+    assert!(!fs.exists(&tmp).expect("exists"));
+}
+
+#[test]
+fn a_failed_sync_stops_writes_until_reopen() {
+    let fs = MemFs::new();
+    let kv = open(opts(&fs));
+    write_batches(&kv, 1..=2);
+    fs.fail_syncs(true);
+    let capture = belay_common::log::CaptureLogger::new();
+    let err = capture
+        .scope(|| kv.write(batch(3)))
+        .expect_err("sync fails");
+    assert!(matches!(err, StoreError::Failed { .. }), "{err}");
+    assert!(err.to_string().contains("simulated sync failure"), "{err}");
+    assert!(capture.contains("store stopped accepting writes"));
+    fs.fail_syncs(false);
+    // Stays failed even though the disk recovered: the kernel may have
+    // dropped the unsynced pages.
+    assert!(matches!(kv.write(batch(3)), Err(StoreError::Failed { .. })));
+    assert!(matches!(kv.flush(), Err(StoreError::Failed { .. })));
+    assert!(matches!(kv.checkpoint(), Err(StoreError::Failed { .. })));
+    // Reads keep working.
+    assert_eq!(dump(&kv), states(2)[2]);
+    kv.close().expect("close");
+
+    let kv = open(opts(&fs));
+    let seq = kv.last_seq();
+    assert!(
+        seq == 2 || seq == 3,
+        "the failed batch may or may not survive"
+    );
+    assert_eq!(dump(&kv), states(seq)[seq as usize]);
+}
+
+#[test]
+fn a_closed_store_rejects_everything() {
+    let fs = MemFs::new();
+    let kv = open(opts(&fs));
+    kv.put(b"k", b"v").expect("put");
+    kv.close().expect("close");
+    kv.close().expect("closing twice is fine");
+    assert!(kv.is_closed());
+    assert!(matches!(kv.get(b"k"), Err(StoreError::Closed)));
+    assert!(matches!(kv.scan(KeyRange::all()), Err(StoreError::Closed)));
+    assert!(matches!(kv.put(b"k", b"w"), Err(StoreError::Closed)));
+    assert!(matches!(kv.flush(), Err(StoreError::Closed)));
+    assert!(matches!(kv.checkpoint(), Err(StoreError::Closed)));
+}
+
+#[test]
+fn the_directory_lock_keeps_a_second_handle_out() {
+    let fs = MemFs::new();
+    let kv = open(opts(&fs));
+    assert!(matches!(
+        LogKv::open(dir(), opts(&fs)),
+        Err(StoreError::Locked { .. })
+    ));
+    drop(kv);
+    open(opts(&fs));
+}
