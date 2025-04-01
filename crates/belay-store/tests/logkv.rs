@@ -221,3 +221,140 @@ fn automatic_checkpoints_bound_the_log() {
     assert!(kv.recovery().snapshot_seq > 0);
     assert_eq!(dump(&kv), states(150)[150]);
 }
+
+#[test]
+fn a_torn_tail_is_truncated_with_a_warning() {
+    let fs = MemFs::new();
+    let kv = open(opts(&fs).sync(SyncPolicy::Never));
+    write_batches(&kv, 1..=3);
+    kv.flush().expect("flush");
+    write_batches(&kv, 4..=6);
+    let seg = support::last_segment(&fs, &dir());
+    let crashed = fs.crash_copy(&Crash::TornWrite {
+        path: seg.clone(),
+        keep: 10,
+    });
+
+    let (kv, capture) = open_captured(opts(&crashed));
+    let kv = kv.expect("a torn tail is not an error");
+    assert_eq!(dump(&kv), states(3)[3]);
+    let rec = kv.recovery();
+    assert_eq!(rec.torn_tails, 1);
+    assert_eq!(rec.torn_bytes, 10);
+    assert!(rec.lost_data());
+    assert_eq!(kv.stats().recovery, *rec);
+    let warning = capture
+        .records()
+        .into_iter()
+        .find(|r| r.message.contains("truncating torn log tail"))
+        .expect("a warning is logged");
+    assert_eq!(warning.field("bytes"), Some("10"));
+    // The damage is gone: the next open is clean and numbering continues.
+    assert_eq!(kv.write(batch(4)).expect("write"), 4);
+    kv.close().expect("close");
+    let kv = open(opts(&crashed));
+    assert_eq!(kv.recovery().torn_tails, 0);
+    assert_eq!(dump(&kv), states(4)[4]);
+}
+
+/// Offsets of the records in the segment at `path`.
+fn record_offsets(fs: &MemFs, path: &std::path::Path) -> Vec<u64> {
+    inspect::read_segment(fs, path, false)
+        .expect("dump")
+        .records
+        .iter()
+        .map(|r| r.offset)
+        .collect()
+}
+
+#[test]
+fn damage_in_a_sealed_segment_is_corruption() {
+    let fs = MemFs::new();
+    let kv = open(opts(&fs).segment_size(256));
+    write_batches(&kv, 1..=30);
+    kv.close().expect("close");
+    let files = inspect::list_files(&fs, &dir()).expect("list");
+    let sealed = &files.segments[0].path;
+    let offsets = record_offsets(&fs, sealed);
+    fs.overwrite(sealed, offsets[1] as usize + 30, b"\x00\x00\x00")
+        .expect("damage");
+
+    match LogKv::open(dir(), opts(&fs)) {
+        Err(StoreError::Corrupt {
+            file,
+            offset,
+            reason,
+        }) => {
+            assert_eq!(&file, sealed);
+            assert_eq!(offset, offsets[1]);
+            assert!(reason.starts_with("checksum mismatch"), "{reason}");
+        }
+        other => panic!("expected corruption, got {other:?}"),
+    }
+
+    let (kv, capture) = open_captured(opts(&fs).recovery(RecoveryMode::SkipCorrupt));
+    let kv = kv.expect("skip-corrupt opens");
+    assert!(kv.recovery().skipped_regions >= 1);
+    assert!(capture.contains("skipping corrupt data"));
+    // Batch 2 is lost; every other batch was applied.
+    let mut expected = states(1)[1].clone();
+    for i in 3..=30 {
+        support::apply(&mut expected, &batch(i));
+    }
+    assert_eq!(dump(&kv), expected);
+    kv.close().expect("close");
+
+    // The damage was retired by a checkpoint, so strict mode opens again.
+    let kv = open(opts(&fs));
+    assert_eq!(dump(&kv), expected);
+    assert!(inspect::verify(&fs, &dir()).expect("verify").is_ok());
+}
+
+#[test]
+fn damage_in_an_unsynced_group_is_a_torn_tail_even_with_intact_records_after_it() {
+    // Out-of-order page writeback: batch 4's bytes never reached the disk
+    // but batches 5 and 6, written later without a sync, did.
+    let fs = MemFs::new();
+    let kv = open(opts(&fs).sync(SyncPolicy::Never));
+    write_batches(&kv, 1..=3);
+    kv.flush().expect("flush");
+    write_batches(&kv, 4..=6);
+    let crashed = fs.crash_copy(&Crash::ProcessExit);
+    let seg = support::last_segment(&crashed, &dir());
+    let offsets = record_offsets(&crashed, &seg);
+    let len = (offsets[4] - offsets[3]) as usize;
+    crashed
+        .overwrite(&seg, offsets[3] as usize, &vec![0u8; len])
+        .expect("zero batch 4");
+    let kv = open(opts(&crashed));
+    assert_eq!(dump(&kv), states(3)[3]);
+    assert_eq!(kv.recovery().torn_tails, 1);
+}
+
+#[test]
+fn a_corrupt_snapshot_falls_back_when_the_log_still_covers_it() {
+    let fs = MemFs::new();
+    let kv = open(opts(&fs));
+    write_batches(&kv, 1..=10);
+    kv.close().expect("close");
+    // Take a snapshot on a copy and plant it next to the full log.
+    let copy = fs.deep_copy();
+    let kv = open(opts(&copy));
+    kv.checkpoint().expect("checkpoint");
+    kv.close().expect("close");
+    let snap = inspect::list_files(&copy, &dir()).expect("list").snapshots[0].clone();
+    let mut bytes = copy.read(&snap.path).expect("read");
+    bytes[40] ^= 0xFF;
+    let mut f = fs.create(&snap.path).expect("plant");
+    f.write_all(&bytes).expect("write");
+    drop(f);
+
+    let kv = open(opts(&fs));
+    assert_eq!(dump(&kv), states(10)[10]);
+    assert_eq!(kv.recovery().bad_snapshots, 1);
+    let files = inspect::list_files(&fs, &dir()).expect("list");
+    assert!(
+        files.other_files.iter().any(|n| n.ends_with(".db.corrupt")),
+        "{files:?}"
+    );
+}
