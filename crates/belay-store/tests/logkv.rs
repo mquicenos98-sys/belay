@@ -474,3 +474,78 @@ fn the_directory_lock_keeps_a_second_handle_out() {
     drop(kv);
     open(opts(&fs));
 }
+
+#[test]
+fn missing_directories_are_created_unless_told_otherwise() {
+    let fs = MemFs::new();
+    assert!(matches!(
+        LogKv::open(dir(), opts(&fs).create_if_missing(false)),
+        Err(StoreError::NotFound { .. })
+    ));
+    let kv = LogKv::open(dir().join("nested"), opts(&fs)).expect("created");
+    assert_eq!(kv.dir(), dir().join("nested"));
+}
+
+#[test]
+fn invalid_options_are_rejected_before_touching_the_disk() {
+    let fs = MemFs::new();
+    let err = LogKv::open(dir(), opts(&fs).segment_size(1)).expect_err("invalid");
+    assert!(matches!(err, StoreError::InvalidOptions(_)));
+    assert!(fs.paths().is_empty());
+}
+
+#[test]
+fn empty_and_oversized_batches_consume_no_sequence_number() {
+    let fs = MemFs::new();
+    let kv = open(opts(&fs));
+    assert_eq!(kv.write(WriteBatch::new()).expect("empty"), 0);
+    let mut big = WriteBatch::new();
+    big.put(vec![1u8; MAX_KEY_LEN + 1], "v");
+    assert!(matches!(kv.write(big), Err(StoreError::TooLarge { .. })));
+    assert_eq!(kv.put(b"a", b"1").expect("put"), 1);
+    assert_eq!(kv.write(WriteBatch::new()).expect("empty"), 1);
+    assert_eq!(kv.stats().batches, 1);
+}
+
+#[test]
+fn stats_describe_the_store() {
+    let fs = MemFs::new();
+    let kv = open(opts(&fs));
+    write_batches(&kv, 1..=5);
+    let stats = kv.stats();
+    let model = &states(5)[5];
+    assert_eq!(stats.keys, model.len() as u64);
+    assert_eq!(
+        stats.live_bytes,
+        model
+            .iter()
+            .map(|(k, v)| (k.len() + v.len()) as u64)
+            .sum::<u64>()
+    );
+    assert_eq!((stats.last_seq, stats.durable_seq), (5, 5));
+    assert_eq!(stats.batches, 5);
+    assert_eq!(
+        stats.ops,
+        (1..=5).map(|i| batch(i).len() as u64).sum::<u64>()
+    );
+    assert_eq!(stats.commit_groups, 5);
+    assert!(stats.wal_bytes_written > 0);
+    assert_eq!(stats.wal_segments, 1);
+    assert_eq!(stats.checkpoints, 0);
+    assert!(format!("{kv:?}").contains("seq: 5"));
+    assert_eq!(kv.sync_policy(), SyncPolicy::Always);
+}
+
+#[test]
+fn dropping_the_store_closes_it() {
+    let fs = MemFs::new();
+    {
+        let kv = open(opts(&fs).sync(SyncPolicy::Never));
+        write_batches(&kv, 1..=3);
+    }
+    // Drop synced the log and released the lock.
+    let kv = open(opts(&fs.crash_copy(&Crash::PowerLoss)));
+    assert_eq!(dump(&kv), states(3)[3]);
+    drop(kv);
+    open(opts(&fs));
+}
