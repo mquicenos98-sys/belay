@@ -60,3 +60,56 @@ fn random_bound(rng: &mut Rng) -> Bound<Vec<u8>> {
         _ => Bound::Unbounded,
     }
 }
+
+fn random_range(rng: &mut Rng) -> KeyRange {
+    let mut range = if rng.gen_bool(0.3) {
+        let key = random_key(rng);
+        KeyRange::prefix(&key[..rng.gen_range(0..=key.len())])
+    } else {
+        KeyRange::from_bounds(random_bound(rng), random_bound(rng))
+    };
+    if rng.gen_bool(0.5) {
+        range = range.limit(rng.gen_range(0..8usize));
+    }
+    if rng.gen_bool(0.5) {
+        range = range.reverse();
+    }
+    range
+}
+
+/// What a scan of `range` over `model` must return.
+fn expected_scan(model: &Model, range: &KeyRange) -> Vec<(Vec<u8>, Vec<u8>)> {
+    let mut entries: Vec<(Vec<u8>, Vec<u8>)> = model
+        .iter()
+        .filter(|(k, _)| range.contains(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    if range.is_reverse() {
+        entries.reverse();
+    }
+    entries.truncate(range.max_results().unwrap_or(usize::MAX));
+    entries
+}
+
+/// Checks reads against the model: a few gets and one scan.
+fn check_reads(kv: &dyn Kv, model: &Model, rng: &mut Rng, context: &str) {
+    for _ in 0..3 {
+        let key = random_key(rng);
+        assert_eq!(
+            kv.get(&key).expect("get"),
+            model.get(&key).cloned(),
+            "{context}"
+        );
+    }
+    let range = random_range(rng);
+    assert_eq!(
+        kv.scan(range.clone()).expect("scan"),
+        expected_scan(model, &range),
+        "{context}: {range}"
+    );
+    assert_eq!(
+        kv.count(range.clone()).expect("count"),
+        expected_scan(model, &range).len(),
+        "{context}: {range}"
+    );
+}
