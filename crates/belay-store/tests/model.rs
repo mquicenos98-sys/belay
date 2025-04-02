@@ -113,3 +113,69 @@ fn check_reads(kv: &dyn Kv, model: &Model, rng: &mut Rng, context: &str) {
         "{context}: {range}"
     );
 }
+
+fn options(fs: &MemFs, segment_size: u64, sync: SyncPolicy) -> Options {
+    opts(fs).segment_size(segment_size).sync(sync)
+}
+
+/// Runs random operations with the `Always` policy, under which every
+/// acknowledged write must survive every kind of crash.
+fn run_durable(seed: u64, steps: usize) {
+    let mut rng = Rng::seed_from_u64(seed);
+    let fs = MemFs::new();
+    let segment_size = rng.gen_range(128..2048u64);
+    let open = |fs: &MemFs| LogKv::open(dir(), options(fs, segment_size, SyncPolicy::Always));
+    let mut kv = open(&fs).expect("open");
+    let mut model = Model::new();
+    let mut seq = 0;
+
+    for step in 0..steps {
+        let context = format!("seed {seed} step {step}");
+        match rng.gen_range(0..100u32) {
+            0..=54 => {
+                let batch = random_batch(&mut rng);
+                apply(&mut model, &batch);
+                seq += 1;
+                assert_eq!(kv.write(batch).expect("write"), seq, "{context}");
+            }
+            55..=79 => check_reads(&kv, &model, &mut rng, &context),
+            80..=86 => {
+                let info = kv.checkpoint().expect("checkpoint");
+                assert_eq!(info.seq, seq, "{context}");
+            }
+            87..=91 => {
+                kv.close().expect("close");
+                kv = open(&fs).expect("reopen");
+            }
+            92..=96 => {
+                fs.crash(&Crash::PowerLoss);
+                drop_quietly(kv);
+                kv = open(&fs).expect("recover after power loss");
+            }
+            _ => {
+                // Everything was synced, so a torn write finds nothing to
+                // tear.
+                let path = last_segment(&fs, &dir());
+                fs.crash(&Crash::TornWrite {
+                    path,
+                    keep: rng.gen_range(0..64usize),
+                });
+                drop_quietly(kv);
+                kv = open(&fs).expect("recover after torn write");
+            }
+        }
+        assert_eq!(kv.last_seq(), seq, "{context}");
+    }
+    assert_eq!(dump(&kv), model, "seed {seed}: final state");
+    kv.close().expect("close");
+    let report = inspect::verify(&fs, &dir()).expect("verify");
+    assert!(report.is_ok(), "seed {seed}: {report}");
+    assert_eq!(report.last_seq, seq);
+}
+
+#[test]
+fn random_workloads_match_the_model_under_always() {
+    for seed in 0..10 {
+        run_durable(seed, 400);
+    }
+}
