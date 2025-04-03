@@ -88,3 +88,67 @@ fn a_second_open_of_the_same_directory_is_refused() {
     drop(kv);
     LogKv::open(tmp.path(), Options::new()).expect("open after the first closed");
 }
+
+#[test]
+fn a_garbage_tail_on_disk_is_truncated() {
+    let tmp = temp();
+    let kv = LogKv::open(tmp.path(), Options::new()).expect("open");
+    for i in 1..=3 {
+        kv.write(batch(i)).expect("write");
+    }
+    kv.close().expect("close");
+    let segment = tmp.join("wal-00000000000000000001.log");
+    let clean_len = fs::metadata(&segment).expect("stat").len();
+    let mut f = fs::OpenOptions::new()
+        .append(true)
+        .open(&segment)
+        .expect("append");
+    f.write_all(&[0x5A; 100]).expect("garbage");
+    drop(f);
+
+    let kv = LogKv::open(tmp.path(), Options::new()).expect("reopen");
+    assert_eq!(kv.recovery().torn_tails, 1);
+    assert_eq!(kv.recovery().torn_bytes, 100);
+    assert_eq!(fs::metadata(&segment).expect("stat").len(), clean_len);
+    assert_eq!(dump(&kv), states(3)[3]);
+}
+
+#[test]
+fn concurrent_durable_writes_on_disk() {
+    let tmp = temp();
+    let kv = Arc::new(LogKv::open(tmp.path(), Options::new()).expect("open"));
+    let writers: Vec<_> = (0..4)
+        .map(|t| {
+            let kv = Arc::clone(&kv);
+            thread::spawn(move || {
+                for i in 0..10 {
+                    let mut b = WriteBatch::new();
+                    b.put(format!("{t}/{i}"), "v");
+                    kv.write(b).expect("write");
+                }
+            })
+        })
+        .collect();
+    for w in writers {
+        w.join().expect("writer");
+    }
+    let stats = kv.stats();
+    assert_eq!((stats.batches, stats.durable_seq), (40, 40));
+    assert!(stats.wal_syncs <= 40);
+    drop(kv);
+    let kv = LogKv::open(tmp.path(), Options::new()).expect("reopen");
+    assert_eq!(kv.count(KeyRange::all()).expect("count"), 40);
+}
+
+#[test]
+fn interval_syncing_on_disk() {
+    let tmp = temp();
+    let options = || Options::new().sync(SyncPolicy::Interval(std::time::Duration::from_millis(5)));
+    let kv = LogKv::open(tmp.path(), options()).expect("open");
+    for i in 1..=20 {
+        kv.write(batch(i)).expect("write");
+    }
+    kv.close().expect("close");
+    let kv = LogKv::open(tmp.path(), options()).expect("reopen");
+    assert_eq!(dump(&kv), states(20)[20]);
+}
