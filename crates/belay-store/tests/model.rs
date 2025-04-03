@@ -179,3 +179,136 @@ fn random_workloads_match_the_model_under_always() {
         run_durable(seed, 400);
     }
 }
+
+/// Runs random operations with a lazy policy, where a power loss may take
+/// back acknowledged but unsynced batches: recovery must land exactly on
+/// the state after some batch between the last sync and the last write.
+fn run_lazy(seed: u64, steps: usize) {
+    let mut rng = Rng::seed_from_u64(seed);
+    let fs = MemFs::new();
+    let segment_size = rng.gen_range(128..2048u64);
+    let open = |fs: &MemFs| LogKv::open(dir(), options(fs, segment_size, SyncPolicy::Never));
+    let mut kv = open(&fs).expect("open");
+    // history[n] is the state after batch n.
+    let mut history = vec![Model::new()];
+
+    for step in 0..steps {
+        let context = format!("seed {seed} step {step}");
+        let current = history.len() as u64 - 1;
+        match rng.gen_range(0..100u32) {
+            0..=59 => {
+                let batch = random_batch(&mut rng);
+                let mut next = history.last().expect("non-empty").clone();
+                apply(&mut next, &batch);
+                history.push(next);
+                assert_eq!(kv.write(batch).expect("write"), current + 1, "{context}");
+            }
+            60..=74 => {
+                let model = history.last().expect("non-empty");
+                check_reads(&kv, model, &mut rng, &context);
+            }
+            75..=79 => kv.flush().expect("flush"),
+            80..=84 => {
+                kv.checkpoint().expect("checkpoint");
+            }
+            85..=89 => {
+                kv.close().expect("close");
+                kv = open(&fs).expect("reopen");
+                assert_eq!(kv.last_seq(), current, "{context}: close syncs");
+            }
+            _ => {
+                let durable = kv.stats().durable_seq;
+                let crash = if rng.gen_bool(0.5) {
+                    Crash::PowerLoss
+                } else {
+                    Crash::TornWrite {
+                        path: last_segment(&fs, &dir()),
+                        keep: rng.gen_range(0..400usize),
+                    }
+                };
+                fs.crash(&crash);
+                drop_quietly(kv);
+                kv = open(&fs).expect("recover");
+                let recovered = kv.last_seq();
+                assert!(
+                    (durable..=current).contains(&recovered),
+                    "{context}: recovered {recovered}, durable {durable}, written {current}"
+                );
+                history.truncate(recovered as usize + 1);
+                assert_eq!(
+                    dump(&kv),
+                    history[recovered as usize],
+                    "{context}: {crash:?}"
+                );
+            }
+        }
+    }
+    assert_eq!(
+        &dump(&kv),
+        history.last().expect("non-empty"),
+        "seed {seed}"
+    );
+}
+
+#[test]
+fn random_workloads_with_lazy_syncs_recover_a_prefix() {
+    for seed in 100..110 {
+        run_lazy(seed, 400);
+    }
+}
+
+#[test]
+fn background_checkpoints_do_not_disturb_the_model() {
+    let mut rng = Rng::seed_from_u64(7);
+    let fs = MemFs::new();
+    let open = |fs: &MemFs| LogKv::open(dir(), opts(fs).segment_size(256).checkpoint_every(1024));
+    let mut kv = open(&fs).expect("open");
+    let mut model = Model::new();
+    for step in 0..1500 {
+        let batch = random_batch(&mut rng);
+        apply(&mut model, &batch);
+        kv.write(batch).expect("write");
+        if step % 300 == 150 {
+            // The log has long passed the threshold; make sure the
+            // background thread got to it before crashing.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while kv.stats().checkpoints == 0 {
+                assert!(Instant::now() < deadline, "no background checkpoint");
+                thread::yield_now();
+            }
+        }
+        if step % 300 == 299 {
+            // Crash wherever the next background checkpoint happens to be.
+            fs.crash(&Crash::PowerLoss);
+            drop_quietly(kv);
+            kv = open(&fs).expect("recover");
+            assert_eq!(dump(&kv), model, "step {step}");
+            assert!(kv.recovery().snapshot_seq > 0, "step {step}");
+        }
+    }
+}
+
+#[test]
+fn memkv_and_logkv_agree() {
+    let mut rng = Rng::seed_from_u64(42);
+    let fs = MemFs::new();
+    let log = LogKv::open(dir(), opts(&fs)).expect("open");
+    let mem = MemKv::new();
+    for _ in 0..300 {
+        let batch = random_batch(&mut rng);
+        assert_eq!(
+            log.write(batch.clone()).expect("log write"),
+            mem.write(batch).expect("mem write")
+        );
+        let range = random_range(&mut rng);
+        assert_eq!(
+            log.scan(range.clone()).expect("scan"),
+            mem.scan(range).expect("scan")
+        );
+    }
+    let (a, b) = (log.stats(), mem.stats());
+    assert_eq!(
+        (a.keys, a.live_bytes, a.last_seq),
+        (b.keys, b.live_bytes, b.last_seq)
+    );
+}
