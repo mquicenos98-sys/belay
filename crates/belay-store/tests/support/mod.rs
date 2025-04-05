@@ -29,3 +29,46 @@ pub fn opts(fs: &MemFs) -> Options {
     quiet_logs();
     Options::new().fs(fs.clone()).manual_checkpoints()
 }
+
+pub fn open(opts: Options) -> LogKv {
+    LogKv::open(dir(), opts).expect("opening the store")
+}
+
+/// Opens with log output captured, returning the store and the capture.
+pub fn open_captured(opts: Options) -> (belay_store::Result<LogKv>, CaptureLogger) {
+    let capture = CaptureLogger::new();
+    let kv = capture.scope(|| LogKv::open(dir(), opts));
+    (kv, capture)
+}
+
+/// Drops a store whose file system crashed under it, keeping the
+/// expected "closing store failed" warning out of the test output.
+pub fn drop_quietly(kv: LogKv) {
+    CaptureLogger::new().scope(move || drop(kv));
+}
+
+/// Every entry of a store.
+pub fn dump(kv: &dyn Kv) -> Model {
+    kv.scan(KeyRange::all())
+        .expect("scanning the store")
+        .into_iter()
+        .collect()
+}
+
+/// A deterministic batch number `i`: a put of its own key, an overwrite of
+/// a shared key and, every few batches, a deletion.
+pub fn batch(i: u64) -> WriteBatch {
+    let mut b = WriteBatch::new();
+    b.put(
+        format!("key/{i:04}"),
+        format!("value {i}").repeat(1 + (i % 3) as usize),
+    )
+    .put("counter", i.to_string());
+    if i % 4 == 3 {
+        b.delete(format!("key/{:04}", i - 2));
+    }
+    if i % 10 == 9 {
+        b.delete_prefix(format!("key/{:03}", i / 10));
+    }
+    b
+}
