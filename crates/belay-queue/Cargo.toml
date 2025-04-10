@@ -1,0 +1,19 @@
+[package]
+name = "belay-queue"
+description = "Durable job queue engine for belay: leasing, retries, uniqueness, fair share, rate limits and retention over belay-store"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "belay_queue"
+path = "src/lib.rs"
+
+[dependencies]
+belay-common = { path = "../belay-common" }
+belay-json = { path = "../belay-json" }
+belay-proto = { path = "../belay-proto" }
+belay-store = { path = "../belay-store" }
