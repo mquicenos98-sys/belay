@@ -155,3 +155,15 @@ impl std::error::Error for Error {
         }
     }
 }
+
+impl From<StoreError> for Error {
+    fn from(e: StoreError) -> Error {
+        Error::Store(e)
+    }
+}
+
+impl From<Violations> for Error {
+    fn from(v: Violations) -> Error {
+        Error::Invalid(v)
+    }
+}
