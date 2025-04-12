@@ -93,3 +93,74 @@ pub(crate) struct ReadyKey {
     run_at: Timestamp,
     pub(crate) id: JobId,
 }
+
+impl ReadyKey {
+    pub(crate) fn new(priority: i16, run_at: Timestamp, id: JobId) -> ReadyKey {
+        ReadyKey {
+            rank: -i32::from(priority),
+            run_at,
+            id,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_common::Ulid;
+    use belay_proto::{JobSpec, Lease};
+    use std::time::Duration;
+
+    fn id(n: u128) -> JobId {
+        JobId::from_ulid(Ulid::from_u128(n))
+    }
+
+    #[test]
+    fn ready_order_is_priority_then_age_then_id() {
+        let t = Timestamp::from_secs;
+        let mut keys = vec![
+            ReadyKey::new(0, t(5), id(1)),
+            ReadyKey::new(10, t(9), id(2)),
+            ReadyKey::new(0, t(1), id(3)),
+            ReadyKey::new(-1000, t(0), id(4)),
+            ReadyKey::new(0, t(1), id(0)),
+            ReadyKey::new(i16::MIN, t(0), id(5)),
+        ];
+        keys.sort();
+        let order: Vec<u128> = keys.iter().map(|k| k.id.ulid().to_u128()).collect();
+        assert_eq!(order, [2, 0, 3, 1, 4, 5]);
+    }
+
+    #[test]
+    fn meta_mirrors_the_indexed_fields() {
+        let now = Timestamp::from_secs(100);
+        let mut job = Job::new(
+            id(7),
+            JobSpec::new("q", "k")
+                .priority(3)
+                .tenant("acme".parse().expect("tenant")),
+            now,
+        );
+        let meta = Meta::of(&job);
+        assert_eq!(meta.state, JobState::Ready);
+        assert_eq!(meta.tenant.as_ref().map(TenantId::as_str), Some("acme"));
+        assert_eq!(meta.ready_key(job.id), ReadyKey::new(3, now, job.id));
+        assert_eq!(meta.lease_deadline(), Timestamp::MIN);
+
+        job.transition(JobState::Running, now)
+            .expect("ready -> running");
+        let token = LeaseToken::new(9);
+        job.lease = Some(Lease::new(
+            WorkerId::from_static("w1"),
+            token,
+            now,
+            Duration::from_secs(30),
+        ));
+        let running = Meta::of(&job);
+        assert_eq!(running.lease_deadline(), Timestamp::from_secs(130));
+        assert!(running.holds_lease(token, Timestamp::from_secs(129)));
+        assert!(!running.holds_lease(token, Timestamp::from_secs(130)));
+        assert!(!running.holds_lease(LeaseToken::new(8), now));
+        assert!(!running.holds_lease(LeaseToken::REDACTED, now));
+    }
+}
