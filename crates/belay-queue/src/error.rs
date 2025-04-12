@@ -167,3 +167,137 @@ impl From<Violations> for Error {
         Error::Invalid(v)
     }
 }
+
+/// A transition the state machine refuses. The engine checks states before
+/// transitioning, so reaching this means the stored record and the indexes
+/// disagree.
+impl From<TransitionError> for Error {
+    fn from(e: TransitionError) -> Error {
+        Error::Internal(format!("state machine refused a transition: {e}"))
+    }
+}
+
+impl From<Error> for ApiError {
+    fn from(e: Error) -> ApiError {
+        match e {
+            Error::Invalid(v) => ApiError::from(v),
+            Error::JobNotFound(id) => ApiError::not_found("job", id),
+            Error::QueueNotFound(name) => ApiError::not_found("queue", name),
+            Error::LeaseLost(id) => ApiError::lease_lost(id),
+            Error::UniqueConflict {
+                ref queue,
+                ref key,
+                holder,
+            } => ApiError::new(ErrorCode::AlreadyExists, e.to_string()).with_details(json!({
+                "queue": queue.as_str(),
+                "key": key.as_str(),
+                "job": holder,
+            })),
+            Error::WrongState { job, state, .. } => ApiError::failed_precondition(e.to_string())
+                .with_details(json!({"job": job, "state": state})),
+            other => ApiError::new(other.code(), other.to_string()),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn id() -> JobId {
+        "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().expect("valid id")
+    }
+
+    #[test]
+    fn messages_are_specific_and_lowercase() {
+        let cases: Vec<(Error, &str)> = vec![
+            (
+                Error::JobNotFound(id()),
+                "job 01HQ3K9Z8N6V2T4R5S7W0X1Y2Z not found",
+            ),
+            (
+                Error::UniqueConflict {
+                    queue: QueueName::from_static("emails"),
+                    key: "user:42".into(),
+                    holder: id(),
+                },
+                r#"unique key "user:42" in queue emails is held by job 01HQ3K9Z8N6V2T4R5S7W0X1Y2Z"#,
+            ),
+            (
+                Error::WrongState {
+                    job: id(),
+                    state: JobState::Running,
+                    action: "retry",
+                    expected: "dead or cancelled",
+                },
+                "cannot retry job 01HQ3K9Z8N6V2T4R5S7W0X1Y2Z: it is running, expected dead or cancelled",
+            ),
+            (Error::ShuttingDown, "queue engine is shutting down"),
+        ];
+        for (err, text) in cases {
+            assert_eq!(err.to_string(), text);
+        }
+    }
+
+    #[test]
+    fn api_errors_carry_the_right_code_and_details() {
+        let lost = ApiError::from(Error::LeaseLost(id()));
+        assert_eq!(lost.code, ErrorCode::LeaseLost);
+        assert_eq!(lost.http_status(), 409);
+
+        let conflict = ApiError::from(Error::UniqueConflict {
+            queue: QueueName::from_static("emails"),
+            key: "k".into(),
+            holder: id(),
+        });
+        assert_eq!(conflict.code, ErrorCode::AlreadyExists);
+        let details = conflict.details.expect("details");
+        assert_eq!(details["key"], "k");
+        assert_eq!(details["job"], "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z");
+
+        let missing = ApiError::from(Error::QueueNotFound(QueueName::from_static("q")));
+        assert_eq!(missing.code, ErrorCode::NotFound);
+
+        let state = ApiError::from(Error::WrongState {
+            job: id(),
+            state: JobState::Ready,
+            action: "delete",
+            expected: "succeeded, dead or cancelled",
+        });
+        assert_eq!(state.code, ErrorCode::FailedPrecondition);
+        assert_eq!(state.details.expect("details")["state"], "ready");
+    }
+
+    #[test]
+    fn store_failures_are_retryable_but_corruption_is_not() {
+        let failed = Error::from(StoreError::Failed {
+            reason: "disk full".into(),
+        });
+        assert_eq!(failed.code(), ErrorCode::Unavailable);
+        assert!(failed.is_retryable());
+        assert!(std::error::Error::source(&failed).is_some());
+
+        let corrupt = Error::from(StoreError::Corrupt {
+            file: PathBuf::from("wal-1.log"),
+            offset: 7,
+            reason: "bad crc".into(),
+        });
+        assert_eq!(corrupt.code(), ErrorCode::Internal);
+        assert!(!corrupt.is_retryable());
+
+        let record = Error::corrupt("job/01H", "missing field");
+        assert_eq!(record.to_string(), "corrupt record job/01H: missing field");
+        assert_eq!(ApiError::from(record).code, ErrorCode::Internal);
+    }
+
+    #[test]
+    fn transition_errors_become_internal() {
+        let e: Error = JobState::Succeeded
+            .check_transition(JobState::Running)
+            .unwrap_err()
+            .into();
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert!(e.to_string().contains("succeeded to running"));
+    }
+}
