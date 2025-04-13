@@ -35,3 +35,19 @@ impl fmt::Display for QueueOrder {
         })
     }
 }
+
+/// Error parsing a [`QueueOrder`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseQueueOrderError(String);
+
+impl fmt::Display for ParseQueueOrderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unknown queue order {:?}, expected round_robin or in_order",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ParseQueueOrderError {}
