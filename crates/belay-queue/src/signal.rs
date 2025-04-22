@@ -59,3 +59,40 @@ impl Signal {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn a_change_before_the_wait_is_not_lost() {
+        let s = Signal::new();
+        let seen = s.current();
+        s.notify();
+        let start = Instant::now();
+        assert!(s.wait(seen, Duration::from_secs(5)));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn times_out_without_a_change() {
+        let s = Signal::new();
+        let seen = s.current();
+        assert!(!s.wait(seen, Duration::from_millis(20)));
+    }
+
+    #[test]
+    fn wakes_a_waiter_on_another_thread() {
+        let s = Arc::new(Signal::new());
+        let seen = s.current();
+        let waiter = {
+            let s = Arc::clone(&s);
+            thread::spawn(move || s.wait(seen, Duration::from_secs(10)))
+        };
+        thread::sleep(Duration::from_millis(10));
+        s.notify();
+        assert!(waiter.join().expect("waiter thread"));
+    }
+}
