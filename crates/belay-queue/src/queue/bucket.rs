@@ -17,3 +17,71 @@ pub(crate) struct TokenBucket {
     tokens: f64,
     updated: Timestamp,
 }
+
+impl TokenBucket {
+    /// A full bucket: a queue that was idle may burst right away.
+    pub(crate) fn new(limit: RateLimit, now: Timestamp) -> TokenBucket {
+        TokenBucket {
+            limit,
+            tokens: f64::from(limit.burst),
+            updated: now,
+        }
+    }
+
+    fn refill(&mut self, now: Timestamp) {
+        if let Some(elapsed) = now.duration_since(self.updated) {
+            let added = elapsed.as_secs_f64() * self.limit.per_second;
+            self.tokens = (self.tokens + added).min(f64::from(self.limit.burst));
+            self.updated = now;
+        }
+    }
+
+    /// Takes a token if one is available at `now`.
+    pub(crate) fn try_take(&mut self, now: Timestamp) -> bool {
+        self.refill(now);
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Tokens available at `now`, fractional.
+    pub(crate) fn available(&self, now: Timestamp) -> f64 {
+        let mut copy = *self;
+        copy.refill(now);
+        copy.tokens
+    }
+
+    /// How long until a token is available, zero if one is now.
+    pub(crate) fn wait_time(&self, now: Timestamp) -> Duration {
+        let missing = 1.0 - self.available(now);
+        if missing <= 0.0 {
+            Duration::ZERO
+        } else {
+            // Round up to the next millisecond: waking a hair early would
+            // find no token and go back to sleep.
+            let secs = missing / self.limit.per_second;
+            let millis = (secs * 1000.0).ceil();
+            Duration::from_millis(if millis.is_finite() {
+                millis.min(u64::MAX as f64) as u64
+            } else {
+                u64::MAX
+            })
+        }
+    }
+
+    /// Switches to a new limit, keeping the tokens accumulated so far (up
+    /// to the new burst) so that reconfiguring cannot be used to refill.
+    pub(crate) fn reconfigure(&mut self, limit: RateLimit, now: Timestamp) {
+        self.refill(now);
+        self.limit = limit;
+        self.tokens = self.tokens.min(f64::from(limit.burst));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn limit(&self) -> RateLimit {
+        self.limit
+    }
+}
