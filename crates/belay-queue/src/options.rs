@@ -255,3 +255,55 @@ impl EngineOptions {
         self.tenant_quantum.saturating_mul(weight)
     }
 }
+
+impl Default for EngineOptions {
+    fn default() -> EngineOptions {
+        EngineOptions::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn queue_order_text_round_trips() {
+        for order in [QueueOrder::RoundRobin, QueueOrder::InOrder] {
+            assert_eq!(order.to_string().parse::<QueueOrder>(), Ok(order));
+        }
+        assert_eq!(
+            "fifo".parse::<QueueOrder>().unwrap_err().to_string(),
+            r#"unknown queue order "fifo", expected round_robin or in_order"#
+        );
+    }
+
+    #[test]
+    fn builder_clamps_nonsensical_values() {
+        let opts = EngineOptions::new()
+            .tenant_quantum(0)
+            .batch_size(0)
+            .retention_per_tick(0)
+            .throughput_window(Duration::ZERO)
+            .max_poll_interval(Duration::ZERO);
+        assert_eq!(opts.tenant_quantum, 1);
+        assert_eq!(opts.batch(), 1);
+        assert_eq!(opts.retention_per_tick, 1);
+        assert_eq!(opts.throughput_window, Duration::from_secs(1));
+        assert_eq!(opts.max_poll_interval, Duration::from_millis(1));
+    }
+
+    #[test]
+    fn tenant_quantum_scales_with_weight() {
+        let acme: TenantId = "acme".parse().expect("valid tenant");
+        let opts = EngineOptions::new()
+            .tenant_quantum(2)
+            .tenant_weight(acme.clone(), 3);
+        assert_eq!(opts.tenant_quantum_for(Some(&acme)), 6);
+        assert_eq!(
+            opts.tenant_quantum_for(Some(&"other".parse().expect("valid tenant"))),
+            2
+        );
+        assert_eq!(opts.tenant_quantum_for(None), 2);
+        assert_eq!(opts.order(), QueueOrder::RoundRobin);
+    }
+}
