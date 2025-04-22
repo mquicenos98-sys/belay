@@ -85,3 +85,47 @@ impl TokenBucket {
         self.limit
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(ms: i64) -> Timestamp {
+        Timestamp::from_millis(1_000_000 + ms)
+    }
+
+    #[test]
+    fn starts_full_and_refills_at_the_configured_rate() {
+        let mut b = TokenBucket::new(RateLimit::new(2.0, 3), at(0));
+        assert!(b.try_take(at(0)) && b.try_take(at(0)) && b.try_take(at(0)));
+        assert!(!b.try_take(at(0)));
+        assert_eq!(b.wait_time(at(0)), Duration::from_millis(500));
+        assert!(!b.try_take(at(499)));
+        assert!(b.try_take(at(500)));
+        assert!(!b.try_take(at(500)));
+        // Idle for a long time: capped at the burst.
+        assert!((b.available(at(60_000)) - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_clock_stepping_back_mints_nothing() {
+        let mut b = TokenBucket::new(RateLimit::new(1.0, 1), at(10_000));
+        assert!(b.try_take(at(10_000)));
+        assert!(!b.try_take(at(0)));
+        assert!(!b.try_take(at(10_500)));
+        assert!(b.try_take(at(11_000)));
+    }
+
+    #[test]
+    fn reconfiguring_keeps_accumulated_tokens_up_to_the_new_burst() {
+        let mut b = TokenBucket::new(RateLimit::new(1.0, 10), at(0));
+        for _ in 0..8 {
+            assert!(b.try_take(at(0)));
+        }
+        b.reconfigure(RateLimit::new(100.0, 50), at(0));
+        assert!((b.available(at(0)) - 2.0).abs() < 1e-9);
+        assert_eq!(b.limit().burst, 50);
+        b.reconfigure(RateLimit::new(1.0, 1), at(1_000));
+        assert!((b.available(at(1_000)) - 1.0).abs() < 1e-9);
+    }
+}
