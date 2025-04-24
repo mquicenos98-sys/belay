@@ -121,3 +121,60 @@ pub(crate) struct LatencyLog {
     dropped: u64,
     summary: LatencySummary,
 }
+
+impl LatencyLog {
+    pub(crate) fn new(capacity: usize) -> LatencyLog {
+        LatencyLog {
+            samples: VecDeque::with_capacity(capacity.min(1024)),
+            capacity,
+            dropped: 0,
+            summary: LatencySummary::default(),
+        }
+    }
+
+    pub(crate) fn observe(&mut self, sample: LeaseLatency) {
+        self.summary.observe(sample.waited);
+        if self.capacity == 0 {
+            self.dropped += 1;
+            return;
+        }
+        if self.samples.len() == self.capacity {
+            self.samples.pop_front();
+            self.dropped += 1;
+        }
+        self.samples.push_back(sample);
+    }
+
+    pub(crate) fn drain(&mut self) -> Vec<LeaseLatency> {
+        self.samples.drain(..).collect()
+    }
+
+    pub(crate) fn summary(&self) -> LatencySummary {
+        self.summary
+    }
+
+    pub(crate) fn dropped(&self) -> u64 {
+        self.dropped
+    }
+}
+
+/// One queue's numbers.
+#[derive(Clone, Debug, PartialEq)]
+pub struct QueueStats {
+    /// The queue.
+    pub name: QueueName,
+    /// Whether leasing is paused.
+    pub paused: bool,
+    /// Jobs per state.
+    pub counts: StateCounts,
+    /// How long the oldest ready job has been waiting.
+    pub oldest_ready_age: Option<Duration>,
+    /// Activity over the throughput window.
+    pub throughput: Throughput,
+    /// Uniqueness keys currently claimed.
+    pub unique_keys: usize,
+    /// Tenants with ready jobs.
+    pub tenants: usize,
+    /// Rate-limit tokens available now, when the queue is rate limited.
+    pub rate_tokens: Option<f64>,
+}
