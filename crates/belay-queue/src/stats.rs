@@ -79,3 +79,45 @@ pub struct LeaseLatency {
     /// Time from eligibility (`run_at`) to lease.
     pub waited: Duration,
 }
+
+/// Aggregate of every lease latency since open.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LatencySummary {
+    /// Leases measured.
+    pub count: u64,
+    /// Sum of the waits.
+    pub total: Duration,
+    /// Longest wait.
+    pub max: Duration,
+}
+
+impl LatencySummary {
+    /// Mean wait, zero when nothing was measured.
+    #[must_use]
+    pub fn mean(&self) -> Duration {
+        match u32::try_from(self.count) {
+            Ok(0) => Duration::ZERO,
+            Ok(n) => self.total / n,
+            Err(_) => Duration::from_secs_f64(self.total.as_secs_f64() / self.count as f64),
+        }
+    }
+
+    fn observe(&mut self, waited: Duration) {
+        self.count += 1;
+        self.total = self.total.saturating_add(waited);
+        self.max = self.max.max(waited);
+    }
+}
+
+/// Recent latency samples for exporters, plus the running summary.
+///
+/// Samples are kept in a bounded buffer that a metrics exporter drains
+/// periodically and feeds into its histogram; when nobody drains it the
+/// oldest samples are dropped (and counted), so memory stays bounded.
+#[derive(Debug)]
+pub(crate) struct LatencyLog {
+    samples: VecDeque<LeaseLatency>,
+    capacity: usize,
+    dropped: u64,
+    summary: LatencySummary,
+}
