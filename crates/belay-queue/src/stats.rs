@@ -178,3 +178,86 @@ pub struct QueueStats {
     /// Rate-limit tokens available now, when the queue is rate limited.
     pub rate_tokens: Option<f64>,
 }
+
+/// A snapshot of the whole engine, for metrics exporters.
+#[derive(Clone, Debug, PartialEq)]
+pub struct EngineStats {
+    /// Per-queue numbers, by queue name.
+    pub queues: Vec<QueueStats>,
+    /// Jobs per state across all queues.
+    pub totals: StateCounts,
+    /// Event counts since open.
+    pub counters: Counters,
+    /// Lease latency since open.
+    pub lease_latency: LatencySummary,
+    /// Latency samples dropped because nobody drained them in time.
+    pub latency_samples_dropped: u64,
+    /// Workers in the registry.
+    pub workers: usize,
+    /// Lease requests currently long-polling.
+    pub waiting_leases: usize,
+}
+
+impl EngineStats {
+    /// The stats of queue `name`.
+    #[must_use]
+    pub fn queue(&self, name: &str) -> Option<&QueueStats> {
+        self.queues.iter().find(|q| q.name == name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample(ms: u64) -> LeaseLatency {
+        LeaseLatency {
+            queue: QueueName::from_static("q"),
+            waited: Duration::from_millis(ms),
+        }
+    }
+
+    #[test]
+    fn latency_log_is_bounded_and_keeps_the_newest() {
+        let mut log = LatencyLog::new(2);
+        for ms in [10, 20, 30] {
+            log.observe(sample(ms));
+        }
+        assert_eq!(log.dropped(), 1);
+        let drained: Vec<u64> = log
+            .drain()
+            .iter()
+            .map(|s| s.waited.as_millis() as u64)
+            .collect();
+        assert_eq!(drained, [20, 30]);
+        assert!(log.drain().is_empty());
+        let summary = log.summary();
+        assert_eq!(summary.count, 3);
+        assert_eq!(summary.max, Duration::from_millis(30));
+        assert_eq!(summary.mean(), Duration::from_millis(20));
+    }
+
+    #[test]
+    fn zero_capacity_only_summarises() {
+        let mut log = LatencyLog::new(0);
+        log.observe(sample(5));
+        assert!(log.drain().is_empty());
+        assert_eq!((log.dropped(), log.summary().count), (1, 1));
+        assert_eq!(LatencySummary::default().mean(), Duration::ZERO);
+    }
+
+    #[test]
+    fn counters_add_field_by_field() {
+        let mut a = Counters {
+            enqueued: 1,
+            lease_lost: 2,
+            ..Counters::default()
+        };
+        a += Counters {
+            enqueued: 3,
+            heartbeats: 4,
+            ..Counters::default()
+        };
+        assert_eq!((a.enqueued, a.heartbeats, a.lease_lost), (4, 4, 2));
+    }
+}
