@@ -26,3 +26,8 @@ struct Entry {
     info: WorkerInfo,
     lost: bool,
 }
+
+#[derive(Debug, Default)]
+pub(crate) struct Workers {
+    entries: BTreeMap<WorkerId, Entry>,
+}
