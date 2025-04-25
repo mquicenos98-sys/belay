@@ -14,7 +14,7 @@ use belay_store::{
     KeyRange, Kv, LogKv, Options, RecoveryMode, StoreError, SyncPolicy, WriteBatch, MAX_KEY_LEN,
 };
 
-use support::{batch, dir, dump, open, open_captured, opts, states};
+use support::{batch, dir, drop_quietly, dump, open, open_captured, opts, states};
 
 fn write_batches(kv: &LogKv, range: std::ops::RangeInclusive<u64>) {
     for i in range {
@@ -398,6 +398,44 @@ fn a_missing_segment_is_a_gap() {
     let kv = open(opts(&fs).recovery(RecoveryMode::SkipCorrupt));
     assert_eq!(kv.last_seq(), 40);
     assert!(kv.recovery().skipped_regions >= 1);
+}
+
+#[test]
+fn crash_at_every_step_of_a_checkpoint_recovers_the_same_state() {
+    let base = MemFs::new();
+    let kv = open(opts(&base).segment_size(256));
+    write_batches(&kv, 1..=20);
+    kv.checkpoint().expect("first checkpoint");
+    write_batches(&kv, 21..=30);
+    kv.close().expect("close");
+    let expected = states(30)[30].clone();
+
+    let mut saw_leftovers_removed = false;
+    let mut completed = false;
+    for budget in 0..200 {
+        let fs = base.deep_copy();
+        let kv = open(opts(&fs).segment_size(256));
+        fs.fail_after_ops(Some(budget));
+        // Failed deletions are only warnings; keep them out of the output.
+        let result = belay_common::log::CaptureLogger::new().scope(|| kv.checkpoint());
+        for crash in [Crash::PowerLoss, Crash::ProcessExit] {
+            let after = fs.crash_copy(&crash);
+            let recovered = open(opts(&after));
+            assert_eq!(dump(&recovered), expected, "budget {budget}, {crash:?}");
+            saw_leftovers_removed |= recovered.recovery().removed_files > 0;
+        }
+        fs.crash(&Crash::PowerLoss);
+        drop_quietly(kv);
+        if result.is_ok() {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed, "the checkpoint finished within the budget");
+    assert!(
+        saw_leftovers_removed,
+        "some crash left files for recovery to delete"
+    );
 }
 
 #[test]

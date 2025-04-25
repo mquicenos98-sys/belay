@@ -84,10 +84,7 @@ impl Inner {
             (seq, visible.table.map().clone(), trim)
         };
 
-        // Phase 2: write the snapshot, replacing the previous one.
-        if had_snapshot && previous_seq != seq {
-            self.remove_file(&snapshot_name(previous_seq));
-        }
+        // Phase 2: write the snapshot.
         let started = Instant::now();
         let bytes = snapshot::write(&*self.fs, &self.dir, seq, &map)?;
 
@@ -103,6 +100,9 @@ impl Inner {
             if self.remove_file(&segment_name(*first)) {
                 removed += 1;
             }
+        }
+        if had_snapshot && previous_seq != seq {
+            self.remove_file(&snapshot_name(previous_seq));
         }
         // The new snapshot is already durable; syncing the removals only
         // saves recovery from deleting the same files again.
