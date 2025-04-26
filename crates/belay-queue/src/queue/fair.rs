@@ -38,3 +38,100 @@ pub(crate) struct FairCursor {
     ring: VecDeque<TenantKey>,
     credit: u32,
 }
+
+/// The ready jobs of one queue, grouped into per-tenant flows.
+#[derive(Debug, Default)]
+pub(crate) struct FairQueue {
+    flows: HashMap<TenantKey, BTreeSet<ReadyKey>>,
+    cursor: FairCursor,
+    len: usize,
+}
+
+impl FairQueue {
+    /// Adds a ready job. A tenant whose flow was empty joins the back of
+    /// the ring.
+    pub(crate) fn insert(&mut self, tenant: &TenantKey, key: ReadyKey) {
+        let flow = match self.flows.get_mut(tenant) {
+            Some(flow) => flow,
+            None => {
+                self.cursor.ring.push_back(tenant.clone());
+                self.flows.entry(tenant.clone()).or_default()
+            }
+        };
+        if flow.insert(key) {
+            self.len += 1;
+        }
+    }
+
+    /// Removes a ready job; returns whether it was present. A tenant whose
+    /// flow empties leaves the ring, forfeiting the rest of its turn.
+    pub(crate) fn remove(&mut self, tenant: &TenantKey, key: &ReadyKey) -> bool {
+        let Some(flow) = self.flows.get_mut(tenant) else {
+            return false;
+        };
+        if !flow.remove(key) {
+            return false;
+        }
+        self.len -= 1;
+        if flow.is_empty() {
+            self.flows.remove(tenant);
+            if let Some(pos) = self.cursor.ring.iter().position(|t| t == tenant) {
+                self.cursor.ring.remove(pos);
+                if pos == 0 {
+                    self.cursor.credit = 0;
+                }
+            }
+        }
+        true
+    }
+
+    /// Ready jobs in all flows.
+    pub(crate) fn len(&self) -> usize {
+        self.len
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// Tenants with ready jobs.
+    pub(crate) fn tenants(&self) -> usize {
+        self.flows.len()
+    }
+
+    /// Every ready job, flow by flow (no particular flow order).
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &ReadyKey> + '_ {
+        self.flows.values().flat_map(|flow| flow.iter())
+    }
+
+    /// Starts planning picks from the current position.
+    pub(crate) fn planner(&self) -> Planner<'_> {
+        Planner {
+            queue: self,
+            cursor: self.cursor.clone(),
+            taken: HashMap::new(),
+        }
+    }
+
+    /// Adopts the position a committed plan ended at.
+    ///
+    /// Only valid when the plan's picks are removed right after (as a
+    /// lease commit does): the plan already dropped tenants whose flows it
+    /// exhausted, and the removals then find nothing more to drop.
+    pub(crate) fn install(&mut self, cursor: FairCursor) {
+        self.cursor.ring = cursor.ring;
+    }
+
+    #[cfg(test)]
+    fn ring(&self) -> Vec<TenantKey> {
+        self.cursor.ring.iter().cloned().collect()
+    }
+}
+
+/// Picks jobs in fair order without changing the queue.
+#[derive(Debug)]
+pub(crate) struct Planner<'a> {
+    queue: &'a FairQueue,
+    cursor: FairCursor,
+    taken: HashMap<TenantKey, usize>,
+}
