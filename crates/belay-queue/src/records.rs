@@ -113,3 +113,32 @@ impl Layout {
 pub(crate) fn printable(key: &[u8]) -> String {
     Printable(key).to_string()
 }
+
+pub(crate) fn encode<T: ToJson + ?Sized>(value: &T) -> Vec<u8> {
+    belay_json::to_string_of(value).into_bytes()
+}
+
+pub(crate) fn decode<T: FromJson>(key: &[u8], bytes: &[u8]) -> Result<T> {
+    belay_json::from_bytes(bytes).map_err(|e| Error::corrupt(printable(key), e))
+}
+
+/// Decodes a job document and checks that it is stored under its own id.
+pub(crate) fn decode_job(layout: &Layout, key: &[u8], bytes: &[u8]) -> Result<Job> {
+    let job: Job = decode(key, bytes)?;
+    match layout.job_id_of(key) {
+        Some(id) if id == job.id => Ok(job),
+        Some(id) => Err(Error::corrupt(
+            printable(key),
+            format!("document of job {} stored under id {id}", job.id),
+        )),
+        None => Err(Error::corrupt(printable(key), "not a job key")),
+    }
+}
+
+/// A queue's persisted settings. Queues are recorded on first use, so they
+/// survive restarts even while empty.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct QueueRecord {
+    pub(crate) config: QueueConfig,
+    pub(crate) paused: bool,
+}
