@@ -103,3 +103,78 @@ impl QueueEngine {
         })
     }
 }
+
+/// Stages one enqueue.
+fn stage_enqueue(cx: &mut Ctx<'_>, mut spec: JobSpec) -> Result<EnqueueResult> {
+    let now = cx.now;
+    let record = cx.ensure_queue(&spec.queue);
+    spec.apply_queue_defaults(&record.config);
+
+    let mut replaced = false;
+    if let Some(unique) = spec.unique.clone() {
+        if let Some((claim, holder_state)) = live_claim(cx, &spec, &unique.key) {
+            let pending = !holder_state.is_terminal();
+            match unique.on_conflict {
+                OnConflict::Reject => {
+                    return Err(Error::UniqueConflict {
+                        queue: spec.queue,
+                        key: unique.key,
+                        holder: claim.job,
+                    });
+                }
+                OnConflict::Replace if pending => {
+                    // A pending holder that was purged since has nothing
+                    // left to cancel; the new job simply takes its key.
+                    if cx.job_state(claim.job).is_some() {
+                        cancel_holder(cx, claim.job)?;
+                    }
+                    replaced = true;
+                }
+                OnConflict::ReturnExisting | OnConflict::Replace => {
+                    cx.counters().duplicates += 1;
+                    return Ok(EnqueueResult {
+                        id: claim.job,
+                        status: EnqueueStatus::Duplicate,
+                        state: holder_state,
+                    });
+                }
+            }
+        }
+    }
+
+    let id = cx.job_id()?;
+    let job = Job::new(id, spec, now);
+    if let Some(unique) = &job.spec.unique {
+        let until = match unique.scope {
+            UniqueScope::For(period) => Some(now + period),
+            UniqueScope::UntilStarted | UniqueScope::UntilFinished => None,
+        };
+        cx.set_claim(&job.spec.queue, &unique.key, Some(Claim::new(id, until)));
+    }
+    cx.emit(EventKind::JobEnqueued {
+        job: id,
+        queue: job.spec.queue.clone(),
+        kind: job.spec.kind.clone(),
+        run_at: job.run_at,
+    });
+    cx.metric(&job.spec.queue, Metric::Enqueued);
+    let counters = cx.counters();
+    counters.enqueued += 1;
+    if replaced {
+        counters.replaced += 1;
+    }
+    if job.state == JobState::Ready {
+        cx.notify();
+    }
+    let result = EnqueueResult {
+        id,
+        status: if replaced {
+            EnqueueStatus::Replaced
+        } else {
+            EnqueueStatus::Created
+        },
+        state: job.state,
+    };
+    cx.put(job);
+    Ok(result)
+}
