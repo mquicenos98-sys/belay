@@ -22,9 +22,7 @@
 //! indexes end up exactly as they would be if rebuilt from scratch.
 
 pub(crate) mod bucket;
-
 pub(crate) mod fair;
-
 pub(crate) mod throughput;
 
 use std::collections::{BTreeSet, HashMap};
@@ -309,5 +307,156 @@ impl QueueState {
             self.leases.len(),
             self.finished.iter().map(BTreeSet::len).sum(),
         ]
+    }
+}
+
+/// Ids of `(time, id)` entries at or before `until`, at most `limit`.
+fn up_to(set: &BTreeSet<(Timestamp, JobId)>, until: Timestamp, limit: usize) -> Vec<JobId> {
+    set.range((Bound::Unbounded, Bound::Included((until, MAX_ID))))
+        .take(limit)
+        .map(|(_, id)| *id)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_proto::{Job, JobSpec, Lease, LeaseToken, RateLimit, WorkerId};
+
+    fn at(secs: i64) -> Timestamp {
+        Timestamp::from_secs(1_000 + secs)
+    }
+
+    fn id(n: u128) -> JobId {
+        JobId::from_ulid(Ulid::from_u128(n))
+    }
+
+    fn queue() -> QueueState {
+        QueueState::new(
+            QueueName::from_static("q"),
+            QueueRecord::default(),
+            at(0),
+            Duration::from_secs(60),
+        )
+    }
+
+    fn job(n: u128, spec: JobSpec) -> Job {
+        Job::new(id(n), spec, at(0))
+    }
+
+    #[test]
+    fn every_state_lands_in_exactly_one_index_and_leaves_no_trace() {
+        let mut q = queue();
+        let mut metas = Vec::new();
+
+        let ready = job(1, JobSpec::new("q", "k"));
+        let scheduled = job(2, JobSpec::new("q", "k").delay(Duration::from_secs(5)));
+        let mut running = job(3, JobSpec::new("q", "k"));
+        running.transition(JobState::Running, at(1)).expect("run");
+        running.lease = Some(Lease::new(
+            WorkerId::from_static("w"),
+            LeaseToken::new(1),
+            at(1),
+            Duration::from_secs(30),
+        ));
+        let mut dead = job(4, JobSpec::new("q", "k"));
+        dead.transition(JobState::Cancelled, at(2)).expect("cancel");
+
+        for j in [&ready, &scheduled, &running, &dead] {
+            let meta = Meta::of(j);
+            q.insert(j.id, &meta);
+            metas.push((j.id, meta));
+        }
+        assert_eq!(q.index_sizes(), [1, 1, 1, 1, 1]);
+        assert_eq!(q.counts.total(), 4);
+        assert_eq!(q.oldest_ready(), Some(at(0)));
+        assert_eq!(q.next_timer(), Some(at(5)));
+        assert_eq!(q.due_timers(at(4), 10), Vec::<JobId>::new());
+        assert_eq!(q.due_timers(at(5), 10), [id(2)]);
+        assert_eq!(q.expired_leases(at(30), 10), Vec::<JobId>::new());
+        assert_eq!(q.expired_leases(at(31), 10), [id(3)]);
+
+        for (id, meta) in &metas {
+            q.remove(*id, meta);
+        }
+        assert_eq!(q.index_sizes(), [0; 5]);
+        assert!(q.jobs.is_empty());
+        assert_eq!(q.counts, StateCounts::default());
+    }
+
+    #[test]
+    fn retention_uses_the_per_state_period() {
+        let mut q = queue();
+        q.config.retention.succeeded = Duration::from_secs(10);
+        q.config.retention.dead = Duration::from_secs(100);
+        let mut ok = job(1, JobSpec::new("q", "k"));
+        ok.transition(JobState::Running, at(0)).expect("run");
+        ok.transition(JobState::Succeeded, at(0)).expect("succeed");
+        let mut dead = job(2, JobSpec::new("q", "k"));
+        dead.transition(JobState::Running, at(0)).expect("run");
+        dead.transition(JobState::Dead, at(0)).expect("die");
+        for j in [&ok, &dead] {
+            q.insert(j.id, &Meta::of(j));
+        }
+        assert!(q.retention_due(at(9), 10).is_empty());
+        assert_eq!(q.retention_due(at(10), 10), [id(1)]);
+        assert_eq!(q.retention_due(at(100), 10), [id(1), id(2)]);
+        assert_eq!(q.retention_due(at(100), 1), [id(1)]);
+    }
+
+    #[test]
+    fn claims_keep_the_expiry_index_exact() {
+        let mut q = queue();
+        q.set_claim("a", Some(Claim::new(id(1), Some(at(10)))));
+        q.set_claim("b", Some(Claim::new(id(2), None)));
+        assert_eq!(q.claim_count(), 2);
+        assert_eq!(q.expired_claims(at(10), 10), ["a"]);
+        // Re-claiming with a later expiry replaces the old index entry.
+        q.set_claim("a", Some(Claim::new(id(3), Some(at(20)))));
+        assert!(q.expired_claims(at(10), 10).is_empty());
+        assert_eq!(q.claim("a").map(|c| c.job), Some(id(3)));
+        q.set_claim("a", None);
+        assert!(q.expired_claims(at(99), 10).is_empty());
+        assert_eq!(q.claim_count(), 1);
+    }
+
+    #[test]
+    fn capacity_honours_pause_and_concurrency() {
+        let mut q = queue();
+        assert!(q.has_capacity());
+        q.config.max_concurrency = Some(1);
+        q.counts.running = 1;
+        assert!(!q.has_capacity());
+        q.counts.running = 0;
+        q.paused = true;
+        assert!(!q.has_capacity());
+    }
+
+    #[test]
+    fn updates_create_reconfigure_and_drop_the_bucket() {
+        let mut q = queue();
+        assert!(q.bucket.is_none());
+        let mut record = q.record();
+        record.config.rate_limit = Some(RateLimit::new(1.0, 2));
+        q.update(record.clone(), at(0));
+        assert_eq!(q.bucket.map(|b| b.limit().burst), Some(2));
+        record.config.rate_limit = Some(RateLimit::new(5.0, 5));
+        q.update(record.clone(), at(0));
+        assert_eq!(q.bucket.map(|b| b.limit().burst), Some(5));
+        record.config.rate_limit = None;
+        record.paused = true;
+        q.update(record, at(0));
+        assert!(q.bucket.is_none() && q.paused);
+    }
+
+    #[test]
+    fn range_helpers_cover_ties_on_time() {
+        let mut set = BTreeSet::new();
+        set.insert((at(5), id(9)));
+        set.insert((at(5), id(1)));
+        set.insert((at(6), id(2)));
+        assert_eq!(up_to(&set, at(5), 10), [id(1), id(9)]);
+        assert_eq!(up_to(&set, at(4), 10), Vec::<JobId>::new());
+        assert_eq!(up_to(&set, at(6), 2), [id(1), id(9)]);
     }
 }
