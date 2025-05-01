@@ -178,3 +178,15 @@ fn stage_enqueue(cx: &mut Ctx<'_>, mut spec: JobSpec) -> Result<EnqueueResult> {
     cx.put(job);
     Ok(result)
 }
+
+/// The claim on `key` in the spec's queue if it is still held, with the
+/// holder's current (or, once deleted, last) state.
+fn live_claim(cx: &Ctx<'_>, spec: &JobSpec, key: &str) -> Option<(Claim, JobState)> {
+    let claim = cx.claim(&spec.queue, key)?;
+    if claim.expired(cx.now) {
+        // Timed out but not yet swept by tick: free to take.
+        return None;
+    }
+    let state = cx.job_state(claim.job).or(claim.holder_state)?;
+    Some((claim, state))
+}
