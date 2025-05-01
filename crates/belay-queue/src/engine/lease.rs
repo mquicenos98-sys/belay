@@ -331,3 +331,24 @@ fn stage_lease(
     }
     Ok((leased, None))
 }
+
+/// How long until one of `queues` might have work that no notification
+/// will announce: its earliest timer, or its next rate-limit token while
+/// it has ready jobs and room to run them.
+fn wake_hint(st: &State, queues: &[QueueName], now: Timestamp) -> Option<Duration> {
+    let mut hint: Option<Duration> = None;
+    let mut consider = |d: Duration| {
+        hint = Some(hint.map_or(d, |h| h.min(d)));
+    };
+    for queue in queues.iter().filter_map(|name| st.queues.get(name)) {
+        if let Some(at) = queue.next_timer() {
+            consider(at.saturating_duration_since(now));
+        }
+        if let Some(bucket) = &queue.bucket {
+            if !queue.ready.is_empty() && queue.has_capacity() {
+                consider(bucket.wait_time(now));
+            }
+        }
+    }
+    hint
+}
