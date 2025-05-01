@@ -177,3 +177,146 @@ pub(crate) struct Claim {
     /// it.
     pub(crate) holder_state: Option<JobState>,
 }
+
+impl Claim {
+    pub(crate) fn new(job: JobId, until: Option<Timestamp>) -> Claim {
+        Claim {
+            job,
+            until,
+            holder_state: None,
+        }
+    }
+
+    /// Whether a timed claim has run out at `now`.
+    pub(crate) fn expired(&self, now: Timestamp) -> bool {
+        self.until.is_some_and(|until| until <= now)
+    }
+}
+
+impl ToJson for Claim {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("job", self.job)
+            .opt_timestamp("until", self.until)
+            .opt_field("holder_state", &self.holder_state)
+            .build()
+    }
+}
+
+impl FromJson for Claim {
+    fn from_json(value: &Value) -> Result<Claim, FromJsonError> {
+        let r = ObjectReader::new(value, "Claim")?;
+        Ok(Claim {
+            job: r.req("job")?,
+            until: r.opt_timestamp("until")?,
+            holder_state: r.opt("holder_state")?,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::json;
+    use belay_proto::JobSpec;
+    use std::time::Duration;
+
+    fn layout() -> Layout {
+        Layout::new(&Namespace::root())
+    }
+
+    #[test]
+    fn keys_round_trip_and_stay_in_their_namespace() {
+        let l = layout();
+        let id: JobId = "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().expect("id");
+        let key = l.job_key(id);
+        assert_eq!(l.job_id_of(&key), Some(id));
+        assert!(l.jobs().contains(&key));
+        assert!(!l.queues().contains(&key));
+
+        let q = QueueName::from_static("billing:invoices");
+        assert_eq!(l.queue_name_of(&l.queue_key(&q)), Some(q.clone()));
+        let claim = l.claim_key(&q, "invoice\u{0}7");
+        assert_eq!(
+            l.claim_of(&claim),
+            Some((q.clone(), "invoice\u{0}7".into()))
+        );
+        assert!(claim.starts_with(&l.claim_prefix(&q)));
+        assert!(!l
+            .claim_key(&QueueName::from_static("billing"), "x")
+            .starts_with(&l.claim_prefix(&q)));
+        assert_eq!(l.job_id_of(&l.queue_key(&q)), None);
+    }
+
+    #[test]
+    fn job_keys_sort_by_creation_time() {
+        let l = layout();
+        let early = JobId::from_ulid(belay_common::Ulid::from_parts(1_000, 99));
+        let late = JobId::from_ulid(belay_common::Ulid::from_parts(2_000, 1));
+        assert!(l.job_key(early) < l.job_key(late));
+    }
+
+    #[test]
+    fn nested_roots_keep_engines_apart() {
+        let a = Layout::new(&Namespace::new("tenant-a"));
+        let b = Layout::new(&Namespace::new("tenant-b"));
+        let id = JobId::generate();
+        assert_ne!(a.job_key(id), b.job_key(id));
+        assert!(!b.jobs().contains(&a.job_key(id)));
+    }
+
+    #[test]
+    fn job_documents_must_live_under_their_own_id() {
+        let l = layout();
+        let job = Job::new(
+            JobId::generate(),
+            JobSpec::new("q", "k"),
+            Timestamp::from_secs(5),
+        );
+        let bytes = encode(&job);
+        assert_eq!(
+            decode_job(&l, &l.job_key(job.id), &bytes).expect("decodes"),
+            job
+        );
+        let other = l.job_key(JobId::generate());
+        let err = decode_job(&l, &other, &bytes).unwrap_err();
+        assert!(err.to_string().contains("stored under id"), "{err}");
+        let err = decode_job(&l, &l.job_key(job.id), b"{not json").unwrap_err();
+        assert!(matches!(err, Error::Corrupt { .. }), "{err}");
+    }
+
+    #[test]
+    fn queue_records_round_trip_and_tolerate_new_fields() {
+        let mut record = QueueRecord::default();
+        record.paused = true;
+        record.config.max_concurrency = Some(4);
+        record.config.retention.succeeded = Duration::from_secs(60);
+        let v = record.to_json();
+        assert_eq!(QueueRecord::from_json(&v), Ok(record.clone()));
+        let mut extended = v.clone();
+        extended.as_object_mut().expect("object").insert("shard", 3);
+        assert_eq!(QueueRecord::from_json(&extended), Ok(record));
+        assert_eq!(
+            QueueRecord::from_json(&json!({})),
+            Ok(QueueRecord::default())
+        );
+    }
+
+    #[test]
+    fn claims_round_trip_with_optional_parts() {
+        let id = JobId::generate();
+        let plain = Claim::new(id, None);
+        assert_eq!(plain.to_json(), json!({"job": id}));
+        let timed = Claim {
+            until: Some(Timestamp::from_secs(60)),
+            holder_state: Some(JobState::Succeeded),
+            ..plain.clone()
+        };
+        for c in [plain, timed.clone()] {
+            assert_eq!(Claim::from_json(&c.to_json()), Ok(c));
+        }
+        assert!(timed.expired(Timestamp::from_secs(60)));
+        assert!(!timed.expired(Timestamp::from_millis(59_999)));
+        assert!(!Claim::new(id, None).expired(Timestamp::MAX));
+    }
+}
