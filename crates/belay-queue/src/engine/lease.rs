@@ -186,3 +186,13 @@ impl QueueEngine {
         })
     }
 }
+
+/// Picks from one queue within a lease plan: the fair planner plus copies
+/// of the limits it consumes.
+struct QueuePlan<'a> {
+    queue: &'a QueueState,
+    planner: Planner<'a>,
+    bucket: Option<TokenBucket>,
+    running: u64,
+    picked: usize,
+}
