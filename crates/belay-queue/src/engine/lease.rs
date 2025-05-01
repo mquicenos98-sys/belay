@@ -196,3 +196,138 @@ struct QueuePlan<'a> {
     running: u64,
     picked: usize,
 }
+
+impl<'a> QueuePlan<'a> {
+    fn new(queue: &'a QueueState) -> QueuePlan<'a> {
+        QueuePlan {
+            queue,
+            planner: queue.ready.planner(),
+            bucket: queue.bucket,
+            running: queue.counts.running,
+            picked: 0,
+        }
+    }
+
+    fn next(&mut self, now: Timestamp, opts: &EngineOptions) -> Option<JobId> {
+        if self.queue.paused || !self.planner.has_next() {
+            return None;
+        }
+        if let Some(max) = self.queue.config.max_concurrency {
+            if self.running >= u64::from(max) {
+                return None;
+            }
+        }
+        // Tokens are only taken once a job is known to be available, so an
+        // idle queue does not drain its bucket.
+        if let Some(bucket) = &mut self.bucket {
+            if !bucket.try_take(now) {
+                return None;
+            }
+        }
+        let key = self
+            .planner
+            .next(|tenant| opts.tenant_quantum_for(tenant.as_ref()))?;
+        self.running += 1;
+        self.picked += 1;
+        Some(key.id)
+    }
+}
+
+/// Plans and stages one lease request. Returns the leased jobs, or the
+/// wake hint when there are none.
+fn stage_lease(
+    cx: &mut Ctx<'_>,
+    req: &LeaseRequest,
+    opts: &EngineOptions,
+) -> Result<(Vec<LeasedJob>, Option<Duration>)> {
+    let st = cx.state();
+    let now = cx.now;
+    let mut plans: Vec<QueuePlan<'_>> = req
+        .queues
+        .iter()
+        .filter_map(|name| st.queues.get(name))
+        .map(QueuePlan::new)
+        .collect();
+    if plans.is_empty() {
+        return Ok((Vec::new(), None));
+    }
+
+    let max = req.max_jobs as usize;
+    let mut picks: Vec<JobId> = Vec::with_capacity(max);
+    match opts.queue_order {
+        QueueOrder::InOrder => {
+            for plan in &mut plans {
+                while picks.len() < max {
+                    match plan.next(now, opts) {
+                        Some(id) => picks.push(id),
+                        None => break,
+                    }
+                }
+            }
+        }
+        QueueOrder::RoundRobin => {
+            let n = plans.len();
+            let start = st.round_robin % n;
+            let mut open: Vec<usize> = (0..n).map(|k| (start + k) % n).collect();
+            while picks.len() < max && !open.is_empty() {
+                open.retain(|&i| {
+                    if picks.len() >= max {
+                        return true;
+                    }
+                    match plans[i].next(now, opts) {
+                        Some(id) => {
+                            picks.push(id);
+                            true
+                        }
+                        None => false,
+                    }
+                });
+            }
+        }
+    }
+
+    if picks.is_empty() {
+        return Ok((Vec::new(), wake_hint(st, &req.queues, now)));
+    }
+    if opts.queue_order == QueueOrder::RoundRobin {
+        cx.set_round_robin(st.round_robin.wrapping_add(1));
+    }
+    for plan in plans {
+        if plan.picked > 0 {
+            cx.plan(Plan {
+                queue: plan.queue.name.clone(),
+                cursor: plan.planner.into_cursor(),
+                bucket: plan.bucket,
+            });
+        }
+    }
+
+    let mut leased = Vec::with_capacity(picks.len());
+    for id in picks {
+        let mut job = cx.require(id)?;
+        job.transition(JobState::Running, now)?;
+        job.attempt += 1;
+        job.started_at = Some(now);
+        let token = cx.token();
+        let mut lease = Lease::new(req.worker.clone(), token, now, req.lease_for);
+        if let Some(deadline) = job.deadline() {
+            lease.expires_at = lease.expires_at.min(deadline);
+        }
+        job.lease = Some(lease);
+        cx.latency(LeaseLatency {
+            queue: job.spec.queue.clone(),
+            waited: now.saturating_duration_since(job.run_at),
+        });
+        cx.emit(EventKind::JobStarted {
+            job: id,
+            queue: job.spec.queue.clone(),
+            worker: req.worker.clone(),
+            attempt: job.attempt,
+        });
+        cx.counters().leased += 1;
+        cx.outcome(&req.worker, Outcome::Leased);
+        cx.put(job.clone());
+        leased.push(LeasedJob { job, token });
+    }
+    Ok((leased, None))
+}
