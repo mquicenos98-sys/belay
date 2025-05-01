@@ -190,3 +190,18 @@ fn live_claim(cx: &Ctx<'_>, spec: &JobSpec, key: &str) -> Option<(Claim, JobStat
     let state = cx.job_state(claim.job).or(claim.holder_state)?;
     Some((claim, state))
 }
+
+/// Cancels a pending holder whose key an enqueue with `replace` takes
+/// over.
+fn cancel_holder(cx: &mut Ctx<'_>, id: JobId) -> Result<()> {
+    let mut holder = cx.require(id)?;
+    holder.transition(JobState::Cancelled, cx.now)?;
+    cx.emit(EventKind::JobCancelled {
+        job: id,
+        queue: holder.spec.queue.clone(),
+    });
+    cx.counters().cancelled += 1;
+    cx.finished(holder.clone());
+    cx.put(holder);
+    Ok(())
+}
