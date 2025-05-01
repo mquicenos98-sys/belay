@@ -302,3 +302,31 @@ impl QueueEngine {
         }
     }
 }
+
+/// Picks up to `limit` ids from `ids` after `after` whose state passes
+/// `wanted`, looking at a bounded number of entries. Returns the picks,
+/// the last id looked at, and whether the end was reached.
+fn select(
+    ids: &BTreeSet<JobId>,
+    st: &State,
+    after: Option<JobId>,
+    limit: usize,
+    wanted: impl Fn(JobState) -> bool,
+) -> (Vec<JobId>, Option<JobId>, bool) {
+    let start = after.map_or(Bound::Unbounded, Bound::Excluded);
+    let budget = limit.saturating_mul(SCAN_BUDGET_PER_BATCH);
+    let mut picked = Vec::new();
+    let mut last = after;
+    let mut scanned = 0;
+    for id in ids.range((start, Bound::Unbounded)) {
+        last = Some(*id);
+        if picked.len() == limit || scanned == budget {
+            return (picked, last, false);
+        }
+        scanned += 1;
+        if st.jobs.get(id).is_some_and(|meta| wanted(meta.state)) {
+            picked.push(*id);
+        }
+    }
+    (picked, last, true)
+}
