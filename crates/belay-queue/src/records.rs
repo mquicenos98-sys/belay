@@ -142,3 +142,38 @@ pub(crate) struct QueueRecord {
     pub(crate) config: QueueConfig,
     pub(crate) paused: bool,
 }
+
+impl ToJson for QueueRecord {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("config", &self.config)
+            .field("paused", self.paused)
+            .build()
+    }
+}
+
+impl FromJson for QueueRecord {
+    /// Written by the engine itself, so unknown fields are tolerated: a
+    /// store written by a newer version still opens.
+    fn from_json(value: &Value) -> Result<QueueRecord, FromJsonError> {
+        let r = ObjectReader::new(value, "QueueRecord")?;
+        Ok(QueueRecord {
+            config: r.or_default("config")?,
+            paused: r.or_default("paused")?,
+        })
+    }
+}
+
+/// Who holds a uniqueness key, and until when.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Claim {
+    /// The holder.
+    pub(crate) job: JobId,
+    /// For `for:<duration>` scopes, when the key is released whatever
+    /// happens to the job. Other scopes release with the job's state.
+    pub(crate) until: Option<Timestamp>,
+    /// The holder's last state, recorded when the holder was deleted while
+    /// the key was still claimed, so a duplicate enqueue can still report
+    /// it.
+    pub(crate) holder_state: Option<JobState>,
+}
