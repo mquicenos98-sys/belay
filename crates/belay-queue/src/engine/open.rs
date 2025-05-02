@@ -115,3 +115,28 @@ impl QueueEngine {
         })
     }
 }
+
+/// Records the schema version in a new store and refuses stores written
+/// by a newer, incompatible version.
+fn check_schema(kv: &dyn Kv, layout: &Layout) -> Result<()> {
+    let key = layout.schema_key();
+    match kv.get(&key)? {
+        None => {
+            kv.put(&key, SCHEMA_VERSION.to_string().as_bytes())?;
+            Ok(())
+        }
+        Some(bytes) => {
+            let version: u32 = std::str::from_utf8(&bytes)
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .ok_or_else(|| Error::corrupt(printable(&key), "unreadable schema version"))?;
+            if version > SCHEMA_VERSION {
+                return Err(Error::FailedPrecondition(format!(
+                    "store holds queue records in format {version}, but this version \
+                     of belay only reads up to {SCHEMA_VERSION}; upgrade belay"
+                )));
+            }
+            Ok(())
+        }
+    }
+}
