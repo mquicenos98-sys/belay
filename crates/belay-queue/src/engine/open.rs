@@ -140,3 +140,19 @@ fn check_schema(kv: &dyn Kv, layout: &Layout) -> Result<()> {
         }
     }
 }
+
+pub(super) fn load_queues(
+    kv: &dyn Kv,
+    layout: &Layout,
+    st: &mut State,
+    now: Timestamp,
+) -> Result<()> {
+    for (key, value) in kv.scan(layout.queues())? {
+        let name = layout
+            .queue_name_of(&key)
+            .ok_or_else(|| Error::corrupt(printable(&key), "not a queue key"))?;
+        let record: QueueRecord = decode(&key, &value)?;
+        st.upsert_queue(&name, record, now);
+    }
+    Ok(())
+}
