@@ -10,7 +10,6 @@
 //!           -> dead       (failed for good: exhausted or non-retryable)
 //!           -> cancelled  (cancellation requested, then acknowledged)
 //! retrying  -> ready      (backoff elapsed, or promoted)
-//!           -> running    (leased once the backoff elapsed)
 //!           -> cancelled
 //! succeeded -> (nothing)
 //! dead      -> ready      (explicit retry)
@@ -105,7 +104,7 @@ impl JobState {
             Scheduled => &[Ready, Cancelled],
             Ready => &[Running, Cancelled],
             Running => &[Succeeded, Retrying, Dead, Cancelled],
-            Retrying => &[Ready, Running, Cancelled],
+            Retrying => &[Ready, Cancelled],
             Succeeded => &[],
             Dead | Cancelled => &[Ready],
         }
@@ -177,6 +176,34 @@ impl std::error::Error for TransitionError {}
 mod tests {
     use super::*;
     use belay_json::{json, FromJson, ToJson};
+
+    /// The full table, written out independently of `successors` so that a
+    /// change to one without the other fails here.
+    const TABLE: [(JobState, [bool; 7]); 7] = [
+        //            sched  ready  run    retry  succ   dead   canc
+        (Scheduled, [false, true, false, false, false, false, true]),
+        (Ready, [false, false, true, false, false, false, true]),
+        (Running, [false, false, false, true, true, true, true]),
+        (Retrying, [false, true, false, false, false, false, true]),
+        (Succeeded, [false, false, false, false, false, false, false]),
+        (Dead, [false, true, false, false, false, false, false]),
+        (Cancelled, [false, true, false, false, false, false, false]),
+    ];
+
+    #[test]
+    fn transition_table_is_exactly_as_documented() {
+        for (from, row) in TABLE {
+            for (to, allowed) in JobState::ALL.into_iter().zip(row) {
+                assert_eq!(
+                    from.can_transition_to(to),
+                    allowed,
+                    "{from} -> {to} should be {}",
+                    if allowed { "allowed" } else { "forbidden" }
+                );
+                assert_eq!(from.check_transition(to).is_ok(), allowed);
+            }
+        }
+    }
 
     #[test]
     fn every_state_is_reachable_from_ready() {
