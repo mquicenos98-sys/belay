@@ -109,6 +109,35 @@ fn redefinitions_are_rejected() {
 }
 
 #[test]
+fn inline_tables_and_header_tables_are_closed_to_dotted_extension() {
+    check(&[
+        ("p = { x = 1 }\n[p]", 2, 1, "cannot extend inline table `p`"),
+        (
+            "p = { x = 1 }\np.y = 2",
+            2,
+            1,
+            "cannot extend inline table `p`",
+        ),
+        (
+            "p = { x = 1 }\n[p.q]",
+            2,
+            2,
+            "cannot extend inline table `p`",
+        ),
+        (
+            "[a.b.c]\nz = 1\n[a]\nb.c.t = 2",
+            4,
+            3,
+            "cannot add keys to [a.b.c] with dotted keys; it has its own [table] header",
+        ),
+    ]);
+    // Implicitly created parents may still be defined once, and dotted-key
+    // tables may still get sub-tables.
+    Document::parse("[a.b.c]\nz = 1\n[a]\ny = 2\n[a.b]\nx = 3").unwrap();
+    Document::parse("[fruit]\napple.color = 'red'\n[fruit.apple.texture]\nsmooth = true").unwrap();
+}
+
+#[test]
 fn notes_point_at_the_first_definition() {
     let err = parse_error("[queues.emails]\nmax = 1\n\n[queues.emails]\n");
     match err {

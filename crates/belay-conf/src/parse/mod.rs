@@ -5,7 +5,8 @@
 //! The rules, in short (TOML 1.0, "Table" and "Inline Table" sections):
 //! a key is defined once; a `[table]` header appears once per table, though
 //! a table created implicitly as the parent of `[a.b]` may still get its own
-//! `[a]` later; tables created by dotted keys cannot get a header, and
+//! `[a]` later; tables created by dotted keys cannot get a header, tables
+//! with a header cannot be extended through dotted keys from elsewhere, and
 //! inline tables and static arrays are complete when closed.
 
 pub(crate) mod lexer;
@@ -192,9 +193,16 @@ impl Tree {
                     locs.insert(abs, loc);
                 }
                 Some(("table", _)) => match self.kind(&child) {
-                    Some(Kind::Dotted) | Some(Kind::Header) => {}
+                    Some(Kind::Dotted) => {}
                     Some(Kind::Implicit) => {
                         self.kinds.insert(child.clone(), Kind::Dotted);
+                    }
+                    Some(Kind::Header) => {
+                        let msg = format!(
+                            "cannot add keys to [{abs}] with dotted keys; it has its own [table] header"
+                        );
+                        let first = def_span(locs, &abs, false);
+                        return Err(Diag::new(seg.span, msg).related("defined", first));
                     }
                     _ => {
                         let first = def_span(locs, &abs, false);
