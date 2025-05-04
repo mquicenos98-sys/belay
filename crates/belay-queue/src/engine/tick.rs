@@ -55,3 +55,126 @@ impl TickReport {
         *self == TickReport::default()
     }
 }
+
+impl QueueEngine {
+    /// Runs every time-driven change due at `now`. See the module docs
+    /// for the steps.
+    pub fn tick(&self, now: Timestamp) -> Result<TickReport> {
+        let mut report = TickReport::default();
+        let batch = self.opts.batch_size;
+        let names: Vec<QueueName> = self.lock().st.queues.keys().cloned().collect();
+
+        for name in &names {
+            let (moved, effects) = {
+                let mut core = self.lock();
+                self.promote_due(&mut core, std::slice::from_ref(name), now, batch)?
+            };
+            self.after(effects);
+            report.promoted += moved as u64;
+        }
+
+        for name in &names {
+            loop {
+                let expired = self.tick_step(now, |cx| expire_leases(cx, name, batch))?;
+                report.expired += expired as u64;
+                if expired < batch {
+                    break;
+                }
+            }
+        }
+
+        let mut allowance = self.opts.retention_per_tick;
+        'retention: for name in &names {
+            loop {
+                if allowance == 0 {
+                    report.backlog = self.retention_pending(name, now);
+                    break 'retention;
+                }
+                let limit = batch.min(allowance);
+                let deleted = self.tick_step(now, |cx| enforce_retention(cx, name, limit))?;
+                allowance -= deleted;
+                report.deleted += deleted as u64;
+                if deleted < limit {
+                    break;
+                }
+            }
+        }
+
+        for name in &names {
+            loop {
+                let released = self.tick_step(now, |cx| release_claims(cx, name, batch))?;
+                report.claims_released += released as u64;
+                if released < batch {
+                    break;
+                }
+            }
+        }
+
+        report.workers_lost = self.sweep_workers(now);
+        if !report.is_idle() {
+            debug!(
+                "queue tick";
+                promoted = report.promoted,
+                expired = report.expired,
+                deleted = report.deleted,
+                claims_released = report.claims_released,
+                workers_lost = report.workers_lost
+            );
+        }
+        Ok(report)
+    }
+
+    /// One batch of tick work at `now`, committed under the lock.
+    fn tick_step(
+        &self,
+        now: Timestamp,
+        stage: impl FnOnce(&mut Ctx<'_>) -> Result<usize>,
+    ) -> Result<usize> {
+        let (count, effects): (usize, Effects) = {
+            let mut core = self.lock();
+            self.transact_locked(&mut core, now, stage)?
+        };
+        self.after(effects);
+        Ok(count)
+    }
+
+    fn retention_pending(&self, queue: &QueueName, now: Timestamp) -> bool {
+        self.lock()
+            .st
+            .queues
+            .get(queue)
+            .is_some_and(|q| !q.retention_due(now, 1).is_empty())
+    }
+
+    fn sweep_workers(&self, now: Timestamp) -> u64 {
+        let mut core = self.lock();
+        let lost = core
+            .st
+            .workers
+            .sweep(now, self.opts.worker_timeout, self.opts.worker_retention);
+        for (worker, last_seen) in &lost {
+            self.sink.emit(EventKind::WorkerLost {
+                worker: worker.clone(),
+                last_seen: *last_seen,
+            });
+        }
+        lost.len() as u64
+    }
+}
+
+/// Fails the attempts of up to `limit` running jobs of `queue` whose lease
+/// has run out.
+fn expire_leases(cx: &mut Ctx<'_>, queue: &QueueName, limit: usize) -> Result<usize> {
+    let Some(q) = cx.state().queues.get(queue) else {
+        return Ok(0);
+    };
+    let mut expired = 0;
+    for id in q.expired_leases(cx.now, limit) {
+        let job = cx.require(id)?;
+        if job.lease_expired(cx.now) {
+            stage_expiry(cx, job)?;
+            expired += 1;
+        }
+    }
+    Ok(expired)
+}
