@@ -253,3 +253,27 @@ fn candidates(st: &State, filter: &JobFilter, position: Option<JobId>, max: usiz
     }
     round
 }
+
+/// Ids of a per-queue set after `position` in `order`.
+fn walk(
+    ids: &BTreeSet<JobId>,
+    position: Option<JobId>,
+    order: SortOrder,
+) -> Box<dyn Iterator<Item = JobId> + '_> {
+    let bound = position.map_or(Bound::Unbounded, Bound::Excluded);
+    match order {
+        SortOrder::Asc => Box::new(ids.range((bound, Bound::Unbounded)).copied()),
+        SortOrder::Desc => Box::new(ids.range((Bound::Unbounded, bound)).rev().copied()),
+    }
+}
+
+/// The part of [`JobFilter::matches`] that the index can answer.
+fn prefilter(filter: &JobFilter, meta: &Meta) -> bool {
+    (filter.states.is_empty() || filter.states.contains(&meta.state))
+        && filter
+            .tenant
+            .as_ref()
+            .map_or(true, |t| meta.tenant.as_ref() == Some(t))
+        && filter.created_after.map_or(true, |t| meta.created_at > t)
+        && filter.created_before.map_or(true, |t| meta.created_at < t)
+}
