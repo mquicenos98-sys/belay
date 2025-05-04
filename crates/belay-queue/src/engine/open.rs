@@ -156,3 +156,94 @@ pub(super) fn load_queues(
     }
     Ok(())
 }
+
+/// Indexes every job, in chunks. Returns the uniqueness holders for the
+/// claim check that follows.
+pub(super) fn load_jobs(
+    kv: &dyn Kv,
+    layout: &Layout,
+    st: &mut State,
+    repair: &mut WriteBatch,
+    now: Timestamp,
+    chunk: usize,
+) -> Result<HashMap<JobId, Holder>> {
+    let mut holders = HashMap::new();
+    let mut last_key: Option<Vec<u8>> = None;
+    loop {
+        let mut range = layout.jobs().limit(chunk);
+        if let Some(key) = &last_key {
+            range = range.after(key);
+        }
+        let entries = kv.scan(range)?;
+        for (key, value) in &entries {
+            let job = decode_job(layout, key, value)?;
+            if !st.queues.contains_key(job.queue()) {
+                let record = QueueRecord::default();
+                repair.put(layout.queue_key(job.queue()), encode(&record));
+                st.upsert_queue(job.queue(), record, now);
+            }
+            if let Some(unique) = &job.spec.unique {
+                holders.insert(
+                    job.id,
+                    Holder {
+                        queue: job.spec.queue.clone(),
+                        key: unique.key.clone(),
+                        scope: unique.scope,
+                        state: job.state,
+                        created_at: job.created_at,
+                    },
+                );
+            }
+            st.apply_job(job.id, Some(&job), now);
+        }
+        if entries.len() < chunk {
+            return Ok(holders);
+        }
+        last_key = entries.last().map(|(key, _)| key.clone());
+    }
+}
+
+/// Loads the claims that are still valid and schedules the rest for
+/// deletion. Returns how many were loaded.
+///
+/// A timed claim is valid while its queue exists, whatever became of its
+/// holder (expired ones are released by the next tick, with the usual
+/// bookkeeping). An untimed claim is valid only while its holder exists,
+/// carries that key, and is in a state its scope holds in.
+pub(super) fn load_claims(
+    kv: &dyn Kv,
+    layout: &Layout,
+    st: &mut State,
+    holders: &HashMap<JobId, Holder>,
+    repair: &mut WriteBatch,
+    now: Timestamp,
+) -> Result<usize> {
+    let mut loaded = 0;
+    for (key, value) in kv.scan(layout.claims())? {
+        let Some((queue, unique_key)) = layout.claim_of(&key) else {
+            repair.delete(key);
+            continue;
+        };
+        let claim: Claim = decode(&key, &value)?;
+        let valid = st.queues.contains_key(&queue)
+            && match claim.until {
+                Some(_) => true,
+                None => holders.get(&claim.job).is_some_and(|h| {
+                    h.queue == queue
+                        && h.key == unique_key
+                        && !matches!(h.scope, UniqueScope::For(_))
+                        && h.scope.holds(h.state, h.created_at, now)
+                }),
+            };
+        match st.queues.get_mut(&queue) {
+            Some(q) if valid => {
+                q.set_claim(&unique_key, Some(claim));
+                loaded += 1;
+            }
+            _ => {
+                repair.delete(key);
+            }
+        }
+    }
+    Ok(loaded)
+}
