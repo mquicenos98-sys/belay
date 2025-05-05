@@ -20,3 +20,35 @@ use crate::state::State;
 
 /// Most problems listed in a [`VerifyReport`]; the rest are counted.
 const MAX_PROBLEMS: usize = 100;
+
+/// Outcome of [`QueueEngine::verify`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[must_use]
+pub struct VerifyReport {
+    /// Jobs found in the store.
+    pub jobs: u64,
+    /// Queues found in the store (records, plus queues implied by jobs).
+    pub queues: u64,
+    /// Valid uniqueness claims found in the store.
+    pub claims: u64,
+    /// One line per inconsistency, at most 100; empty when all is well.
+    pub problems: Vec<String>,
+    /// Inconsistencies beyond those listed.
+    pub more_problems: u64,
+}
+
+impl VerifyReport {
+    /// Whether memory and store agree.
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        self.problems.is_empty()
+    }
+
+    fn problem(&mut self, line: String) {
+        if self.problems.len() < MAX_PROBLEMS {
+            self.problems.push(line);
+        } else {
+            self.more_problems += 1;
+        }
+    }
+}
