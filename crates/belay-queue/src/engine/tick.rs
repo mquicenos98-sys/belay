@@ -178,3 +178,63 @@ fn expire_leases(cx: &mut Ctx<'_>, queue: &QueueName, limit: usize) -> Result<us
     }
     Ok(expired)
 }
+
+fn stage_expiry(cx: &mut Ctx<'_>, job: Job) -> Result<()> {
+    let now = cx.now;
+    let worker = job.lease.as_ref().map(|l| l.worker.clone());
+    let timeout = job
+        .deadline()
+        .filter(|deadline| now >= *deadline)
+        .and(job.spec.timeout);
+    let mut error = match timeout {
+        Some(timeout) => JobError::new(
+            now,
+            job.attempt,
+            format!("timed out after {}", format_duration(timeout)),
+        )
+        .kind("timeout"),
+        None => JobError::new(now, job.attempt, "lease expired").kind("lease_expired"),
+    };
+    error.worker = worker.clone();
+    if let Some(worker) = worker {
+        cx.emit(EventKind::JobExpired {
+            job: job.id,
+            queue: job.spec.queue.clone(),
+            worker,
+            attempt: job.attempt,
+        });
+    }
+    cx.counters().expired += 1;
+    stage_failure(cx, job, error, None)?;
+    Ok(())
+}
+
+/// Deletes up to `limit` finished jobs of `queue` past their retention.
+fn enforce_retention(cx: &mut Ctx<'_>, queue: &QueueName, limit: usize) -> Result<usize> {
+    let Some(q) = cx.state().queues.get(queue) else {
+        return Ok(0);
+    };
+    let ids = q.retention_due(cx.now, limit);
+    for id in &ids {
+        let job = cx.require(*id)?;
+        cx.delete(&job);
+        cx.emit(EventKind::JobDeleted {
+            job: job.id,
+            queue: job.spec.queue.clone(),
+        });
+    }
+    cx.counters().deleted += ids.len() as u64;
+    Ok(ids.len())
+}
+
+/// Releases up to `limit` timed claims of `queue` that ran out.
+fn release_claims(cx: &mut Ctx<'_>, queue: &QueueName, limit: usize) -> Result<usize> {
+    let Some(q) = cx.state().queues.get(queue) else {
+        return Ok(0);
+    };
+    let keys = q.expired_claims(cx.now, limit);
+    for key in &keys {
+        cx.set_claim(queue, key, None);
+    }
+    Ok(keys.len())
+}
