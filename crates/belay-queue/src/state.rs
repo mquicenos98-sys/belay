@@ -44,3 +44,12 @@ pub(crate) struct State {
     /// Throughput window for queues created from now on.
     window: Duration,
 }
+
+/// Sources of randomness and ids. Kept apart from [`State`] so a staging
+/// context can draw from them while it borrows the committed state.
+pub(crate) struct Gen {
+    pub(crate) rng: Rng,
+    ids: UlidGenerator,
+    /// The newest id handed out or found in the store; new ids go above it.
+    floor: Option<Ulid>,
+}
