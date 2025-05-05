@@ -53,3 +53,11 @@ pub(crate) struct Gen {
     /// The newest id handed out or found in the store; new ids go above it.
     floor: Option<Ulid>,
 }
+
+impl std::fmt::Debug for Gen {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Gen")
+            .field("floor", &self.floor)
+            .finish_non_exhaustive()
+    }
+}
