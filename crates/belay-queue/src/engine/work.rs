@@ -147,3 +147,76 @@ impl QueueEngine {
         result
     }
 }
+
+/// Stages a failed attempt of a running job: records `error`, then moves
+/// the job to retrying, dead or cancelled as [`Job::state_after_failure`]
+/// decides. Shared by [`QueueEngine::fail`] and the lease reaper.
+pub(super) fn stage_failure(
+    cx: &mut Ctx<'_>,
+    mut job: Job,
+    error: JobError,
+    retry_in: Option<Duration>,
+) -> Result<JobState> {
+    let now = cx.now;
+    let next = job.state_after_failure(error.retryable);
+    let queue = job.spec.queue.clone();
+    let worker = job.lease.as_ref().map(|l| l.worker.clone());
+    let message = error.message.clone();
+    let attempt = job.attempt;
+    job.record_error(error);
+    match next {
+        JobState::Retrying => {
+            let policy = cx.queue_config(&queue).default_retry;
+            let delay = match retry_in {
+                Some(delay) => delay,
+                None => job.retry_delay(&policy, cx.rng()),
+            };
+            job.transition(JobState::Retrying, now)?;
+            job.run_at = now + delay;
+            cx.emit(EventKind::JobFailed {
+                job: job.id,
+                queue: queue.clone(),
+                attempt,
+                error: message,
+                retry_at: job.run_at,
+            });
+        }
+        JobState::Dead => {
+            job.transition(JobState::Dead, now)?;
+            cx.emit(EventKind::JobDead {
+                job: job.id,
+                queue: queue.clone(),
+                attempt,
+                error: message,
+            });
+            cx.counters().dead += 1;
+            cx.metric(&queue, Metric::Dead);
+            cx.finished(job.clone());
+        }
+        _ => {
+            job.transition(JobState::Cancelled, now)?;
+            cx.emit(EventKind::JobCancelled {
+                job: job.id,
+                queue: queue.clone(),
+            });
+            cx.counters().cancelled += 1;
+            cx.finished(job.clone());
+        }
+    }
+    cx.counters().failed += 1;
+    cx.metric(&queue, Metric::Failed);
+    if let Some(worker) = &worker {
+        cx.outcome(worker, Outcome::Failed);
+    }
+    capacity_freed(cx, &queue);
+    cx.put(job);
+    Ok(next)
+}
+
+/// A running job of `queue` stopped. Only concurrency-limited queues can
+/// have ready jobs waiting on that, so only they wake long polls.
+pub(super) fn capacity_freed(cx: &mut Ctx<'_>, queue: &QueueName) {
+    if cx.queue_config(queue).max_concurrency.is_some() {
+        cx.notify();
+    }
+}
