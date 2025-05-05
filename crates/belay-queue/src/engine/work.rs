@@ -220,3 +220,25 @@ pub(super) fn capacity_freed(cx: &mut Ctx<'_>, queue: &QueueName) {
         cx.notify();
     }
 }
+
+/// The engine serves workers in the same process directly, with the same
+/// lease protocol as the HTTP API.
+impl JobSource for QueueEngine {
+    fn lease(&self, req: &LeaseRequest) -> Result<Vec<LeasedJob>, ApiError> {
+        QueueEngine::lease(self, req).map_err(ApiError::from)
+    }
+
+    fn heartbeat(&self, id: &JobId, req: &HeartbeatRequest) -> Result<HeartbeatResponse, ApiError> {
+        QueueEngine::heartbeat(self, id, req).map_err(ApiError::from)
+    }
+
+    fn complete(&self, id: &JobId, req: &CompleteRequest) -> Result<(), ApiError> {
+        QueueEngine::complete(self, id, req).map_err(ApiError::from)
+    }
+
+    fn fail(&self, id: &JobId, req: &FailRequest) -> Result<(), ApiError> {
+        QueueEngine::fail(self, id, req)
+            .map(|_| ())
+            .map_err(ApiError::from)
+    }
+}
