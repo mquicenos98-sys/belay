@@ -52,3 +52,80 @@ impl VerifyReport {
         }
     }
 }
+
+impl QueueEngine {
+    /// Rebuilds every index from the store and compares it with the live
+    /// one, reporting each difference.
+    ///
+    /// This holds the engine lock for a full scan of the store, so every
+    /// other operation waits for it: it is a diagnostic to run on demand,
+    /// not periodically. The comparison covers job states and scheduling
+    /// fields, per-queue counts and indexes, configurations and uniqueness
+    /// claims; it skips the in-memory-only parts (fairness position, token
+    /// buckets, throughput windows, the worker registry).
+    pub fn verify(&self) -> Result<VerifyReport> {
+        let core = self.lock();
+        let live = &core.st;
+        let now = self.clock.now();
+        let mut fresh = State::new(self.opts.throughput_window, 0);
+        let mut repair = WriteBatch::new();
+        load_queues(&*self.kv, &self.layout, &mut fresh, now)?;
+        let holders = load_jobs(
+            &*self.kv,
+            &self.layout,
+            &mut fresh,
+            &mut repair,
+            now,
+            self.opts.open_chunk,
+        )?;
+        let claims = load_claims(
+            &*self.kv,
+            &self.layout,
+            &mut fresh,
+            &holders,
+            &mut repair,
+            now,
+        )?;
+
+        let mut report = VerifyReport {
+            jobs: fresh.jobs.len() as u64,
+            queues: fresh.queues.len() as u64,
+            claims: claims as u64,
+            ..VerifyReport::default()
+        };
+        for op in repair.ops() {
+            report.problem(format!(
+                "store record {} is stale or missing",
+                printable(op.key())
+            ));
+        }
+
+        let ids: BTreeSet<_> = live.jobs.keys().chain(fresh.jobs.keys()).collect();
+        for id in ids {
+            match (live.jobs.get(id), fresh.jobs.get(id)) {
+                (Some(_), None) => report.problem(format!("job {id} is indexed but not stored")),
+                (None, Some(_)) => report.problem(format!("job {id} is stored but not indexed")),
+                (Some(mem), Some(disk)) if mem != disk => report.problem(format!(
+                    "job {id} is indexed as {} in {} but stored as {} in {}",
+                    mem.state, mem.queue, disk.state, disk.queue
+                )),
+                _ => {}
+            }
+        }
+
+        let names: BTreeSet<_> = live.queues.keys().chain(fresh.queues.keys()).collect();
+        for name in names {
+            match (live.queues.get(name), fresh.queues.get(name)) {
+                (Some(_), None) => report.problem(format!("queue {name} exists only in memory")),
+                (None, Some(_)) => report.problem(format!("queue {name} exists only in the store")),
+                (Some(mem), Some(disk)) => {
+                    for index in mem.differences(disk) {
+                        report.problem(format!("queue {name}: {index} differ from the store"));
+                    }
+                }
+                (None, None) => {}
+            }
+        }
+        Ok(report)
+    }
+}
