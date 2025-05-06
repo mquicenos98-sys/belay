@@ -110,6 +110,7 @@ pub(crate) fn write(
         let size = out.written();
         out.finish().map_err(io_err("syncing", &tmp))?;
         fs.rename(&tmp, &path).map_err(io_err("renaming", &tmp))?;
+        fs.sync_dir(dir).map_err(io_err("syncing directory", dir))?;
         Ok(size)
     })();
     if result.is_err() {
@@ -225,7 +226,7 @@ pub(crate) fn path_for(dir: &Path, seq: u64) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vfs::MemFs;
+    use crate::vfs::{Crash, MemFs};
     use std::path::PathBuf;
 
     fn sample() -> BTreeMap<Vec<u8>, Vec<u8>> {
@@ -355,5 +356,40 @@ mod tests {
             err.to_string().contains("snap-00000000000000000005.db"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn failed_writes_never_expose_a_partial_snapshot() {
+        let (fs, dir) = setup();
+        let map = sample();
+        let path = path_for(&dir, 7);
+        // Fail at each successive operation of the write, then crash.
+        for budget in 0.. {
+            let fs = fs.deep_copy();
+            fs.fail_after_ops(Some(budget));
+            let result = write(&fs, &dir, 7, &map);
+            for crash in [Crash::ProcessExit, Crash::PowerLoss] {
+                let after = fs.crash_copy(&crash);
+                if after.exists(&path).expect("exists") {
+                    let snap = read(&after, &path).expect("final name means complete");
+                    assert_eq!(snap.map, map, "budget {budget}");
+                } else {
+                    assert!(result.is_err(), "budget {budget}: acknowledged but lost");
+                }
+            }
+            if result.is_ok() {
+                assert_eq!(fs.list(&dir).expect("list"), vec![snapshot_name(7)]);
+                break;
+            }
+        }
+    }
+
+    #[test]
+    fn a_snapshot_survives_power_loss_only_complete() {
+        let (fs, dir) = setup();
+        write(&fs, &dir, 1, &sample()).expect("write");
+        let after = fs.crash_copy(&Crash::PowerLoss);
+        let snap = read(&after, &path_for(&dir, 1)).expect("complete snapshot");
+        assert_eq!(snap.map, sample());
     }
 }
