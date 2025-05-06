@@ -487,7 +487,7 @@ impl<'a> OccupiedEntry<'a> {
 
     /// Removes the entry, returning its value.
     pub fn remove(self) -> Value {
-        self.map.entries.remove(self.position).1
+        self.map.remove_at(self.position).1
     }
 }
 
@@ -677,6 +677,29 @@ mod tests {
             .slots
             .insert(index.hash("z"), Slot::Many(vec![0, 1, 2]));
         assert_eq!(index.find(&entries, "z"), Some(2));
+    }
+
+    #[test]
+    fn entry_api_inserts_and_modifies() {
+        let mut map = numbered(12);
+        *map.entry("k3").or_insert(0) = Value::from("three");
+        map.entry("new").or_insert_with(|| "fresh");
+        let _ = map
+            .entry("k4")
+            .and_modify(|v| *v = Value::Bool(true))
+            .or_insert(0);
+        let _ = map.entry("absent").and_modify(|v| *v = Value::Bool(true));
+        assert_eq!(map.get("k3"), Some(&Value::from("three")));
+        assert_eq!(map.get("new"), Some(&Value::from("fresh")));
+        assert_eq!(map.get("k4"), Some(&Value::Bool(true)));
+        assert!(!map.contains_key("absent"));
+        assert_eq!(map.get_index_of("new"), Some(12));
+
+        match map.entry("k5") {
+            Entry::Occupied(e) => assert_eq!(e.remove(), Value::from(5)),
+            Entry::Vacant(_) => panic!("k5 should be present"),
+        }
+        assert_eq!(map.get_index_of("k6"), Some(5));
     }
 
     #[test]
