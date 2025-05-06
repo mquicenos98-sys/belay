@@ -39,3 +39,81 @@ pub(crate) struct Plan {
     pub(crate) cursor: FairCursor,
     pub(crate) bucket: Option<TokenBucket>,
 }
+
+/// Everything one operation changes.
+#[derive(Debug)]
+pub(crate) struct Txn {
+    pub(crate) now: Timestamp,
+    /// New job versions; `None` deletes.
+    pub(crate) jobs: BTreeMap<JobId, Option<Job>>,
+    /// Claim changes; `None` releases.
+    pub(crate) claims: BTreeMap<(QueueName, String), Option<Claim>>,
+    /// Queue records; `None` drops the queue with its claims.
+    pub(crate) queues: BTreeMap<QueueName, Option<QueueRecord>>,
+    pub(crate) plans: Vec<Plan>,
+    pub(crate) round_robin: Option<usize>,
+    pub(crate) events: Vec<EventKind>,
+    /// Jobs that reached a terminal state, for the `on_finished` hooks.
+    pub(crate) finished: Vec<Job>,
+    /// Whether waiting lease requests should look again.
+    pub(crate) notify: bool,
+    pub(crate) counters: Counters,
+    pub(crate) metrics: Vec<(QueueName, Metric)>,
+    pub(crate) latencies: Vec<LeaseLatency>,
+    pub(crate) outcomes: Vec<(WorkerId, Outcome)>,
+    /// A worker that called in, for the registry.
+    pub(crate) touched: Option<WorkerId>,
+}
+
+impl Txn {
+    fn new(now: Timestamp) -> Txn {
+        Txn {
+            now,
+            jobs: BTreeMap::new(),
+            claims: BTreeMap::new(),
+            queues: BTreeMap::new(),
+            plans: Vec::new(),
+            round_robin: None,
+            events: Vec::new(),
+            finished: Vec::new(),
+            notify: false,
+            counters: Counters::default(),
+            metrics: Vec::new(),
+            latencies: Vec::new(),
+            outcomes: Vec::new(),
+            touched: None,
+        }
+    }
+
+    /// The store writes of this transaction, as one batch.
+    pub(crate) fn batch(&self, layout: &Layout) -> WriteBatch {
+        let mut batch = WriteBatch::with_capacity(self.jobs.len() + self.claims.len());
+        // Queue drops come first: their prefix deletion of claims must not
+        // wipe claims written later in the same batch.
+        for (name, record) in &self.queues {
+            match record {
+                Some(record) => {
+                    batch.put(layout.queue_key(name), encode(record));
+                }
+                None => {
+                    batch
+                        .delete(layout.queue_key(name))
+                        .delete_prefix(layout.claim_prefix(name));
+                }
+            }
+        }
+        for (id, job) in &self.jobs {
+            match job {
+                Some(job) => batch.put(layout.job_key(*id), encode(job)),
+                None => batch.delete(layout.job_key(*id)),
+            };
+        }
+        for ((queue, key), claim) in &self.claims {
+            match claim {
+                Some(claim) => batch.put(layout.claim_key(queue, key), encode(claim)),
+                None => batch.delete(layout.claim_key(queue, key)),
+            };
+        }
+        batch
+    }
+}
