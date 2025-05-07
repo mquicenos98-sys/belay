@@ -265,3 +265,162 @@ fn workers_report_their_queues_and_outcomes() {
     );
     assert_eq!((info.first_seen, info.last_seen), (start(), h.now()));
 }
+
+#[test]
+fn invalid_specs_are_rejected_with_every_problem() {
+    let h = Harness::new();
+    let mut spec = JobSpec::new("q", "bad kind").priority(5000);
+    spec.max_attempts = Some(0);
+    let err = h.engine.enqueue(spec).unwrap_err();
+    let Error::Invalid(violations) = &err else {
+        panic!("expected invalid, got {err}");
+    };
+    assert_eq!(violations.len(), 3);
+    assert!(h.engine.list_queues().is_empty(), "nothing created");
+    let api = ApiError::from(err);
+    assert_eq!(api.code, ErrorCode::InvalidArgument);
+}
+
+#[test]
+fn batch_validation_names_the_offending_spec() {
+    let h = Harness::new();
+    let err = h
+        .engine
+        .enqueue_batch(vec![
+            JobSpec::new("q", "fine"),
+            JobSpec::new("q", "fine").priority(2000),
+        ])
+        .unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "$.jobs[1].priority: must be between -1000 and 1000, got 2000"
+    );
+    assert!(h.all_jobs().is_empty());
+    assert!(h
+        .engine
+        .enqueue_batch(Vec::new())
+        .expect("empty")
+        .is_empty());
+    let too_many = vec![JobSpec::new("q", "k"); belay_proto::limits::MAX_ENQUEUE_BATCH + 1];
+    assert_eq!(
+        h.engine.enqueue_batch(too_many).unwrap_err().code(),
+        ErrorCode::InvalidArgument
+    );
+}
+
+#[test]
+fn lease_requests_are_validated() {
+    let h = Harness::new();
+    let req = belay_proto::api::LeaseRequest::new(w("w1"), Vec::new());
+    let err = h.engine.lease(&req).unwrap_err();
+    assert_eq!(err.to_string(), "$.queues: must name at least one queue");
+    assert!(
+        h.engine.workers().is_empty(),
+        "an invalid request is not a sighting"
+    );
+}
+
+#[test]
+fn invalid_configs_change_nothing() {
+    let h = Harness::new();
+    let mut config = QueueConfig::default();
+    config.max_concurrency = Some(0);
+    let err = h.engine.set_config(&q("q"), config).unwrap_err();
+    assert_eq!(err.code(), ErrorCode::InvalidArgument);
+    assert!(h.engine.queue_info(&q("q")).is_err());
+    let mut config = QueueConfig::default();
+    config.max_concurrency = Some(4);
+    let info = h
+        .engine
+        .set_config(&q("q"), config.clone())
+        .expect("config");
+    assert_eq!(info.config, config);
+    assert_eq!(h.events(), ["queue.configured"]);
+}
+
+#[test]
+fn deleting_a_queue_requires_it_to_be_drained_unless_forced() {
+    let h = Harness::with_options(EngineOptions::new().batch_size(3));
+    h.enqueue(
+        JobSpec::new("q", "done")
+            .unique("u", belay_proto::UniqueScope::For(Duration::from_secs(600))),
+    );
+    let l = h.lease_one("q");
+    h.complete(&l);
+    let pending: Vec<JobId> = (0..7).map(|_| h.enqueue(JobSpec::new("q", "k"))).collect();
+    let running = h.lease_one("q");
+    let err = h.engine.delete_queue(&q("q"), false).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "queue q has 7 pending jobs; cancel or purge them, or delete the queue with force"
+    );
+    assert_eq!(h.engine.delete_queue(&q("q"), true).expect("forced"), 8);
+    assert!(h.engine.queue_info(&q("q")).is_err());
+    assert!(h.engine.get(&pending[0]).is_err());
+    // The worker holding a job of the deleted queue loses it.
+    let err = h
+        .engine
+        .complete(&running.job.id, &CompleteRequest::new(running.token))
+        .unwrap_err();
+    assert!(matches!(err, Error::LeaseLost(_)));
+    // Timed claims went with the queue.
+    let fresh = h
+        .engine
+        .enqueue(
+            JobSpec::new("q", "done")
+                .unique("u", belay_proto::UniqueScope::For(Duration::from_secs(600))),
+        )
+        .expect("enqueue");
+    assert_eq!(fresh.status, belay_proto::api::EnqueueStatus::Created);
+    assert!(h.events().contains(&"queue.deleted"));
+    assert_eq!(h.engine.workers()[0].active_jobs, 0);
+    h.assert_consistent();
+}
+
+#[test]
+fn a_queue_with_only_finished_jobs_can_be_deleted() {
+    let h = Harness::new();
+    let id = h.enqueue(JobSpec::new("q", "k"));
+    h.engine.cancel(&id).expect("cancel");
+    assert_eq!(h.engine.delete_queue(&q("q"), false).expect("delete"), 1);
+    assert!(h.engine.list_queues().is_empty());
+    assert!(matches!(
+        h.engine.delete_queue(&q("q"), false),
+        Err(Error::QueueNotFound(_))
+    ));
+}
+
+#[test]
+fn job_state_is_answered_from_memory() {
+    let h = Harness::new();
+    let id = h.enqueue(JobSpec::new("q", "k"));
+    assert_eq!(h.engine.job_state(&id), Some(JobState::Ready));
+    h.engine.cancel(&id).expect("cancel");
+    assert_eq!(h.engine.job_state(&id), Some(JobState::Cancelled));
+    assert_eq!(h.engine.job_state(&JobId::generate()), None);
+}
+
+#[test]
+fn the_engine_serves_workers_through_the_job_source_trait() {
+    use belay_proto::source::JobSource;
+    let h = Harness::new();
+    let id = h.enqueue(JobSpec::new("q", "k"));
+    let source: std::sync::Arc<dyn JobSource> = h.engine.clone();
+    let req = belay_proto::api::LeaseRequest::new(w("w1"), vec![q("q")]);
+    let leased = source.lease(&req).expect("lease");
+    let token = leased[0].token;
+    let err = source
+        .complete(&id, &CompleteRequest::new(belay_proto::LeaseToken::new(1)))
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::LeaseLost);
+    source
+        .complete(&id, &CompleteRequest::new(token))
+        .expect("complete");
+    assert_eq!(h.state(id), JobState::Succeeded);
+}
+
+#[test]
+fn the_engine_is_shareable_between_threads() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<belay_queue::QueueEngine>();
+}
