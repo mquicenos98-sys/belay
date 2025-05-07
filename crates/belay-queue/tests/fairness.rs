@@ -145,3 +145,182 @@ fn tenant_turns_carry_over_between_requests() {
     let order: Vec<String> = (0..6).flat_map(|_| kinds(&h, &["q"], 1)).collect();
     assert_eq!(order, ["a0", "b0", "a1", "b1", "a2", "b2"]);
 }
+
+#[test]
+fn weighted_tenants_get_proportional_turns() {
+    let h = Harness::with_options(EngineOptions::new().tenant_weight(tenant("gold"), 3));
+    for i in 0..6 {
+        h.enqueue(JobSpec::new("q", format!("gold{i}")).tenant(tenant("gold")));
+        h.enqueue(JobSpec::new("q", format!("free{i}")).tenant(tenant("free")));
+    }
+    assert_eq!(
+        kinds(&h, &["q"], 8),
+        ["gold0", "gold1", "gold2", "free0", "gold3", "gold4", "gold5", "free1"]
+    );
+}
+
+#[test]
+fn priority_orders_jobs_within_a_tenant_only() {
+    let h = Harness::new();
+    h.enqueue(JobSpec::new("q", "a-low").tenant(tenant("a")));
+    h.enqueue(JobSpec::new("q", "a-high").tenant(tenant("a")).priority(50));
+    h.enqueue(
+        JobSpec::new("q", "b-urgent")
+            .tenant(tenant("b"))
+            .priority(1000),
+    );
+    assert_eq!(kinds(&h, &["q"], 3), ["a-high", "b-urgent", "a-low"]);
+}
+
+#[test]
+fn jobs_without_a_tenant_share_one_turn() {
+    let h = Harness::new();
+    h.enqueue(JobSpec::new("q", "anon0"));
+    h.enqueue(JobSpec::new("q", "anon1"));
+    h.enqueue(JobSpec::new("q", "t0").tenant(tenant("t")));
+    assert_eq!(kinds(&h, &["q"], 3), ["anon0", "t0", "anon1"]);
+    let stats = h.engine.stats();
+    assert_eq!(stats.queue("q").map(|s| s.tenants), Some(0));
+}
+
+#[test]
+fn max_concurrency_caps_running_jobs() {
+    let h = Harness::new();
+    configure(&h, "q", |c| c.max_concurrency = Some(2));
+    fill(&h, "q", 5);
+    let first = h.lease("q", 5);
+    assert_eq!(first.len(), 2);
+    assert!(h.lease("q", 1).is_empty());
+    h.complete(&first[0]);
+    assert_eq!(h.lease("q", 5).len(), 1);
+    h.fail(&first[1], true);
+    assert_eq!(h.lease("q", 5).len(), 1, "a failed attempt frees its slot");
+    // An expired lease frees a slot too.
+    h.secs(30);
+    assert_eq!(h.tick().expired, 2);
+    assert_eq!(h.lease("q", 5).len(), 2);
+    h.assert_consistent();
+}
+
+#[test]
+fn raising_the_concurrency_limit_applies_at_once() {
+    let h = Harness::new();
+    configure(&h, "q", |c| c.max_concurrency = Some(1));
+    fill(&h, "q", 3);
+    assert_eq!(h.lease("q", 3).len(), 1);
+    configure(&h, "q", |c| c.max_concurrency = Some(3));
+    assert_eq!(h.lease("q", 3).len(), 2);
+}
+
+#[test]
+fn rate_limit_allows_a_burst_then_refills_with_the_clock() {
+    let h = Harness::new();
+    configure(&h, "q", |c| c.rate_limit = Some(RateLimit::new(2.0, 2)));
+    fill(&h, "q", 10);
+    assert_eq!(h.lease("q", 10).len(), 2);
+    assert!(h.lease("q", 10).is_empty());
+    h.advance(Duration::from_millis(499));
+    assert!(h.lease("q", 10).is_empty());
+    h.advance(Duration::from_millis(1));
+    assert_eq!(h.lease("q", 10).len(), 1);
+    // A long idle period refills only up to the burst.
+    h.secs(60);
+    assert_eq!(h.lease("q", 10).len(), 2);
+    let tokens = h.engine.stats().queue("q").and_then(|s| s.rate_tokens);
+    assert!(tokens.is_some_and(|t| t < 1.0), "{tokens:?}");
+}
+
+#[test]
+fn fractional_rates_space_grants_out() {
+    let h = Harness::new();
+    configure(&h, "q", |c| c.rate_limit = Some(RateLimit::new(0.5, 1)));
+    fill(&h, "q", 3);
+    let mut granted_at = Vec::new();
+    for second in 0..6 {
+        if !h.lease("q", 1).is_empty() {
+            granted_at.push(second);
+        }
+        h.secs(1);
+    }
+    assert_eq!(granted_at, [0, 2, 4]);
+}
+
+#[test]
+fn an_idle_rate_limited_queue_keeps_its_tokens() {
+    let h = Harness::new();
+    configure(&h, "q", |c| c.rate_limit = Some(RateLimit::new(1.0, 3)));
+    for _ in 0..5 {
+        assert!(h.lease("q", 3).is_empty());
+    }
+    fill(&h, "q", 3);
+    assert_eq!(h.lease("q", 3).len(), 3);
+}
+
+#[test]
+fn rate_and_concurrency_limits_combine() {
+    let h = Harness::new();
+    configure(&h, "q", |c| {
+        c.rate_limit = Some(RateLimit::new(100.0, 100));
+        c.max_concurrency = Some(1);
+    });
+    fill(&h, "q", 3);
+    let l = h.lease("q", 3);
+    assert_eq!(l.len(), 1);
+    // The refused picks did not spend tokens.
+    let tokens = h.engine.stats().queue("q").and_then(|s| s.rate_tokens);
+    assert!(
+        tokens.is_some_and(|t| (t - 99.0).abs() < 1e-6),
+        "{tokens:?}"
+    );
+    h.complete(&l[0]);
+    assert_eq!(h.lease("q", 3).len(), 1);
+}
+
+#[test]
+fn a_paused_queue_accepts_jobs_but_hands_none_out() {
+    let h = Harness::new();
+    h.engine.pause(&q("q")).expect("pause");
+    let id = h.enqueue(JobSpec::new("q", "k"));
+    fill(&h, "other", 1);
+    assert_eq!(kinds(&h, &["q", "other"], 5), ["other0"]);
+    let info = h.engine.queue_info(&q("q")).expect("info");
+    assert!(info.paused);
+    assert_eq!(info.counts.ready, 1);
+    h.engine.resume(&q("q")).expect("resume");
+    assert_eq!(h.lease_one("q").job.id, id);
+}
+
+#[test]
+fn pausing_before_the_first_job_creates_the_queue() {
+    let mut h = Harness::new();
+    h.engine.pause(&q("later")).expect("pause");
+    h.reopen();
+    let info = h.engine.queue_info(&q("later")).expect("queue exists");
+    assert!(info.paused, "the pause is persisted");
+}
+
+#[test]
+fn max_jobs_is_honoured_across_queues() {
+    let h = Harness::new();
+    fill(&h, "a", 5);
+    fill(&h, "b", 5);
+    fill(&h, "c", 5);
+    assert_eq!(h.lease_from("w1", &["a", "b", "c"], 7).len(), 7);
+    assert_eq!(h.lease_from("w1", &["a", "b", "c"], 100).len(), 8);
+}
+
+#[test]
+fn leases_by_different_workers_never_share_a_job() {
+    let h = Harness::new();
+    fill(&h, "q", 50);
+    let mut seen = std::collections::HashSet::new();
+    for worker in ["w1", "w2", "w3", "w4", "w5"].iter().cycle().take(20) {
+        for l in h.lease_from(worker, &["q"], 3) {
+            assert!(seen.insert(l.job.id), "job {} leased twice", l.job.id);
+        }
+    }
+    assert_eq!(seen.len(), 50);
+    let workers = h.engine.workers();
+    assert_eq!(workers.len(), 5);
+    assert_eq!(workers.iter().map(|w| w.active_jobs).sum::<u32>(), 50);
+}
