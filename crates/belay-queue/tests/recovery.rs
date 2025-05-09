@@ -325,3 +325,113 @@ fn indexes_are_rebuilt_from_thousands_of_jobs() {
         "every ready job is leasable after the rebuild"
     );
 }
+
+#[test]
+fn a_failed_write_leaves_the_engine_unchanged() {
+    let flaky = Arc::new(FlakyKv::new());
+    let h = Harness::on(flaky.clone(), EngineOptions::new());
+    let ready = h.enqueue(JobSpec::new("q", "ready"));
+    let running_id = h.enqueue(JobSpec::new("q", "running").priority(1));
+    let running = h.lease_one("q");
+    assert_eq!(running.job.id, running_id);
+    h.sink.take();
+    let before = snapshot(&h);
+    let counters = h.engine.stats().counters;
+
+    flaky.fail_writes(true);
+    let err = h.engine.enqueue(JobSpec::new("fresh", "k")).unwrap_err();
+    assert!(matches!(err, Error::Store(_)));
+    assert_eq!(err.code(), ErrorCode::Unavailable);
+    assert!(h
+        .engine
+        .lease(&belay_proto::api::LeaseRequest::new(w("w2"), vec![q("q")]))
+        .is_err());
+    assert!(h
+        .engine
+        .complete(&running.job.id, &CompleteRequest::new(running.token))
+        .is_err());
+    assert!(h.engine.cancel(&ready).is_err());
+    assert!(h.engine.pause(&q("q")).is_err());
+    let later = h.secs(60);
+    assert!(h.engine.tick(later).is_err(), "expiring the lease fails");
+
+    // Compare at the time of the first snapshot: ages depend on the clock.
+    h.clock.set(start());
+    assert_eq!(snapshot(&h), before);
+    h.clock.set(later);
+    assert!(
+        h.engine.queue_info(&q("fresh")).is_err(),
+        "no queue half-created"
+    );
+    let after = h.engine.stats().counters;
+    assert_eq!(
+        (
+            after.enqueued,
+            after.leased,
+            after.succeeded,
+            after.cancelled
+        ),
+        (
+            counters.enqueued,
+            counters.leased,
+            counters.succeeded,
+            counters.cancelled
+        )
+    );
+    assert!(
+        h.events().iter().all(|e| *e == "worker.seen"),
+        "no event for an unpersisted change"
+    );
+    h.assert_consistent();
+
+    flaky.fail_writes(false);
+    // The expired lease is reaped now; the ready job is still there.
+    assert_eq!(h.tick().expired, 1);
+    let l = h.lease_one("q");
+    assert_eq!((l.job.id, l.job.attempt), (ready, 1));
+    h.assert_consistent();
+}
+
+#[test]
+fn ids_keep_increasing_across_a_restart_in_the_same_millisecond() {
+    // Regression: a freshly seeded id generator could mint an id already
+    // stored when restarted within the same millisecond, overwriting it.
+    let mut h = Harness::new();
+    let first: Vec<JobId> = (0..5).map(|_| h.enqueue(JobSpec::new("q", "k"))).collect();
+    h.reopen();
+    let second: Vec<JobId> = (0..5).map(|_| h.enqueue(JobSpec::new("q", "k"))).collect();
+    let mut all = first.clone();
+    all.extend(&second);
+    let mut sorted = all.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted, all, "ids are distinct and in creation order");
+    assert_eq!(h.all_jobs().len(), 10);
+}
+
+#[test]
+fn ids_stay_ordered_when_the_clock_steps_back() {
+    let h = Harness::new();
+    let a = h.enqueue(JobSpec::new("q", "k"));
+    h.clock.set(start() - Duration::from_secs(3600));
+    let b = h.enqueue(JobSpec::new("q", "k"));
+    assert!(b > a);
+    assert_eq!(h.job(b).created_at, h.now(), "timestamps follow the clock");
+}
+
+#[test]
+fn a_store_from_a_newer_version_is_refused() {
+    let kv: Arc<dyn Kv> = Arc::new(MemKv::new());
+    let schema = Namespace::new("qmeta").key_buf().str("schema").into_vec();
+    kv.put(&schema, b"2").expect("put");
+    let clock = belay_common::ManualClock::new(start());
+    let err = QueueEngine::open(
+        kv,
+        clock.shared(),
+        belay_proto::source::NoopSink::shared(),
+        EngineOptions::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::FailedPrecondition(_)), "{err}");
+    assert!(err.to_string().contains("format 2"), "{err}");
+}
