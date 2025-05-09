@@ -24,3 +24,7 @@ use belay_store::vfs::{Crash, MemFs};
 use support::*;
 
 const QUEUES: [&str; 3] = ["a", "b", "c"];
+
+const LEASE: Duration = Duration::from_secs(30);
+
+const BACKOFF: Duration = Duration::from_secs(5);
