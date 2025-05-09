@@ -59,3 +59,148 @@ struct Workload {
     leased: Vec<LeasedJob>,
     ids: Vec<JobId>,
 }
+
+impl Workload {
+    fn new() -> Workload {
+        Workload {
+            rng: Rng::seed_from_u64(42),
+            leased: Vec::new(),
+            ids: Vec::new(),
+        }
+    }
+
+    fn step(&mut self, h: &Harness) {
+        let queues = ["mail", "sms"];
+        let queue = queues[self.rng.gen_range(0..2u64) as usize];
+        match self.rng.gen_range(0..12u64) {
+            0..=2 => {
+                let mut spec = JobSpec::new(queue, "send")
+                    .payload(json!({"n": self.ids.len()}))
+                    .priority(self.rng.gen_range(0..3u64) as i16)
+                    .max_attempts(2)
+                    .retry(BackoffPolicy::constant(Duration::from_secs(5)));
+                if self.rng.gen_bool(0.3) {
+                    spec = spec.delay(Duration::from_secs(self.rng.gen_range(1..20u64)));
+                }
+                if self.rng.gen_bool(0.3) {
+                    let key = format!("u{}", self.rng.gen_range(0..4u64));
+                    spec = spec.unique(key, UniqueScope::UntilFinished);
+                }
+                if self.rng.gen_bool(0.3) {
+                    spec = spec.tenant("acme".parse().expect("tenant"));
+                }
+                let result = h.engine.enqueue(spec).expect("enqueue");
+                self.ids.push(result.id);
+            }
+            3 | 4 => {
+                let n = self.rng.gen_range(1..3u64) as u32;
+                self.leased.extend(h.lease_from("w1", &[queue], n));
+            }
+            5 if !self.leased.is_empty() => {
+                let l = self.take();
+                let _ = h.engine.complete(&l.job.id, &CompleteRequest::new(l.token));
+            }
+            6 if !self.leased.is_empty() => {
+                let l = self.take();
+                let retryable = self.rng.gen_bool(0.7);
+                let mut req = belay_proto::api::FailRequest::new(l.token, "boom");
+                req.retryable = retryable;
+                let _ = h.engine.fail(&l.job.id, &req);
+            }
+            7 if !self.leased.is_empty() => {
+                let i = self.rng.gen_range(0..self.leased.len() as u64) as usize;
+                let l = &self.leased[i];
+                let _ = h
+                    .engine
+                    .heartbeat(&l.job.id, &HeartbeatRequest::new(l.token));
+            }
+            8 if !self.ids.is_empty() => {
+                let id = self.ids[self.rng.gen_range(0..self.ids.len() as u64) as usize];
+                let _ = match self.rng.gen_range(0..4u64) {
+                    0 => h.engine.cancel(&id).map(drop),
+                    1 => h.engine.retry(&id).map(drop),
+                    2 => h.engine.promote(&id).map(drop),
+                    _ => h.engine.delete(&id),
+                };
+            }
+            9 => {
+                if self.rng.gen_bool(0.5) {
+                    h.engine.pause(&q(queue)).expect("pause");
+                } else {
+                    h.engine.resume(&q(queue)).expect("resume");
+                }
+            }
+            10 => {
+                let mut config = QueueConfig::default();
+                config.max_concurrency = Some(self.rng.gen_range(1..5u64) as u32);
+                config.retention.succeeded = Duration::from_secs(30);
+                h.engine.set_config(&q(queue), config).expect("config");
+            }
+            _ => {
+                h.secs(self.rng.gen_range(1..15u64));
+                h.tick();
+            }
+        }
+    }
+
+    fn take(&mut self) -> LeasedJob {
+        let i = self.rng.gen_range(0..self.leased.len() as u64) as usize;
+        self.leased.swap_remove(i)
+    }
+}
+
+fn durable_harness(fs: &MemFs) -> Harness {
+    Harness::on(durable(fs), EngineOptions::new())
+}
+
+#[test]
+fn everything_acknowledged_survives_a_clean_restart() {
+    let fs = MemFs::new();
+    let mut h = durable_harness(&fs);
+    let mut work = Workload::new();
+    for _ in 0..150 {
+        work.step(&h);
+    }
+    let before = snapshot(&h);
+    assert!(before.jobs.len() > 20, "the workload should build up jobs");
+    h.restart(|| durable(&fs));
+    assert_eq!(snapshot(&h), before);
+    h.assert_consistent();
+}
+
+#[test]
+fn a_power_loss_keeps_every_acknowledged_operation() {
+    // Reference run: the state after each step.
+    let reference_fs = MemFs::new();
+    let h = durable_harness(&reference_fs);
+    let mut work = Workload::new();
+    let mut expected = vec![snapshot(&h)];
+    for _ in 0..120 {
+        work.step(&h);
+        expected.push(snapshot(&h));
+    }
+    drop(h);
+
+    for crash_after in [0usize, 1, 7, 23, 58, 91, 120] {
+        let fs = MemFs::new();
+        let mut h = durable_harness(&fs);
+        let mut work = Workload::new();
+        for _ in 0..crash_after {
+            work.step(&h);
+        }
+        assert_eq!(snapshot(&h), expected[crash_after], "replay diverged");
+        fs.crash(&Crash::PowerLoss);
+        h.restart(|| durable(&fs));
+        assert_eq!(
+            snapshot(&h),
+            expected[crash_after],
+            "state after a crash at step {crash_after}"
+        );
+        h.assert_consistent();
+        // The recovered engine keeps working, tokens included.
+        for _ in 0..10 {
+            work.step(&h);
+        }
+        h.assert_consistent();
+    }
+}
