@@ -435,3 +435,101 @@ fn a_store_from_a_newer_version_is_refused() {
     assert!(matches!(err, Error::FailedPrecondition(_)), "{err}");
     assert!(err.to_string().contains("format 2"), "{err}");
 }
+
+#[test]
+fn a_corrupt_job_document_stops_the_open_with_its_key() {
+    let mut h = Harness::new();
+    let id = h.enqueue(JobSpec::new("q", "k"));
+    let key = Namespace::new("job").key_buf().ulid(id.ulid()).into_vec();
+    h.kv.put(&key, b"{\"id\": 1").expect("put");
+    let err = QueueEngine::open(
+        Arc::clone(&h.kv),
+        h.clock.shared(),
+        belay_proto::source::NoopSink::shared(),
+        EngineOptions::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Corrupt { .. }), "{err}");
+    // Put it back and all is well.
+    h.kv.delete(&key).expect("delete");
+    h.reopen();
+    assert!(h.all_jobs().is_empty());
+}
+
+#[test]
+fn stale_claims_and_missing_queue_records_are_repaired_on_open() {
+    let mut h = Harness::new();
+    let id = h.enqueue(JobSpec::new("q", "k").unique("kept", UniqueScope::UntilFinished));
+    let ghost = JobId::generate();
+    let claim = |key: &str| {
+        Namespace::new("uniq")
+            .key_buf()
+            .str("q")
+            .str(key)
+            .into_vec()
+    };
+    h.kv.put(
+        &claim("stale"),
+        format!("{{\"job\":\"{ghost}\"}}").as_bytes(),
+    )
+    .expect("put");
+    let queue_key = Namespace::new("queue").key_buf().str("q").into_vec();
+    h.kv.delete(&queue_key).expect("delete");
+    h.reopen();
+    assert!(
+        h.kv.get(&claim("stale")).expect("get").is_none(),
+        "stale claim deleted"
+    );
+    assert!(h.kv.get(&claim("kept")).expect("get").is_some());
+    assert!(
+        h.kv.get(&queue_key).expect("get").is_some(),
+        "queue record restored"
+    );
+    let dup = h
+        .engine
+        .enqueue(JobSpec::new("q", "k").unique("kept", UniqueScope::UntilFinished))
+        .expect("enqueue");
+    assert_eq!(dup.id, id);
+    h.assert_consistent();
+}
+
+#[test]
+fn verify_reports_a_store_changed_behind_the_engines_back() {
+    let h = Harness::new();
+    let id = h.enqueue(JobSpec::new("q", "k"));
+    h.assert_consistent();
+    let key = Namespace::new("job").key_buf().ulid(id.ulid()).into_vec();
+    h.kv.delete(&key).expect("delete");
+    let report = h.engine.verify().expect("verify");
+    assert!(!report.is_consistent());
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("indexed but not stored")),
+        "{:?}",
+        report.problems
+    );
+    // Reads report the damage instead of panicking.
+    assert!(h.engine.cancel(&id).is_err());
+}
+
+#[test]
+fn engines_in_separate_namespaces_share_a_store_without_seeing_each_other() {
+    let kv: Arc<dyn Kv> = Arc::new(MemKv::new());
+    let a = Harness::on(
+        Arc::clone(&kv),
+        EngineOptions::new().namespace(Namespace::new("a")),
+    );
+    let b = Harness::on(
+        Arc::clone(&kv),
+        EngineOptions::new().namespace(Namespace::new("b")),
+    );
+    a.enqueue(JobSpec::new("q", "from-a"));
+    assert!(b.all_jobs().is_empty());
+    assert!(b.lease("q", 1).is_empty());
+    b.enqueue(JobSpec::new("q", "from-b"));
+    assert_eq!(a.lease_one("q").job.spec.kind, "from-a");
+    a.assert_consistent();
+    b.assert_consistent();
+}
