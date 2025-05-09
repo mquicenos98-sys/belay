@@ -204,3 +204,124 @@ fn a_power_loss_keeps_every_acknowledged_operation() {
         h.assert_consistent();
     }
 }
+
+#[test]
+fn a_process_crash_loses_nothing_even_without_syncing() {
+    // Handles from before a crash stop working, so each open takes a
+    // fresh clone of the file system.
+    let unsynced = |fs: &MemFs| -> Arc<dyn Kv> {
+        let opts = Options::new()
+            .fs(fs.clone())
+            .sync(SyncPolicy::Never)
+            .manual_checkpoints();
+        Arc::new(LogKv::open("store", opts).expect("open"))
+    };
+    quiet_logs();
+    let fs = MemFs::new();
+    let mut h = Harness::on(unsynced(&fs), EngineOptions::new());
+    let mut work = Workload::new();
+    for _ in 0..80 {
+        work.step(&h);
+    }
+    let before = snapshot(&h);
+    fs.crash(&Crash::ProcessExit);
+    h.restart(|| unsynced(&fs));
+    assert_eq!(snapshot(&h), before);
+}
+
+#[test]
+fn running_jobs_keep_their_lease_tokens_across_a_restart() {
+    let fs = MemFs::new();
+    let mut h = durable_harness(&fs);
+    let id = h.enqueue(JobSpec::new("q", "k"));
+    let l = h.lease_one("q");
+    h.restart(|| durable(&fs));
+    let workers = h.engine.workers();
+    assert_eq!(workers.len(), 1, "seeded from running leases");
+    assert_eq!(workers[0].active_jobs, 1);
+    h.heartbeat(&l);
+    h.complete(&l);
+    assert_eq!(h.state(id), JobState::Succeeded);
+}
+
+#[test]
+fn indexes_are_rebuilt_from_thousands_of_jobs() {
+    let fs = MemFs::new();
+    let mut h = durable_harness(&fs);
+    let tenants: Vec<TenantId> = ["a", "b", "c", "d"]
+        .iter()
+        .map(|t| t.parse().expect("tenant"))
+        .collect();
+    let queues = ["alpha", "beta", "gamma"];
+    let mut rng = Rng::seed_from_u64(7);
+    let mut specs = Vec::new();
+    for i in 0..3000u64 {
+        let queue = queues[(i % 3) as usize];
+        let mut spec = JobSpec::new(queue, "k")
+            .priority(rng.gen_range(0..5u64) as i16)
+            .tenant(tenants[rng.gen_range(0..4u64) as usize].clone());
+        if i % 6 == 0 {
+            spec = spec.delay(Duration::from_secs(rng.gen_range(10..1000u64)));
+        }
+        if i % 10 == 0 {
+            spec = spec.unique(format!("key{i}"), UniqueScope::UntilFinished);
+        }
+        specs.push(spec);
+        if specs.len() == 500 {
+            h.engine
+                .enqueue_batch(std::mem::take(&mut specs))
+                .expect("batch");
+        }
+    }
+    let leased = h.lease_from("w1", &queues, 100);
+    for (i, l) in leased.iter().enumerate() {
+        match i % 4 {
+            0 => h.complete(l),
+            1 => {
+                h.fail(l, true);
+            }
+            2 => {
+                h.fail(l, false);
+            }
+            _ => {}
+        }
+    }
+    for id in h.all_jobs().iter().step_by(37).map(|j| j.id) {
+        let _ = h.engine.cancel(&id);
+    }
+    h.secs(20);
+    h.tick();
+    let before = snapshot(&h);
+    let stats_before = h.engine.stats();
+    assert_eq!(stats_before.totals.total(), 3000);
+
+    h.restart(|| durable(&fs));
+    assert_eq!(snapshot(&h), before);
+    let stats = h.engine.stats();
+    assert_eq!(stats.totals, stats_before.totals);
+    h.assert_consistent();
+
+    // The rebuilt ready sets hand jobs out by priority within each tenant.
+    let mut last_priority: std::collections::HashMap<(String, Option<TenantId>), i16> =
+        std::collections::HashMap::new();
+    let ready = stats.totals.ready as usize;
+    let mut leased = 0;
+    loop {
+        let batch = h.lease_from("w2", &queues, 100);
+        if batch.is_empty() {
+            break;
+        }
+        for l in batch {
+            leased += 1;
+            let key = (l.job.spec.queue.to_string(), l.job.spec.tenant.clone());
+            let p = l.job.spec.priority;
+            if let Some(prev) = last_priority.insert(key, p) {
+                assert!(p <= prev, "priority went up within a tenant flow");
+            }
+        }
+    }
+    assert!(
+        leased >= ready,
+        "every ready job is leasable after the rebuild"
+    );
+}
