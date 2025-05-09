@@ -589,3 +589,41 @@ impl Run {
         self.h.assert_consistent();
     }
 }
+
+fn run(seed: u64, steps: usize) {
+    let mut run = Run::new(seed);
+    for step in 0..steps {
+        run.step();
+        if step % 25 == 24 {
+            run.check_all();
+        }
+    }
+    run.check_all();
+    // Every kind of operation was exercised.
+    for op in [
+        "enqueue",
+        "lease",
+        "heartbeat",
+        "complete",
+        "fail",
+        "cancel",
+        "retry",
+        "promote",
+        "delete",
+        "pause",
+        "advance",
+        "tick",
+        "purge",
+        "restart",
+    ] {
+        assert!(
+            run.ops.get(op).copied().unwrap_or(0) > 0,
+            "seed {seed} never ran {op}"
+        );
+    }
+}
+
+#[test]
+fn engine_agrees_with_the_model_seed_1() {
+    run(1, 2000);
+}
