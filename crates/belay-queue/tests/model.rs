@@ -24,9 +24,7 @@ use belay_store::vfs::{Crash, MemFs};
 use support::*;
 
 const QUEUES: [&str; 3] = ["a", "b", "c"];
-
 const LEASE: Duration = Duration::from_secs(30);
-
 const BACKOFF: Duration = Duration::from_secs(5);
 
 #[derive(Clone, Debug)]
@@ -626,4 +624,14 @@ fn run(seed: u64, steps: usize) {
 #[test]
 fn engine_agrees_with_the_model_seed_1() {
     run(1, 2000);
+}
+
+#[test]
+fn engine_agrees_with_the_model_seed_2() {
+    run(2, 1500);
+}
+
+#[test]
+fn engine_agrees_with_the_model_seed_3() {
+    run(3, 1500);
 }
