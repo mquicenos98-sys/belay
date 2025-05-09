@@ -71,3 +71,79 @@ fn an_empty_wait_times_out_with_nothing() {
     let counters = h.engine.stats().counters;
     assert_eq!((counters.lease_requests, counters.empty_leases), (1, 1));
 }
+
+#[test]
+fn an_enqueue_on_another_thread_wakes_the_poller() {
+    let h = Harness::new();
+    let poller = poll(&h.engine, "q");
+    until_waiting(&h.engine, 1);
+    h.enqueue(JobSpec::new("q", "k"));
+    let (result, elapsed) = poller.join().expect("poller thread");
+    assert_eq!(result.expect("lease"), 1);
+    assert!(elapsed < PATIENCE, "woke after {elapsed:?}");
+}
+
+#[test]
+fn a_tick_promoting_a_timer_wakes_the_poller() {
+    let h = Harness::new();
+    h.enqueue(JobSpec::new("q", "k").delay(Duration::from_secs(60)));
+    let poller = poll(&h.engine, "q");
+    until_waiting(&h.engine, 1);
+    h.secs(60);
+    assert_eq!(h.tick().promoted, 1);
+    let (result, elapsed) = poller.join().expect("poller thread");
+    assert_eq!(result.expect("lease"), 1);
+    assert!(elapsed < PATIENCE);
+}
+
+#[test]
+fn resuming_a_paused_queue_wakes_the_poller() {
+    let h = Harness::new();
+    h.engine.pause(&q("q")).expect("pause");
+    h.enqueue(JobSpec::new("q", "k"));
+    let poller = poll(&h.engine, "q");
+    until_waiting(&h.engine, 1);
+    h.engine.resume(&q("q")).expect("resume");
+    let (result, elapsed) = poller.join().expect("poller thread");
+    assert_eq!(result.expect("lease"), 1);
+    assert!(elapsed < PATIENCE);
+}
+
+#[test]
+fn freed_concurrency_wakes_the_poller() {
+    let h = Harness::new();
+    let mut config = QueueConfig::default();
+    config.max_concurrency = Some(1);
+    h.engine.set_config(&q("q"), config).expect("config");
+    h.enqueue(JobSpec::new("q", "a"));
+    h.enqueue(JobSpec::new("q", "b"));
+    let running = h.lease_one("q");
+    let poller = poll(&h.engine, "q");
+    until_waiting(&h.engine, 1);
+    h.engine
+        .complete(&running.job.id, &CompleteRequest::new(running.token))
+        .expect("complete");
+    let (result, elapsed) = poller.join().expect("poller thread");
+    assert_eq!(result.expect("lease"), 1);
+    assert!(elapsed < PATIENCE);
+}
+
+#[test]
+fn work_in_another_queue_does_not_satisfy_the_poller() {
+    let h = Harness::new();
+    let started = Instant::now();
+    let other = {
+        let engine = Arc::clone(&h.engine);
+        thread::spawn(move || {
+            until_waiting(&engine, 1);
+            engine.enqueue(JobSpec::new("other", "k")).expect("enqueue");
+        })
+    };
+    let jobs = h
+        .engine
+        .lease(&waiting("q", Duration::from_millis(200)))
+        .expect("lease");
+    other.join().expect("enqueuer thread");
+    assert!(jobs.is_empty());
+    assert!(started.elapsed() >= Duration::from_millis(200));
+}
