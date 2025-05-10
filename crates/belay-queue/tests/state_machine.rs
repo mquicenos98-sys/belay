@@ -326,3 +326,237 @@ fn a_cancel_requested_job_whose_lease_expires_is_cancelled() {
     assert_eq!(report.expired, 1);
     assert_eq!(h.state(id), JobState::Cancelled);
 }
+
+#[test]
+fn retrying_a_dead_job_grants_fresh_attempts_and_keeps_history() {
+    let h = Harness::new();
+    let id = h.enqueue(spec().max_attempts(1));
+    let l = h.lease_one("q");
+    assert_eq!(h.fail(&l, true), JobState::Dead);
+    h.secs(100);
+    let job = h.engine.retry(&id).expect("retry");
+    assert_eq!((job.state, job.attempt), (JobState::Ready, 0));
+    assert_eq!(job.run_at, h.now());
+    assert_eq!(job.finished_at, None);
+    assert_eq!(job.errors.len(), 1);
+    let l = h.lease_one("q");
+    assert_eq!(l.job.attempt, 1);
+    h.complete(&l);
+    assert_eq!(h.state(id), JobState::Succeeded);
+}
+
+#[test]
+fn completing_records_the_result_and_runtime() {
+    let h = Harness::new();
+    let id = h.enqueue(spec());
+    let l = h.lease_one("q");
+    h.secs(3);
+    let req = CompleteRequest {
+        token: l.token,
+        result: Some(json!({"sent": true})),
+    };
+    h.engine.complete(&id, &req).expect("complete");
+    let job = h.job(id);
+    assert_eq!(job.result, Some(json!({"sent": true})));
+    assert_eq!(job.runtime(), Some(Duration::from_secs(3)));
+    assert!(job.lease.is_none());
+    // An explicit null result is kept apart from none at all.
+    let id = h.enqueue(spec());
+    let l = h.lease_one("q");
+    let req = CompleteRequest {
+        token: l.token,
+        result: Some(belay_json::Value::Null),
+    };
+    h.engine.complete(&id, &req).expect("complete");
+    assert_eq!(h.job(id).result, Some(belay_json::Value::Null));
+}
+
+#[test]
+fn promoting_makes_a_waiting_job_ready_now() {
+    let h = Harness::new();
+    let id = h.enqueue(spec().delay(Duration::from_secs(3600)));
+    h.secs(5);
+    let job = h.engine.promote(&id).expect("promote");
+    assert_eq!((job.state, job.run_at), (JobState::Ready, h.now()));
+    assert_eq!(h.lease_one("q").job.id, id);
+}
+
+#[test]
+fn lifecycle_events_are_emitted_in_order() {
+    let h = Harness::new();
+    let id = h.enqueue(spec());
+    let l = h.lease_one("q");
+    let req = HeartbeatRequest {
+        progress: Some(Progress::percent(40.0).with_message("halfway")),
+        ..HeartbeatRequest::new(l.token)
+    };
+    h.engine.heartbeat(&id, &req).expect("heartbeat");
+    assert_eq!(h.job(id).progress, req.progress);
+    h.fail(&l, true);
+    h.secs(10);
+    let l = h.lease_one("q");
+    assert_eq!(h.job(id).progress, None, "progress belongs to one attempt");
+    h.complete(&l);
+    h.engine.delete(&id).expect("delete");
+    assert_eq!(
+        h.events(),
+        [
+            "job.enqueued",
+            "worker.seen",
+            "job.started",
+            "job.progress",
+            "job.failed",
+            "job.started",
+            "job.succeeded",
+            "job.deleted"
+        ]
+    );
+}
+
+#[test]
+fn operator_events_name_what_happened() {
+    let h = Harness::new();
+    let a = h.enqueue(spec().delay(Duration::from_secs(60)));
+    h.engine.promote(&a).expect("promote");
+    h.engine.cancel(&a).expect("cancel");
+    h.engine.retry(&a).expect("retry");
+    h.engine.pause(&q("q")).expect("pause");
+    h.engine.pause(&q("q")).expect("pause again is a no-op");
+    h.engine.resume(&q("q")).expect("resume");
+    assert_eq!(
+        h.events(),
+        [
+            "job.enqueued",
+            "job.promoted",
+            "job.cancelled",
+            "job.retried",
+            "queue.paused",
+            "queue.resumed"
+        ]
+    );
+}
+
+#[test]
+fn failure_events_carry_the_error_and_the_retry_time() {
+    let h = Harness::new();
+    let id = h.enqueue(spec().max_attempts(2));
+    let l = h.lease_one("q");
+    h.sink.take();
+    h.engine
+        .fail(&id, &FailRequest::new(l.token, "connection reset"))
+        .expect("fail");
+    h.secs(10);
+    let l = h.lease_one("q");
+    h.engine
+        .fail(&id, &FailRequest::new(l.token, "still down"))
+        .expect("fail");
+    let events = h.sink.take();
+    use belay_proto::event::EventKind;
+    match &events[0] {
+        EventKind::JobFailed {
+            error,
+            retry_at,
+            attempt,
+            ..
+        } => {
+            assert_eq!((error.as_str(), *attempt), ("connection reset", 1));
+            assert_eq!(*retry_at, start() + Duration::from_secs(10));
+        }
+        other => panic!("expected job.failed, got {other:?}"),
+    }
+    match events.last() {
+        Some(EventKind::JobDead { error, attempt, .. }) => {
+            assert_eq!((error.as_str(), *attempt), ("still down", 2));
+        }
+        other => panic!("expected job.dead, got {other:?}"),
+    }
+}
+
+#[test]
+fn finished_hooks_run_once_per_terminal_transition_outside_the_lock() {
+    let h = Harness::new();
+    let seen: Arc<Mutex<Vec<(JobId, JobState)>>> = Arc::default();
+    {
+        let seen = Arc::clone(&seen);
+        let engine = Arc::downgrade(&h.engine);
+        h.engine.on_finished(move |job| {
+            // Calling back into the engine would deadlock if hooks ran
+            // under the engine lock.
+            let engine = engine.upgrade().expect("engine alive");
+            let stored = engine.get(&job.id).expect("persisted before the hook");
+            assert_eq!(stored.state, job.state);
+            seen.lock().unwrap().push((job.id, job.state));
+        });
+    }
+    let done = h.enqueue(spec());
+    let l = h.lease_one("q");
+    h.complete(&l);
+    let dead = h.enqueue(spec());
+    let l = h.lease_one("q");
+    h.fail(&l, false);
+    let cancelled = h.enqueue(spec());
+    h.engine.cancel(&cancelled).expect("cancel");
+    let expired = h.enqueue(spec().max_attempts(1));
+    h.lease_one("q");
+    h.secs(30);
+    h.tick();
+    let retried = h.enqueue(spec());
+    let l = h.lease_one("q");
+    h.fail(&l, true);
+
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(
+        seen,
+        [
+            (done, JobState::Succeeded),
+            (dead, JobState::Dead),
+            (cancelled, JobState::Cancelled),
+            (expired, JobState::Dead),
+        ]
+    );
+    assert_eq!(h.state(retried), JobState::Retrying, "not finished");
+}
+
+#[test]
+fn a_panicking_hook_does_not_break_the_operation_or_other_hooks() {
+    let h = Harness::new();
+    let calls = Arc::new(Mutex::new(0));
+    h.engine.on_finished(|_| panic!("hook bug"));
+    {
+        let calls = Arc::clone(&calls);
+        h.engine.on_finished(move |_| *calls.lock().unwrap() += 1);
+    }
+    let id = h.enqueue(spec());
+    h.engine
+        .cancel(&id)
+        .expect("cancel succeeds despite the hook");
+    assert_eq!(*calls.lock().unwrap(), 1);
+    assert_eq!(h.state(id), JobState::Cancelled);
+}
+
+#[test]
+fn stale_tokens_are_refused_after_the_job_moves_on() {
+    let h = Harness::new();
+    let id = h.enqueue(spec());
+    let first = h.lease_one("q");
+    h.secs(30);
+    h.tick();
+    h.secs(10);
+    let second = h.lease_one("q");
+    assert_ne!(first.token, second.token);
+    for result in [
+        h.engine
+            .complete(&id, &CompleteRequest::new(first.token))
+            .map(drop),
+        h.engine
+            .heartbeat(&id, &HeartbeatRequest::new(first.token))
+            .map(drop),
+        h.engine
+            .fail(&id, &FailRequest::new(first.token, "late"))
+            .map(drop),
+    ] {
+        assert!(matches!(result, Err(Error::LeaseLost(got)) if got == id));
+    }
+    h.complete(&second);
+    assert_eq!(h.engine.stats().counters.lease_lost, 3);
+}
