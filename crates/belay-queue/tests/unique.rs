@@ -249,3 +249,85 @@ fn a_rejected_spec_fails_the_whole_batch() {
     assert_eq!(h.engine.stats().counters, before.counters);
     h.assert_consistent();
 }
+
+#[test]
+fn retrying_a_dead_job_does_not_reclaim_its_key() {
+    let h = Harness::new();
+    let id = h.enqueue(until_finished("k").max_attempts(1));
+    let l = h.lease_one("q");
+    h.fail(&l, true);
+    let newer = h.enqueue(until_finished("k"));
+    h.engine.retry(&id).expect("retry");
+    assert_eq!(
+        h.engine.enqueue(until_finished("k")).expect("enqueue").id,
+        newer
+    );
+    // Finishing the retried job leaves the newer claim in place.
+    let leased = h.lease("q", 2);
+    for l in &leased {
+        if l.job.id == id {
+            h.complete(l);
+        }
+    }
+    assert_eq!(
+        h.engine.enqueue(until_finished("k")).expect("enqueue").id,
+        newer
+    );
+    h.assert_consistent();
+}
+
+#[test]
+fn claims_survive_a_restart() {
+    let mut h = Harness::new();
+    let held = h.enqueue(until_finished("held"));
+    let timed = h.enqueue(keyed(
+        "timed",
+        UniqueScope::For(Duration::from_secs(60)),
+        OnConflict::ReturnExisting,
+    ));
+    // Same priority and time: the older id goes first.
+    for l in h.lease("q", 2) {
+        h.complete(&l);
+    }
+    h.reopen();
+    h.assert_consistent();
+    let dup = h
+        .engine
+        .enqueue(keyed(
+            "timed",
+            UniqueScope::For(Duration::from_secs(60)),
+            OnConflict::ReturnExisting,
+        ))
+        .expect("enqueue");
+    assert_eq!(dup.id, timed, "timed claims hold after completion");
+    let again = h.engine.enqueue(until_finished("held")).expect("enqueue");
+    assert_eq!(
+        again.status,
+        EnqueueStatus::Created,
+        "released on completion"
+    );
+    assert_ne!(again.id, held);
+    h.secs(60);
+    assert_eq!(h.tick().claims_released, 1);
+}
+
+#[test]
+fn cancelled_holders_release_their_key() {
+    let h = Harness::new();
+    let id = h.enqueue(until_finished("k"));
+    h.engine.cancel(&id).expect("cancel");
+    let next = h.engine.enqueue(until_finished("k")).expect("enqueue");
+    assert_eq!(next.status, EnqueueStatus::Created);
+    let ids: Vec<JobId> = h.all_jobs().iter().map(|j| j.id).collect();
+    assert_eq!(ids, [id, next.id]);
+}
+
+#[test]
+fn queue_stats_count_claimed_keys() {
+    let h = Harness::new();
+    h.enqueue(until_finished("a"));
+    h.enqueue(until_finished("b"));
+    h.enqueue(JobSpec::new("q", "plain"));
+    let stats = h.engine.stats();
+    assert_eq!(stats.queue("q").map(|s| s.unique_keys), Some(2));
+}
