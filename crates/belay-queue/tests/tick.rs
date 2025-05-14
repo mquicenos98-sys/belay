@@ -186,3 +186,81 @@ fn retention_works_off_a_backlog_over_several_ticks() {
     assert_eq!((third.deleted, third.backlog), (5, false));
     assert!(h.all_jobs().is_empty());
 }
+
+#[test]
+fn retention_never_touches_pending_jobs() {
+    let h = Harness::new();
+    retention(
+        &h,
+        "q",
+        Retention {
+            succeeded: Duration::ZERO,
+            dead: Duration::ZERO,
+            cancelled: Duration::ZERO,
+        },
+    );
+    let ready = h.enqueue(JobSpec::new("q", "ready"));
+    let scheduled = h.enqueue(JobSpec::new("q", "later").delay(secs(3600)));
+    h.secs(100);
+    assert_eq!(h.tick().deleted, 0);
+    assert_eq!(h.state(scheduled), JobState::Scheduled);
+    assert_eq!(h.state(ready), JobState::Ready);
+}
+
+#[test]
+fn silent_workers_are_reported_lost_and_announced_on_return() {
+    let h = Harness::with_options(
+        EngineOptions::new()
+            .worker_timeout(secs(60))
+            .worker_retention(secs(600)),
+    );
+    h.lease_from("w1", &["q"], 1);
+    h.lease_from("w2", &["q"], 1);
+    h.sink.take();
+    h.secs(30);
+    h.lease_from("w2", &["q"], 1);
+    h.secs(30);
+    let report = h.tick();
+    assert_eq!(report.workers_lost, 1);
+    match h.sink.take().as_slice() {
+        [EventKind::WorkerLost { worker, last_seen }] => {
+            assert_eq!((worker.as_str(), *last_seen), ("w1", start()));
+        }
+        other => panic!("expected one worker.lost, got {other:?}"),
+    }
+    assert_eq!(h.tick().workers_lost, 0, "reported once");
+    h.lease_from("w1", &["q"], 1);
+    assert_eq!(h.events(), ["worker.seen"]);
+    // Silent past the retention period with nothing held: forgotten.
+    h.secs(3600);
+    h.tick();
+    assert!(h.engine.workers().is_empty());
+}
+
+#[test]
+fn a_worker_holding_jobs_is_not_forgotten() {
+    let h = Harness::with_options(
+        EngineOptions::new()
+            .worker_timeout(secs(60))
+            .worker_retention(secs(60)),
+    );
+    h.enqueue(JobSpec::new("q", "k").timeout(Duration::from_secs(7 * 86_400)));
+    let req = belay_proto::api::LeaseRequest::new(w("slow"), vec![q("q")])
+        .lease_for(Duration::from_secs(3600));
+    h.engine.lease(&req).expect("lease");
+    h.secs(600);
+    h.tick();
+    let workers = h.engine.workers();
+    assert_eq!(workers.len(), 1);
+    assert_eq!(workers[0].active_jobs, 1);
+}
+
+#[test]
+fn tick_uses_the_time_it_is_given() {
+    let h = Harness::new();
+    let id = h.enqueue(JobSpec::new("q", "k").delay(secs(60)));
+    // The engine clock has not moved, but the caller says it is later.
+    let report = h.engine.tick(h.now() + secs(60)).expect("tick");
+    assert_eq!(report.promoted, 1);
+    assert_eq!(h.state(id), JobState::Ready);
+}
