@@ -560,3 +560,105 @@ fn stale_tokens_are_refused_after_the_job_moves_on() {
     h.complete(&second);
     assert_eq!(h.engine.stats().counters.lease_lost, 3);
 }
+
+#[test]
+fn an_expired_lease_is_lost_even_before_the_reaper_runs() {
+    let h = Harness::new();
+    let id = h.enqueue(spec());
+    let l = h.lease_one("q");
+    h.secs(29);
+    h.heartbeat(&l);
+    h.secs(30);
+    // Valid strictly before the expiry instant.
+    let err = h
+        .engine
+        .heartbeat(&id, &HeartbeatRequest::new(l.token))
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::LeaseLost);
+    assert_eq!(h.state(id), JobState::Running, "until the reaper runs");
+    assert_eq!(h.tick().expired, 1);
+    assert_eq!(h.state(id), JobState::Retrying);
+}
+
+#[test]
+fn redacted_and_unknown_tokens_never_match() {
+    let h = Harness::new();
+    let id = h.enqueue(spec());
+    let l = h.lease_one("q");
+    let shown = h.job(id);
+    assert_eq!(
+        shown.lease.as_ref().map(|lease| lease.token),
+        Some(LeaseToken::REDACTED),
+        "reads never reveal the token"
+    );
+    for token in [LeaseToken::REDACTED, LeaseToken::new(l.token.as_u64() ^ 1)] {
+        let err = h
+            .engine
+            .complete(&id, &CompleteRequest::new(token))
+            .unwrap_err();
+        assert_eq!(err.code(), ErrorCode::LeaseLost);
+    }
+    let missing = JobId::generate();
+    let err = h
+        .engine
+        .complete(&missing, &CompleteRequest::new(l.token))
+        .unwrap_err();
+    assert!(matches!(err, Error::LeaseLost(got) if got == missing));
+}
+
+#[test]
+fn lease_expiry_fails_the_attempt_with_a_lease_expired_error() {
+    let h = Harness::new();
+    let id = h.enqueue(spec());
+    h.lease_one("q");
+    h.sink.take();
+    h.secs(30);
+    assert_eq!(h.tick().expired, 1);
+    let job = h.job(id);
+    assert_eq!(job.state, JobState::Retrying);
+    let error = job.last_error().expect("error recorded");
+    assert_eq!(error.message, "lease expired");
+    assert_eq!(error.kind.as_deref(), Some("lease_expired"));
+    assert_eq!(error.worker, Some(w("w1")));
+    assert_eq!(h.events(), ["job.expired", "job.failed"]);
+    let workers = h.engine.workers();
+    assert_eq!((workers[0].active_jobs, workers[0].failed), (0, 1));
+}
+
+#[test]
+fn heartbeats_extend_the_lease_by_its_length_without_shortening_it() {
+    let h = Harness::new();
+    let id = h.enqueue(spec());
+    let l = h.lease_one("q");
+    h.secs(20);
+    assert_eq!(
+        h.heartbeat(&l).expires_at,
+        h.now() + Duration::from_secs(30)
+    );
+    h.secs(20);
+    assert!(h.tick().is_idle(), "renewed lease has not run out");
+    let short = HeartbeatRequest {
+        extend_by: Some(Duration::from_secs(1)),
+        ..HeartbeatRequest::new(l.token)
+    };
+    let before = h.job(id).lease.expect("lease").expires_at;
+    let resp = h.engine.heartbeat(&id, &short).expect("heartbeat");
+    assert_eq!(resp.expires_at, before, "never shortened");
+    let long = HeartbeatRequest {
+        extend_by: Some(Duration::from_secs(600)),
+        ..HeartbeatRequest::new(l.token)
+    };
+    let resp = h.engine.heartbeat(&id, &long).expect("heartbeat");
+    assert_eq!(resp.expires_at, h.now() + Duration::from_secs(600));
+}
+
+#[test]
+fn cancelled_ready_jobs_leave_the_ready_order() {
+    let h = Harness::new();
+    let a = h.enqueue(spec().priority(10));
+    let b = h.enqueue(spec());
+    h.engine.cancel(&a).expect("cancel");
+    assert_eq!(h.lease_one("q").job.id, b);
+    assert!(h.lease("q", 1).is_empty());
+    h.assert_consistent();
+}
