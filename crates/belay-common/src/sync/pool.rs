@@ -151,9 +151,15 @@ impl ThreadPool {
     fn shutdown(&mut self) {
         lock(&self.shared.state).closing = true;
         self.shared.work.notify_all();
+        let current = thread::current().id();
         for handle in self.workers.drain(..) {
-            // Tasks run under catch_unwind, so a worker never panics.
-            let _ = handle.join();
+            // The last handle to a pool may be dropped by one of its own
+            // tasks; joining that worker from itself would deadlock, and it
+            // exits by itself once the queue is drained.
+            if handle.thread().id() != current {
+                // Tasks run under catch_unwind, so a worker never panics.
+                let _ = handle.join();
+            }
         }
     }
 }
@@ -330,6 +336,22 @@ mod tests {
         for _ in 0..SIZE {
             assert_eq!(rx.recv_timeout(Duration::from_secs(20)), Ok(true));
         }
+    }
+
+    #[test]
+    fn dropping_the_last_handle_inside_a_task_does_not_deadlock() {
+        let p = Arc::new(pool("selfdrop", 2));
+        let (go_tx, go_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel();
+        let inner = Arc::clone(&p);
+        p.execute(move || {
+            let _ = go_rx.recv();
+            drop(inner);
+            let _ = done_tx.send(());
+        });
+        drop(p);
+        go_tx.send(()).expect("task is waiting");
+        assert_eq!(done_rx.recv_timeout(Duration::from_secs(10)), Ok(()));
     }
 
     #[test]
