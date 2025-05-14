@@ -90,3 +90,31 @@ impl fmt::Debug for Extensions {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn values_are_keyed_by_type_not_by_value() {
+        let mut ext = Extensions::new();
+        ext.insert(1u32);
+        ext.insert(2u64);
+        ext.insert(String::from("tenant-a"));
+        assert_eq!(ext.len(), 3);
+        assert_eq!(ext.get::<u32>(), Some(&1));
+        assert_eq!(ext.get::<u64>(), Some(&2));
+        assert!(ext.contains::<String>());
+        assert!(!ext.contains::<i32>());
+        assert_eq!(ext.get::<i32>(), None);
+    }
+
+    #[test]
+    fn get_mut_updates_in_place() {
+        let mut ext = Extensions::new();
+        ext.insert(vec![1, 2]);
+        ext.get_mut::<Vec<i32>>().expect("inserted above").push(3);
+        assert_eq!(ext.get::<Vec<i32>>(), Some(&vec![1, 2, 3]));
+        assert_eq!(format!("{ext:?}"), "Extensions { len: 1 }");
+    }
+}
