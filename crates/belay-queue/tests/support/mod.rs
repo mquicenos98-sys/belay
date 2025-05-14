@@ -35,3 +35,24 @@ pub fn q(name: &'static str) -> QueueName {
 pub fn w(name: &'static str) -> WorkerId {
     WorkerId::from_static(name)
 }
+
+/// Keeps engine and store log lines out of the test output.
+pub fn quiet_logs() {
+    set_max_level(LevelFilter::Off);
+}
+
+/// A durable store on an in-memory file system that syncs every write.
+pub fn durable(fs: &MemFs) -> Arc<dyn Kv> {
+    quiet_logs();
+    let opts = Options::new()
+        .fs(fs.clone())
+        .sync(SyncPolicy::Always)
+        .manual_checkpoints();
+    Arc::new(LogKv::open(PathBuf::from("store"), opts).expect("opening the store"))
+}
+
+/// Drops a store whose file system crashed under it, keeping the expected
+/// "closing store failed" warning out of the output.
+pub fn drop_quietly<T>(value: T) {
+    CaptureLogger::new().scope(move || drop(value));
+}
