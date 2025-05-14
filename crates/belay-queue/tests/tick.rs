@@ -98,3 +98,91 @@ fn many_expired_leases_are_reaped_in_one_tick() {
     assert_eq!((info.counts.running, info.counts.retrying), (0, 10));
     h.assert_consistent();
 }
+
+#[test]
+fn finished_jobs_are_deleted_after_their_retention() {
+    let h = Harness::new();
+    retention(
+        &h,
+        "q",
+        Retention {
+            succeeded: secs(60),
+            dead: secs(600),
+            cancelled: Duration::ZERO,
+        },
+    );
+    let ok = h.enqueue(JobSpec::new("q", "ok"));
+    let l = h.lease_one("q");
+    h.complete(&l);
+    let dead = h.enqueue(JobSpec::new("q", "dead"));
+    let l = h.lease_one("q");
+    h.fail(&l, false);
+    let cancelled = h.enqueue(JobSpec::new("q", "cancelled"));
+    h.engine.cancel(&cancelled).expect("cancel");
+    h.sink.take();
+
+    assert_eq!(h.tick().deleted, 1, "zero retention deletes at once");
+    assert!(h.engine.get(&cancelled).is_err());
+    h.secs(59);
+    assert_eq!(h.tick().deleted, 0);
+    h.secs(1);
+    assert_eq!(h.tick().deleted, 1);
+    assert!(h.engine.get(&ok).is_err());
+    assert_eq!(h.state(dead), JobState::Dead);
+    h.secs(540);
+    assert_eq!(h.tick().deleted, 1);
+    assert!(h.all_jobs().is_empty());
+    let deleted: Vec<_> = h
+        .sink
+        .take()
+        .into_iter()
+        .filter(|e| matches!(e, EventKind::JobDeleted { .. }))
+        .collect();
+    assert_eq!(deleted.len(), 3);
+    h.assert_consistent();
+}
+
+#[test]
+fn shortening_retention_applies_to_jobs_already_finished() {
+    let h = Harness::new();
+    let id = h.enqueue(JobSpec::new("q", "k"));
+    let l = h.lease_one("q");
+    h.complete(&l);
+    h.secs(120);
+    assert_eq!(h.tick().deleted, 0, "default keeps succeeded jobs a day");
+    retention(
+        &h,
+        "q",
+        Retention {
+            succeeded: secs(60),
+            ..Retention::default()
+        },
+    );
+    assert_eq!(h.tick().deleted, 1);
+    assert!(h.engine.get(&id).is_err());
+}
+
+#[test]
+fn retention_works_off_a_backlog_over_several_ticks() {
+    let h = Harness::with_options(EngineOptions::new().batch_size(3).retention_per_tick(10));
+    retention(
+        &h,
+        "q",
+        Retention {
+            cancelled: secs(1),
+            ..Retention::default()
+        },
+    );
+    for i in 0..25 {
+        let id = h.enqueue(JobSpec::new("q", format!("k{i}")));
+        h.engine.cancel(&id).expect("cancel");
+    }
+    h.secs(1);
+    let first = h.tick();
+    assert_eq!((first.deleted, first.backlog), (10, true));
+    let second = h.tick();
+    assert_eq!((second.deleted, second.backlog), (10, true));
+    let third = h.tick();
+    assert_eq!((third.deleted, third.backlog), (5, false));
+    assert!(h.all_jobs().is_empty());
+}
