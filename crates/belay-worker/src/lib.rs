@@ -103,17 +103,31 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
 pub mod builtin;
-
 mod context;
-
 mod error;
-
 mod extensions;
-
 mod handler;
-
 pub mod macros;
-
 pub mod middleware;
-
 mod registry;
+mod stats;
+pub mod testing;
+mod worker;
+
+pub use context::{CancelHandle, CancelReason, JobContext};
+pub use error::{Error, Result};
+pub use extensions::Extensions;
+pub use handler::{failure_kind, handler_fn, FnHandler, Handler, HandlerError, Outcome};
+pub use middleware::Middleware;
+pub use registry::{KindOptions, Registry};
+pub use stats::WorkerStats;
+pub use worker::{
+    default_worker_id, StatsHandle, Worker, WorkerConfig, WorkerHandle, WorkerReport,
+    MAX_CONCURRENCY,
+};
+
+/// Implementation details of the `job_*` macros. Not public API.
+#[doc(hidden)]
+pub mod __private {
+    pub use belay_common::log;
+}
