@@ -325,3 +325,211 @@ fn indexes_are_rebuilt_from_thousands_of_jobs() {
         "every ready job is leasable after the rebuild"
     );
 }
+
+#[test]
+fn a_failed_write_leaves_the_engine_unchanged() {
+    let flaky = Arc::new(FlakyKv::new());
+    let h = Harness::on(flaky.clone(), EngineOptions::new());
+    let ready = h.enqueue(JobSpec::new("q", "ready"));
+    let running_id = h.enqueue(JobSpec::new("q", "running").priority(1));
+    let running = h.lease_one("q");
+    assert_eq!(running.job.id, running_id);
+    h.sink.take();
+    let before = snapshot(&h);
+    let counters = h.engine.stats().counters;
+
+    flaky.fail_writes(true);
+    let err = h.engine.enqueue(JobSpec::new("fresh", "k")).unwrap_err();
+    assert!(matches!(err, Error::Store(_)));
+    assert_eq!(err.code(), ErrorCode::Unavailable);
+    assert!(h
+        .engine
+        .lease(&belay_proto::api::LeaseRequest::new(w("w2"), vec![q("q")]))
+        .is_err());
+    assert!(h
+        .engine
+        .complete(&running.job.id, &CompleteRequest::new(running.token))
+        .is_err());
+    assert!(h.engine.cancel(&ready).is_err());
+    assert!(h.engine.pause(&q("q")).is_err());
+    let later = h.secs(60);
+    assert!(h.engine.tick(later).is_err(), "expiring the lease fails");
+
+    // Compare at the time of the first snapshot: ages depend on the clock.
+    h.clock.set(start());
+    assert_eq!(snapshot(&h), before);
+    h.clock.set(later);
+    assert!(
+        h.engine.queue_info(&q("fresh")).is_err(),
+        "no queue half-created"
+    );
+    let after = h.engine.stats().counters;
+    assert_eq!(
+        (
+            after.enqueued,
+            after.leased,
+            after.succeeded,
+            after.cancelled
+        ),
+        (
+            counters.enqueued,
+            counters.leased,
+            counters.succeeded,
+            counters.cancelled
+        )
+    );
+    assert!(
+        h.events().iter().all(|e| *e == "worker.seen"),
+        "no event for an unpersisted change"
+    );
+    h.assert_consistent();
+
+    flaky.fail_writes(false);
+    // The expired lease is reaped now; the ready job is still there.
+    assert_eq!(h.tick().expired, 1);
+    let l = h.lease_one("q");
+    assert_eq!((l.job.id, l.job.attempt), (ready, 1));
+    h.assert_consistent();
+}
+
+#[test]
+fn ids_keep_increasing_across_a_restart_in_the_same_millisecond() {
+    // Regression: a freshly seeded id generator could mint an id already
+    // stored when restarted within the same millisecond, overwriting it.
+    let mut h = Harness::new();
+    let first: Vec<JobId> = (0..5).map(|_| h.enqueue(JobSpec::new("q", "k"))).collect();
+    h.reopen();
+    let second: Vec<JobId> = (0..5).map(|_| h.enqueue(JobSpec::new("q", "k"))).collect();
+    let mut all = first.clone();
+    all.extend(&second);
+    let mut sorted = all.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted, all, "ids are distinct and in creation order");
+    assert_eq!(h.all_jobs().len(), 10);
+}
+
+#[test]
+fn ids_stay_ordered_when_the_clock_steps_back() {
+    let h = Harness::new();
+    let a = h.enqueue(JobSpec::new("q", "k"));
+    h.clock.set(start() - Duration::from_secs(3600));
+    let b = h.enqueue(JobSpec::new("q", "k"));
+    assert!(b > a);
+    assert_eq!(h.job(b).created_at, h.now(), "timestamps follow the clock");
+}
+
+#[test]
+fn a_store_from_a_newer_version_is_refused() {
+    let kv: Arc<dyn Kv> = Arc::new(MemKv::new());
+    let schema = Namespace::new("qmeta").key_buf().str("schema").into_vec();
+    kv.put(&schema, b"2").expect("put");
+    let clock = belay_common::ManualClock::new(start());
+    let err = QueueEngine::open(
+        kv,
+        clock.shared(),
+        belay_proto::source::NoopSink::shared(),
+        EngineOptions::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::FailedPrecondition(_)), "{err}");
+    assert!(err.to_string().contains("format 2"), "{err}");
+}
+
+#[test]
+fn a_corrupt_job_document_stops_the_open_with_its_key() {
+    let mut h = Harness::new();
+    let id = h.enqueue(JobSpec::new("q", "k"));
+    let key = Namespace::new("job").key_buf().ulid(id.ulid()).into_vec();
+    h.kv.put(&key, b"{\"id\": 1").expect("put");
+    let err = QueueEngine::open(
+        Arc::clone(&h.kv),
+        h.clock.shared(),
+        belay_proto::source::NoopSink::shared(),
+        EngineOptions::new(),
+    )
+    .unwrap_err();
+    assert!(matches!(err, Error::Corrupt { .. }), "{err}");
+    // Put it back and all is well.
+    h.kv.delete(&key).expect("delete");
+    h.reopen();
+    assert!(h.all_jobs().is_empty());
+}
+
+#[test]
+fn stale_claims_and_missing_queue_records_are_repaired_on_open() {
+    let mut h = Harness::new();
+    let id = h.enqueue(JobSpec::new("q", "k").unique("kept", UniqueScope::UntilFinished));
+    let ghost = JobId::generate();
+    let claim = |key: &str| {
+        Namespace::new("uniq")
+            .key_buf()
+            .str("q")
+            .str(key)
+            .into_vec()
+    };
+    h.kv.put(
+        &claim("stale"),
+        format!("{{\"job\":\"{ghost}\"}}").as_bytes(),
+    )
+    .expect("put");
+    let queue_key = Namespace::new("queue").key_buf().str("q").into_vec();
+    h.kv.delete(&queue_key).expect("delete");
+    h.reopen();
+    assert!(
+        h.kv.get(&claim("stale")).expect("get").is_none(),
+        "stale claim deleted"
+    );
+    assert!(h.kv.get(&claim("kept")).expect("get").is_some());
+    assert!(
+        h.kv.get(&queue_key).expect("get").is_some(),
+        "queue record restored"
+    );
+    let dup = h
+        .engine
+        .enqueue(JobSpec::new("q", "k").unique("kept", UniqueScope::UntilFinished))
+        .expect("enqueue");
+    assert_eq!(dup.id, id);
+    h.assert_consistent();
+}
+
+#[test]
+fn verify_reports_a_store_changed_behind_the_engines_back() {
+    let h = Harness::new();
+    let id = h.enqueue(JobSpec::new("q", "k"));
+    h.assert_consistent();
+    let key = Namespace::new("job").key_buf().ulid(id.ulid()).into_vec();
+    h.kv.delete(&key).expect("delete");
+    let report = h.engine.verify().expect("verify");
+    assert!(!report.is_consistent());
+    assert!(
+        report
+            .problems
+            .iter()
+            .any(|p| p.contains("indexed but not stored")),
+        "{:?}",
+        report.problems
+    );
+    // Reads report the damage instead of panicking.
+    assert!(h.engine.cancel(&id).is_err());
+}
+
+#[test]
+fn engines_in_separate_namespaces_share_a_store_without_seeing_each_other() {
+    let kv: Arc<dyn Kv> = Arc::new(MemKv::new());
+    let a = Harness::on(
+        Arc::clone(&kv),
+        EngineOptions::new().namespace(Namespace::new("a")),
+    );
+    let b = Harness::on(
+        Arc::clone(&kv),
+        EngineOptions::new().namespace(Namespace::new("b")),
+    );
+    a.enqueue(JobSpec::new("q", "from-a"));
+    assert!(b.all_jobs().is_empty());
+    assert!(b.lease("q", 1).is_empty());
+    b.enqueue(JobSpec::new("q", "from-b"));
+    assert_eq!(a.lease_one("q").job.spec.kind, "from-a");
+    a.assert_consistent();
+    b.assert_consistent();
+}
