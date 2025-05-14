@@ -39,3 +39,82 @@ pub enum Error {
 
 /// `Result` with this crate's [`Error`] as the default error type.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    pub(crate) fn config(field: &'static str, message: impl Into<String>) -> Error {
+        Error::Config {
+            field,
+            message: message.into(),
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Config { field, message } => {
+                write!(f, "invalid worker config: {field} {message}")
+            }
+            Error::NoHandlers => f.write_str("no job handlers registered"),
+            Error::DuplicateKind(kind) => {
+                write!(f, "handler for kind {kind:?} registered more than once")
+            }
+            Error::KindOptions { kind, message } => {
+                write!(f, "invalid options for kind {kind:?}: {message}")
+            }
+            Error::Spawn { thread, source } => {
+                write!(f, "cannot start thread {thread}: {source}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Spawn { source, .. } => Some(source),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn messages_name_the_problem() {
+        assert_eq!(
+            Error::config("concurrency", "must be at least 1, got 0").to_string(),
+            "invalid worker config: concurrency must be at least 1, got 0"
+        );
+        assert_eq!(
+            Error::DuplicateKind("resize".into()).to_string(),
+            r#"handler for kind "resize" registered more than once"#
+        );
+        assert_eq!(
+            Error::KindOptions {
+                kind: "resize".into(),
+                message: "concurrency must be at least 1".into(),
+            }
+            .to_string(),
+            r#"invalid options for kind "resize": concurrency must be at least 1"#
+        );
+        assert_eq!(Error::NoHandlers.to_string(), "no job handlers registered");
+    }
+
+    #[test]
+    fn spawn_errors_expose_their_cause() {
+        let err = Error::Spawn {
+            thread: "belay-worker-poll".into(),
+            source: io::Error::new(io::ErrorKind::OutOfMemory, "no stack"),
+        };
+        assert_eq!(
+            err.to_string(),
+            "cannot start thread belay-worker-poll: no stack"
+        );
+        assert!(err.source().is_some());
+        assert!(Error::NoHandlers.source().is_none());
+    }
+}
