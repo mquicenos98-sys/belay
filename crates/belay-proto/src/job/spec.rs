@@ -373,7 +373,7 @@ impl UniqueScope {
         match *self {
             UniqueScope::UntilStarted => matches!(state, JobState::Scheduled | JobState::Ready),
             UniqueScope::UntilFinished => !state.is_terminal(),
-            UniqueScope::For(period) => now <= created_at + period,
+            UniqueScope::For(period) => now < created_at + period,
         }
     }
 }
@@ -739,6 +739,23 @@ mod tests {
         assert_eq!(spec.max_attempts, Some(2));
         assert_eq!(spec.timeout, Some(Duration::from_secs(60)));
         assert_eq!(spec.retry, Some(config.default_retry));
+    }
+
+    #[test]
+    fn unique_scopes_release_at_the_documented_moment() {
+        let created = Timestamp::from_millis(0);
+        let now = Timestamp::from_millis(10_000);
+        let started = UniqueScope::UntilStarted;
+        assert!(started.holds(JobState::Scheduled, created, now));
+        assert!(started.holds(JobState::Ready, created, now));
+        assert!(!started.holds(JobState::Running, created, now));
+        assert!(!started.holds(JobState::Retrying, created, now));
+        let finished = UniqueScope::UntilFinished;
+        assert!(finished.holds(JobState::Retrying, created, now));
+        assert!(!finished.holds(JobState::Dead, created, now));
+        let timed = UniqueScope::For(Duration::from_secs(10));
+        assert!(timed.holds(JobState::Succeeded, created, Timestamp::from_millis(9_999)));
+        assert!(!timed.holds(JobState::Ready, created, now));
     }
 
     #[test]
