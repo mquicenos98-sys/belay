@@ -137,3 +137,115 @@ fn reject_fails_with_already_exists() {
     assert_eq!(api.code, ErrorCode::AlreadyExists);
     assert_eq!(api.http_status(), 409);
 }
+
+#[test]
+fn replace_cancels_a_pending_holder() {
+    let h = Harness::new();
+    let finished = Arc::new(Mutex::new(Vec::new()));
+    {
+        let finished = Arc::clone(&finished);
+        h.engine
+            .on_finished(move |job| finished.lock().unwrap().push(job.id));
+    }
+    let spec = |payload: i64| {
+        keyed("profile:9", UniqueScope::UntilFinished, OnConflict::Replace)
+            .payload(belay_json::json!({ "version": payload }))
+    };
+    let old = h.enqueue(spec(1).delay(Duration::from_secs(30)));
+    h.sink.take();
+    let new = h.engine.enqueue(spec(2)).expect("enqueue");
+    assert_eq!(new.status, EnqueueStatus::Replaced);
+    assert_eq!(h.state(old), JobState::Cancelled);
+    assert_eq!(h.events(), ["job.cancelled", "job.enqueued"]);
+    assert_eq!(*finished.lock().unwrap(), [old]);
+    let l = h.lease_one("q");
+    assert_eq!(l.job.spec.payload, belay_json::json!({"version": 2}));
+    assert_eq!(h.engine.stats().counters.replaced, 1);
+}
+
+#[test]
+fn replace_takes_the_key_of_a_purged_pending_holder() {
+    let h = Harness::new();
+    let spec = || {
+        keyed(
+            "k",
+            UniqueScope::For(Duration::from_secs(600)),
+            OnConflict::Replace,
+        )
+    };
+    let old = h.enqueue(spec());
+    assert_eq!(h.engine.purge(&q("q"), None).expect("purge"), 1);
+    let dup = h
+        .engine
+        .enqueue(keyed(
+            "k",
+            UniqueScope::For(Duration::from_secs(600)),
+            OnConflict::ReturnExisting,
+        ))
+        .expect("enqueue");
+    assert_eq!((dup.id, dup.state), (old, JobState::Ready));
+    let new = h.engine.enqueue(spec()).expect("enqueue");
+    assert_eq!(new.status, EnqueueStatus::Replaced);
+    assert_ne!(new.id, old);
+    h.assert_consistent();
+}
+
+#[test]
+fn keys_are_scoped_to_their_queue() {
+    let h = Harness::new();
+    let a = h.enqueue(until_finished("k"));
+    let other = JobSpec::new("other", "k").unique("k", UniqueScope::UntilFinished);
+    let b = h.engine.enqueue(other).expect("enqueue");
+    assert_eq!(b.status, EnqueueStatus::Created);
+    assert_ne!(a, b.id);
+}
+
+#[test]
+fn a_batch_sees_its_own_claims() {
+    let h = Harness::new();
+    let results = h
+        .engine
+        .enqueue_batch(vec![
+            until_finished("a"),
+            until_finished("b"),
+            until_finished("a"),
+            keyed("b", UniqueScope::UntilFinished, OnConflict::Replace),
+        ])
+        .expect("batch");
+    let statuses: Vec<EnqueueStatus> = results.iter().map(|r| r.status).collect();
+    assert_eq!(
+        statuses,
+        [
+            EnqueueStatus::Created,
+            EnqueueStatus::Created,
+            EnqueueStatus::Duplicate,
+            EnqueueStatus::Replaced
+        ]
+    );
+    assert_eq!(results[2].id, results[0].id);
+    assert_eq!(h.state(results[1].id), JobState::Cancelled);
+    assert_eq!(h.all_jobs().len(), 3);
+    h.assert_consistent();
+}
+
+#[test]
+fn a_rejected_spec_fails_the_whole_batch() {
+    let h = Harness::new();
+    h.enqueue(keyed(
+        "taken",
+        UniqueScope::UntilFinished,
+        OnConflict::Reject,
+    ));
+    let before = h.engine.stats();
+    let err = h
+        .engine
+        .enqueue_batch(vec![
+            JobSpec::new("q", "fine"),
+            keyed("taken", UniqueScope::UntilFinished, OnConflict::Reject),
+        ])
+        .unwrap_err();
+    assert!(matches!(err, Error::UniqueConflict { .. }));
+    assert_eq!(h.all_jobs().len(), 1, "nothing from the batch was written");
+    assert_eq!(h.engine.stats().counters, before.counters);
+    h.assert_consistent();
+}
