@@ -96,18 +96,29 @@ impl KeyRange {
         self
     }
 
-    /// Resumes a paginated scan: narrows the range to keys strictly above
-    /// `key`. Passing the last key of the previous page yields the next
-    /// page.
+    /// Resumes a paginated scan: narrows the range to keys strictly after
+    /// `key` in scan order (above it for forward scans, below it for
+    /// reverse ones). Passing the last key of the previous page yields the
+    /// next page.
     #[must_use]
     pub fn after(mut self, key: impl AsRef<[u8]>) -> KeyRange {
         let key = key.as_ref().to_vec();
-        let tighter = match &self.start {
-            Bound::Unbounded => true,
-            Bound::Included(start) | Bound::Excluded(start) => key >= *start,
-        };
-        if tighter {
-            self.start = Bound::Excluded(key);
+        if self.reverse {
+            let tighter = match &self.end {
+                Bound::Unbounded => true,
+                Bound::Included(end) | Bound::Excluded(end) => key <= *end,
+            };
+            if tighter {
+                self.end = Bound::Excluded(key);
+            }
+        } else {
+            let tighter = match &self.start {
+                Bound::Unbounded => true,
+                Bound::Included(start) | Bound::Excluded(start) => key >= *start,
+            };
+            if tighter {
+                self.start = Bound::Excluded(key);
+            }
         }
         self
     }
@@ -323,6 +334,37 @@ mod tests {
             Bound::Excluded(b"a\0\0".to_vec())
         )
         .is_empty());
+    }
+
+    #[test]
+    fn after_pages_through_a_range_in_either_direction() {
+        let keys: Vec<Vec<u8>> = (0..10u8).map(|i| vec![b'k', i]).collect();
+        let m: BTreeMap<Vec<u8>, Vec<u8>> = keys.iter().map(|k| (k.clone(), vec![])).collect();
+        for reverse in [false, true] {
+            let mut base = KeyRange::prefix(b"k").limit(3);
+            if reverse {
+                base = base.reverse();
+            }
+            let mut seen = Vec::new();
+            let mut range = base.clone();
+            loop {
+                let page = keys_of(range.scan_map(&m));
+                if page.is_empty() {
+                    break;
+                }
+                let last = page.last().expect("non-empty").clone();
+                seen.extend(page);
+                range = base.clone().after(&last);
+            }
+            let mut expected = keys.clone();
+            if reverse {
+                expected.reverse();
+            }
+            assert_eq!(seen, expected, "reverse={reverse}");
+        }
+        // `after` never widens a range.
+        let r = KeyRange::new(&b"m"[..]..).after(b"a");
+        assert_eq!(r.start_bound(), Bound::Included(&b"m"[..]));
     }
 
     #[test]
