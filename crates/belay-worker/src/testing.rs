@@ -53,3 +53,55 @@ impl JobOutcome {
         }
     }
 }
+
+#[derive(Default)]
+struct Faults {
+    down: Option<ApiError>,
+    lease_failures: u32,
+    heartbeat_failures: u32,
+    report_failures: u32,
+    latency: Duration,
+    revoked: HashSet<JobId>,
+    cancel: HashSet<JobId>,
+}
+
+struct Inner {
+    ready: VecDeque<Job>,
+    leased: HashMap<JobId, (Job, LeaseToken)>,
+    outcomes: Vec<(JobId, JobOutcome)>,
+    heartbeats: Vec<(JobId, HeartbeatRequest)>,
+    lease_calls: usize,
+    requeue: bool,
+    faults: Faults,
+    rng: Rng,
+}
+
+/// An in-memory job source. See the [module docs](self).
+///
+/// ```
+/// use std::time::Duration;
+/// use belay_proto::api::{CompleteRequest, LeaseRequest};
+/// use belay_proto::source::JobSource;
+/// use belay_proto::JobSpec;
+/// use belay_worker::testing::{JobOutcome, MemorySource};
+///
+/// let source = MemorySource::new();
+/// let id = source.push(JobSpec::new("default", "echo"));
+/// let leased = source
+///     .lease(&LeaseRequest::new("w1".parse()?, vec!["default".parse()?]))
+///     .unwrap();
+/// assert_eq!(leased[0].job.attempt, 1);
+/// source.complete(&id, &CompleteRequest::new(leased[0].token)).unwrap();
+/// assert_eq!(source.outcome(&id), Some(JobOutcome::Completed(None)));
+/// # Ok::<(), belay_proto::ParseError>(())
+/// ```
+pub struct MemorySource {
+    inner: Mutex<Inner>,
+    changed: Condvar,
+}
+
+impl Default for MemorySource {
+    fn default() -> MemorySource {
+        MemorySource::new()
+    }
+}
