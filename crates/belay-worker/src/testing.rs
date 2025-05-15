@@ -105,3 +105,197 @@ impl Default for MemorySource {
         MemorySource::new()
     }
 }
+
+impl MemorySource {
+    /// An empty source that puts retryable failures back in line.
+    #[must_use]
+    pub fn new() -> MemorySource {
+        MemorySource {
+            inner: Mutex::new(Inner {
+                ready: VecDeque::new(),
+                leased: HashMap::new(),
+                outcomes: Vec::new(),
+                heartbeats: Vec::new(),
+                lease_calls: 0,
+                requeue: true,
+                faults: Faults::default(),
+                rng: Rng::from_entropy(),
+            }),
+            changed: Condvar::new(),
+        }
+    }
+
+    /// Adds a job built from `spec`, ready at once.
+    pub fn push(&self, spec: JobSpec) -> JobId {
+        self.push_job(Job::new(JobId::generate(), spec, Timestamp::now()))
+    }
+
+    /// Adds `job` as is, made ready.
+    pub fn push_job(&self, mut job: Job) -> JobId {
+        let id = job.id;
+        job.state = JobState::Ready;
+        self.mutate(|s| s.ready.push_back(job));
+        id
+    }
+
+    /// Whether a retryable failure with attempts left puts the job back in
+    /// line (the default) or ends it.
+    pub fn set_requeue(&self, requeue: bool) {
+        self.mutate(|s| s.requeue = requeue);
+    }
+
+    /// Makes every call fail with `error` until called with `None`.
+    pub fn set_down(&self, error: Option<ApiError>) {
+        self.mutate(|s| s.faults.down = error);
+    }
+
+    /// Makes the next `n` lease calls fail with `unavailable`.
+    pub fn fail_next_leases(&self, n: u32) {
+        self.mutate(|s| s.faults.lease_failures = n);
+    }
+
+    /// Makes the next `n` heartbeat calls fail with `unavailable`.
+    pub fn fail_next_heartbeats(&self, n: u32) {
+        self.mutate(|s| s.faults.heartbeat_failures = n);
+    }
+
+    /// Makes the next `n` complete or fail calls fail with `unavailable`.
+    pub fn fail_next_reports(&self, n: u32) {
+        self.mutate(|s| s.faults.report_failures = n);
+    }
+
+    /// Delays every call by `d`.
+    pub fn set_latency(&self, d: Duration) {
+        self.mutate(|s| s.faults.latency = d);
+    }
+
+    /// Takes the lease on `id` away, as if it had expired and gone to
+    /// another worker: every later call about it fails with `lease_lost`.
+    pub fn revoke_lease(&self, id: &JobId) {
+        self.mutate(|s| {
+            s.leased.remove(id);
+            s.faults.revoked.insert(*id);
+        });
+    }
+
+    /// Marks `id` as cancel-requested; heartbeats say so from now on.
+    pub fn request_cancel(&self, id: &JobId) {
+        self.mutate(|s| {
+            s.faults.cancel.insert(*id);
+        });
+    }
+
+    /// Runs `f` on a consistent view of the source.
+    pub fn view<R>(&self, f: impl FnOnce(&SourceView<'_>) -> R) -> R {
+        f(&SourceView(&lock(&self.inner)))
+    }
+
+    /// Waits until `pred` holds, re-checking whenever the source changes.
+    /// Returns `false` if `timeout` passes first.
+    pub fn wait_until(
+        &self,
+        timeout: Duration,
+        mut pred: impl FnMut(&SourceView<'_>) -> bool,
+    ) -> bool {
+        let deadline = Instant::now().checked_add(timeout);
+        let mut inner = lock(&self.inner);
+        loop {
+            if pred(&SourceView(&inner)) {
+                return true;
+            }
+            let remaining = match deadline {
+                Some(d) => d.saturating_duration_since(Instant::now()),
+                None => Duration::from_secs(3600),
+            };
+            if remaining.is_zero() {
+                return false;
+            }
+            inner = wait_timeout(&self.changed, inner, remaining).0;
+        }
+    }
+
+    /// The latest outcome reported for `id`.
+    #[must_use]
+    pub fn outcome(&self, id: &JobId) -> Option<JobOutcome> {
+        self.view(|v| v.outcome(id).cloned())
+    }
+
+    /// Every outcome reported, in order.
+    #[must_use]
+    pub fn outcomes(&self) -> Vec<(JobId, JobOutcome)> {
+        lock(&self.inner).outcomes.clone()
+    }
+
+    fn mutate<R>(&self, f: impl FnOnce(&mut Inner) -> R) -> R {
+        let r = f(&mut lock(&self.inner));
+        self.changed.notify_all();
+        r
+    }
+
+    fn pause(&self) {
+        let latency = lock(&self.inner).faults.latency;
+        if !latency.is_zero() {
+            thread::sleep(latency);
+        }
+    }
+}
+
+impl Inner {
+    /// Hands out up to `req.max_jobs` jobs, queues in the order given,
+    /// highest priority first within a queue, then oldest.
+    fn take(&mut self, req: &LeaseRequest) -> Vec<LeasedJob> {
+        let now = Timestamp::now();
+        let mut out = Vec::new();
+        for queue in &req.queues {
+            while out.len() < req.max_jobs as usize {
+                let best = self
+                    .ready
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, j)| j.queue() == queue)
+                    .max_by(|(ia, a), (ib, b)| {
+                        a.spec.priority.cmp(&b.spec.priority).then(ib.cmp(ia))
+                    })
+                    .map(|(i, _)| i);
+                let Some(mut job) = best.and_then(|i| self.ready.remove(i)) else {
+                    break;
+                };
+                let token = LeaseToken::generate(&mut self.rng);
+                job.attempt += 1;
+                job.state = JobState::Running;
+                job.started_at = Some(now);
+                job.updated_at = now;
+                job.lease = Some(Lease::new(req.worker.clone(), token, now, req.lease_for));
+                self.leased.insert(job.id, (job.clone(), token));
+                out.push(LeasedJob { job, token });
+            }
+        }
+        out
+    }
+
+    /// The job leased under `token`, or `lease_lost`.
+    fn held(&mut self, id: &JobId, token: LeaseToken) -> Result<&mut Job, ApiError> {
+        if self.faults.revoked.contains(id) {
+            return Err(ApiError::lease_lost(*id));
+        }
+        match self.leased.get_mut(id) {
+            Some((job, held)) if *held == token => Ok(job),
+            _ => Err(ApiError::lease_lost(*id)),
+        }
+    }
+
+    fn check_down(&self) -> Result<(), ApiError> {
+        match &self.faults.down {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        }
+    }
+
+    fn injected(counter: &mut u32, what: &str) -> Result<(), ApiError> {
+        if *counter > 0 {
+            *counter -= 1;
+            return Err(ApiError::unavailable(format!("injected {what} failure")));
+        }
+        Ok(())
+    }
+}
