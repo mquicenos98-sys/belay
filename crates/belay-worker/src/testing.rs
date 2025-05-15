@@ -299,3 +299,101 @@ impl Inner {
         Ok(())
     }
 }
+
+impl JobSource for MemorySource {
+    fn lease(&self, req: &LeaseRequest) -> Result<Vec<LeasedJob>, ApiError> {
+        self.pause();
+        let deadline = req.wait.and_then(|w| Instant::now().checked_add(w));
+        let mut inner = lock(&self.inner);
+        inner.lease_calls += 1;
+        self.changed.notify_all();
+        inner.check_down()?;
+        Inner::injected(&mut inner.faults.lease_failures, "lease")?;
+        loop {
+            let jobs = inner.take(req);
+            let remaining = deadline.map_or(Duration::ZERO, |d| {
+                d.saturating_duration_since(Instant::now())
+            });
+            if !jobs.is_empty() || remaining.is_zero() {
+                self.changed.notify_all();
+                return Ok(jobs);
+            }
+            inner = wait_timeout(&self.changed, inner, remaining).0;
+        }
+    }
+
+    fn heartbeat(&self, id: &JobId, req: &HeartbeatRequest) -> Result<HeartbeatResponse, ApiError> {
+        self.pause();
+        let mut inner = lock(&self.inner);
+        inner.check_down()?;
+        inner.held(id, req.token)?;
+        Inner::injected(&mut inner.faults.heartbeat_failures, "heartbeat")?;
+        let now = Timestamp::now();
+        let job = inner.held(id, req.token)?;
+        if let Some(p) = &req.progress {
+            job.progress = Some(p.clone());
+        }
+        let lease_for = job.lease.as_ref().map_or(Duration::from_secs(30), |l| {
+            l.expires_at.saturating_duration_since(l.acquired_at)
+        });
+        if let Some(lease) = &mut job.lease {
+            lease.renew(now, req.extend_by.unwrap_or(lease_for));
+        }
+        let expires_at = job.lease.as_ref().map_or(now, |l| l.expires_at);
+        let cancel_requested = inner.faults.cancel.contains(id);
+        inner.heartbeats.push((*id, req.clone()));
+        self.changed.notify_all();
+        Ok(HeartbeatResponse {
+            expires_at,
+            cancel_requested,
+        })
+    }
+
+    fn complete(&self, id: &JobId, req: &CompleteRequest) -> Result<(), ApiError> {
+        self.pause();
+        let mut inner = lock(&self.inner);
+        inner.check_down()?;
+        inner.held(id, req.token)?;
+        Inner::injected(&mut inner.faults.report_failures, "report")?;
+        inner.leased.remove(id);
+        inner
+            .outcomes
+            .push((*id, JobOutcome::Completed(req.result.clone())));
+        self.changed.notify_all();
+        Ok(())
+    }
+
+    fn fail(&self, id: &JobId, req: &FailRequest) -> Result<(), ApiError> {
+        self.pause();
+        let mut inner = lock(&self.inner);
+        inner.check_down()?;
+        inner.held(id, req.token)?;
+        Inner::injected(&mut inner.faults.report_failures, "report")?;
+        let Some((mut job, _)) = inner.leased.remove(id) else {
+            return Err(ApiError::lease_lost(*id));
+        };
+        inner.outcomes.push((*id, JobOutcome::Failed(req.clone())));
+        let worker = job.lease.take().map(|l| l.worker);
+        job.record_error(req.to_job_error(Timestamp::now(), job.attempt, worker));
+        let cancelled = inner.faults.cancel.contains(id);
+        if inner.requeue && req.retryable && !cancelled && job.attempts_left() > 0 {
+            job.state = JobState::Ready;
+            job.progress = None;
+            inner.ready.push_back(job);
+        }
+        self.changed.notify_all();
+        Ok(())
+    }
+}
+
+impl fmt::Debug for MemorySource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let inner = lock(&self.inner);
+        f.debug_struct("MemorySource")
+            .field("ready", &inner.ready.len())
+            .field("leased", &inner.leased.len())
+            .field("outcomes", &inner.outcomes.len())
+            .field("lease_calls", &inner.lease_calls)
+            .finish()
+    }
+}
