@@ -252,3 +252,18 @@ impl WorkerConfig {
         Ok(())
     }
 }
+
+fn check_range(field: &'static str, d: Duration, min: Duration, max: Duration) -> Result<()> {
+    if d < min || d > max {
+        return Err(Error::config(
+            field,
+            format!(
+                "must be between {} and {}, got {}",
+                format_duration(min),
+                format_duration(max),
+                format_duration(d)
+            ),
+        ));
+    }
+    Ok(())
+}
