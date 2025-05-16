@@ -267,3 +267,37 @@ fn check_range(field: &'static str, d: Duration, min: Duration, max: Duration) -
     }
     Ok(())
 }
+
+impl fmt::Debug for WorkerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkerConfig")
+            .field("id", &self.id)
+            .field("queues", &self.queues)
+            .field("concurrency", &self.concurrency)
+            .field("lease_for", &self.lease_for)
+            .field("poll_wait", &self.poll_wait)
+            .field("poll_interval", &self.poll_interval)
+            .field("heartbeat_every", &self.heartbeat_every)
+            .field("shutdown_grace", &self.shutdown_grace)
+            .field("cancel_grace", &self.cancel_grace)
+            .field("source_backoff", &self.source_backoff)
+            .field("report_attempts", &self.report_attempts)
+            .field("logger", &self.logger.as_ref().map(|_| ".."))
+            .finish()
+    }
+}
+
+/// `host:pid`, with the host name from `HOSTNAME` or `COMPUTERNAME` (std
+/// has no portable host name call), cleaned to the characters worker ids
+/// allow. Falls back to `worker:pid`.
+#[must_use]
+pub fn default_worker_id() -> WorkerId {
+    let host = ["HOSTNAME", "COMPUTERNAME"]
+        .iter()
+        .filter_map(|var| std::env::var(var).ok())
+        .map(|h| clean_host(&h))
+        .find(|h| !h.is_empty())
+        .unwrap_or_else(|| "worker".to_owned());
+    WorkerId::new(format!("{host}:{}", std::process::id()))
+        .unwrap_or_else(|_| WorkerId::from_static("worker"))
+}
