@@ -397,3 +397,237 @@ impl fmt::Debug for MemorySource {
             .finish()
     }
 }
+
+/// A read-only view of a [`MemorySource`], for assertions.
+pub struct SourceView<'a>(&'a Inner);
+
+impl SourceView<'_> {
+    /// Completions reported.
+    #[must_use]
+    pub fn completed(&self) -> usize {
+        self.count(|o| matches!(o, JobOutcome::Completed(_)))
+    }
+
+    /// Failures reported.
+    #[must_use]
+    pub fn failed(&self) -> usize {
+        self.count(|o| matches!(o, JobOutcome::Failed(_)))
+    }
+
+    /// Outcomes reported, of either kind.
+    #[must_use]
+    pub fn reported(&self) -> usize {
+        self.0.outcomes.len()
+    }
+
+    /// The latest outcome for `id`.
+    #[must_use]
+    pub fn outcome(&self, id: &JobId) -> Option<&JobOutcome> {
+        self.0
+            .outcomes
+            .iter()
+            .rev()
+            .find(|(j, _)| j == id)
+            .map(|(_, o)| o)
+    }
+
+    /// Every outcome for `id`, oldest first.
+    #[must_use]
+    pub fn outcomes_for(&self, id: &JobId) -> Vec<&JobOutcome> {
+        self.0
+            .outcomes
+            .iter()
+            .filter(|(j, _)| j == id)
+            .map(|(_, o)| o)
+            .collect()
+    }
+
+    /// Jobs waiting to be leased.
+    #[must_use]
+    pub fn ready(&self) -> usize {
+        self.0.ready.len()
+    }
+
+    /// Jobs currently leased.
+    #[must_use]
+    pub fn leased(&self) -> usize {
+        self.0.leased.len()
+    }
+
+    /// Whether `id` is currently leased.
+    #[must_use]
+    pub fn is_leased(&self, id: &JobId) -> bool {
+        self.0.leased.contains_key(id)
+    }
+
+    /// Lease calls received, including failed ones.
+    #[must_use]
+    pub fn lease_calls(&self) -> usize {
+        self.0.lease_calls
+    }
+
+    /// Successful heartbeats received for `id`.
+    #[must_use]
+    pub fn heartbeats_for(&self, id: &JobId) -> usize {
+        self.0.heartbeats.iter().filter(|(j, _)| j == id).count()
+    }
+
+    /// Progress values delivered for `id`, in order.
+    #[must_use]
+    pub fn progress_for(&self, id: &JobId) -> Vec<&Progress> {
+        self.0
+            .heartbeats
+            .iter()
+            .filter(|(j, _)| j == id)
+            .filter_map(|(_, req)| req.progress.as_ref())
+            .collect()
+    }
+
+    fn count(&self, f: impl Fn(&JobOutcome) -> bool) -> usize {
+        self.0.outcomes.iter().filter(|(_, o)| f(o)).count()
+    }
+}
+
+impl fmt::Debug for SourceView<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SourceView")
+            .field("ready", &self.ready())
+            .field("leased", &self.leased())
+            .field("reported", &self.reported())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_proto::api::ErrorCode;
+    use belay_proto::{QueueName, WorkerId};
+
+    fn req(queues: &[&'static str], n: u32) -> LeaseRequest {
+        LeaseRequest::new(
+            WorkerId::from_static("w1"),
+            queues.iter().map(|q| QueueName::from_static(q)).collect(),
+        )
+        .max_jobs(n)
+    }
+
+    #[test]
+    fn leases_by_queue_preference_then_priority() {
+        let source = MemorySource::new();
+        let low = source.push(JobSpec::new("a", "k"));
+        let high = source.push(JobSpec::new("a", "k").priority(5));
+        let other = source.push(JobSpec::new("b", "k"));
+        let got: Vec<JobId> = source
+            .lease(&req(&["b", "a"], 3))
+            .unwrap()
+            .into_iter()
+            .map(|l| l.job.id)
+            .collect();
+        assert_eq!(got, [other, high, low]);
+        assert!(source.lease(&req(&["a", "b"], 3)).unwrap().is_empty());
+        source.view(|v| assert_eq!((v.leased(), v.ready(), v.lease_calls()), (3, 0, 2)));
+    }
+
+    #[test]
+    fn stale_tokens_and_revoked_leases_are_lost() {
+        let source = MemorySource::new();
+        let id = source.push(JobSpec::new("a", "k"));
+        let leased = source.lease(&req(&["a"], 1)).unwrap().remove(0);
+        let stale = LeaseToken::new(leased.token.as_u64() ^ 1);
+        let err = source
+            .complete(&id, &CompleteRequest::new(stale))
+            .unwrap_err();
+        assert!(err.is(ErrorCode::LeaseLost));
+        assert!(source
+            .heartbeat(&id, &HeartbeatRequest::new(leased.token))
+            .is_ok());
+        source.revoke_lease(&id);
+        let err = source
+            .heartbeat(&id, &HeartbeatRequest::new(leased.token))
+            .unwrap_err();
+        assert!(err.is(ErrorCode::LeaseLost));
+        assert!(source.outcome(&id).is_none());
+    }
+
+    #[test]
+    fn retryable_failures_requeue_until_attempts_run_out() {
+        let source = MemorySource::new();
+        let id = source.push(JobSpec::new("a", "k").max_attempts(2));
+        for attempt in 1..=2 {
+            let leased = source.lease(&req(&["a"], 1)).unwrap().remove(0);
+            assert_eq!(leased.job.attempt, attempt);
+            source
+                .fail(&id, &FailRequest::new(leased.token, "flaky"))
+                .unwrap();
+        }
+        source.view(|v| {
+            assert_eq!(v.ready(), 0, "no attempts left");
+            assert_eq!(v.outcomes_for(&id).len(), 2);
+            assert_eq!(v.failed(), 2);
+        });
+    }
+
+    #[test]
+    fn injected_faults_fire_the_requested_number_of_times() {
+        let source = MemorySource::new();
+        source.fail_next_leases(2);
+        assert!(source.lease(&req(&["a"], 1)).is_err());
+        assert!(source.lease(&req(&["a"], 1)).is_err());
+        assert!(source.lease(&req(&["a"], 1)).is_ok());
+        source.set_down(Some(ApiError::unavailable("maintenance")));
+        assert_eq!(
+            source.lease(&req(&["a"], 1)).unwrap_err().message,
+            "maintenance"
+        );
+        source.set_down(None);
+
+        let id = source.push(JobSpec::new("a", "k"));
+        let leased = source.lease(&req(&["a"], 1)).unwrap().remove(0);
+        source.fail_next_reports(1);
+        assert!(source
+            .complete(&id, &CompleteRequest::new(leased.token))
+            .is_err());
+        assert!(source
+            .complete(&id, &CompleteRequest::new(leased.token))
+            .is_ok());
+    }
+
+    #[test]
+    fn heartbeats_record_progress_and_relay_cancellation() {
+        let source = MemorySource::new();
+        let id = source.push(JobSpec::new("a", "k"));
+        let leased = source.lease(&req(&["a"], 1)).unwrap().remove(0);
+        let beat = HeartbeatRequest {
+            progress: Some(Progress::percent(40.0)),
+            ..HeartbeatRequest::new(leased.token)
+        };
+        assert!(!source.heartbeat(&id, &beat).unwrap().cancel_requested);
+        source.request_cancel(&id);
+        assert!(source.heartbeat(&id, &beat).unwrap().cancel_requested);
+        source.view(|v| {
+            assert_eq!(v.heartbeats_for(&id), 2);
+            assert_eq!(
+                v.progress_for(&id),
+                [&Progress::percent(40.0), &Progress::percent(40.0)]
+            );
+        });
+    }
+
+    #[test]
+    fn long_polls_return_when_a_job_arrives() {
+        let source = std::sync::Arc::new(MemorySource::new());
+        let pusher = {
+            let source = std::sync::Arc::clone(&source);
+            thread::spawn(move || {
+                source.wait_until(Duration::from_secs(5), |v| v.lease_calls() == 1);
+                source.push(JobSpec::new("a", "k"))
+            })
+        };
+        let got = source
+            .lease(&req(&["a"], 1).wait(Duration::from_secs(30)))
+            .unwrap();
+        let pushed = pusher.join().expect("pusher thread");
+        assert_eq!(got[0].job.id, pushed);
+    }
+}
