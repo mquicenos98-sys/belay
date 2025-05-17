@@ -301,3 +301,112 @@ pub fn default_worker_id() -> WorkerId {
     WorkerId::new(format!("{host}:{}", std::process::id()))
         .unwrap_or_else(|_| WorkerId::from_static("worker"))
 }
+
+/// Keeps what a worker id allows, drops leading punctuation and caps the
+/// length so `:pid` still fits in 128 characters.
+fn clean_host(raw: &str) -> String {
+    const MAX_HOST: usize = 100;
+    raw.trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .skip_while(|c| !c.is_ascii_alphanumeric())
+        .take(MAX_HOST)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid() -> WorkerConfig {
+        WorkerConfig::new(
+            WorkerId::from_static("w1"),
+            vec![QueueName::from_static("q")],
+        )
+    }
+
+    fn problem(config: WorkerConfig) -> String {
+        config.validate().unwrap_err().to_string()
+    }
+
+    #[test]
+    fn defaults_are_valid() {
+        assert!(WorkerConfig::default().validate().is_ok());
+        let config = valid();
+        assert_eq!(config.effective_heartbeat(), Duration::from_secs(15));
+        assert_eq!(config.max_batch(), 4);
+        assert_eq!(valid().concurrency(500).max_batch(), 100);
+    }
+
+    #[test]
+    fn rejects_bad_queue_lists() {
+        assert_eq!(
+            problem(valid().queues(vec![])),
+            "invalid worker config: queues must name at least one queue"
+        );
+        let twice = vec![QueueName::from_static("a"), QueueName::from_static("a")];
+        assert_eq!(
+            problem(valid().queues(twice)),
+            "invalid worker config: queues lists a twice"
+        );
+        let many = (0..33)
+            .map(|i| QueueName::new(format!("q{i}")).expect("valid name"))
+            .collect();
+        assert!(problem(valid().queues(many)).contains("at most 32 queues, got 33"));
+    }
+
+    #[test]
+    fn rejects_out_of_range_numbers() {
+        assert_eq!(
+            problem(valid().concurrency(0)),
+            "invalid worker config: concurrency must be between 1 and 1024, got 0"
+        );
+        assert_eq!(
+            problem(valid().lease_for(Duration::from_millis(100))),
+            "invalid worker config: lease_for must be between 1s and 1h, got 100ms"
+        );
+        assert_eq!(
+            problem(valid().poll_wait(Duration::from_secs(120))),
+            "invalid worker config: poll_wait must be between 0s and 1m, got 2m"
+        );
+        assert_eq!(
+            problem(valid().report_attempts(0)),
+            "invalid worker config: report_attempts must be at least 1, got 0"
+        );
+    }
+
+    #[test]
+    fn heartbeat_must_beat_the_lease() {
+        assert_eq!(
+            problem(valid().heartbeat_every(Duration::from_secs(30))),
+            "invalid worker config: heartbeat_every must be positive and shorter than lease_for (30s), got 30s"
+        );
+        assert!(valid().heartbeat_every(Duration::ZERO).validate().is_err());
+        let fast = valid().heartbeat_every(Duration::from_millis(10));
+        assert!(fast.validate().is_ok());
+        assert_eq!(fast.effective_heartbeat(), Duration::from_millis(10));
+    }
+
+    #[test]
+    fn host_names_are_cleaned_into_valid_worker_ids() {
+        assert_eq!(clean_host(" build box #3 "), "build-box--3");
+        assert_eq!(clean_host("--.node"), "node");
+        assert_eq!(clean_host("???"), "");
+        assert_eq!(clean_host(&"h".repeat(300)).len(), 100);
+        let id = default_worker_id();
+        assert!(id.as_str().ends_with(&format!(":{}", std::process::id())));
+    }
+
+    #[test]
+    fn debug_hides_the_logger() {
+        let config = valid().logger(Arc::new(belay_common::log::CaptureLogger::new()));
+        let text = format!("{config:?}");
+        assert!(text.contains("logger: Some(\"..\")"), "{text}");
+    }
+}
