@@ -40,10 +40,8 @@ pub const EX_TEMPFAIL: i32 = 75;
 
 /// How long to wait for the output pipes to close after the child exits.
 const PIPE_DRAIN: Duration = Duration::from_millis(250);
-
 /// Longest pause between two checks on the child.
 const MAX_POLL: Duration = Duration::from_millis(50);
-
 /// Output quoted in a failure message, at most.
 const MAX_QUOTED_OUTPUT: usize = 1024;
 
@@ -358,5 +356,298 @@ impl Handler for ShellHandler {
     fn handle(&self, ctx: &mut JobContext) -> Result<Outcome, HandlerError> {
         let command: ShellCommand = ctx.payload_as()?;
         self.run(ctx, &command)
+    }
+}
+
+/// Starts the stdin feeder and the two output readers. Returns how many
+/// readers will report on `done`.
+fn start_io(
+    child: &mut Child,
+    command: &ShellCommand,
+    stdout: &Arc<Mutex<Tail>>,
+    stderr: &Arc<Mutex<Tail>>,
+    done: &Sender<()>,
+) -> io::Result<usize> {
+    if let (Some(input), Some(mut pipe)) = (command.stdin.clone(), child.stdin.take()) {
+        // A separate thread, so a command that does not read its input
+        // cannot block us on a full pipe. Errors (the command exited or
+        // closed stdin early) are its business, not ours.
+        thread::Builder::new()
+            .name("belay-shell-stdin".to_owned())
+            .spawn(move || {
+                let _ = pipe.write_all(input.as_bytes());
+            })?;
+    }
+    let mut readers = 0;
+    if let Some(pipe) = child.stdout.take() {
+        spawn_reader("belay-shell-stdout", pipe, Arc::clone(stdout), done.clone())?;
+        readers += 1;
+    }
+    if let Some(pipe) = child.stderr.take() {
+        spawn_reader("belay-shell-stderr", pipe, Arc::clone(stderr), done.clone())?;
+        readers += 1;
+    }
+    Ok(readers)
+}
+
+fn spawn_reader(
+    name: &str,
+    mut pipe: impl Read + Send + 'static,
+    tail: Arc<Mutex<Tail>>,
+    done: Sender<()>,
+) -> io::Result<()> {
+    thread::Builder::new()
+        .name(name.to_owned())
+        .spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => lock(&tail).push(&chunk[..n]),
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            let _ = done.send(());
+        })?;
+    Ok(())
+}
+
+/// Waits for `readers` end-of-file notices, for at most `limit` in total.
+fn drain(done: &Receiver<()>, readers: usize, limit: Duration) {
+    let deadline = Instant::now() + limit;
+    for _ in 0..readers {
+        let left = deadline.saturating_duration_since(Instant::now());
+        if done.recv_timeout(left).is_err() {
+            return;
+        }
+    }
+}
+
+/// Polls the child until it exits, the timeout passes or the job is
+/// cancelled; kills it in the latter two cases.
+fn wait(
+    ctx: &JobContext,
+    child: &mut Child,
+    timeout: Option<Duration>,
+) -> Result<ExitStatus, HandlerError> {
+    let limit = timeout.and_then(|t| Instant::now().checked_add(t));
+    let mut pause = Duration::from_millis(1);
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => {}
+            Err(e) => {
+                kill(child);
+                return Err(
+                    HandlerError::retry(format!("waiting for the command failed: {e}"))
+                        .with_kind(failure_kind::IO),
+                );
+            }
+        }
+        let mut nap = pause;
+        if let (Some(limit), Some(timeout)) = (limit, timeout) {
+            let left = limit.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                kill(child);
+                return Err(HandlerError::retry(format!(
+                    "command timed out after {}",
+                    format_duration(timeout)
+                ))
+                .with_kind(failure_kind::TIMEOUT));
+            }
+            nap = nap.min(left);
+        }
+        if !ctx.sleep_or_cancel(nap) {
+            kill(child);
+            return Err(HandlerError::cancelled());
+        }
+        pause = (pause * 2).min(MAX_POLL);
+    }
+}
+
+fn kill(child: &mut Child) {
+    // Fails only if the child already exited, which is what we want.
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+fn spawn_error(program: &str, e: &io::Error) -> HandlerError {
+    let error = match e.kind() {
+        io::ErrorKind::NotFound => {
+            HandlerError::fatal(format!("cannot run {program:?}: program not found"))
+        }
+        io::ErrorKind::PermissionDenied => {
+            HandlerError::fatal(format!("cannot run {program:?}: permission denied"))
+        }
+        _ => HandlerError::retry(format!("cannot run {program:?}: {e}")),
+    };
+    error.with_kind("spawn")
+}
+
+/// Appends the end of stderr (or of stdout, if stderr is empty) to a
+/// failure message.
+fn with_output(mut message: String, stderr: &Tail, stdout: &Tail) -> String {
+    let source = if stderr.is_empty() { stdout } else { stderr };
+    let text = source.text();
+    let text = text.trim();
+    if !text.is_empty() {
+        let mut start = text.len().saturating_sub(MAX_QUOTED_OUTPUT);
+        while !text.is_char_boundary(start) {
+            start += 1;
+        }
+        message.push_str(": ");
+        message.push_str(&text[start..]);
+    }
+    message
+}
+
+/// The last `cap` bytes written to a stream.
+#[derive(Debug)]
+struct Tail {
+    buf: VecDeque<u8>,
+    cap: usize,
+    total: u64,
+}
+
+impl Tail {
+    fn new(cap: usize) -> Tail {
+        Tail {
+            buf: VecDeque::with_capacity(cap.min(8192)),
+            cap,
+            total: 0,
+        }
+    }
+
+    fn push(&mut self, data: &[u8]) {
+        self.total += data.len() as u64;
+        if data.len() >= self.cap {
+            self.buf.clear();
+            self.buf.extend(&data[data.len() - self.cap..]);
+            return;
+        }
+        let overflow = (self.buf.len() + data.len()).saturating_sub(self.cap);
+        self.buf.drain(..overflow);
+        self.buf.extend(data);
+    }
+
+    fn truncated(&self) -> bool {
+        self.total > self.buf.len() as u64
+    }
+
+    fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+
+    /// The kept bytes as text. When the start was cut off it may fall in
+    /// the middle of a UTF-8 sequence; those stray continuation bytes are
+    /// skipped rather than shown as replacement characters.
+    fn text(&self) -> String {
+        let bytes: Vec<u8> = self.buf.iter().copied().collect();
+        let start = if self.truncated() {
+            bytes
+                .iter()
+                .position(|b| b & 0xC0 != 0x80)
+                .unwrap_or(bytes.len())
+        } else {
+            0
+        };
+        String::from_utf8_lossy(&bytes[start..]).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::json;
+
+    #[test]
+    fn tail_keeps_the_last_bytes() {
+        let mut t = Tail::new(5);
+        t.push(b"abc");
+        assert_eq!((t.text().as_str(), t.truncated()), ("abc", false));
+        t.push(b"defg");
+        assert_eq!((t.text().as_str(), t.truncated()), ("cdefg", true));
+        t.push(b"0123456789");
+        assert_eq!(t.text(), "56789");
+        assert_eq!(t.total, 17);
+    }
+
+    #[test]
+    fn tail_skips_a_cut_utf8_sequence() {
+        let mut t = Tail::new(3);
+        t.push("xé€".as_bytes()); // 1 + 2 + 3 bytes; the tail is the euro sign
+        assert_eq!(t.text(), "€");
+        let mut t = Tail::new(4);
+        t.push("é€".as_bytes()); // keeps the last byte of 'é' and all of '€'
+        assert_eq!(t.text(), "€");
+    }
+
+    #[test]
+    fn a_zero_capacity_tail_keeps_nothing() {
+        let mut t = Tail::new(0);
+        t.push(b"abc");
+        assert!(t.is_empty() && t.truncated());
+        assert_eq!(t.text(), "");
+    }
+
+    #[test]
+    fn payload_round_trips() {
+        let cmd = ShellCommand::new(["prog", "arg"])
+            .env("A", "1")
+            .cwd("/tmp")
+            .stdin("input")
+            .timeout(Duration::from_secs(30))
+            .retry_on_exit(vec![75, 1]);
+        let json = cmd.to_json();
+        assert_eq!(
+            json,
+            json!({"cmd": ["prog", "arg"], "env": {"A": "1"}, "cwd": "/tmp", "stdin": "input", "timeout": "30s", "retry_on_exit": [75, 1]})
+        );
+        assert_eq!(ShellCommand::from_json(&json), Ok(cmd));
+    }
+
+    #[test]
+    fn payload_validation_names_the_field() {
+        let err = |v: Value| ShellCommand::from_json(&v).unwrap_err().to_string();
+        assert_eq!(err(json!({"cmd": []})), "$.cmd: must name a program");
+        assert_eq!(
+            err(json!({"cmd": [""]})),
+            "$.cmd: program name must not be empty"
+        );
+        assert_eq!(
+            err(json!({})),
+            r#"$: missing required field "cmd" in ShellCommand"#
+        );
+        assert!(err(json!({"cmd": ["a"], "env": {"A=B": "1"}}))
+            .starts_with("$.env: \"A=B\" is not a valid variable"));
+        assert!(err(json!({"cmd": ["a"], "timeout": 30}))
+            .starts_with("$.timeout: expected duration string"));
+        assert!(err(json!({"cmd": ["a"], "tmeout": "1s"})).contains(r#"did you mean "timeout"?"#));
+    }
+
+    #[test]
+    fn failure_messages_quote_the_end_of_the_output() {
+        let mut err = Tail::new(64);
+        let mut out = Tail::new(64);
+        out.push(b"progress\n");
+        assert_eq!(with_output("failed".into(), &err, &out), "failed: progress");
+        err.push(b"  disk full\n");
+        assert_eq!(
+            with_output("failed".into(), &err, &out),
+            "failed: disk full"
+        );
+        let empty = Tail::new(64);
+        assert_eq!(with_output("failed".into(), &empty, &empty), "failed");
+    }
+
+    #[test]
+    fn spawn_errors_distinguish_permanent_problems() {
+        let e = spawn_error("nope", &io::Error::new(io::ErrorKind::NotFound, "x"));
+        assert_eq!(e.message, r#"cannot run "nope": program not found"#);
+        assert!(!e.retryable);
+        let e = spawn_error("p", &io::Error::new(io::ErrorKind::WouldBlock, "busy"));
+        assert!(e.retryable);
+        assert_eq!(e.kind.as_deref(), Some("spawn"));
     }
 }
