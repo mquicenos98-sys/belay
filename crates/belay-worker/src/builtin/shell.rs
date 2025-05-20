@@ -201,3 +201,162 @@ pub struct ShellHandler {
     inherit_env: bool,
     retry_on_exit: Vec<i32>,
 }
+
+impl Default for ShellHandler {
+    fn default() -> ShellHandler {
+        ShellHandler::new()
+    }
+}
+
+impl ShellHandler {
+    /// Runs any program, keeps 64 KiB of each output stream, inherits the
+    /// worker's environment and retries [`EX_TEMPFAIL`].
+    #[must_use]
+    pub fn new() -> ShellHandler {
+        ShellHandler {
+            allowed: None,
+            max_output: DEFAULT_MAX_OUTPUT,
+            default_timeout: None,
+            inherit_env: true,
+            retry_on_exit: Vec::new(),
+        }
+    }
+
+    /// Only runs these programs, compared exactly with `cmd[0]` (list
+    /// `/usr/bin/convert` separately from `convert` if both are wanted).
+    /// Other programs fail permanently with kind `not_allowed`.
+    #[must_use]
+    pub fn allow<I, S>(mut self, programs: I) -> ShellHandler
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.allowed
+            .get_or_insert_with(BTreeSet::new)
+            .extend(programs.into_iter().map(Into::into));
+        self
+    }
+
+    /// Keeps the last `bytes` of stdout and of stderr.
+    #[must_use]
+    pub fn max_output(mut self, bytes: usize) -> ShellHandler {
+        self.max_output = bytes;
+        self
+    }
+
+    /// Timeout for payloads that do not set one.
+    #[must_use]
+    pub fn default_timeout(mut self, timeout: Duration) -> ShellHandler {
+        self.default_timeout = Some(timeout);
+        self
+    }
+
+    /// Starts commands with an empty environment plus the payload's `env`.
+    #[must_use]
+    pub fn clear_env(mut self) -> ShellHandler {
+        self.inherit_env = false;
+        self
+    }
+
+    /// Exit statuses retried when the payload does not say.
+    #[must_use]
+    pub fn retry_on_exit(mut self, codes: Vec<i32>) -> ShellHandler {
+        self.retry_on_exit = codes;
+        self
+    }
+
+    /// Runs `command` for the job in `ctx`.
+    pub fn run(&self, ctx: &JobContext, command: &ShellCommand) -> Result<Outcome, HandlerError> {
+        let program = command
+            .cmd
+            .first()
+            .ok_or_else(|| HandlerError::invalid_payload("$.cmd: must name a program"))?;
+        if let Some(allowed) = &self.allowed {
+            if !allowed.contains(program) {
+                return Err(HandlerError::fatal(format!(
+                    "program {program:?} is not in the allowed list"
+                ))
+                .with_kind("not_allowed"));
+            }
+        }
+
+        let mut cmd = Command::new(program);
+        cmd.args(&command.cmd[1..])
+            .stdin(if command.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if !self.inherit_env {
+            cmd.env_clear();
+        }
+        cmd.envs(&command.env);
+        if let Some(dir) = &command.cwd {
+            cmd.current_dir(dir);
+        }
+        let mut child = cmd.spawn().map_err(|e| spawn_error(program, &e))?;
+
+        let stdout = Arc::new(Mutex::new(Tail::new(self.max_output)));
+        let stderr = Arc::new(Mutex::new(Tail::new(self.max_output)));
+        let (done_tx, done_rx) = mpsc::channel();
+        let started = start_io(&mut child, command, &stdout, &stderr, &done_tx);
+        drop(done_tx);
+        let readers = match started {
+            Ok(readers) => readers,
+            Err(e) => {
+                kill(&mut child);
+                return Err(
+                    HandlerError::retry(format!("cannot start output readers: {e}"))
+                        .with_kind(failure_kind::IO),
+                );
+            }
+        };
+
+        let timeout = command.timeout.or(self.default_timeout);
+        let status = wait(ctx, &mut child, timeout);
+        drain(&done_rx, readers, PIPE_DRAIN);
+        let status = status?;
+
+        let out = lock(&stdout);
+        let err = lock(&stderr);
+        match status.code() {
+            Some(0) => Ok(Outcome::with(
+                ObjectBuilder::new()
+                    .field("exit_code", 0)
+                    .field("stdout", out.text())
+                    .field("stderr", err.text())
+                    .field_if(out.truncated(), "stdout_truncated", true)
+                    .field_if(err.truncated(), "stderr_truncated", true)
+                    .build(),
+            )),
+            Some(code) => {
+                let retry_on = command
+                    .retry_on_exit
+                    .as_deref()
+                    .unwrap_or(&self.retry_on_exit);
+                let message = with_output(format!("command exited with status {code}"), &err, &out);
+                let error = if retry_on.contains(&code) {
+                    HandlerError::retry(message)
+                } else {
+                    HandlerError::fatal(message)
+                };
+                Err(error.with_kind(format!("exit:{code}")))
+            }
+            None => Err(HandlerError::retry(with_output(
+                format!("command was terminated by a signal ({status})"),
+                &err,
+                &out,
+            ))
+            .with_kind("signal")),
+        }
+    }
+}
+
+impl Handler for ShellHandler {
+    fn handle(&self, ctx: &mut JobContext) -> Result<Outcome, HandlerError> {
+        let command: ShellCommand = ctx.payload_as()?;
+        self.run(ctx, &command)
+    }
+}
