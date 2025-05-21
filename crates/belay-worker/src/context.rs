@@ -384,3 +384,127 @@ impl fmt::Debug for JobContext {
             .finish()
     }
 }
+
+/// Cuts `s` to at most `max` bytes without splitting a character.
+pub(crate) fn truncate_at_char(s: &mut String, max: usize) {
+    if s.len() <= max {
+        return;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_common::Timestamp;
+    use belay_json::json;
+    use belay_proto::JobSpec;
+    use std::thread;
+
+    fn ctx_with(payload: Value) -> JobContext {
+        let mut job = Job::new(
+            JobId::generate(),
+            JobSpec::new("default", "test")
+                .payload(payload)
+                .max_attempts(3),
+            Timestamp::from_secs(1_700_000_000),
+        );
+        job.attempt = 2;
+        JobContext::detached(job)
+    }
+
+    #[test]
+    fn exposes_the_job_and_attempt() {
+        let ctx = ctx_with(json!({"user": 42}));
+        assert_eq!(ctx.kind(), "test");
+        assert_eq!(ctx.queue(), "default");
+        assert_eq!(ctx.attempt(), 2);
+        assert!(!ctx.is_last_attempt());
+        assert_eq!(ctx.payload()["user"], 42);
+        assert_eq!(ctx.worker(), "detached");
+        assert_eq!(ctx.deadline(), None);
+        assert_eq!(ctx.remaining(), None);
+        assert!(!ctx.is_shutting_down());
+    }
+
+    #[test]
+    fn payload_as_reports_decoding_errors_as_fatal() {
+        let ctx = ctx_with(json!({"user": "x"}));
+        let err = ctx
+            .payload_as::<std::collections::BTreeMap<String, u64>>()
+            .unwrap_err();
+        assert!(!err.retryable);
+        assert_eq!(
+            err.message,
+            r#"invalid payload: $.user: expected integer in range 0..=18446744073709551615, found string "x""#
+        );
+    }
+
+    #[test]
+    fn progress_is_clamped_and_truncated() {
+        let ctx = ctx_with(Value::Null);
+        ctx.progress(250.0, "");
+        assert_eq!(ctx.pending_progress(), Some(Progress::percent(100.0)));
+        ctx.progress(f32::NAN, "é".repeat(MAX_PROGRESS_MESSAGE_BYTES));
+        let p = ctx.pending_progress().expect("progress was set");
+        assert_eq!(p.percent, None);
+        let message = p.message.expect("message was set");
+        assert!(message.len() <= MAX_PROGRESS_MESSAGE_BYTES);
+        assert!(message.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn first_cancel_reason_sticks() {
+        let ctx = ctx_with(Value::Null);
+        assert!(ctx.check_cancelled().is_ok());
+        let handle = ctx.cancel_handle();
+        assert!(handle.cancel());
+        assert!(!ctx.signals.cancel(CancelReason::TimedOut));
+        assert!(handle.is_cancelled());
+        assert_eq!(ctx.cancel_reason(), Some(CancelReason::Requested));
+        assert!(ctx.check_cancelled().unwrap_err().is_cancellation());
+    }
+
+    #[test]
+    fn sleep_or_cancel_wakes_when_cancelled_from_another_thread() {
+        let ctx = ctx_with(Value::Null);
+        let handle = ctx.cancel_handle();
+        let canceller = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(10));
+            handle.cancel();
+        });
+        let started = Instant::now();
+        assert!(!ctx.sleep_or_cancel(Duration::from_secs(30)));
+        assert!(started.elapsed() < Duration::from_secs(10));
+        canceller.join().expect("canceller thread");
+    }
+
+    #[test]
+    fn sleep_or_cancel_completes_short_sleeps() {
+        let ctx = ctx_with(Value::Null);
+        assert!(ctx.sleep_or_cancel(Duration::from_millis(2)));
+        assert!(ctx.sleep_or_cancel(Duration::ZERO));
+    }
+
+    #[test]
+    fn deadlines_count_down_to_zero() {
+        let ctx = ctx_with(Value::Null).with_deadline(Instant::now());
+        assert_eq!(ctx.remaining(), Some(Duration::ZERO));
+        let ctx = ctx_with(Value::Null).with_deadline(Instant::now() + Duration::from_secs(60));
+        assert!(ctx.remaining().expect("deadline set") > Duration::from_secs(50));
+    }
+
+    #[test]
+    fn truncation_respects_char_boundaries() {
+        let mut s = String::from("aé");
+        truncate_at_char(&mut s, 2);
+        assert_eq!(s, "a");
+        let mut s = String::from("abc");
+        truncate_at_char(&mut s, 10);
+        assert_eq!(s, "abc");
+    }
+}
