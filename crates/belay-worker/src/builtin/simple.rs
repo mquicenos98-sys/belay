@@ -30,3 +30,47 @@ pub struct SleepHandler {
     default: Duration,
     max: Duration,
 }
+
+#[derive(Debug)]
+struct SleepPayload {
+    duration: Option<Duration>,
+}
+
+impl FromJson for SleepPayload {
+    fn from_json(value: &Value) -> Result<SleepPayload, FromJsonError> {
+        if value.is_null() {
+            return Ok(SleepPayload { duration: None });
+        }
+        let r = ObjectReader::new(value, "SleepPayload")?;
+        let payload = SleepPayload {
+            duration: r.opt_duration("for")?,
+        };
+        r.deny_unknown_fields()?;
+        Ok(payload)
+    }
+}
+
+impl SleepHandler {
+    /// Sleeps one second by default and at most an hour.
+    #[must_use]
+    pub fn new() -> SleepHandler {
+        SleepHandler {
+            default: Duration::from_secs(1),
+            max: Duration::from_secs(3600),
+        }
+    }
+
+    /// Sets the duration used when the payload has none.
+    #[must_use]
+    pub fn default_duration(mut self, d: Duration) -> SleepHandler {
+        self.default = d;
+        self
+    }
+
+    /// Rejects payloads asking for longer than `max`.
+    #[must_use]
+    pub fn max(mut self, max: Duration) -> SleepHandler {
+        self.max = max;
+        self
+    }
+}
