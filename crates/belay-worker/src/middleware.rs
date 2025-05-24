@@ -97,3 +97,74 @@ where
         (self.0)(ctx, next)
     }
 }
+
+/// Turns a closure into [`Middleware`].
+///
+/// ```
+/// use belay_worker::middleware::{middleware_fn, Next};
+/// use belay_worker::{JobContext, Registry};
+///
+/// #[derive(Debug)]
+/// struct Region(&'static str);
+///
+/// let registry = Registry::new().wrap(middleware_fn(|ctx: &mut JobContext, next: Next<'_>| {
+///     ctx.extensions_mut().insert(Region("eu-west"));
+///     next.run(ctx)
+/// }));
+/// # let _ = registry;
+/// ```
+pub fn middleware_fn<F>(f: F) -> FnMiddleware<F>
+where
+    F: Fn(&mut JobContext, Next<'_>) -> Result<Outcome, HandlerError> + Send + Sync,
+{
+    FnMiddleware(f)
+}
+
+/// Logs a line when a job starts and one when it finishes, with its
+/// duration and outcome. Failures are logged at `warn` whatever the
+/// configured level.
+#[derive(Clone, Copy, Debug)]
+pub struct LoggingMiddleware {
+    level: Level,
+}
+
+impl LoggingMiddleware {
+    /// Logs at `info`.
+    #[must_use]
+    pub fn new() -> LoggingMiddleware {
+        LoggingMiddleware { level: Level::Info }
+    }
+
+    /// Logs starts and successes at `level` instead.
+    #[must_use]
+    pub fn level(mut self, level: Level) -> LoggingMiddleware {
+        self.level = level;
+        self
+    }
+}
+
+impl Default for LoggingMiddleware {
+    fn default() -> LoggingMiddleware {
+        LoggingMiddleware::new()
+    }
+}
+
+impl Middleware for LoggingMiddleware {
+    fn call(&self, ctx: &mut JobContext, next: Next<'_>) -> Result<Outcome, HandlerError> {
+        crate::job_log!(self.level, ctx, "job started"; queue = %ctx.queue());
+        let started = Instant::now();
+        let result = next.run(ctx);
+        let duration = started.elapsed();
+        match &result {
+            Ok(_) => crate::job_log!(self.level, ctx, "job finished"; duration, outcome = "ok"),
+            Err(e) => crate::job_warn!(
+                ctx, "job failed";
+                duration,
+                error = %e,
+                retryable = e.retryable,
+                error_kind = e.kind.as_deref(),
+            ),
+        }
+        result
+    }
+}
