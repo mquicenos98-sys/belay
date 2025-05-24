@@ -125,3 +125,91 @@ pub(crate) struct Counters {
     pub(crate) report_errors: AtomicU64,
     last_error: Mutex<Option<String>>,
 }
+
+impl Counters {
+    /// Adds one to `counter`.
+    pub(crate) fn bump(counter: &AtomicU64) {
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Remembers `error` as the latest one.
+    pub(crate) fn note_error(&self, error: impl fmt::Display) {
+        let mut text = error.to_string();
+        crate::context::truncate_at_char(&mut text, MAX_LAST_ERROR_BYTES);
+        *lock(&self.last_error) = Some(text);
+    }
+
+    /// The counters as a snapshot; the caller fills in the gauges.
+    pub(crate) fn snapshot(&self) -> WorkerStats {
+        let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        WorkerStats {
+            leased: get(&self.leased),
+            succeeded: get(&self.succeeded),
+            failed: get(&self.failed),
+            retried: get(&self.retried),
+            abandoned: get(&self.abandoned),
+            panicked: get(&self.panicked),
+            timed_out: get(&self.timed_out),
+            cancelled: get(&self.cancelled),
+            handed_back: get(&self.handed_back),
+            lease_errors: get(&self.lease_errors),
+            heartbeat_errors: get(&self.heartbeat_errors),
+            report_errors: get(&self.report_errors),
+            last_error: lock(&self.last_error).clone(),
+            ..WorkerStats::default()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_shows_rare_counters_only_when_set() {
+        let mut stats = WorkerStats {
+            leased: 12,
+            succeeded: 9,
+            failed: 2,
+            retried: 1,
+            running: 1,
+            concurrency: 4,
+            ..WorkerStats::default()
+        };
+        assert_eq!(
+            stats.to_string(),
+            "leased=12 succeeded=9 failed=2 retried=1 abandoned=0 running=1/4"
+        );
+        stats.panicked = 1;
+        stats.lease_errors = 3;
+        assert!(stats.to_string().ends_with(" panicked=1 lease_errors=3"));
+    }
+
+    #[test]
+    fn derived_numbers() {
+        let stats = WorkerStats {
+            succeeded: 3,
+            failed: 2,
+            busy_slots: 5,
+            concurrency: 4,
+            ..WorkerStats::default()
+        };
+        assert_eq!(stats.finished(), 5);
+        assert_eq!(stats.idle_slots(), 0, "abandoned handlers can overcommit");
+    }
+
+    #[test]
+    fn counters_snapshot_and_abridge_errors() {
+        let counters = Counters::default();
+        Counters::bump(&counters.leased);
+        Counters::bump(&counters.leased);
+        Counters::bump(&counters.report_errors);
+        counters.note_error("x".repeat(2 * MAX_LAST_ERROR_BYTES));
+        let stats = counters.snapshot();
+        assert_eq!((stats.leased, stats.report_errors), (2, 1));
+        assert_eq!(
+            stats.last_error.map(|e| e.len()),
+            Some(MAX_LAST_ERROR_BYTES)
+        );
+    }
+}
