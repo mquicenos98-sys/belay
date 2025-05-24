@@ -106,3 +106,22 @@ impl fmt::Display for WorkerStats {
         Ok(())
     }
 }
+
+/// The worker's counters. Gauges (`running`, `busy_slots`, ...) are read
+/// from the worker's state when a snapshot is taken.
+#[derive(Debug, Default)]
+pub(crate) struct Counters {
+    pub(crate) leased: AtomicU64,
+    pub(crate) succeeded: AtomicU64,
+    pub(crate) failed: AtomicU64,
+    pub(crate) retried: AtomicU64,
+    pub(crate) abandoned: AtomicU64,
+    pub(crate) panicked: AtomicU64,
+    pub(crate) timed_out: AtomicU64,
+    pub(crate) cancelled: AtomicU64,
+    pub(crate) handed_back: AtomicU64,
+    pub(crate) lease_errors: AtomicU64,
+    pub(crate) heartbeat_errors: AtomicU64,
+    pub(crate) report_errors: AtomicU64,
+    last_error: Mutex<Option<String>>,
+}
