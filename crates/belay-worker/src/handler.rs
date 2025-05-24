@@ -63,3 +63,127 @@ impl<H: Handler + ?Sized> Handler for Box<H> {
         (**self).handle(ctx)
     }
 }
+
+/// A [`Handler`] made from a closure by [`handler_fn`].
+#[derive(Clone)]
+pub struct FnHandler<F>(F);
+
+impl<F> fmt::Debug for FnHandler<F> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("FnHandler(..)")
+    }
+}
+
+impl<F> Handler for FnHandler<F>
+where
+    F: Fn(&mut JobContext) -> Result<Outcome, HandlerError> + Send + Sync,
+{
+    fn handle(&self, ctx: &mut JobContext) -> Result<Outcome, HandlerError> {
+        (self.0)(ctx)
+    }
+}
+
+/// Turns a closure into a [`Handler`].
+///
+/// ```
+/// use belay_worker::{handler_fn, HandlerError, JobContext, Outcome};
+///
+/// let greet = handler_fn(|ctx: &mut JobContext| {
+///     let name: String = ctx.payload_as()?;
+///     if name.is_empty() {
+///         return Err(HandlerError::fatal("name must not be empty"));
+///     }
+///     Ok(Outcome::with(format!("hello, {name}")))
+/// });
+/// # let _ = greet;
+/// ```
+pub fn handler_fn<F>(f: F) -> FnHandler<F>
+where
+    F: Fn(&mut JobContext) -> Result<Outcome, HandlerError> + Send + Sync,
+{
+    FnHandler(f)
+}
+
+/// A successful attempt.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Outcome {
+    /// The job is done; the value, if any, is stored as the job's result.
+    /// `Some(Value::Null)` stores an explicit `null`.
+    Done(Option<Value>),
+}
+
+impl Outcome {
+    /// Done, without a result.
+    #[must_use]
+    pub fn done() -> Outcome {
+        Outcome::Done(None)
+    }
+
+    /// Done, with `result`.
+    #[must_use]
+    pub fn with(result: impl Into<Value>) -> Outcome {
+        Outcome::Done(Some(result.into()))
+    }
+
+    /// Done, with the JSON form of `result`.
+    #[must_use]
+    pub fn json<T: ToJson + ?Sized>(result: &T) -> Outcome {
+        Outcome::Done(Some(result.to_json()))
+    }
+
+    /// The result, if any.
+    #[must_use]
+    pub fn result(&self) -> Option<&Value> {
+        match self {
+            Outcome::Done(result) => result.as_ref(),
+        }
+    }
+
+    /// The result, owned.
+    #[must_use]
+    pub fn into_result(self) -> Option<Value> {
+        match self {
+            Outcome::Done(result) => result,
+        }
+    }
+}
+
+impl From<Value> for Outcome {
+    fn from(result: Value) -> Outcome {
+        Outcome::Done(Some(result))
+    }
+}
+
+impl From<()> for Outcome {
+    fn from((): ()) -> Outcome {
+        Outcome::done()
+    }
+}
+
+/// A failed attempt, as reported to the source in a
+/// [`FailRequest`](belay_proto::api::FailRequest).
+///
+/// ```
+/// use std::time::Duration;
+/// use belay_worker::HandlerError;
+///
+/// let throttled = HandlerError::retry("upstream answered 429")
+///     .with_kind("http_429")
+///     .retry_after(Duration::from_secs(30));
+/// assert!(throttled.retryable);
+///
+/// let bad_input = HandlerError::fatal("unknown template \"welcom\"");
+/// assert!(!bad_input.retryable);
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HandlerError {
+    /// What went wrong, for people.
+    pub message: String,
+    /// Machine-readable class, e.g. `timeout` or `http_503`. Characters
+    /// outside the allowed set are replaced when the failure is reported.
+    pub kind: Option<String>,
+    /// Whether another attempt may succeed.
+    pub retryable: bool,
+    /// Retry after exactly this long instead of the job's backoff policy.
+    pub retry_in: Option<Duration>,
+}
