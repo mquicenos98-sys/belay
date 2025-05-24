@@ -268,3 +268,97 @@ impl From<&str> for HandlerError {
         HandlerError::retry(message)
     }
 }
+
+/// I/O errors are retryable: most (refused connections, timeouts, full
+/// disks) are transient. Map the others to [`HandlerError::fatal`] by hand.
+impl From<io::Error> for HandlerError {
+    fn from(e: io::Error) -> HandlerError {
+        HandlerError::retry(e.to_string()).with_kind(failure_kind::IO)
+    }
+}
+
+impl From<FromJsonError> for HandlerError {
+    fn from(e: FromJsonError) -> HandlerError {
+        HandlerError::invalid_payload(e)
+    }
+}
+
+impl From<belay_json::Error> for HandlerError {
+    fn from(e: belay_json::Error) -> HandlerError {
+        HandlerError::invalid_payload(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::json;
+
+    #[test]
+    fn outcomes_keep_explicit_nulls_apart_from_no_result() {
+        assert_eq!(Outcome::done().result(), None);
+        assert_eq!(Outcome::with(Value::Null).result(), Some(&Value::Null));
+        assert_eq!(Outcome::from(()), Outcome::Done(None));
+        assert_eq!(
+            Outcome::json(&vec![1u8, 2]).into_result(),
+            Some(json!([1, 2]))
+        );
+        assert_eq!(
+            Outcome::from(json!({"ok": true})).result(),
+            Some(&json!({"ok": true}))
+        );
+    }
+
+    #[test]
+    fn error_constructors_set_retryability() {
+        let e = HandlerError::retry("flaky");
+        assert!(e.retryable && e.kind.is_none() && e.retry_in.is_none());
+        let e = HandlerError::fatal("broken").with_kind("config");
+        assert!(!e.retryable);
+        assert_eq!(e.kind.as_deref(), Some("config"));
+        assert_eq!(e.to_string(), "broken");
+    }
+
+    #[test]
+    fn retry_after_turns_a_fatal_error_retryable() {
+        let e = HandlerError::fatal("quota").retry_after(Duration::from_secs(60));
+        assert!(e.retryable);
+        assert_eq!(e.retry_in, Some(Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn cancellation_is_recognised_by_kind() {
+        assert!(HandlerError::cancelled().is_cancellation());
+        assert!(!HandlerError::retry("cancelled").is_cancellation());
+    }
+
+    #[test]
+    fn conversions_pick_sensible_defaults() {
+        let e: HandlerError = "boom".into();
+        assert!(e.retryable);
+        let e: HandlerError = io::Error::new(io::ErrorKind::ConnectionRefused, "refused").into();
+        assert_eq!((e.retryable, e.kind.as_deref()), (true, Some("io")));
+        let json_err = belay_json::from_str::<u8>("300").unwrap_err();
+        let e: HandlerError = json_err.into();
+        assert!(!e.retryable);
+        assert_eq!(e.kind.as_deref(), Some(failure_kind::INVALID_PAYLOAD));
+        assert_eq!(
+            e.message,
+            "invalid payload: $: expected integer in range 0..=255, found 300"
+        );
+    }
+
+    #[test]
+    fn closures_and_smart_pointers_are_handlers() {
+        fn assert_handler<H: Handler>(_: &H) {}
+        let h = handler_fn(|_: &mut JobContext| Ok(Outcome::done()));
+        assert_handler(&h);
+        assert_handler(&Arc::new(h.clone()));
+        let boxed: Box<dyn Handler> = Box::new(h);
+        assert_handler(&boxed);
+        assert_eq!(
+            format!("{:?}", handler_fn(|_: &mut JobContext| Ok(Outcome::done()))),
+            "FnHandler(..)"
+        );
+    }
+}
