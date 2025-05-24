@@ -168,3 +168,75 @@ impl Middleware for LoggingMiddleware {
         result
     }
 }
+
+/// Counters for one job kind, collected by [`TimingMiddleware`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KindTiming {
+    /// Attempts that finished (including failures and panics).
+    pub runs: u64,
+    /// Attempts that failed or panicked.
+    pub errors: u64,
+    /// Time spent in all attempts.
+    pub total: Duration,
+    /// The slowest attempt.
+    pub max: Duration,
+    /// The most recent attempt.
+    pub last: Duration,
+}
+
+impl KindTiming {
+    /// Mean attempt duration.
+    #[must_use]
+    pub fn mean(&self) -> Duration {
+        match u32::try_from(self.runs) {
+            Ok(0) => Duration::ZERO,
+            Ok(n) => self.total / n,
+            Err(_) => Duration::from_secs_f64(self.total.as_secs_f64() / self.runs as f64),
+        }
+    }
+
+    fn record(&mut self, elapsed: Duration, failed: bool) {
+        self.runs += 1;
+        self.errors += u64::from(failed);
+        self.total = self.total.saturating_add(elapsed);
+        self.max = self.max.max(elapsed);
+        self.last = elapsed;
+    }
+}
+
+/// Shared per-kind timing table; clones see the same data.
+#[derive(Clone, Debug, Default)]
+pub struct Timings {
+    kinds: Arc<Mutex<BTreeMap<String, KindTiming>>>,
+}
+
+impl Timings {
+    /// Counters for every kind seen so far.
+    #[must_use]
+    pub fn snapshot(&self) -> BTreeMap<String, KindTiming> {
+        lock(&self.kinds).clone()
+    }
+
+    /// Counters for one kind.
+    #[must_use]
+    pub fn get(&self, kind: &str) -> Option<KindTiming> {
+        lock(&self.kinds).get(kind).copied()
+    }
+
+    /// Forgets everything.
+    pub fn reset(&self) {
+        lock(&self.kinds).clear();
+    }
+
+    fn record(&self, kind: &str, elapsed: Duration, failed: bool) {
+        let mut kinds = lock(&self.kinds);
+        match kinds.get_mut(kind) {
+            Some(t) => t.record(elapsed, failed),
+            None => {
+                let mut t = KindTiming::default();
+                t.record(elapsed, failed);
+                kinds.insert(kind.to_owned(), t);
+            }
+        }
+    }
+}
