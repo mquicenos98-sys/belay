@@ -527,8 +527,8 @@ impl<T> Page<T> {
     pub fn paginate(mut items: Vec<T>, limit: u32, cursor_of: impl Fn(&T) -> Cursor) -> Page<T> {
         let limit = limit as usize;
         if items.len() > limit {
-            let next_cursor = items.last().map(cursor_of);
             items.truncate(limit);
+            let next_cursor = items.last().map(cursor_of);
             Page::new(items, next_cursor)
         } else {
             Page::last(items)
@@ -794,6 +794,23 @@ mod tests {
         assert_eq!(
             JobFilter::new().limit(5_000).effective_limit(),
             MAX_PAGE_LIMIT
+        );
+    }
+
+    #[test]
+    fn paginate_uses_one_extra_item_to_detect_more() {
+        let page = Page::paginate(vec![1u64, 2, 3], 2, |n| Cursor::from_seq(*n));
+        assert_eq!(page.items, [1, 2]);
+        assert_eq!(page.next_cursor, Some(Cursor::from_seq(2)));
+        assert!(page.has_more());
+        let last = Page::paginate(vec![1u64, 2], 2, |n| Cursor::from_seq(*n));
+        assert!(!last.has_more());
+        let v = page.clone().map(|n| n * 10).to_json();
+        assert_eq!(v["items"], belay_json::json!([10, 20]));
+        assert_eq!(Page::<u64>::from_json(&page.to_json()), Ok(page));
+        assert_eq!(
+            Page::<u64>::from_json(&belay_json::json!({})),
+            Ok(Page::default())
         );
     }
 }
