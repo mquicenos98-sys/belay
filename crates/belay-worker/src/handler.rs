@@ -187,3 +187,84 @@ pub struct HandlerError {
     /// Retry after exactly this long instead of the job's backoff policy.
     pub retry_in: Option<Duration>,
 }
+
+impl HandlerError {
+    /// A failure worth retrying (subject to the job's remaining attempts).
+    #[must_use]
+    pub fn retry(message: impl Into<String>) -> HandlerError {
+        HandlerError {
+            message: message.into(),
+            kind: None,
+            retryable: true,
+            retry_in: None,
+        }
+    }
+
+    /// A failure that no retry will fix: the job goes straight to `dead`.
+    #[must_use]
+    pub fn fatal(message: impl Into<String>) -> HandlerError {
+        HandlerError {
+            retryable: false,
+            ..HandlerError::retry(message)
+        }
+    }
+
+    /// What a cooperative handler returns after noticing
+    /// [`JobContext::is_cancelled`]. The worker replaces it with a failure
+    /// that says why the job was stopped (timed out, cancelled on request,
+    /// worker shutting down).
+    #[must_use]
+    pub fn cancelled() -> HandlerError {
+        HandlerError::retry("cancelled").with_kind(failure_kind::CANCELLED)
+    }
+
+    /// The payload did not decode; never retryable.
+    #[must_use]
+    pub fn invalid_payload(reason: impl fmt::Display) -> HandlerError {
+        HandlerError::fatal(format!("invalid payload: {reason}"))
+            .with_kind(failure_kind::INVALID_PAYLOAD)
+    }
+
+    /// Sets the machine-readable kind.
+    #[must_use]
+    pub fn with_kind(mut self, kind: impl Into<String>) -> HandlerError {
+        self.kind = Some(kind.into());
+        self
+    }
+
+    /// Asks for the next attempt after exactly `delay`. Implies retryable.
+    #[must_use]
+    pub fn retry_after(mut self, delay: Duration) -> HandlerError {
+        self.retryable = true;
+        self.retry_in = Some(delay);
+        self
+    }
+
+    /// Whether this is the error from [`cancelled`](Self::cancelled).
+    #[must_use]
+    pub fn is_cancellation(&self) -> bool {
+        self.kind.as_deref() == Some(failure_kind::CANCELLED)
+    }
+}
+
+impl fmt::Display for HandlerError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for HandlerError {}
+
+/// Plain messages are retryable, matching the protocol's default for
+/// failures that do not say otherwise.
+impl From<String> for HandlerError {
+    fn from(message: String) -> HandlerError {
+        HandlerError::retry(message)
+    }
+}
+
+impl From<&str> for HandlerError {
+    fn from(message: &str) -> HandlerError {
+        HandlerError::retry(message)
+    }
+}
