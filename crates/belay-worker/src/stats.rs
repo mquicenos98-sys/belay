@@ -59,3 +59,50 @@ pub struct WorkerStats {
     /// The most recent error from the source or a handler, abridged.
     pub last_error: Option<String>,
 }
+
+impl WorkerStats {
+    /// Executor threads not doing anything.
+    #[must_use]
+    pub fn idle_slots(&self) -> usize {
+        self.concurrency.saturating_sub(self.busy_slots)
+    }
+
+    /// Attempts that ended one way or the other.
+    #[must_use]
+    pub fn finished(&self) -> u64 {
+        self.succeeded + self.failed
+    }
+}
+
+/// `leased=12 succeeded=9 failed=2 retried=1 abandoned=0 running=1/4`,
+/// with the rarer counters only when they are non-zero.
+impl fmt::Display for WorkerStats {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "leased={} succeeded={} failed={} retried={} abandoned={} running={}/{}",
+            self.leased,
+            self.succeeded,
+            self.failed,
+            self.retried,
+            self.abandoned,
+            self.running,
+            self.concurrency
+        )?;
+        let optional = [
+            ("panicked", self.panicked),
+            ("timed_out", self.timed_out),
+            ("cancelled", self.cancelled),
+            ("handed_back", self.handed_back),
+            ("lease_errors", self.lease_errors),
+            ("heartbeat_errors", self.heartbeat_errors),
+            ("report_errors", self.report_errors),
+        ];
+        for (name, value) in optional {
+            if value > 0 {
+                write!(f, " {name}={value}")?;
+            }
+        }
+        Ok(())
+    }
+}
