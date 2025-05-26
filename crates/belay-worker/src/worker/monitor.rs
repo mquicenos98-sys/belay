@@ -71,3 +71,19 @@ pub(crate) fn heartbeat_pass(shared: &Shared) {
         warn!("heartbeats failed; leases may expire"; failed, error = %e);
     }
 }
+
+/// The source says someone else holds the job now: stop the handler and
+/// make sure nothing about the job is reported any more.
+fn lease_lost(shared: &Shared, job: &Tracked) {
+    // A job already finishing learns about the loss from its own report.
+    if job.abandon() {
+        job.signals.cancel(CancelReason::LeaseLost);
+        Counters::bump(&shared.counters.abandoned);
+        warn!(
+            "lease lost; abandoning the job, its result will be dropped";
+            job = %job.id(),
+            kind = job.kind(),
+        );
+        shared.forget(job.id());
+    }
+}
