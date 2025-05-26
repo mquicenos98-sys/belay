@@ -247,3 +247,91 @@ impl fmt::Debug for Registry {
             .finish()
     }
 }
+
+/// The failure for a job whose kind has no handler here.
+pub(crate) fn unknown_kind(kind: &str) -> HandlerError {
+    HandlerError::fatal(format!("no handler registered for kind {kind:?}"))
+        .with_kind(failure_kind::UNKNOWN_KIND)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::handler_fn;
+    use belay_common::Timestamp;
+    use belay_json::json;
+    use belay_proto::{Job, JobId, JobSpec};
+
+    fn ok() -> impl Handler {
+        handler_fn(|_: &mut JobContext| Ok(Outcome::done()))
+    }
+
+    fn ctx(kind: &str) -> JobContext {
+        JobContext::detached(Job::new(
+            JobId::generate(),
+            JobSpec::new("default", kind).payload(json!(5)),
+            Timestamp::from_secs(1),
+        ))
+    }
+
+    #[test]
+    fn run_dispatches_on_kind() {
+        let registry = Registry::new()
+            .register(
+                "double",
+                handler_fn(|ctx: &mut JobContext| {
+                    let n: i64 = ctx.payload_as()?;
+                    Ok(Outcome::with(n * 2))
+                }),
+            )
+            .register("noop", ok());
+        assert_eq!(registry.run(&mut ctx("double")), Ok(Outcome::with(10)));
+        assert_eq!(registry.run(&mut ctx("noop")), Ok(Outcome::done()));
+        assert_eq!(registry.len(), 2);
+        assert!(registry.contains("noop") && !registry.contains("nope"));
+    }
+
+    #[test]
+    fn unknown_kinds_fail_permanently_with_a_quoted_name() {
+        let err = Registry::new()
+            .register("a", ok())
+            .run(&mut ctx("x"))
+            .unwrap_err();
+        assert_eq!(err.message, r#"no handler registered for kind "x""#);
+        assert!(!err.retryable);
+        assert_eq!(err.kind.as_deref(), Some(failure_kind::UNKNOWN_KIND));
+    }
+
+    #[test]
+    fn validate_rejects_setup_mistakes() {
+        assert!(matches!(Registry::new().validate(), Err(Error::NoHandlers)));
+        let twice = Registry::new().register("a", ok()).register("a", ok());
+        assert!(matches!(twice.validate(), Err(Error::DuplicateKind(k)) if k == "a"));
+        let zero = Registry::new().register_with("a", ok(), KindOptions::new().concurrency(0));
+        assert_eq!(
+            zero.validate().unwrap_err().to_string(),
+            r#"invalid options for kind "a": concurrency must be at least 1"#
+        );
+        let instant =
+            Registry::new().register_with("a", ok(), KindOptions::new().timeout(Duration::ZERO));
+        assert!(instant.validate().is_err());
+        let unnamed = Registry::new().register("", ok());
+        assert!(unnamed.validate().is_err());
+        assert!(Registry::new().register("a", ok()).validate().is_ok());
+    }
+
+    #[test]
+    fn unlimited_kinds_are_detected() {
+        let limited = Registry::new().register_with("a", ok(), KindOptions::new().concurrency(1));
+        assert!(!limited.has_unlimited_kind());
+        assert!(limited.register("b", ok()).has_unlimited_kind());
+    }
+
+    #[test]
+    fn debug_lists_kinds_and_their_options() {
+        let registry = Registry::new().register_with("a", ok(), KindOptions::new().concurrency(3));
+        let text = format!("{registry:?}");
+        assert!(text.contains("\"a\""), "{text}");
+        assert!(text.contains("concurrency: Some(3)"), "{text}");
+    }
+}
