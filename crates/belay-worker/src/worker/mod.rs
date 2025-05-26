@@ -8,15 +8,10 @@
 //! [`Worker`].
 
 mod config;
-
 mod executor;
-
 mod monitor;
-
 mod poller;
-
 mod report;
-
 mod state;
 
 use std::fmt;
@@ -536,4 +531,74 @@ fn stop_background(shared: &Shared, stop_heartbeats: &Shutdown) {
     shared.draining.trigger();
     stop_heartbeats.trigger();
     shared.changed.notify_all();
+}
+
+/// Tells executor threads to exit once idle.
+fn close_executors(shared: &Shared) {
+    lock(&shared.state).closing = true;
+    shared.work.notify_all();
+}
+
+/// Closes the executor and joins its threads, giving busy ones up to
+/// `limit`. Returns how many were left running (detached).
+fn close_executors_within(
+    shared: &Shared,
+    handles: &mut Vec<JoinHandle<()>>,
+    limit: Duration,
+) -> usize {
+    close_executors(shared);
+    let total = handles.len();
+    let deadline = Instant::now().checked_add(limit);
+    let mut state = lock(&shared.state);
+    while state.exited < total {
+        let remaining = match deadline {
+            Some(d) => d.saturating_duration_since(Instant::now()),
+            None => Duration::from_secs(3600),
+        };
+        if remaining.is_zero() {
+            break;
+        }
+        state = wait_timeout(&shared.changed, state, remaining).0;
+    }
+    let exited = state.exited;
+    drop(state);
+    if exited >= total {
+        for handle in handles.drain(..) {
+            let _ = handle.join();
+        }
+        return 0;
+    }
+    let detached = total - exited;
+    warn!(
+        "handler threads still running at shutdown; detaching them";
+        detached,
+    );
+    for handle in handles.drain(..) {
+        if handle.is_finished() {
+            let _ = handle.join();
+        }
+    }
+    detached
+}
+
+fn spawn_named<F, T>(name: String, f: F) -> Result<JoinHandle<T>>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    thread::Builder::new()
+        .name(name.clone())
+        .spawn(f)
+        .map_err(|source| Error::Spawn {
+            thread: name,
+            source,
+        })
+}
+
+/// Runs `f` with `logger` receiving this thread's records, if configured.
+fn scoped<R>(logger: Option<&Arc<dyn Logger>>, f: impl FnOnce() -> R) -> R {
+    match logger {
+        Some(logger) => with_logger(Arc::clone(logger), f),
+        None => f(),
+    }
 }
