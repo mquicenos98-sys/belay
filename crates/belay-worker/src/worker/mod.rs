@@ -303,3 +303,237 @@ impl fmt::Debug for WorkerHandle {
             .finish()
     }
 }
+
+/// How a worker's run ended.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct WorkerReport {
+    /// Statistics at the end.
+    pub stats: WorkerStats,
+    /// How long the worker ran.
+    pub uptime: Duration,
+    /// Every running job finished within the shutdown grace period.
+    pub drained: bool,
+    /// Executor threads still inside a handler when the worker returned.
+    pub detached_threads: usize,
+}
+
+impl WorkerReport {
+    fn from_stats(stats: WorkerStats) -> WorkerReport {
+        WorkerReport {
+            stats,
+            ..WorkerReport::default()
+        }
+    }
+}
+
+impl fmt::Display for WorkerReport {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Milliseconds are plenty for a summary line.
+        let uptime =
+            Duration::from_millis(u64::try_from(self.uptime.as_millis()).unwrap_or(u64::MAX));
+        write!(
+            f,
+            "ran for {}, {}",
+            belay_common::format_duration(uptime),
+            self.stats
+        )?;
+        if !self.drained {
+            f.write_str(", not drained")?;
+        }
+        if self.detached_threads > 0 {
+            write!(f, ", {} handler threads detached", self.detached_threads)?;
+        }
+        Ok(())
+    }
+}
+
+/// The worker's threads, as started.
+struct Threads {
+    started: Instant,
+    executors: Vec<JoinHandle<()>>,
+    watchdog: Option<JoinHandle<()>>,
+    heartbeat: Option<JoinHandle<()>>,
+    poller: Option<JoinHandle<()>>,
+    stop_heartbeats: Shutdown,
+}
+
+impl Threads {
+    /// Starts every thread, the poller last so nothing is leased before
+    /// the rest is up. On failure, stops what did start.
+    fn start(shared: &Arc<Shared>) -> Result<Threads> {
+        let mut threads = Threads {
+            started: Instant::now(),
+            executors: Vec::with_capacity(shared.config.concurrency),
+            watchdog: None,
+            heartbeat: None,
+            poller: None,
+            stop_heartbeats: Shutdown::new(),
+        };
+        if let Err(e) = threads.start_all(shared) {
+            threads.abort(shared);
+            return Err(e);
+        }
+        let queues: Vec<&str> = shared.config.queues.iter().map(|q| q.as_str()).collect();
+        info!(
+            "worker started";
+            worker = %shared.config.id,
+            queues = queues.join(","),
+            concurrency = shared.config.concurrency,
+            kinds = shared.registry.kinds().collect::<Vec<_>>().join(","),
+        );
+        Ok(threads)
+    }
+
+    fn start_all(&mut self, shared: &Arc<Shared>) -> Result<()> {
+        for i in 0..shared.config.concurrency {
+            let s = Arc::clone(shared);
+            self.executors
+                .push(spawn_named(format!("belay-worker-exec-{i}"), move || {
+                    scoped(s.config.logger.as_ref(), || executor::run_executor(&s));
+                })?);
+        }
+        let s = Arc::clone(shared);
+        self.watchdog = Some(spawn_named(
+            "belay-worker-watchdog".to_owned(),
+            move || {
+                scoped(s.config.logger.as_ref(), || monitor::run_watchdog(&s));
+            },
+        )?);
+        let s = Arc::clone(shared);
+        let stop = self.stop_heartbeats.clone();
+        self.heartbeat = Some(spawn_named(
+            "belay-worker-heartbeat".to_owned(),
+            move || {
+                scoped(s.config.logger.as_ref(), || {
+                    monitor::run_heartbeats(&s, &stop)
+                });
+            },
+        )?);
+        let s = Arc::clone(shared);
+        self.poller = Some(spawn_named("belay-worker-poll".to_owned(), move || {
+            scoped(s.config.logger.as_ref(), || poller::run_poller(&s));
+        })?);
+        Ok(())
+    }
+
+    /// Stops threads after a failed start. Nothing has been leased yet
+    /// (the poller starts last), so there is nothing to drain.
+    fn abort(&mut self, shared: &Shared) {
+        stop_background(shared, &self.stop_heartbeats);
+        close_executors(shared);
+        for handle in self.threads_to_join() {
+            let _ = handle.join();
+        }
+    }
+
+    fn threads_to_join(&mut self) -> Vec<JoinHandle<()>> {
+        let mut all: Vec<JoinHandle<()>> = self.executors.drain(..).collect();
+        all.extend(self.watchdog.take());
+        all.extend(self.heartbeat.take());
+        all.extend(self.poller.take());
+        all
+    }
+}
+
+/// The shutdown sequence; see [`Worker`].
+fn drain(shared: &Shared, mut threads: Threads) -> WorkerReport {
+    let config = &shared.config;
+
+    // 1. No more leases; hand back what has not started.
+    let (unstarted, held) = {
+        let mut state = lock(&shared.state);
+        state.accepting = false;
+        (state.take_unstarted(), state.jobs.len())
+    };
+    info!(
+        "worker shutting down";
+        worker = %config.id,
+        running = held.saturating_sub(unstarted.len()),
+        unstarted = unstarted.len(),
+        grace = config.shutdown_grace,
+    );
+    shared.draining.trigger();
+    shared.changed.notify_all();
+    for job in unstarted.iter().filter(|job| job.abandon()) {
+        poller::hand_back(shared, job);
+    }
+
+    // 2. Let running jobs finish.
+    let drained = wait_for_jobs(shared, config.shutdown_grace);
+
+    // 3. Fail whatever is left.
+    if !drained {
+        let rest: Vec<_> = lock(&shared.state).jobs.values().cloned().collect();
+        for job in rest {
+            // Abandon before cancelling, so a handler that stops the moment
+            // it is cancelled cannot slip in a report of its own first.
+            if job.abandon() {
+                job.signals.cancel(CancelReason::ShuttingDown);
+                Counters::bump(&shared.counters.abandoned);
+                warn!(
+                    "job still running after the shutdown grace period; handing it back";
+                    job = %job.id(),
+                    kind = job.kind(),
+                );
+                poller::hand_back(shared, &job);
+            }
+        }
+        // Jobs whose handler returned meanwhile are being reported.
+        wait_for_jobs(shared, config.cancel_grace);
+    }
+
+    // 4. Stop the other threads. The poller may be inside a long poll; it
+    // hands back whatever that returns.
+    if let Some(poller) = threads.poller.take() {
+        let _ = poller.join();
+    }
+    stop_background(shared, &threads.stop_heartbeats);
+    for handle in [threads.heartbeat.take(), threads.watchdog.take()]
+        .into_iter()
+        .flatten()
+    {
+        let _ = handle.join();
+    }
+    let detached_threads =
+        close_executors_within(shared, &mut threads.executors, config.cancel_grace);
+
+    let report = WorkerReport {
+        stats: shared.stats(),
+        uptime: threads.started.elapsed(),
+        drained,
+        detached_threads,
+    };
+    info!("worker stopped"; worker = %config.id, summary = %report);
+    report
+}
+
+/// Waits up to `limit` for the job table to empty; `true` if it did.
+fn wait_for_jobs(shared: &Shared, limit: Duration) -> bool {
+    let deadline = Instant::now().checked_add(limit);
+    let mut state = lock(&shared.state);
+    loop {
+        if state.jobs.is_empty() {
+            return true;
+        }
+        let remaining = match deadline {
+            Some(d) => d.saturating_duration_since(Instant::now()),
+            None => Duration::from_secs(3600),
+        };
+        if remaining.is_zero() {
+            return false;
+        }
+        state = wait_timeout(&shared.changed, state, remaining).0;
+    }
+}
+
+/// Stops the heartbeat and watchdog threads.
+fn stop_background(shared: &Shared, stop_heartbeats: &Shutdown) {
+    {
+        let mut state = lock(&shared.state);
+        state.accepting = false;
+        state.stopping = true;
+    }
+    shared.draining.trigger();
+    stop_heartbeats.trigger();
+    shared.changed.notify_all();
+}
