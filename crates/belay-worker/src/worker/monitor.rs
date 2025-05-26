@@ -87,3 +87,86 @@ fn lease_lost(shared: &Shared, job: &Tracked) {
         shared.forget(job.id());
     }
 }
+
+/// Body of the watchdog thread.
+pub(crate) fn run_watchdog(shared: &Shared) {
+    let grace = shared.config.cancel_grace;
+    let mut state = lock(&shared.state);
+    loop {
+        if state.stopping {
+            return;
+        }
+        let now = Instant::now();
+        let mut next_wake: Option<Instant> = None;
+        let mut expired = Vec::new();
+        for job in state.jobs.values() {
+            if job.phase() != Phase::Running {
+                continue;
+            }
+            let Some(deadline) = job.timing().and_then(|t| t.deadline) else {
+                continue;
+            };
+            let wake_at = if now < deadline {
+                deadline
+            } else {
+                if !job
+                    .deadline_hit
+                    .swap(true, std::sync::atomic::Ordering::SeqCst)
+                {
+                    Counters::bump(&shared.counters.timed_out);
+                    job.signals.cancel(CancelReason::TimedOut);
+                    warn!(
+                        "job ran past its timeout; asking the handler to stop";
+                        job = %job.id(),
+                        kind = job.kind(),
+                        grace,
+                    );
+                }
+                match deadline.checked_add(grace) {
+                    Some(give_up) if now < give_up => give_up,
+                    Some(_) => {
+                        expired.push(Arc::clone(job));
+                        continue;
+                    }
+                    None => continue,
+                }
+            };
+            next_wake = Some(next_wake.map_or(wake_at, |w| w.min(wake_at)));
+        }
+        if !expired.is_empty() {
+            drop(state);
+            for job in expired {
+                give_up_on(shared, &job);
+            }
+            state = lock(&shared.state);
+            continue;
+        }
+        state = match next_wake {
+            Some(at) => wait_timeout(&shared.changed, state, at.saturating_duration_since(now)).0,
+            None => wait(&shared.changed, state),
+        };
+    }
+}
+
+/// Reports a timeout for a handler that ignored cancellation.
+fn give_up_on(shared: &Shared, job: &Tracked) {
+    if !job.abandon() {
+        // It returned just now; its executor reports.
+        return;
+    }
+    Counters::bump(&shared.counters.abandoned);
+    warn!(
+        "handler ignored cancellation past the grace period; reporting a timeout and abandoning it";
+        job = %job.id(),
+        kind = job.kind(),
+    );
+    let timeout = job.timing().and_then(|t| t.timeout);
+    settle(
+        shared,
+        job.id(),
+        job.token,
+        job.kind(),
+        &Report::Fail(timeout_error(timeout)),
+    );
+    shared.forget(job.id());
+}
