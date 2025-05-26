@@ -223,3 +223,83 @@ impl fmt::Debug for StatsHandle {
             .finish()
     }
 }
+
+/// Controls a worker started with [`Worker::spawn`].
+///
+/// Dropping the handle begins a shutdown without waiting for it; call
+/// [`stop`](Self::stop) or [`join`](Self::join) to wait and get the report.
+pub struct WorkerHandle {
+    shutdown: Shutdown,
+    stats: StatsHandle,
+    thread: Option<JoinHandle<Option<WorkerReport>>>,
+}
+
+impl WorkerHandle {
+    /// Current statistics.
+    #[must_use]
+    pub fn stats(&self) -> WorkerStats {
+        self.stats.snapshot()
+    }
+
+    /// A handle for reading statistics that outlives this one.
+    #[must_use]
+    pub fn stats_handle(&self) -> StatsHandle {
+        self.stats.clone()
+    }
+
+    /// Begins a graceful shutdown and returns at once.
+    pub fn shutdown(&self) {
+        self.shutdown.trigger();
+    }
+
+    /// Whether the worker has stopped.
+    #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.thread.as_ref().map_or(true, JoinHandle::is_finished)
+    }
+
+    /// Waits for the worker to stop (after [`shutdown`](Self::shutdown),
+    /// from this or another handle clone of the signal) and returns its
+    /// report.
+    ///
+    /// # Panics
+    ///
+    /// Re-raises a panic of the supervisor thread, which would be a bug in
+    /// this crate; handler panics never get there.
+    #[must_use]
+    pub fn join(mut self) -> WorkerReport {
+        let thread = self
+            .thread
+            .take()
+            .expect("the join handle is only taken here, and join consumes self");
+        match thread.join() {
+            Ok(Some(report)) => report,
+            // Unreachable: `spawn` only returns a handle once the threads
+            // started, and only a failed start yields `None`.
+            Ok(None) => WorkerReport::from_stats(self.stats.snapshot()),
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    /// [`shutdown`](Self::shutdown), then [`join`](Self::join).
+    #[must_use]
+    pub fn stop(self) -> WorkerReport {
+        self.shutdown();
+        self.join()
+    }
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        self.shutdown.trigger();
+    }
+}
+
+impl fmt::Debug for WorkerHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkerHandle")
+            .field("shutdown", &self.shutdown)
+            .field("finished", &self.is_finished())
+            .finish()
+    }
+}
