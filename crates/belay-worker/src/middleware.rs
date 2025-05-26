@@ -240,3 +240,228 @@ impl Timings {
         }
     }
 }
+
+/// Measures every attempt per kind.
+///
+/// ```
+/// use belay_worker::middleware::TimingMiddleware;
+/// use belay_worker::{handler_fn, JobContext, Outcome, Registry};
+///
+/// let timing = TimingMiddleware::new();
+/// let timings = timing.timings();
+/// let registry = Registry::new()
+///     .register("noop", handler_fn(|_: &mut JobContext| Ok(Outcome::done())))
+///     .wrap(timing);
+/// // ... run a worker with `registry`, then:
+/// for (kind, t) in timings.snapshot() {
+///     println!("{kind}: {} runs, mean {:?}", t.runs, t.mean());
+/// }
+/// # let _ = registry;
+/// ```
+#[derive(Clone, Debug, Default)]
+pub struct TimingMiddleware {
+    timings: Timings,
+}
+
+impl TimingMiddleware {
+    /// A middleware with an empty table.
+    #[must_use]
+    pub fn new() -> TimingMiddleware {
+        TimingMiddleware::default()
+    }
+
+    /// A handle on the table this middleware fills.
+    #[must_use]
+    pub fn timings(&self) -> Timings {
+        self.timings.clone()
+    }
+}
+
+impl Middleware for TimingMiddleware {
+    fn call(&self, ctx: &mut JobContext, next: Next<'_>) -> Result<Outcome, HandlerError> {
+        /// Records on drop, so a panicking handler still counts, as an
+        /// error, while the panic unwinds to the executor.
+        struct Record<'a> {
+            timings: &'a Timings,
+            kind: String,
+            started: Instant,
+            failed: bool,
+        }
+
+        impl Drop for Record<'_> {
+            fn drop(&mut self) {
+                let failed = self.failed || std::thread::panicking();
+                self.timings
+                    .record(&self.kind, self.started.elapsed(), failed);
+            }
+        }
+
+        let mut record = Record {
+            timings: &self.timings,
+            kind: ctx.kind().to_owned(),
+            started: Instant::now(),
+            failed: false,
+        };
+        let result = next.run(ctx);
+        record.failed = result.is_err();
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::handler_fn;
+    use crate::registry::Registry;
+    use belay_common::log::CaptureLogger;
+    use belay_common::Timestamp;
+    use belay_proto::{Job, JobId, JobSpec};
+    use std::panic::{self, AssertUnwindSafe};
+
+    fn ctx(kind: &str) -> JobContext {
+        JobContext::detached(Job::new(
+            JobId::generate(),
+            JobSpec::new("default", kind),
+            Timestamp::from_secs(1),
+        ))
+    }
+
+    fn tag(name: &'static str, log: Arc<Mutex<Vec<String>>>) -> impl Middleware {
+        middleware_fn(move |ctx: &mut JobContext, next: Next<'_>| {
+            lock(&log).push(format!("{name}:before"));
+            let result = next.run(ctx);
+            lock(&log).push(format!("{name}:after"));
+            result
+        })
+    }
+
+    #[test]
+    fn first_added_middleware_runs_outermost() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::clone(&log);
+        let registry = Registry::new()
+            .register(
+                "k",
+                handler_fn(move |_: &mut JobContext| {
+                    lock(&inner).push("handler".to_owned());
+                    Ok(Outcome::done())
+                }),
+            )
+            .wrap(tag("outer", Arc::clone(&log)))
+            .wrap(tag("inner", Arc::clone(&log)));
+        registry.run(&mut ctx("k")).expect("handler succeeds");
+        assert_eq!(
+            *lock(&log),
+            [
+                "outer:before",
+                "inner:before",
+                "handler",
+                "inner:after",
+                "outer:after"
+            ]
+        );
+    }
+
+    #[test]
+    fn middleware_can_short_circuit_and_pass_extensions() {
+        struct Budget(u32);
+        let registry = Registry::new()
+            .register(
+                "k",
+                handler_fn(|ctx: &mut JobContext| {
+                    let budget = ctx.extensions().get::<Budget>().map_or(0, |b| b.0);
+                    Ok(Outcome::with(budget))
+                }),
+            )
+            .wrap(middleware_fn(|ctx: &mut JobContext, next: Next<'_>| {
+                if ctx.payload().is_null() {
+                    ctx.extensions_mut().insert(Budget(7));
+                    next.run(ctx)
+                } else {
+                    Err(HandlerError::fatal("payloads are not accepted"))
+                }
+            }));
+        assert_eq!(registry.run(&mut ctx("k")), Ok(Outcome::with(7u32)));
+    }
+
+    #[test]
+    fn logging_middleware_logs_start_and_outcome() {
+        let registry = Registry::new()
+            .register("ok", handler_fn(|_: &mut JobContext| Ok(Outcome::done())))
+            .register(
+                "bad",
+                handler_fn(|_: &mut JobContext| {
+                    Err(HandlerError::fatal("nope").with_kind("bad_input"))
+                }),
+            )
+            .wrap(LoggingMiddleware::new().level(Level::Debug));
+        let capture = CaptureLogger::new();
+        capture.scope(|| {
+            registry.run(&mut ctx("ok")).expect("ok handler");
+            registry.run(&mut ctx("bad")).expect_err("bad handler");
+        });
+        let records = capture.records();
+        let summary: Vec<(Level, &str)> = records
+            .iter()
+            .map(|r| (r.level, r.message.as_str()))
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (Level::Debug, "job started"),
+                (Level::Debug, "job finished"),
+                (Level::Debug, "job started"),
+                (Level::Warn, "job failed"),
+            ]
+        );
+        assert_eq!(records[0].field("queue"), Some("default"));
+        assert!(records[1].field("duration").is_some());
+        assert_eq!(records[3].field("error"), Some("nope"));
+        assert_eq!(records[3].field("retryable"), Some("false"));
+        assert_eq!(records[3].field("error_kind"), Some("bad_input"));
+    }
+
+    #[test]
+    fn timing_counts_runs_errors_and_panics_per_kind() {
+        let timing = TimingMiddleware::new();
+        let timings = timing.timings();
+        let registry = Registry::new()
+            .register("ok", handler_fn(|_: &mut JobContext| Ok(Outcome::done())))
+            .register("err", handler_fn(|_: &mut JobContext| Err("flaky".into())))
+            .register(
+                "boom",
+                handler_fn(|_: &mut JobContext| panic!("handler bug")),
+            )
+            .wrap(timing);
+        registry.run(&mut ctx("ok")).expect("ok handler");
+        registry.run(&mut ctx("ok")).expect("ok handler");
+        registry.run(&mut ctx("err")).expect_err("err handler");
+        let panicked = panic::catch_unwind(AssertUnwindSafe(|| registry.run(&mut ctx("boom"))));
+        assert!(panicked.is_err());
+
+        let ok = timings.get("ok").expect("ok ran");
+        assert_eq!((ok.runs, ok.errors), (2, 0));
+        assert!(ok.max >= ok.last && ok.total >= ok.max);
+        assert_eq!(timings.get("err").map(|t| (t.runs, t.errors)), Some((1, 1)));
+        assert_eq!(
+            timings.get("boom").map(|t| (t.runs, t.errors)),
+            Some((1, 1))
+        );
+        assert_eq!(timings.snapshot().len(), 3);
+        timings.reset();
+        assert!(timings.snapshot().is_empty());
+    }
+
+    #[test]
+    fn mean_divides_total_by_runs() {
+        let mut t = KindTiming::default();
+        assert_eq!(t.mean(), Duration::ZERO);
+        t.record(Duration::from_millis(10), false);
+        t.record(Duration::from_millis(30), true);
+        assert_eq!(t.mean(), Duration::from_millis(20));
+        assert_eq!(
+            (t.max, t.last, t.errors),
+            (Duration::from_millis(30), Duration::from_millis(30), 1)
+        );
+    }
+}
