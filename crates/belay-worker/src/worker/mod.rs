@@ -192,3 +192,34 @@ impl Worker {
         }
     }
 }
+
+impl fmt::Debug for Worker {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Worker")
+            .field("config", &self.shared.config)
+            .field("registry", &self.shared.registry)
+            .finish()
+    }
+}
+
+/// Reads a worker's statistics; clones share the worker.
+#[derive(Clone)]
+pub struct StatsHandle {
+    shared: Arc<Shared>,
+}
+
+impl StatsHandle {
+    /// Current statistics.
+    #[must_use]
+    pub fn snapshot(&self) -> WorkerStats {
+        self.shared.stats()
+    }
+}
+
+impl fmt::Debug for StatsHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("StatsHandle")
+            .field("worker", &self.shared.config.id)
+            .finish()
+    }
+}
