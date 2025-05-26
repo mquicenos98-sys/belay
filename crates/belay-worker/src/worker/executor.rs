@@ -52,3 +52,63 @@ pub(crate) fn run_executor(shared: &Shared) {
         shared.changed.notify_all();
     }
 }
+
+/// Runs one job from start to report.
+fn execute(shared: &Shared, job: &Arc<Tracked>) {
+    let timeout = match (job.job.spec.timeout, job.entry.options.timeout) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a, b) => a.or(b),
+    };
+    let started = Instant::now();
+    let timing = Timing {
+        timeout,
+        deadline: timeout.and_then(|t| started.checked_add(t)),
+    };
+    if !job.begin(timing) {
+        // Abandoned (lease lost or shutdown) between leaving the ready
+        // queue and starting; whoever abandoned it has dealt with it.
+        release_kind(shared, job);
+        return;
+    }
+    // The watchdog sleeps until the nearest deadline; this may be nearer.
+    shared.changed.notify_all();
+
+    let mut ctx = JobContext::new(
+        Arc::clone(&job.job),
+        shared.config.id.clone(),
+        Arc::clone(&job.signals),
+        timing.deadline,
+        Some(shared.draining.clone()),
+    );
+    // AssertUnwindSafe: after a panic the context is dropped unused, and
+    // the handler's own shared state is the handler's business, as with
+    // any thread pool.
+    let result = panic::catch_unwind(AssertUnwindSafe(|| {
+        shared.registry.dispatch(&job.entry, &mut ctx)
+    }));
+    drop(ctx);
+    release_kind(shared, job);
+
+    if !job.finish() {
+        warn!(
+            "handler returned after its job was abandoned; result dropped";
+            job = %job.id(),
+            kind = job.kind(),
+            ran_for = started.elapsed(),
+            reason = job.signals.reason().map(|r| r.to_string()),
+            panicked = result.is_err(),
+        );
+        return;
+    }
+    let report = report_for(shared, job, result, timing);
+    settle(shared, job.id(), job.token, job.kind(), &report);
+    shared.forget(job.id());
+}
+
+/// Gives the job's kind slot back, possibly clearing a parked job.
+fn release_kind(shared: &Shared, job: &Tracked) {
+    let promoted = lock(&shared.state).release_kind(job.kind());
+    if promoted {
+        shared.work.notify_all();
+    }
+}
