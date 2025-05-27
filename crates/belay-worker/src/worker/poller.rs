@@ -145,3 +145,28 @@ pub(crate) fn hand_back(shared: &Shared, job: &Tracked) {
     );
     shared.forget(job.id());
 }
+
+/// How long to pause after an empty answer that took `elapsed`: a long
+/// poll that waited has paced itself; an instant empty answer (no long
+/// polling, or a source that ignores it) waits out the poll interval.
+fn idle_pause(poll_interval: Duration, elapsed: Duration) -> Duration {
+    poll_interval.saturating_sub(elapsed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_answers_are_paced_but_long_polls_are_not() {
+        let interval = Duration::from_millis(500);
+        assert_eq!(
+            idle_pause(interval, Duration::from_millis(1)),
+            Duration::from_millis(499)
+        );
+        assert_eq!(
+            idle_pause(interval, Duration::from_secs(10)),
+            Duration::ZERO
+        );
+    }
+}
