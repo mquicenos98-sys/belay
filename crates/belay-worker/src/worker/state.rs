@@ -52,3 +52,23 @@ impl Phase {
         }
     }
 }
+
+/// The time budget of a running attempt.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Timing {
+    pub(crate) timeout: Option<Duration>,
+    pub(crate) deadline: Option<Instant>,
+}
+
+/// A job this worker holds a lease on.
+pub(crate) struct Tracked {
+    pub(crate) job: Arc<Job>,
+    pub(crate) token: LeaseToken,
+    pub(crate) entry: Arc<Entry>,
+    pub(crate) signals: Arc<JobSignals>,
+    phase: AtomicU8,
+    timing: Mutex<Option<Timing>>,
+    /// Set by the watchdog when the deadline passes, so the timeout is
+    /// counted and logged once.
+    pub(crate) deadline_hit: AtomicBool,
+}
