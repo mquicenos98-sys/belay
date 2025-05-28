@@ -148,3 +148,142 @@ pub(crate) fn settle(shared: &Shared, id: JobId, token: LeaseToken, kind: &str, 
         }
     }
 }
+
+/// Makes the `complete` or `fail` call, retrying transient errors.
+fn deliver(shared: &Shared, id: JobId, token: LeaseToken, report: &Report) -> Result<(), ApiError> {
+    let attempts = shared.config.report_attempts.max(1);
+    let mut rng = thread_rng();
+    let mut attempt = 1;
+    loop {
+        let result = match report {
+            Report::Complete(value) => shared.source.complete(
+                &id,
+                &CompleteRequest {
+                    token,
+                    result: value.clone(),
+                },
+            ),
+            Report::Fail(e) => shared.source.fail(&id, &fail_request(token, e)),
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(e) if attempt >= attempts || !worth_retrying(&e) => return Err(e),
+            Err(e) => {
+                debug!("reporting a job result failed; retrying"; job = %id, attempt, error = %e);
+                thread::sleep(shared.config.source_backoff.delay_for(attempt, &mut rng));
+                attempt += 1;
+            }
+        }
+    }
+}
+
+/// Errors a repeat of the same call might not hit.
+fn worth_retrying(e: &ApiError) -> bool {
+    matches!(
+        e.code,
+        ErrorCode::Unavailable
+            | ErrorCode::ResourceExhausted
+            | ErrorCode::Internal
+            | ErrorCode::Conflict
+    )
+}
+
+/// The wire form of a failure, cleaned so the source cannot reject it.
+pub(crate) fn fail_request(token: LeaseToken, e: &HandlerError) -> FailRequest {
+    let error = if e.message.trim().is_empty() {
+        "handler failed without a message".to_owned()
+    } else {
+        e.message.clone()
+    };
+    FailRequest {
+        token,
+        error,
+        kind: e.kind.as_deref().and_then(sanitize_kind),
+        retryable: e.retryable,
+        retry_in: e.retry_in.map(|d| d.min(MAX_DELAY)),
+    }
+}
+
+/// Maps a free-form kind onto the label rule (letters, digits and
+/// `_ . : / -`, starting with a letter or digit, at most 64 characters)
+/// instead of letting the source reject the whole failure report.
+pub(crate) fn sanitize_kind(kind: &str) -> Option<String> {
+    let cleaned: String = kind
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | ':' | '/' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .skip_while(|c| !c.is_ascii_alphanumeric())
+        .take(MAX_ERROR_KIND_LEN)
+        .collect();
+    (!cleaned.is_empty()).then_some(cleaned)
+}
+
+/// The text of a panic payload.
+pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kinds_are_cleaned_to_the_label_rule() {
+        assert_eq!(sanitize_kind("http_503").as_deref(), Some("http_503"));
+        assert_eq!(sanitize_kind("not ok").as_deref(), Some("not_ok"));
+        assert_eq!(sanitize_kind("-x/y").as_deref(), Some("x/y"));
+        assert_eq!(sanitize_kind("é").as_deref(), None);
+        assert_eq!(sanitize_kind("").as_deref(), None);
+        assert_eq!(sanitize_kind(&"k".repeat(100)).map(|k| k.len()), Some(64));
+    }
+
+    #[test]
+    fn fail_requests_are_always_acceptable() {
+        let token = LeaseToken::new(9);
+        let e = HandlerError::retry("  ")
+            .with_kind("rate limited")
+            .retry_after(Duration::from_secs(400 * 86_400));
+        let req = fail_request(token, &e);
+        assert_eq!(req.error, "handler failed without a message");
+        assert_eq!(req.kind.as_deref(), Some("rate_limited"));
+        assert_eq!(req.retry_in, Some(MAX_DELAY));
+        assert!(req.retryable);
+        assert!(belay_proto::Validate::validate(&req).is_ok());
+    }
+
+    #[test]
+    fn canned_failures_say_what_happened() {
+        let t = timeout_error(Some(Duration::from_millis(1500)));
+        assert_eq!(t.message, "timed out after 1s500ms");
+        assert_eq!((t.retryable, t.kind.as_deref()), (true, Some("timeout")));
+        assert_eq!(timeout_error(None).message, "timed out");
+        let s = shutdown_error();
+        assert_eq!(s.message, "worker shutting down");
+        assert_eq!(s.retry_in, Some(Duration::ZERO));
+        assert!(s.retryable);
+    }
+
+    #[test]
+    fn panic_payloads_become_text() {
+        let literal: Box<dyn Any + Send> = Box::new("static text");
+        assert_eq!(panic_message(&*literal), "static text");
+        let other: Box<dyn Any + Send> = Box::new(42u8);
+        assert_eq!(panic_message(&*other), "non-string panic payload");
+    }
+
+    #[test]
+    fn only_transient_errors_are_retried() {
+        assert!(worth_retrying(&ApiError::unavailable("down")));
+        assert!(worth_retrying(&ApiError::internal("oops")));
+        assert!(!worth_retrying(&ApiError::invalid_argument("bad")));
+        assert!(!worth_retrying(&ApiError::lease_lost(JobId::generate())));
+    }
+}
