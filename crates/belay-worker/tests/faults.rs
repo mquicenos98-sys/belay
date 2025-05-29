@@ -224,3 +224,97 @@ fn handlers_that_ignore_timeouts_are_abandoned_after_the_grace_period() {
     assert_eq!(source.view(|v| v.outcomes_for(&id).len()), 1);
     assert_eq!(worker.stop().stats.succeeded, 0);
 }
+
+#[test]
+fn a_stuck_handler_keeps_its_slot() {
+    let source = Arc::new(MemorySource::new());
+    source.set_requeue(false);
+    let stuck = source.push(spec("stubborn"));
+    let gate = Gate::new();
+    let g = Arc::clone(&gate);
+    let registry = Registry::new()
+        .register_with(
+            "stubborn",
+            handler_fn(move |_: &mut JobContext| {
+                g.pass();
+                Ok(Outcome::done())
+            }),
+            KindOptions::new().timeout(Duration::from_millis(10)),
+        )
+        .register("echo", EchoHandler);
+    let worker = start(
+        &source,
+        registry,
+        config(1).cancel_grace(Duration::from_millis(10)),
+    );
+
+    assert!(source.wait_until(PATIENCE, |v| v.outcome(&stuck).is_some()));
+    let next = source.push(spec("echo"));
+    // With the only thread stuck, the worker has no capacity to lease.
+    assert_eq!(worker.stats().idle_slots(), 0);
+    assert!(!source.wait_until(Duration::from_millis(20), |v| v.is_leased(&next)));
+    assert!(source.outcome(&next).is_none());
+
+    gate.open();
+    assert!(source.wait_until(PATIENCE, |v| v.outcome(&next).is_some()));
+    drop(worker);
+}
+
+#[test]
+fn a_source_that_is_down_is_retried_until_it_returns() {
+    let source = Arc::new(MemorySource::new());
+    source.set_down(Some(ApiError::unavailable("maintenance")));
+    let id = source.push(spec("echo"));
+    let worker = start(
+        &source,
+        Registry::new().register("echo", EchoHandler),
+        config(1),
+    );
+
+    assert!(source.wait_until(PATIENCE, |v| v.lease_calls() >= 3));
+    assert!(source.outcome(&id).is_none());
+    source.set_down(None);
+    assert!(source.wait_until(PATIENCE, |v| v.outcome(&id).is_some()));
+    assert!(worker.stop().stats.lease_errors >= 3);
+}
+
+#[test]
+fn results_are_redelivered_after_transient_report_errors() {
+    let source = Arc::new(MemorySource::new());
+    source.fail_next_reports(2);
+    let id = source.push(spec("echo"));
+    let worker = start(
+        &source,
+        Registry::new().register("echo", EchoHandler),
+        config(1),
+    );
+
+    assert!(source.wait_until(PATIENCE, |v| v.outcome(&id).is_some()));
+    assert!(matches!(
+        source.outcome(&id),
+        Some(JobOutcome::Completed(_))
+    ));
+    let stats = worker.stop().stats;
+    assert_eq!((stats.succeeded, stats.report_errors), (1, 0));
+}
+
+#[test]
+fn undeliverable_results_are_counted_and_the_job_is_let_go() {
+    let source = Arc::new(MemorySource::new());
+    source.fail_next_reports(10);
+    let id = source.push(spec("echo"));
+    let worker = start(
+        &source,
+        Registry::new().register("echo", EchoHandler),
+        config(1).report_attempts(2),
+    );
+
+    assert!(eventually(|| worker.stats().report_errors == 1));
+    assert!(source.outcome(&id).is_none());
+    let stats = worker.stop().stats;
+    assert_eq!((stats.succeeded, stats.running), (0, 0));
+    assert_eq!(
+        stats.last_error.as_deref(),
+        Some("unavailable: injected report failure")
+    );
+}
