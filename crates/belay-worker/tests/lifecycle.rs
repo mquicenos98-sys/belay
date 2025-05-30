@@ -345,3 +345,89 @@ fn concurrency_bounds_handlers_and_leases() {
     let stats = worker.stop().stats;
     assert_eq!((stats.running, stats.busy_slots), (0, 0));
 }
+
+#[test]
+fn per_kind_limits_hold_while_other_kinds_run() {
+    let source = Arc::new(MemorySource::new());
+    let slow: Vec<_> = (0..2).map(|_| source.push(spec("slow"))).collect();
+    let fast: Vec<_> = (0..3).map(|_| source.push(spec("fast"))).collect();
+    let gate = Gate::new();
+    let seen = Concurrency::new();
+    let (g, s) = (Arc::clone(&gate), Arc::clone(&seen));
+    let registry = Registry::new()
+        .register_with(
+            "slow",
+            handler_fn(move |_: &mut JobContext| {
+                s.enter();
+                g.pass();
+                s.leave();
+                Ok(Outcome::done())
+            }),
+            KindOptions::new().concurrency(1),
+        )
+        .register("fast", EchoHandler);
+    let worker = start(&source, registry, config(4));
+
+    // The first lease takes both slow jobs and two fast ones: one slow job
+    // runs, the other waits for the limit, the fast ones finish.
+    assert!(source.wait_until(PATIENCE, |v| v.completed() == 2));
+    assert!(eventually(|| worker.stats().waiting == 1));
+    assert_eq!(gate.entered(), 1);
+    // While a job waits for its kind, nothing more is leased.
+    assert_eq!(source.view(|v| v.ready()), 1);
+    assert!(source.outcome(&fast[2]).is_none());
+
+    gate.open();
+    assert!(source.wait_until(PATIENCE, |v| v.completed() == 5));
+    assert_eq!(seen.max(), 1);
+    for id in slow.iter().chain(&fast) {
+        assert!(matches!(source.outcome(id), Some(JobOutcome::Completed(_))));
+    }
+    drop(worker);
+}
+
+#[test]
+fn when_every_kind_is_limited_only_runnable_jobs_are_leased() {
+    let source = Arc::new(MemorySource::new());
+    for _ in 0..3 {
+        source.push(spec("serial"));
+    }
+    let gate = Gate::new();
+    let g = Arc::clone(&gate);
+    let registry = Registry::new().register_with(
+        "serial",
+        handler_fn(move |_: &mut JobContext| {
+            g.pass();
+            Ok(Outcome::done())
+        }),
+        KindOptions::new().concurrency(1),
+    );
+    let worker = start(&source, registry, config(4));
+
+    assert!(eventually(|| gate.entered() == 1));
+    // Three slots are free, but no job the worker could lease would run.
+    assert!(!source.wait_until(std::time::Duration::from_millis(20), |v| v.leased() > 1));
+    assert_eq!(source.view(|v| v.ready()), 2);
+    assert_eq!(worker.stats().waiting, 0);
+
+    gate.open();
+    assert!(source.wait_until(PATIENCE, |v| v.completed() == 3));
+    drop(worker);
+}
+
+#[test]
+fn jobs_from_other_queues_are_left_alone() {
+    let source = Arc::new(MemorySource::new());
+    let elsewhere = source.push(belay_proto::JobSpec::new("other", "echo"));
+    let here = source.push(spec("echo"));
+    let worker = start(
+        &source,
+        Registry::new().register("echo", EchoHandler),
+        config(1),
+    );
+
+    assert!(source.wait_until(PATIENCE, |v| v.outcome(&here).is_some()));
+    assert!(source.outcome(&elsewhere).is_none());
+    assert_eq!(source.view(|v| v.ready()), 1);
+    drop(worker);
+}
