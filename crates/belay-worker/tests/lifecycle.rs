@@ -127,3 +127,221 @@ fn unknown_kinds_fail_permanently() {
     assert!(!req.retryable);
     assert_eq!(worker.stop().stats.failed, 1);
 }
+
+#[test]
+fn panics_fail_the_attempt_retryably_and_the_executor_survives() {
+    let source = Arc::new(MemorySource::new());
+    source.set_requeue(false);
+    let boom = source.push(spec("boom"));
+    let registry = Registry::new()
+        .register(
+            "boom",
+            FailHandler::new("index out of bounds at step 2").panicking(),
+        )
+        .register("echo", EchoHandler);
+    let worker = start(&source, registry, config(1));
+
+    assert!(source.wait_until(PATIENCE, |v| v.failed() == 1));
+    let req = failure(&source, &boom);
+    assert_eq!(req.kind.as_deref(), Some(failure_kind::PANIC));
+    assert!(req.retryable);
+
+    // The only executor thread caught the panic and keeps working.
+    let after = source.push(spec("echo").payload(json!("still here")));
+    assert!(source.wait_until(PATIENCE, |v| v.outcome(&after).is_some()));
+    assert_eq!(
+        source.outcome(&after),
+        Some(JobOutcome::Completed(Some(json!("still here"))))
+    );
+    let stats = worker.stop().stats;
+    assert_eq!(
+        (stats.panicked, stats.failed, stats.retried, stats.succeeded),
+        (1, 1, 1, 1)
+    );
+}
+
+#[test]
+fn oversized_results_fail_instead_of_being_rejected_by_the_source() {
+    let source = Arc::new(MemorySource::new());
+    let id = source.push(spec("big"));
+    let registry = Registry::new().register(
+        "big",
+        handler_fn(|_: &mut JobContext| Ok(Outcome::with("x".repeat(MAX_RESULT_BYTES)))),
+    );
+    let worker = start(&source, registry, config(1));
+
+    assert!(source.wait_until(PATIENCE, |v| v.failed() == 1));
+    let req = failure(&source, &id);
+    assert_eq!(req.kind.as_deref(), Some(failure_kind::RESULT_TOO_LARGE));
+    assert_eq!(
+        req.error,
+        format!(
+            "result is {} bytes as JSON; the limit is {MAX_RESULT_BYTES}",
+            MAX_RESULT_BYTES + 2
+        )
+    );
+    assert!(!req.retryable);
+    drop(worker);
+}
+
+#[test]
+fn undecodable_payloads_fail_permanently() {
+    let source = Arc::new(MemorySource::new());
+    let id = source.push(spec("count").payload(json!("seven")));
+    let registry = Registry::new().register(
+        "count",
+        handler_fn(|ctx: &mut JobContext| {
+            let n: u32 = ctx.payload_as()?;
+            Ok(Outcome::with(n))
+        }),
+    );
+    let worker = start(&source, registry, config(1));
+
+    assert!(source.wait_until(PATIENCE, |v| v.failed() == 1));
+    let req = failure(&source, &id);
+    assert_eq!(req.kind.as_deref(), Some(failure_kind::INVALID_PAYLOAD));
+    assert!(
+        req.error
+            .starts_with("invalid payload: $: expected integer"),
+        "{}",
+        req.error
+    );
+    assert!(!req.retryable);
+    drop(worker);
+}
+
+#[test]
+fn explicit_null_results_are_kept_apart_from_no_result() {
+    let source = Arc::new(MemorySource::new());
+    let null = source.push(spec("null"));
+    let nothing = source.push(spec("nothing"));
+    let registry = Registry::new()
+        .register(
+            "null",
+            handler_fn(|_: &mut JobContext| Ok(Outcome::with(Value::Null))),
+        )
+        .register(
+            "nothing",
+            handler_fn(|_: &mut JobContext| Ok(Outcome::done())),
+        );
+    let worker = start(&source, registry, config(2));
+
+    assert!(source.wait_until(PATIENCE, |v| v.completed() == 2));
+    assert_eq!(
+        source.outcome(&null),
+        Some(JobOutcome::Completed(Some(Value::Null)))
+    );
+    assert_eq!(source.outcome(&nothing), Some(JobOutcome::Completed(None)));
+    drop(worker);
+}
+
+#[test]
+fn progress_is_delivered_once_with_the_next_heartbeat() {
+    let source = Arc::new(MemorySource::new());
+    let id = source.push(spec("report"));
+    let gate = Gate::new();
+    let g = Arc::clone(&gate);
+    let registry = Registry::new().register(
+        "report",
+        handler_fn(move |ctx: &mut JobContext| {
+            ctx.progress(50.0, "half way");
+            g.pass();
+            Ok(Outcome::done())
+        }),
+    );
+    let worker = start(&source, registry, config(1));
+
+    assert!(source.wait_until(PATIENCE, |v| !v.progress_for(&id).is_empty()));
+    // A few more heartbeats go out while the handler is held; none of
+    // them repeats the progress.
+    let beats = source.view(|v| v.heartbeats_for(&id));
+    assert!(source.wait_until(PATIENCE, |v| v.heartbeats_for(&id) >= beats + 2));
+    gate.open();
+    assert!(source.wait_until(PATIENCE, |v| v.completed() == 1));
+
+    let delivered = source.view(|v| v.progress_for(&id).into_iter().cloned().collect::<Vec<_>>());
+    assert_eq!(delivered.len(), 1);
+    assert_eq!(delivered[0].percent, Some(50.0));
+    assert_eq!(delivered[0].message.as_deref(), Some("half way"));
+    drop(worker);
+}
+
+#[test]
+fn middleware_wraps_handlers_in_registration_order() {
+    let source = Arc::new(MemorySource::new());
+    source.push(spec("work"));
+    let trail = Arc::new(Mutex::new(Vec::new()));
+    let layer = |name: &'static str| {
+        let trail = Arc::clone(&trail);
+        middleware_fn(move |ctx: &mut JobContext, next: Next<'_>| {
+            trail.lock().unwrap().push(format!("{name} in"));
+            let result = next.run(ctx);
+            trail.lock().unwrap().push(format!("{name} out"));
+            result
+        })
+    };
+    let handler_trail = Arc::clone(&trail);
+    let timing = TimingMiddleware::new();
+    let timings = timing.timings();
+    let registry = Registry::new()
+        .register(
+            "work",
+            handler_fn(move |_: &mut JobContext| {
+                handler_trail.lock().unwrap().push("handler".to_owned());
+                Ok(Outcome::done())
+            }),
+        )
+        .wrap(layer("auth"))
+        .wrap(timing)
+        .wrap(layer("tracing"));
+    let worker = start(&source, registry, config(1));
+
+    assert!(source.wait_until(PATIENCE, |v| v.completed() == 1));
+    assert_eq!(
+        *trail.lock().unwrap(),
+        [
+            "auth in",
+            "tracing in",
+            "handler",
+            "tracing out",
+            "auth out"
+        ]
+    );
+    assert_eq!(timings.get("work").map(|t| t.runs), Some(1));
+    drop(worker);
+}
+
+#[test]
+fn concurrency_bounds_handlers_and_leases() {
+    let source = Arc::new(MemorySource::new());
+    for _ in 0..9 {
+        source.push(spec("gated"));
+    }
+    let gate = Gate::new();
+    let seen = Concurrency::new();
+    let (g, s) = (Arc::clone(&gate), Arc::clone(&seen));
+    let registry = Registry::new().register(
+        "gated",
+        handler_fn(move |_: &mut JobContext| {
+            s.enter();
+            g.pass();
+            s.leave();
+            Ok(Outcome::done())
+        }),
+    );
+    let worker = start(&source, registry, config(3));
+
+    assert!(eventually(|| gate.entered() == 3));
+    let stats = worker.stats();
+    assert_eq!(
+        (stats.running, stats.busy_slots, stats.idle_slots()),
+        (3, 3, 0)
+    );
+    assert_eq!(source.view(|v| v.leased()), 3, "no more leases than slots");
+
+    gate.open();
+    assert!(source.wait_until(PATIENCE, |v| v.completed() == 9));
+    assert_eq!(seen.max(), 3);
+    let stats = worker.stop().stats;
+    assert_eq!((stats.running, stats.busy_slots), (0, 0));
+}
