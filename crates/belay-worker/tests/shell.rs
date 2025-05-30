@@ -187,3 +187,80 @@ fn the_handler_default_timeout_applies_when_the_payload_has_none() {
     let err = run(&handler, ShellCommand::new(long_running())).unwrap_err();
     assert_eq!(err.message, "command timed out after 50ms");
 }
+
+#[test]
+fn cancellation_kills_the_command() {
+    let command = ShellCommand::new(long_running());
+    let mut ctx = context_for(&command);
+    let cancel = ctx.cancel_handle();
+    let canceller = thread::spawn(move || {
+        thread::sleep(Duration::from_millis(30));
+        cancel.cancel();
+    });
+    let started = Instant::now();
+    let err = ShellHandler::new().handle(&mut ctx).unwrap_err();
+    assert!(err.is_cancellation());
+    assert!(started.elapsed() < Duration::from_secs(10));
+    canceller.join().expect("canceller thread");
+}
+
+#[test]
+fn missing_programs_fail_permanently() {
+    let err = run(
+        &ShellHandler::new(),
+        ShellCommand::new(["belay-no-such-program-4f2a"]),
+    )
+    .unwrap_err();
+    assert_eq!(
+        err.message,
+        r#"cannot run "belay-no-such-program-4f2a": program not found"#
+    );
+    assert!(!err.retryable);
+}
+
+#[test]
+fn the_allow_list_blocks_other_programs() {
+    let handler = ShellHandler::new().allow(["convert"]);
+    let err = run(&handler, ShellCommand::new(shell("echo hi"))).unwrap_err();
+    assert_eq!(err.kind.as_deref(), Some("not_allowed"));
+    assert!(!err.retryable);
+    let program = shell("echo hi").remove(0);
+    let allowed = ShellHandler::new().allow([program]);
+    assert!(run(&allowed, ShellCommand::new(shell("echo hi"))).is_ok());
+}
+
+#[test]
+fn bad_payloads_are_rejected_before_anything_runs() {
+    let mut ctx = JobContext::detached(Job::new(
+        JobId::generate(),
+        JobSpec::new("jobs", SHELL).payload(belay_json::json!({"cmd": []})),
+        Timestamp::now(),
+    ));
+    let err = ShellHandler::new().handle(&mut ctx).unwrap_err();
+    assert_eq!(err.message, "invalid payload: $.cmd: must name a program");
+    assert_eq!(err.kind.as_deref(), Some(failure_kind::INVALID_PAYLOAD));
+}
+
+#[test]
+fn shell_jobs_run_through_a_worker() {
+    let source = Arc::new(MemorySource::new());
+    let id =
+        source.push(spec(SHELL).payload(ShellCommand::new(shell("echo from a worker")).to_json()));
+    let failing = source.push(spec(SHELL).payload(ShellCommand::new(shell("exit 2")).to_json()));
+    let registry = Registry::new().register(SHELL, ShellHandler::new());
+    let worker = start(&source, registry, config(2));
+
+    assert!(source.wait_until(PATIENCE, |v| v.reported() == 2));
+    match source.outcome(&id) {
+        Some(JobOutcome::Completed(Some(result))) => {
+            assert_eq!(text(&result, "stdout"), "from a worker");
+        }
+        other => panic!("unexpected outcome {other:?}"),
+    }
+    let failure = source
+        .outcome(&failing)
+        .and_then(|o| o.failure().cloned())
+        .expect("failed");
+    assert_eq!(failure.kind.as_deref(), Some("exit:2"));
+    drop(worker);
+}
