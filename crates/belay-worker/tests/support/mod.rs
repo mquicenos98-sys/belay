@@ -40,3 +40,35 @@ pub fn config_logging_to(concurrency: usize, capture: CaptureLogger) -> WorkerCo
     .source_backoff(BackoffPolicy::constant(Duration::from_millis(5)))
     .logger(Arc::new(capture))
 }
+
+/// A job of `kind` on the test queue.
+pub fn spec(kind: &str) -> JobSpec {
+    JobSpec::new("jobs", kind)
+}
+
+pub fn start(source: &Arc<MemorySource>, registry: Registry, config: WorkerConfig) -> WorkerHandle {
+    Worker::new(source.clone(), registry, config)
+        .expect("valid worker setup")
+        .spawn()
+        .expect("worker threads start")
+}
+
+/// Polls `cond` until it holds; for conditions the source cannot signal.
+pub fn eventually(mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + PATIENCE;
+    while Instant::now() < deadline {
+        if cond() {
+            return true;
+        }
+        thread::sleep(Duration::from_millis(2));
+    }
+    cond()
+}
+
+/// Holds handlers until opened, and counts how many arrived.
+#[derive(Default)]
+pub struct Gate {
+    open: Mutex<bool>,
+    cv: Condvar,
+    entered: AtomicUsize,
+}
