@@ -72,3 +72,63 @@ pub struct Gate {
     cv: Condvar,
     entered: AtomicUsize,
 }
+
+impl Gate {
+    pub fn new() -> Arc<Gate> {
+        Arc::new(Gate::default())
+    }
+
+    /// Blocks until the gate opens (at most `PATIENCE`, so a failing test
+    /// cannot hang the suite).
+    pub fn pass(&self) {
+        self.entered.fetch_add(1, Ordering::SeqCst);
+        let deadline = Instant::now() + PATIENCE;
+        let mut open = self.open.lock().unwrap_or_else(|e| e.into_inner());
+        while !*open {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return;
+            }
+            open = self
+                .cv
+                .wait_timeout(open, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
+
+    pub fn open(&self) {
+        *self.open.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.cv.notify_all();
+    }
+
+    pub fn entered(&self) -> usize {
+        self.entered.load(Ordering::SeqCst)
+    }
+}
+
+/// Tracks how many handlers run at once.
+#[derive(Default)]
+pub struct Concurrency {
+    now: AtomicUsize,
+    max: AtomicUsize,
+}
+
+impl Concurrency {
+    pub fn new() -> Arc<Concurrency> {
+        Arc::new(Concurrency::default())
+    }
+
+    pub fn enter(&self) {
+        let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+        self.max.fetch_max(now, Ordering::SeqCst);
+    }
+
+    pub fn leave(&self) {
+        self.now.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    pub fn max(&self) -> usize {
+        self.max.load(Ordering::SeqCst)
+    }
+}
