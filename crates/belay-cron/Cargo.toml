@@ -1,0 +1,15 @@
+[package]
+name = "belay-cron"
+description = "Cron expression parsing, POSIX time zone rules and DST-aware schedule iteration for belay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "belay_cron"
+path = "src/lib.rs"
+
+[dependencies]
