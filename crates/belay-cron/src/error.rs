@@ -231,3 +231,80 @@ impl fmt::Display for CronError {
         }
     }
 }
+
+impl std::error::Error for CronError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn out_of_range_message_names_field_range_and_column() {
+        let e = CronError::field(
+            Field::Minute,
+            1,
+            FieldProblem::OutOfRange {
+                value: 61,
+                min: 0,
+                max: 59,
+            },
+        );
+        assert_eq!(
+            e.to_string(),
+            "invalid value 61 in minute field (0-59) at column 1"
+        );
+        assert_eq!(e.column(), Some(1));
+    }
+
+    #[test]
+    fn unknown_zone_message_includes_suggestion_when_present() {
+        let e = CronError::UnknownZone {
+            name: "America/New_Yrok".into(),
+            suggestion: Some("America/New_York"),
+        };
+        assert_eq!(
+            e.to_string(),
+            "unknown time zone \"America/New_Yrok\" (did you mean \"America/New_York\"?)"
+        );
+        assert_eq!(e.column(), None);
+        let e = CronError::UnknownZone {
+            name: "Mars/Olympus".into(),
+            suggestion: None,
+        };
+        assert_eq!(e.to_string(), "unknown time zone \"Mars/Olympus\"");
+    }
+
+    #[test]
+    fn field_problem_messages_are_lowercase_and_specific() {
+        let cases = [
+            (
+                FieldProblem::NotAllowed("'L'"),
+                "'L' is not allowed in the hour field at column 3",
+            ),
+            (
+                FieldProblem::InvalidStep { step: 0, max: 24 },
+                "invalid step 0 in hour field (1-24) at column 3",
+            ),
+            (
+                FieldProblem::UnknownName("FOO".into()),
+                "unknown name \"FOO\" in hour field at column 3",
+            ),
+            (
+                FieldProblem::UnexpectedChar('%'),
+                "unexpected character '%' in hour field at column 3",
+            ),
+        ];
+        for (problem, expected) in cases {
+            assert_eq!(
+                CronError::field(Field::Hour, 3, problem).to_string(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn errors_are_std_errors() {
+        fn assert_error<E: std::error::Error + Send + Sync + 'static>() {}
+        assert_error::<CronError>();
+    }
+}
