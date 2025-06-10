@@ -237,3 +237,22 @@ pub(crate) fn lookup(name: &str) -> Option<(&'static str, &'static str)> {
 pub fn zone_names() -> impl ExactSizeIterator<Item = &'static str> + Clone {
     ZONES.iter().map(|(name, _)| *name)
 }
+
+/// A likely intended name for a misspelt one: a case-insensitive match, else
+/// the closest name within a small edit distance (only for inputs long
+/// enough that such a guess is more help than noise).
+pub(crate) fn suggest(name: &str) -> Option<&'static str> {
+    if let Some((n, _)) = ZONES.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+        return Some(n);
+    }
+    if name.len() < 6 {
+        return None;
+    }
+    let lower = name.to_ascii_lowercase();
+    ZONES
+        .iter()
+        .map(|(n, _)| (edit_distance(&lower, &n.to_ascii_lowercase()), *n))
+        .filter(|(d, _)| *d <= 2)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, n)| n)
+}
