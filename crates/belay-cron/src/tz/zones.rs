@@ -226,3 +226,14 @@ pub(crate) fn lookup(name: &str) -> Option<(&'static str, &'static str)> {
         .ok()
         .map(|i| ZONES[i])
 }
+
+/// Every zone name in the embedded table, in sorted order.
+///
+/// ```
+/// let names: Vec<&str> = belay_cron::zone_names().collect();
+/// assert!(names.contains(&"Europe/Berlin"));
+/// assert!(names.contains(&"UTC"));
+/// ```
+pub fn zone_names() -> impl ExactSizeIterator<Item = &'static str> + Clone {
+    ZONES.iter().map(|(name, _)| *name)
+}
