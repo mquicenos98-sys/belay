@@ -256,3 +256,84 @@ pub(crate) fn suggest(name: &str) -> Option<&'static str> {
         .min_by_key(|(d, _)| *d)
         .map(|(_, n)| n)
 }
+
+/// Levenshtein distance over bytes; zone names are ASCII.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    let mut cur = vec![0; b.len() + 1];
+    for (i, &ca) in a.iter().enumerate() {
+        cur[0] = i + 1;
+        for (j, &cb) in b.iter().enumerate() {
+            let substitute = prev[j] + usize::from(ca != cb);
+            cur[j + 1] = substitute.min(prev[j + 1] + 1).min(cur[j] + 1);
+        }
+        std::mem::swap(&mut prev, &mut cur);
+    }
+    prev[b.len()]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tz::PosixTz;
+
+    #[test]
+    fn table_is_sorted_and_unique() {
+        for pair in ZONES.windows(2) {
+            assert!(pair[0].0 < pair[1].0, "{} !< {}", pair[0].0, pair[1].0);
+        }
+    }
+
+    #[test]
+    fn every_rule_parses_and_prints_back_unchanged() {
+        for (name, rule) in ZONES {
+            let tz = PosixTz::parse(rule).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(tz.to_string(), *rule, "{name}");
+        }
+    }
+
+    #[test]
+    fn table_covers_the_zones_belay_documents() {
+        for (name, rule) in [
+            ("America/New_York", "EST5EDT,M3.2.0,M11.1.0"),
+            ("Europe/London", "GMT0BST,M3.5.0/1,M10.5.0"),
+            ("Europe/Berlin", "CET-1CEST,M3.5.0,M10.5.0/3"),
+            ("Australia/Sydney", "AEST-10AEDT,M10.1.0,M4.1.0/3"),
+            ("America/Sao_Paulo", "<-03>3"),
+            ("Asia/Tehran", "<+0330>-3:30"),
+            ("Pacific/Auckland", "NZST-12NZDT,M9.5.0,M4.1.0/3"),
+            ("Asia/Kolkata", "IST-5:30"),
+            ("America/Bogota", "<-05>5"),
+            ("Etc/GMT+5", "<-05>5"),
+            ("Etc/GMT-14", "<+14>-14"),
+        ] {
+            assert_eq!(lookup(name), Some((name, rule)));
+        }
+        assert!(ZONES.len() >= 70);
+        assert_eq!(lookup("america/new_york"), None);
+    }
+
+    #[test]
+    fn suggestions_catch_case_and_typos_only() {
+        assert_eq!(suggest("america/new_york"), Some("America/New_York"));
+        assert_eq!(suggest("America/New_Yrok"), Some("America/New_York"));
+        assert_eq!(suggest("Europe/Berln"), Some("Europe/Berlin"));
+        assert_eq!(suggest("utc"), Some("UTC"));
+        assert_eq!(suggest("PST"), None);
+        assert_eq!(suggest("Mars/Olympus_Mons"), None);
+    }
+
+    #[test]
+    fn edit_distance_counts_single_edits() {
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+        assert_eq!(edit_distance("", "abc"), 3);
+        assert_eq!(edit_distance("same", "same"), 0);
+    }
+
+    #[test]
+    fn zone_names_lists_the_whole_table() {
+        assert_eq!(zone_names().len(), ZONES.len());
+        assert!(zone_names().any(|n| n == "Asia/Kathmandu"));
+    }
+}
