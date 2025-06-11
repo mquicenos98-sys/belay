@@ -66,3 +66,80 @@ pub(crate) const fn civil_from_days(days: i64) -> (i64, u32, u32) {
     let year = yoe + era * 400 + if month <= 2 { 1 } else { 0 };
     (year, month, day)
 }
+
+/// Weekday of a day number, 0 = Sunday (1970-01-01 was a Thursday).
+pub(crate) const fn weekday_from_days(days: i64) -> u32 {
+    (days + 4).rem_euclid(7) as u32
+}
+
+/// A day of the week.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Weekday {
+    /// Day 0 (and 7) in cron.
+    Sunday,
+    /// Day 1.
+    Monday,
+    /// Day 2.
+    Tuesday,
+    /// Day 3.
+    Wednesday,
+    /// Day 4.
+    Thursday,
+    /// Day 5.
+    Friday,
+    /// Day 6.
+    Saturday,
+}
+
+impl Weekday {
+    /// All weekdays, Sunday first.
+    pub const ALL: [Weekday; 7] = [
+        Weekday::Sunday,
+        Weekday::Monday,
+        Weekday::Tuesday,
+        Weekday::Wednesday,
+        Weekday::Thursday,
+        Weekday::Friday,
+        Weekday::Saturday,
+    ];
+
+    /// The weekday with cron number `index` (taken modulo 7, so 7 is Sunday).
+    #[must_use]
+    pub const fn from_index(index: u32) -> Weekday {
+        Weekday::ALL[(index % 7) as usize]
+    }
+
+    /// Cron number of the weekday: 0 = Sunday … 6 = Saturday.
+    #[must_use]
+    pub const fn index(self) -> u32 {
+        self as u32
+    }
+
+    /// Full English name, e.g. `"Monday"`.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Weekday::Sunday => "Sunday",
+            Weekday::Monday => "Monday",
+            Weekday::Tuesday => "Tuesday",
+            Weekday::Wednesday => "Wednesday",
+            Weekday::Thursday => "Thursday",
+            Weekday::Friday => "Friday",
+            Weekday::Saturday => "Saturday",
+        }
+    }
+
+    /// Three-letter uppercase abbreviation as used in cron, e.g. `"MON"`.
+    #[must_use]
+    pub const fn abbreviation(self) -> &'static str {
+        match self {
+            Weekday::Sunday => "SUN",
+            Weekday::Monday => "MON",
+            Weekday::Tuesday => "TUE",
+            Weekday::Wednesday => "WED",
+            Weekday::Thursday => "THU",
+            Weekday::Friday => "FRI",
+            Weekday::Saturday => "SAT",
+        }
+    }
+}
