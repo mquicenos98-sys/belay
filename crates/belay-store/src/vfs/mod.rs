@@ -149,13 +149,12 @@ impl BufferedFile {
     }
 
     pub(crate) fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if self.buf.len() + bytes.len() > Self::CAPACITY {
+            self.flush_buf()?;
+        }
         if bytes.len() >= Self::CAPACITY {
-            // Too big to be worth copying into the buffer.
             self.file.write_all(bytes)?;
         } else {
-            if self.buf.len() + bytes.len() > Self::CAPACITY {
-                self.flush_buf()?;
-            }
             self.buf.extend_from_slice(bytes);
         }
         self.written += bytes.len() as u64;
@@ -186,6 +185,28 @@ impl BufferedFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn buffered_file_writes_everything_in_order() {
+        let fs = MemFs::new();
+        fs.create_dir_all(Path::new("d")).expect("mkdir");
+        let path = PathBuf::from("d").join("f");
+        let mut out = BufferedFile::new(fs.create(&path).expect("create"));
+        let mut expected = Vec::new();
+        for i in 0..5000u32 {
+            let chunk = vec![(i % 251) as u8; (i % 97) as usize];
+            out.write(&chunk).expect("write");
+            expected.extend_from_slice(&chunk);
+        }
+        let big = vec![7u8; BufferedFile::CAPACITY + 10];
+        out.write(&big).expect("write big");
+        expected.extend_from_slice(&big);
+        assert_eq!(out.written(), expected.len() as u64);
+        out.finish().expect("finish");
+        assert_eq!(fs.read(&path).expect("read"), expected);
+        assert_eq!(fs.synced_len(&path).expect("synced"), expected.len() as u64);
+    }
 
     #[test]
     fn arc_of_a_vfs_is_a_vfs() {
