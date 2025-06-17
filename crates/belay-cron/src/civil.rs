@@ -17,7 +17,6 @@ pub(crate) const SECS_PER_DAY: i64 = 86_400;
 
 /// Naive seconds of 0001-01-01T00:00:00, the earliest representable reading.
 pub(crate) const MIN_NAIVE: i64 = -62_135_596_800;
-
 /// Naive seconds of 9999-12-31T23:59:59, the latest representable reading.
 pub(crate) const MAX_NAIVE: i64 = 253_402_300_799;
 
@@ -141,5 +140,334 @@ impl Weekday {
             Weekday::Friday => "FRI",
             Weekday::Saturday => "SAT",
         }
+    }
+}
+
+impl fmt::Display for Weekday {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
+/// A wall-clock date and time with one-second resolution and no time zone.
+///
+/// Ordering is chronological. Years 1 through 9999 are representable.
+///
+/// ```
+/// use belay_cron::LocalDateTime;
+///
+/// let t: LocalDateTime = "2025-03-09T02:30:00".parse()?;
+/// assert_eq!((t.year(), t.month(), t.day()), (2025, 3, 9));
+/// assert_eq!(t.weekday().name(), "Sunday");
+/// assert_eq!(t.to_string(), "2025-03-09T02:30:00");
+/// # Ok::<(), belay_cron::CronError>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct LocalDateTime {
+    year: i32,
+    month: u8,
+    day: u8,
+    hour: u8,
+    minute: u8,
+    second: u8,
+}
+
+impl LocalDateTime {
+    /// Builds a date-time, returning `None` if any component is out of range
+    /// (including February 29 in a common year).
+    #[must_use]
+    pub fn new(
+        year: i32,
+        month: u32,
+        day: u32,
+        hour: u32,
+        minute: u32,
+        second: u32,
+    ) -> Option<LocalDateTime> {
+        let valid = (1..=9999).contains(&year)
+            && (1..=12).contains(&month)
+            && day >= 1
+            && day <= days_in_month(i64::from(year), month)
+            && hour < 24
+            && minute < 60
+            && second < 60;
+        valid.then(|| LocalDateTime {
+            year,
+            month: month as u8,
+            day: day as u8,
+            hour: hour as u8,
+            minute: minute as u8,
+            second: second as u8,
+        })
+    }
+
+    /// Midnight at the start of the given date.
+    #[must_use]
+    pub fn from_ymd(year: i32, month: u32, day: u32) -> Option<LocalDateTime> {
+        LocalDateTime::new(year, month, day, 0, 0, 0)
+    }
+
+    /// Parses `YYYY-MM-DDTHH:MM[:SS]`; a space may replace the `T`, and a
+    /// bare `YYYY-MM-DD` means midnight.
+    pub fn parse(input: &str) -> Result<LocalDateTime> {
+        let fail = |reason| CronError::InvalidDateTime {
+            input: input.to_string(),
+            reason,
+        };
+        let s = input.trim();
+        let (date, time) = match s.find(['T', 't', ' ']) {
+            Some(i) => (&s[..i], Some(&s[i + 1..])),
+            None => (s, None),
+        };
+        let mut date_parts = date.split('-');
+        let year = parse_component(date_parts.next(), 4)
+            .ok_or_else(|| fail("expected a four-digit year"))?;
+        let month = parse_component(date_parts.next(), 2)
+            .ok_or_else(|| fail("expected a two-digit month"))?;
+        let day = parse_component(date_parts.next(), 2)
+            .ok_or_else(|| fail("expected a two-digit day"))?;
+        if date_parts.next().is_some() {
+            return Err(fail("unexpected text after the date"));
+        }
+        let (hour, minute, second) = match time {
+            None => (0, 0, 0),
+            Some(time) => {
+                let mut parts = time.split(':');
+                let hour = parse_component(parts.next(), 2)
+                    .ok_or_else(|| fail("expected a two-digit hour"))?;
+                let minute = parse_component(parts.next(), 2)
+                    .ok_or_else(|| fail("expected a two-digit minute"))?;
+                let second = match parts.next() {
+                    None => 0,
+                    Some(p) => parse_component(Some(p), 2)
+                        .ok_or_else(|| fail("expected a two-digit second"))?,
+                };
+                if parts.next().is_some() {
+                    return Err(fail("unexpected text after the time"));
+                }
+                (hour, minute, second)
+            }
+        };
+        if !(1..=12).contains(&month) {
+            return Err(fail("month out of range"));
+        }
+        if day == 0 || day > days_in_month(i64::from(year), month) {
+            return Err(fail("day out of range for month"));
+        }
+        LocalDateTime::new(year as i32, month, day, hour, minute, second)
+            .ok_or_else(|| fail("time of day out of range"))
+    }
+
+    /// Calendar year.
+    #[must_use]
+    pub const fn year(&self) -> i32 {
+        self.year
+    }
+
+    /// Month, 1-12.
+    #[must_use]
+    pub const fn month(&self) -> u32 {
+        self.month as u32
+    }
+
+    /// Day of the month, 1-31.
+    #[must_use]
+    pub const fn day(&self) -> u32 {
+        self.day as u32
+    }
+
+    /// Hour, 0-23.
+    #[must_use]
+    pub const fn hour(&self) -> u32 {
+        self.hour as u32
+    }
+
+    /// Minute, 0-59.
+    #[must_use]
+    pub const fn minute(&self) -> u32 {
+        self.minute as u32
+    }
+
+    /// Second, 0-59.
+    #[must_use]
+    pub const fn second(&self) -> u32 {
+        self.second as u32
+    }
+
+    /// Day of the week.
+    #[must_use]
+    pub fn weekday(&self) -> Weekday {
+        Weekday::from_index(weekday_from_days(self.days()))
+    }
+
+    /// Day of the year, 1-366.
+    #[must_use]
+    pub fn ordinal(&self) -> u32 {
+        (self.days() - days_from_civil(i64::from(self.year), 1, 1)) as u32 + 1
+    }
+
+    fn days(&self) -> i64 {
+        days_from_civil(i64::from(self.year), self.month(), self.day())
+    }
+
+    /// Seconds since 1970-01-01T00:00:00 on the same wall clock.
+    pub(crate) fn to_naive(self) -> i64 {
+        self.days() * SECS_PER_DAY
+            + i64::from(self.hour) * 3600
+            + i64::from(self.minute) * 60
+            + i64::from(self.second)
+    }
+
+    /// Inverse of [`to_naive`](Self::to_naive), clamped to years 1-9999.
+    pub(crate) fn from_naive(naive: i64) -> LocalDateTime {
+        let naive = naive.clamp(MIN_NAIVE, MAX_NAIVE);
+        let (year, month, day) = civil_from_days(naive.div_euclid(SECS_PER_DAY));
+        let sod = naive.rem_euclid(SECS_PER_DAY);
+        LocalDateTime {
+            year: year as i32,
+            month: month as u8,
+            day: day as u8,
+            hour: (sod / 3600) as u8,
+            minute: (sod / 60 % 60) as u8,
+            second: (sod % 60) as u8,
+        }
+    }
+}
+
+fn parse_component(part: Option<&str>, digits: usize) -> Option<u32> {
+    let part = part?;
+    if part.len() != digits || !part.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    part.parse().ok()
+}
+
+impl fmt::Display for LocalDateTime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}",
+            self.year, self.month, self.day, self.hour, self.minute, self.second
+        )
+    }
+}
+
+impl FromStr for LocalDateTime {
+    type Err = CronError;
+
+    fn from_str(s: &str) -> Result<Self> {
+        LocalDateTime::parse(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn days_from_civil_matches_known_epochs() {
+        assert_eq!(days_from_civil(1970, 1, 1), 0);
+        assert_eq!(days_from_civil(2000, 1, 1) * SECS_PER_DAY, 946_684_800);
+        assert_eq!(days_from_civil(2025, 1, 1) * SECS_PER_DAY, 1_735_689_600);
+        assert_eq!(days_from_civil(1969, 12, 31), -1);
+        assert_eq!(days_from_civil(1, 1, 1) * SECS_PER_DAY, MIN_NAIVE);
+        assert_eq!(
+            days_from_civil(9999, 12, 31) * SECS_PER_DAY + SECS_PER_DAY - 1,
+            MAX_NAIVE
+        );
+    }
+
+    #[test]
+    fn civil_round_trips_over_four_centuries() {
+        // Walk every day across a full 400-year Gregorian cycle and some
+        // negative day numbers; each must round-trip and advance by one day.
+        let start = days_from_civil(1899, 12, 25);
+        let mut prev = civil_from_days(start - 1);
+        for days in start..start + 146_097 + 10 {
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days);
+            assert!(d >= 1 && d <= days_in_month(y, m));
+            if d == 1 {
+                assert_eq!(prev.2, days_in_month(prev.0, prev.1));
+            } else {
+                assert_eq!((prev.0, prev.1, prev.2 + 1), (y, m, d));
+            }
+            prev = (y, m, d);
+        }
+    }
+
+    #[test]
+    fn leap_years_follow_gregorian_rules() {
+        assert!(is_leap_year(2000));
+        assert!(is_leap_year(2024));
+        assert!(!is_leap_year(1900));
+        assert!(!is_leap_year(2100));
+        assert!(!is_leap_year(2025));
+        assert_eq!(days_in_month(2024, 2), 29);
+        assert_eq!(days_in_month(2100, 2), 28);
+        assert_eq!(days_in_month(2025, 4), 30);
+    }
+
+    #[test]
+    fn weekdays_match_known_dates() {
+        assert_eq!(weekday_from_days(0), 4); // 1970-01-01, Thursday
+        assert_eq!(weekday_from_days(days_from_civil(2025, 3, 9)), 0);
+        assert_eq!(weekday_from_days(days_from_civil(2000, 1, 1)), 6);
+        assert_eq!(weekday_from_days(days_from_civil(1969, 12, 28)), 0);
+        assert_eq!(Weekday::from_index(7), Weekday::Sunday);
+        assert_eq!(Weekday::Friday.abbreviation(), "FRI");
+    }
+
+    #[test]
+    fn local_date_time_rejects_impossible_dates() {
+        assert!(LocalDateTime::new(2025, 2, 29, 0, 0, 0).is_none());
+        assert!(LocalDateTime::new(2024, 2, 29, 0, 0, 0).is_some());
+        assert!(LocalDateTime::new(2025, 13, 1, 0, 0, 0).is_none());
+        assert!(LocalDateTime::new(2025, 1, 1, 24, 0, 0).is_none());
+        assert!(LocalDateTime::new(0, 1, 1, 0, 0, 0).is_none());
+    }
+
+    #[test]
+    fn local_date_time_parses_common_forms() {
+        let t = LocalDateTime::parse("2025-11-02 01:30").unwrap();
+        assert_eq!(t, LocalDateTime::new(2025, 11, 2, 1, 30, 0).unwrap());
+        let t = LocalDateTime::parse("2024-02-29").unwrap();
+        assert_eq!(t.to_string(), "2024-02-29T00:00:00");
+        assert_eq!(t.ordinal(), 60);
+        let err = LocalDateTime::parse("2025-02-29T00:00").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid local date-time \"2025-02-29T00:00\": day out of range for month"
+        );
+        assert!(LocalDateTime::parse("2025-1-01").is_err());
+        assert!(LocalDateTime::parse("2025-01-01T25:00").is_err());
+        assert!(LocalDateTime::parse("2025-01-01T10:00:00:00").is_err());
+        assert!(LocalDateTime::parse("").is_err());
+    }
+
+    #[test]
+    fn naive_seconds_round_trip_and_clamp() {
+        let t = LocalDateTime::new(2025, 3, 9, 2, 30, 15).unwrap();
+        assert_eq!(LocalDateTime::from_naive(t.to_naive()), t);
+        assert_eq!(
+            LocalDateTime::from_naive(i64::MAX).to_string(),
+            "9999-12-31T23:59:59"
+        );
+        assert_eq!(
+            LocalDateTime::from_naive(i64::MIN).to_string(),
+            "0001-01-01T00:00:00"
+        );
+        assert_eq!(
+            LocalDateTime::from_naive(-1).to_string(),
+            "1969-12-31T23:59:59"
+        );
+    }
+
+    #[test]
+    fn ordering_is_chronological() {
+        let a = LocalDateTime::new(2025, 1, 31, 23, 59, 59).unwrap();
+        let b = LocalDateTime::new(2025, 2, 1, 0, 0, 0).unwrap();
+        assert!(a < b);
+        assert!(a.to_naive() < b.to_naive());
     }
 }
