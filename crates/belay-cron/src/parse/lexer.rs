@@ -27,3 +27,7 @@ pub(crate) struct Token {
     /// 1-based column of the token's first character in the whole expression.
     pub column: usize,
 }
+
+/// Numbers longer than this cannot be valid in any field (years have four
+/// digits); rejecting them early keeps the arithmetic in `u32`.
+const MAX_DIGITS: usize = 6;
