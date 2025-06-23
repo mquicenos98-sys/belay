@@ -136,3 +136,281 @@ pub(crate) fn parse_field(
     }
     .run()
 }
+
+struct FieldParser<'a> {
+    tokens: &'a [Token],
+    pos: usize,
+    domain: &'a Domain,
+    end_column: usize,
+    out: ParsedField,
+}
+
+impl FieldParser<'_> {
+    fn run(mut self) -> Result<ParsedField> {
+        loop {
+            self.item()?;
+            match self.bump() {
+                None => return Ok(self.out),
+                Some(t) if t.kind == TokenKind::Comma => {
+                    if self.peek().is_none() {
+                        return Err(self.error(t.column, FieldProblem::EmptyItem));
+                    }
+                }
+                Some(t) => return Err(self.unexpected(&t)),
+            }
+        }
+    }
+
+    fn error(&self, column: usize, problem: FieldProblem) -> CronError {
+        CronError::field(self.domain.field, column, problem)
+    }
+
+    fn peek(&self) -> Option<&TokenKind> {
+        self.tokens.get(self.pos).map(|t| &t.kind)
+    }
+
+    fn bump(&mut self) -> Option<Token> {
+        let t = self.tokens.get(self.pos).cloned();
+        if t.is_some() {
+            self.pos += 1;
+        }
+        t
+    }
+
+    fn eat(&mut self, kind: &TokenKind) -> bool {
+        if self.peek() == Some(kind) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn peek_name(&self, name: &str) -> bool {
+        matches!(self.peek(), Some(TokenKind::Name(n)) if n == name)
+    }
+
+    fn expect_token(&mut self) -> Result<Token> {
+        self.bump()
+            .ok_or_else(|| self.error(self.end_column, FieldProblem::UnexpectedEnd))
+    }
+
+    /// The error for a token that cannot appear where it did.
+    fn unexpected(&self, t: &Token) -> CronError {
+        let problem = match &t.kind {
+            TokenKind::Name(n) if n == "L" || n == "LW" => FieldProblem::NotAllowed("'L'"),
+            TokenKind::Name(n) if n == "W" => FieldProblem::NotAllowed("'W'"),
+            TokenKind::Hash => FieldProblem::NotAllowed("'#'"),
+            TokenKind::Question => FieldProblem::NotAllowed("'?'"),
+            TokenKind::Comma => FieldProblem::EmptyItem,
+            TokenKind::Number(n) => {
+                FieldProblem::UnexpectedChar(n.to_string().chars().next().unwrap_or('0'))
+            }
+            TokenKind::Name(n) => FieldProblem::UnexpectedChar(n.chars().next().unwrap_or('?')),
+            TokenKind::Star => FieldProblem::UnexpectedChar('*'),
+            TokenKind::Dash => FieldProblem::UnexpectedChar('-'),
+            TokenKind::Slash => FieldProblem::UnexpectedChar('/'),
+        };
+        self.error(t.column, problem)
+    }
+
+    fn is_day_field(&self) -> bool {
+        matches!(self.domain.field, Field::DayOfMonth | Field::DayOfWeek)
+    }
+
+    fn item(&mut self) -> Result<()> {
+        let tok = self.expect_token()?;
+        match &tok.kind {
+            TokenKind::Star | TokenKind::Question => {
+                if tok.kind == TokenKind::Question && !self.is_day_field() {
+                    return Err(self.unexpected(&tok));
+                }
+                let step = if self.eat(&TokenKind::Slash) {
+                    self.step()?
+                } else {
+                    1
+                };
+                self.push_range(self.domain.min, self.domain.cycle_max, step);
+                Ok(())
+            }
+            TokenKind::Comma => Err(self.error(tok.column, FieldProblem::EmptyItem)),
+            TokenKind::Name(n) if self.domain.field == Field::DayOfMonth && n == "L" => {
+                if self.eat(&TokenKind::Dash) {
+                    let (k, column) = self.number()?;
+                    if !(1..=30).contains(&k) {
+                        return Err(self.error(
+                            column,
+                            FieldProblem::OutOfRange {
+                                value: k,
+                                min: 1,
+                                max: 30,
+                            },
+                        ));
+                    }
+                    self.special(Special::LastDayOffset(k))
+                } else {
+                    self.special(Special::LastDay)
+                }
+            }
+            TokenKind::Name(n) if self.domain.field == Field::DayOfMonth && n == "LW" => {
+                self.special(Special::LastWeekday)
+            }
+            TokenKind::Name(n) if self.domain.field == Field::DayOfWeek && n == "L" => {
+                let problem = FieldProblem::NotAllowed("'L' without a weekday");
+                Err(self.error(tok.column, problem))
+            }
+            TokenKind::Name(n)
+                if self.domain.field == Field::DayOfWeek
+                    && n.len() == 4
+                    && n.ends_with('L')
+                    && DAY_NAMES.contains(&&n[..3]) =>
+            {
+                let day = self.name_value(&n[..3], tok.column)?;
+                self.special(Special::LastOfWeekday(self.domain.canonical(day)))
+            }
+            TokenKind::Number(_) | TokenKind::Name(_) => self.value_item(&tok),
+            _ => Err(self.unexpected(&tok)),
+        }
+    }
+
+    /// An item starting with a plain value: single, range, step, or one of
+    /// the value-prefixed specials (`15W`, `5L`, `MON#2`).
+    fn value_item(&mut self, tok: &Token) -> Result<()> {
+        let start = self.value(tok)?;
+        match self.domain.field {
+            Field::DayOfMonth if self.peek_name("W") => {
+                self.pos += 1;
+                return self.special(Special::NearestWeekday(start));
+            }
+            Field::DayOfWeek if self.peek_name("L") => {
+                self.pos += 1;
+                return self.special(Special::LastOfWeekday(start));
+            }
+            Field::DayOfWeek if self.peek() == Some(&TokenKind::Hash) => {
+                self.pos += 1;
+                let (n, column) = self.number()?;
+                if !(1..=5).contains(&n) {
+                    return Err(self.error(column, FieldProblem::InvalidOccurrence(n)));
+                }
+                return self.special(Special::NthWeekday(self.domain.canonical(start), n));
+            }
+            _ => {}
+        }
+        if self.eat(&TokenKind::Dash) {
+            let end_tok = self.expect_token()?;
+            let end = self.value(&end_tok)?;
+            let step = if self.eat(&TokenKind::Slash) {
+                self.step()?
+            } else {
+                1
+            };
+            self.push_span(start, end, step, tok.column)
+        } else if self.eat(&TokenKind::Slash) {
+            let step = self.step()?;
+            self.push_range(start, self.domain.cycle_max.max(start), step);
+            Ok(())
+        } else {
+            self.out.values.push(self.domain.canonical(start));
+            Ok(())
+        }
+    }
+
+    /// Records a special item; none of them accept a step.
+    fn special(&mut self, special: Special) -> Result<()> {
+        if let Some(TokenKind::Slash) = self.peek() {
+            let column = self.tokens[self.pos].column;
+            return Err(self.error(
+                column,
+                FieldProblem::NotAllowed("a step after 'L', 'W' or '#'"),
+            ));
+        }
+        self.out.specials.push(special);
+        Ok(())
+    }
+
+    fn number(&mut self) -> Result<(u32, usize)> {
+        let tok = self.expect_token()?;
+        match tok.kind {
+            TokenKind::Number(n) => Ok((n, tok.column)),
+            _ => Err(self.unexpected(&tok)),
+        }
+    }
+
+    fn step(&mut self) -> Result<u32> {
+        let (step, column) = self.number()?;
+        let max = self.domain.span();
+        if step == 0 || step > max {
+            return Err(self.error(column, FieldProblem::InvalidStep { step, max }));
+        }
+        Ok(step)
+    }
+
+    /// A number or name, range-checked, in the field's written numbering.
+    fn value(&self, tok: &Token) -> Result<u32> {
+        match &tok.kind {
+            TokenKind::Number(n) => {
+                if (self.domain.min..=self.domain.max).contains(n) {
+                    Ok(*n)
+                } else {
+                    Err(self.error(
+                        tok.column,
+                        FieldProblem::OutOfRange {
+                            value: *n,
+                            min: self.domain.min,
+                            max: self.domain.max,
+                        },
+                    ))
+                }
+            }
+            TokenKind::Name(n) => self.name_value(n, tok.column),
+            _ => Err(self.unexpected(tok)),
+        }
+    }
+
+    fn name_value(&self, name: &str, column: usize) -> Result<u32> {
+        if let Some(i) = self.domain.names.iter().position(|n| *n == name) {
+            return Ok(i as u32 + self.domain.name_base);
+        }
+        let problem = match name {
+            "L" | "LW" => FieldProblem::NotAllowed("'L'"),
+            "W" => FieldProblem::NotAllowed("'W'"),
+            _ => FieldProblem::UnknownName(name.to_string()),
+        };
+        Err(self.error(column, problem))
+    }
+
+    /// `start-end/step`, wrapping around the cycle when `end < start`.
+    fn push_span(&mut self, start: u32, end: u32, step: u32, column: usize) -> Result<()> {
+        let d = *self.domain;
+        // In the standard day-of-week field 7 is Sunday: `SAT-7` is a plain
+        // range to the top, while `7-TUE` means `SUN-TUE`.
+        let start = if start == 7 && end < 7 && d.cycle_max == 6 {
+            0
+        } else {
+            start
+        };
+        if start <= end {
+            self.push_range(start, end, step);
+            return Ok(());
+        }
+        if d.field == Field::Year {
+            return Err(self.error(column, FieldProblem::ReversedRange { start, end }));
+        }
+        let end = end.min(d.cycle_max);
+        let len = (d.cycle_max - start + 1) + (end - d.min + 1);
+        for k in (0..len).step_by(step as usize) {
+            let mut v = start + k;
+            if v > d.cycle_max {
+                v -= d.span();
+            }
+            self.out.values.push(d.canonical(v));
+        }
+        Ok(())
+    }
+
+    fn push_range(&mut self, lo: u32, hi: u32, step: u32) {
+        for v in (lo..=hi).step_by(step as usize) {
+            self.out.values.push(self.domain.canonical(v));
+        }
+    }
+}
