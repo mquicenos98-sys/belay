@@ -120,3 +120,19 @@ pub(crate) struct ParsedField {
     pub values: Vec<u32>,
     pub specials: Vec<Special>,
 }
+
+/// Parses a non-empty field. `end_column` is the column just past its text.
+pub(crate) fn parse_field(
+    tokens: &[Token],
+    domain: &Domain,
+    end_column: usize,
+) -> Result<ParsedField> {
+    FieldParser {
+        tokens,
+        pos: 0,
+        domain,
+        end_column,
+        out: ParsedField::default(),
+    }
+    .run()
+}
