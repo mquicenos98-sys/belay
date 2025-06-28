@@ -18,7 +18,6 @@ use crate::error::{CronError, Field, FieldProblem, Result};
 pub(crate) const MONTH_NAMES: [&str; 12] = [
     "JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC",
 ];
-
 pub(crate) const DAY_NAMES: [&str; 7] = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"];
 
 /// The values a field accepts and how they map onto the canonical numbering
@@ -412,5 +411,217 @@ impl FieldParser<'_> {
         for v in (lo..=hi).step_by(step as usize) {
             self.out.values.push(self.domain.canonical(v));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::lexer::tokenize;
+    use super::*;
+
+    fn parse(text: &str, domain: &Domain) -> Result<ParsedField> {
+        let tokens = tokenize(text, domain.field, 1)?;
+        parse_field(&tokens, domain, text.chars().count() + 1)
+    }
+
+    fn values(text: &str, domain: &Domain) -> Vec<u32> {
+        let mut v = parse(text, domain).unwrap().values;
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
+    #[test]
+    fn stars_ranges_steps_and_lists() {
+        assert_eq!(values("*", &Domain::HOUR), (0..24).collect::<Vec<_>>());
+        assert_eq!(values("*/15", &Domain::MINUTE), vec![0, 15, 30, 45]);
+        assert_eq!(values("10-50/20", &Domain::MINUTE), vec![10, 30, 50]);
+        assert_eq!(values("5/20", &Domain::MINUTE), vec![5, 25, 45]);
+        assert_eq!(
+            values("1,3,5-7", &Domain::DAY_OF_MONTH),
+            vec![1, 3, 5, 6, 7]
+        );
+        assert_eq!(values("*/5", &Domain::MONTH), vec![1, 6, 11]);
+        assert_eq!(values("2030-2040/5", &Domain::YEAR), vec![2030, 2035, 2040]);
+    }
+
+    #[test]
+    fn names_are_case_insensitive_and_mix_with_numbers() {
+        assert_eq!(values("jan,Mar-MAY", &Domain::MONTH), vec![1, 3, 4, 5]);
+        assert_eq!(values("mon-fri", &Domain::DAY_OF_WEEK), vec![1, 2, 3, 4, 5]);
+        assert_eq!(values("MON-5", &Domain::DAY_OF_WEEK), vec![1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn sunday_is_both_zero_and_seven() {
+        assert_eq!(values("7", &Domain::DAY_OF_WEEK), vec![0]);
+        assert_eq!(values("5-7", &Domain::DAY_OF_WEEK), vec![0, 5, 6]);
+        assert_eq!(
+            values("0-7", &Domain::DAY_OF_WEEK),
+            (0..7).collect::<Vec<_>>()
+        );
+        assert_eq!(values("7-2", &Domain::DAY_OF_WEEK), vec![0, 1, 2]);
+        assert_eq!(values("*/2", &Domain::DAY_OF_WEEK), vec![0, 2, 4, 6]);
+    }
+
+    #[test]
+    fn quartz_weekdays_start_at_one_for_sunday() {
+        let d = Domain::DAY_OF_WEEK_QUARTZ;
+        assert_eq!(values("2-6", &d), vec![1, 2, 3, 4, 5]);
+        assert_eq!(values("1", &d), vec![0]);
+        assert_eq!(values("MON-FRI", &d), vec![1, 2, 3, 4, 5]);
+        assert_eq!(values("1/2", &d), vec![0, 2, 4, 6]);
+        assert!(parse("0", &d).is_err());
+    }
+
+    #[test]
+    fn reversed_ranges_wrap_around_the_cycle() {
+        assert_eq!(values("22-2", &Domain::HOUR), vec![0, 1, 2, 22, 23]);
+        assert_eq!(values("NOV-FEB", &Domain::MONTH), vec![1, 2, 11, 12]);
+        assert_eq!(values("FRI-MON", &Domain::DAY_OF_WEEK), vec![0, 1, 5, 6]);
+        // Stepping continues across the wrap: 22, 0, 2.
+        assert_eq!(values("22-3/2", &Domain::HOUR), vec![0, 2, 22]);
+        // Sunday must not be visited twice when stepping over the wrap.
+        assert_eq!(values("FRI-MON/2", &Domain::DAY_OF_WEEK), vec![0, 5]);
+        assert_eq!(values("30-2", &Domain::DAY_OF_MONTH), vec![1, 2, 30, 31]);
+    }
+
+    #[test]
+    fn year_ranges_do_not_wrap() {
+        let err = parse("2030-2025", &Domain::YEAR).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "reversed range 2030-2025 in year field at column 1"
+        );
+    }
+
+    #[test]
+    fn day_of_month_specials() {
+        let f = parse("1,L,L-3,15W,LW", &Domain::DAY_OF_MONTH).unwrap();
+        assert_eq!(f.values, vec![1]);
+        assert_eq!(
+            f.specials,
+            vec![
+                Special::LastDay,
+                Special::LastDayOffset(3),
+                Special::NearestWeekday(15),
+                Special::LastWeekday
+            ]
+        );
+    }
+
+    #[test]
+    fn day_of_week_specials() {
+        let f = parse("FRIL,5L,MON#2,1#5", &Domain::DAY_OF_WEEK).unwrap();
+        assert!(f.values.is_empty());
+        assert_eq!(
+            f.specials,
+            vec![
+                Special::LastOfWeekday(5),
+                Special::LastOfWeekday(5),
+                Special::NthWeekday(1, 2),
+                Special::NthWeekday(1, 5)
+            ]
+        );
+    }
+
+    #[test]
+    fn errors_point_at_the_offending_token() {
+        let cases: [(&str, Domain, &str); 16] = [
+            (
+                "61",
+                Domain::MINUTE,
+                "invalid value 61 in minute field (0-59) at column 1",
+            ),
+            (
+                "1-61",
+                Domain::MINUTE,
+                "invalid value 61 in minute field (0-59) at column 3",
+            ),
+            (
+                "*/0",
+                Domain::MINUTE,
+                "invalid step 0 in minute field (1-60) at column 3",
+            ),
+            (
+                "*/25",
+                Domain::HOUR,
+                "invalid step 25 in hour field (1-24) at column 3",
+            ),
+            (
+                "1,,2",
+                Domain::HOUR,
+                "empty list item in hour field at column 3",
+            ),
+            (
+                "1,",
+                Domain::HOUR,
+                "empty list item in hour field at column 2",
+            ),
+            (
+                "5-",
+                Domain::HOUR,
+                "unexpected end of hour field at column 3",
+            ),
+            (
+                "L",
+                Domain::HOUR,
+                "'L' is not allowed in the hour field at column 1",
+            ),
+            (
+                "5W",
+                Domain::DAY_OF_WEEK,
+                "'W' is not allowed in the day-of-week field at column 2",
+            ),
+            (
+                "MON#6",
+                Domain::DAY_OF_WEEK,
+                "invalid occurrence #6 in day-of-week field (1-5) at column 5",
+            ),
+            (
+                "1#2",
+                Domain::HOUR,
+                "'#' is not allowed in the hour field at column 2",
+            ),
+            (
+                "?",
+                Domain::MINUTE,
+                "'?' is not allowed in the minute field at column 1",
+            ),
+            (
+                "FOO",
+                Domain::MONTH,
+                "unknown name \"FOO\" in month field at column 1",
+            ),
+            (
+                "L",
+                Domain::DAY_OF_WEEK,
+                "'L' without a weekday is not allowed in the day-of-week field at column 1",
+            ),
+            (
+                "L/2",
+                Domain::DAY_OF_MONTH,
+                "a step after 'L', 'W' or '#' is not allowed in the day-of-month field at column 2",
+            ),
+            (
+                "L-31",
+                Domain::DAY_OF_MONTH,
+                "invalid value 31 in day-of-month field (1-30) at column 3",
+            ),
+        ];
+        for (text, domain, expected) in cases {
+            assert_eq!(
+                parse(text, &domain).unwrap_err().to_string(),
+                expected,
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn nearest_weekday_rejects_day_zero_and_names() {
+        assert!(parse("0W", &Domain::DAY_OF_MONTH).is_err());
+        assert!(parse("32W", &Domain::DAY_OF_MONTH).is_err());
+        assert!(parse("JANW", &Domain::DAY_OF_MONTH).is_err());
     }
 }
