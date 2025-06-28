@@ -192,7 +192,10 @@ impl Job {
     /// [`MAX_ERROR_HISTORY`](crate::limits::MAX_ERROR_HISTORY).
     pub fn record_error(&mut self, error: JobError) {
         self.errors.push(error);
-        self.errors.truncate(MAX_ERROR_HISTORY);
+        if self.errors.len() > MAX_ERROR_HISTORY {
+            let excess = self.errors.len() - MAX_ERROR_HISTORY;
+            self.errors.drain(..excess);
+        }
     }
 
     /// The most recent failure.
@@ -625,6 +628,21 @@ mod tests {
             "a rejected transition changes nothing"
         );
         assert_eq!(job.updated_at, t(50));
+    }
+
+    #[test]
+    fn error_history_is_bounded_and_keeps_the_newest() {
+        let mut job = running_job();
+        for attempt in 1..=15 {
+            job.record_error(JobError::new(
+                t(attempt.into()),
+                attempt,
+                format!("boom {attempt}"),
+            ));
+        }
+        assert_eq!(job.errors.len(), MAX_ERROR_HISTORY);
+        assert_eq!(job.errors[0].attempt, 6);
+        assert_eq!(job.last_error().map(|e| e.attempt), Some(15));
     }
 
     #[test]
