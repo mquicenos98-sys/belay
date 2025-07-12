@@ -387,3 +387,22 @@ fn transition(rule: &PosixTz, at: i64) -> Transition {
         offset_after: rule.offset_at(at),
     }
 }
+
+/// Keeps rule evaluation inside years 1-9999, where the calendar math is
+/// exact and nothing overflows.
+fn clamp(utc: i64) -> i64 {
+    utc.clamp(MIN_NAIVE + 2 * 86_400, MAX_NAIVE - 2 * 86_400)
+}
+
+/// `+05:30`-style text; `sep` is `":"` or `""`. Seconds appear only when
+/// non-zero (no real zone has them today).
+fn format_offset(offset: i32, sep: &str) -> String {
+    let sign = if offset < 0 { '-' } else { '+' };
+    let abs = offset.unsigned_abs();
+    let (h, m, s) = (abs / 3600, abs / 60 % 60, abs % 60);
+    if s == 0 {
+        format!("{sign}{h:02}{sep}{m:02}")
+    } else {
+        format!("{sign}{h:02}{sep}{m:02}{sep}{s:02}")
+    }
+}
