@@ -406,3 +406,60 @@ fn format_offset(offset: i32, sep: &str) -> String {
         format!("{sign}{h:02}{sep}{m:02}{sep}{s:02}")
     }
 }
+
+fn parse_fixed(input: &str, s: &str) -> Result<i32> {
+    let fail = |reason| CronError::InvalidTz {
+        input: input.to_string(),
+        column: input.find(s).unwrap_or(0) + 1,
+        reason,
+    };
+    let negative = s.starts_with('-');
+    let body = &s[1..];
+    let digits: String = body.chars().filter(|c| *c != ':').collect();
+    let colon_ok = match body.find(':') {
+        None => true,
+        Some(2) => body.len() == 5 || (body.len() == 8 && body[5..].starts_with(':')),
+        Some(_) => false,
+    };
+    if !colon_ok || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(fail("expected an offset like +05:30, -0800 or +01"));
+    }
+    let (h, m, sec) = match digits.len() {
+        2 => (&digits[..2], "0", "0"),
+        4 => (&digits[..2], &digits[2..4], "0"),
+        6 => (&digits[..2], &digits[2..4], &digits[4..6]),
+        _ => return Err(fail("expected an offset like +05:30, -0800 or +01")),
+    };
+    let parse = |p: &str| p.parse::<i32>().unwrap_or(i32::MAX);
+    let (h, m, sec) = (parse(h), parse(m), parse(sec));
+    if m > 59 || sec > 59 {
+        return Err(fail("offset minutes and seconds must be 0-59"));
+    }
+    let total = h * 3600 + m * 60 + sec;
+    if total > MAX_OFFSET {
+        return Err(fail("offset must be within 24:59:59 of UTC"));
+    }
+    Ok(if negative { -total } else { total })
+}
+
+fn looks_like_zone_name(s: &str) -> bool {
+    s.contains('/')
+        || (!s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphabetic() || b == b'_' || b == b'-'))
+}
+
+impl fmt::Display for Tz {
+    /// Prints the zone name when known, otherwise `+05:30` or the normalised
+    /// POSIX rule. The output parses back with [`Tz::parse`].
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Tz::Utc => f.write_str("UTC"),
+            Tz::Fixed(offset) => f.write_str(&format_offset(*offset, ":")),
+            Tz::Rule(rule) => match rule.name() {
+                Some(name) => f.write_str(name),
+                None => write!(f, "{rule}"),
+            },
+        }
+    }
+}
