@@ -12,7 +12,6 @@
 //! reading inside a forward jump (spring) maps to none.
 
 mod posix;
-
 pub(crate) mod zones;
 
 use std::borrow::Cow;
@@ -461,5 +460,217 @@ impl fmt::Display for Tz {
                 None => write!(f, "{rule}"),
             },
         }
+    }
+}
+
+impl FromStr for Tz {
+    type Err = CronError;
+
+    fn from_str(s: &str) -> Result<Tz> {
+        Tz::parse(s)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::civil::{days_from_civil, SECS_PER_DAY};
+
+    fn ts(y: i64, mo: u32, d: u32, h: i64, mi: i64) -> i64 {
+        days_from_civil(y, mo, d) * SECS_PER_DAY + h * 3600 + mi * 60
+    }
+
+    fn local(y: i32, mo: u32, d: u32, h: u32, mi: u32) -> LocalDateTime {
+        LocalDateTime::new(y, mo, d, h, mi, 0).unwrap()
+    }
+
+    #[test]
+    fn parse_accepts_names_offsets_and_rules() {
+        assert_eq!(Tz::parse("UTC").unwrap(), Tz::Utc);
+        assert_eq!(Tz::parse("Etc/UTC").unwrap(), Tz::Utc);
+        assert_eq!(Tz::parse("GMT").unwrap(), Tz::Utc);
+        assert_eq!(Tz::parse("Z").unwrap(), Tz::Utc);
+        assert_eq!(Tz::parse("+05:30").unwrap(), Tz::Fixed(19_800));
+        assert_eq!(Tz::parse("-0800").unwrap(), Tz::Fixed(-28_800));
+        assert_eq!(Tz::parse("+01").unwrap(), Tz::Fixed(3600));
+        assert_eq!(Tz::parse("-03:00:30").unwrap(), Tz::Fixed(-10_830));
+        assert_eq!(
+            Tz::parse(":Europe/Paris").unwrap().name(),
+            Some("Europe/Paris")
+        );
+        let rule = Tz::parse("CET-1CEST,M3.5.0,M10.5.0/3").unwrap();
+        assert_eq!(rule.name(), None);
+        assert!(rule.has_transitions());
+        assert_eq!(Tz::parse("UTC+3").unwrap().offset_at(0), -3 * 3600);
+    }
+
+    #[test]
+    fn parse_rejects_bad_offsets_and_unknown_names() {
+        for bad in ["+5:30", "+05:3", "+123", "+25:00", "+05:60", "-", "+05:30:"] {
+            assert!(
+                matches!(Tz::parse(bad), Err(CronError::InvalidTz { .. })),
+                "{bad}"
+            );
+        }
+        assert_eq!(
+            Tz::parse("Europe/Berln").unwrap_err(),
+            CronError::UnknownZone {
+                name: "Europe/Berln".into(),
+                suggestion: Some("Europe/Berlin"),
+            }
+        );
+        assert!(matches!(
+            Tz::parse("Pacific_Time"),
+            Err(CronError::UnknownZone { .. })
+        ));
+        assert!(matches!(
+            Tz::parse("EST5EDT,M3"),
+            Err(CronError::InvalidTz { .. })
+        ));
+    }
+
+    #[test]
+    fn display_round_trips_through_parse() {
+        for s in [
+            "UTC",
+            "+05:30",
+            "-08:00",
+            "America/New_York",
+            "Etc/GMT+5",
+            "EST5EDT,M3.2.0,M11.1.0",
+            "<+0330>-3:30",
+        ] {
+            let tz = Tz::parse(s).unwrap();
+            assert_eq!(tz.to_string(), s);
+            assert_eq!(Tz::parse(&tz.to_string()).unwrap(), tz);
+        }
+    }
+
+    #[test]
+    fn fixed_rejects_offsets_beyond_a_day() {
+        assert!(Tz::fixed(14 * 3600).is_ok());
+        assert!(Tz::fixed(-(MAX_OFFSET)).is_ok());
+        assert!(Tz::fixed(MAX_OFFSET + 1).is_err());
+    }
+
+    #[test]
+    fn from_local_classifies_gap_overlap_and_normal_readings() {
+        let ny = Tz::named("America/New_York").unwrap();
+        assert_eq!(
+            ny.from_local(local(2025, 7, 4, 12, 0)),
+            LocalResult::Single(ts(2025, 7, 4, 16, 0))
+        );
+        let gap = ny.from_local(local(2025, 3, 9, 2, 30));
+        let t = ts(2025, 3, 9, 7, 0);
+        assert_eq!(
+            gap,
+            LocalResult::Gap {
+                before: t - 1,
+                after: t
+            }
+        );
+        assert_eq!(gap.single(), None);
+        assert_eq!(gap.latest(), t - 1);
+        let overlap = ny.from_local(local(2025, 11, 2, 1, 30));
+        assert_eq!(
+            overlap,
+            LocalResult::Ambiguous(ts(2025, 11, 2, 5, 30), ts(2025, 11, 2, 6, 30))
+        );
+        assert_eq!(overlap.earliest(), ts(2025, 11, 2, 5, 30));
+        assert_eq!(overlap.latest(), ts(2025, 11, 2, 6, 30));
+        // The readings bounding the gap and the overlap are ordinary.
+        assert_eq!(
+            ny.from_local(local(2025, 3, 9, 3, 0)),
+            LocalResult::Single(t)
+        );
+        assert_eq!(
+            ny.from_local(LocalDateTime::new(2025, 3, 9, 1, 59, 59).unwrap()),
+            LocalResult::Single(t - 1)
+        );
+        assert_eq!(
+            ny.from_local(local(2025, 11, 2, 2, 0)),
+            LocalResult::Single(ts(2025, 11, 2, 7, 0))
+        );
+    }
+
+    #[test]
+    fn from_local_handles_negative_dst_and_half_hour_shifts() {
+        let dublin = Tz::named("Europe/Dublin").unwrap();
+        let t = ts(2025, 3, 30, 1, 0);
+        assert_eq!(
+            dublin.from_local(local(2025, 3, 30, 1, 30)),
+            LocalResult::Gap {
+                before: t - 1,
+                after: t
+            }
+        );
+        assert_eq!(
+            dublin.from_local(local(2025, 10, 26, 1, 30)),
+            LocalResult::Ambiguous(ts(2025, 10, 26, 0, 30), ts(2025, 10, 26, 1, 30))
+        );
+        let lord_howe = Tz::named("Australia/Lord_Howe").unwrap();
+        // DST starts 2025-10-05 02:00 +10:30 (15:30 UTC) and skips 30 minutes.
+        let t = ts(2025, 10, 4, 15, 30);
+        assert_eq!(
+            lord_howe.from_local(local(2025, 10, 5, 2, 15)),
+            LocalResult::Gap {
+                before: t - 1,
+                after: t
+            }
+        );
+        assert_eq!(
+            lord_howe.from_local(local(2025, 10, 5, 2, 30)),
+            LocalResult::Single(t)
+        );
+    }
+
+    #[test]
+    fn transitions_report_offsets_on_both_sides() {
+        let london = Tz::named("Europe/London").unwrap();
+        let tr = london.next_transition(ts(2025, 1, 1, 0, 0)).unwrap();
+        assert_eq!(
+            tr,
+            Transition {
+                at: ts(2025, 3, 30, 1, 0),
+                offset_before: 0,
+                offset_after: 3600,
+            }
+        );
+        assert!(tr.is_forward());
+        let back = london.next_transition(tr.at).unwrap();
+        assert_eq!(back.at, ts(2025, 10, 26, 1, 0));
+        assert!(!back.is_forward());
+        assert_eq!(london.prev_transition(back.at), Some(back));
+        assert_eq!(london.prev_transition(back.at - 1), Some(tr));
+        assert_eq!(Tz::Utc.next_transition(0), None);
+        assert_eq!(Tz::named("Asia/Kolkata").unwrap().next_transition(0), None);
+    }
+
+    #[test]
+    fn abbreviations_and_rfc3339_follow_the_offset() {
+        let ny = Tz::named("America/New_York").unwrap();
+        assert_eq!(ny.abbreviation_at(ts(2025, 1, 1, 0, 0)), "EST");
+        assert_eq!(ny.abbreviation_at(ts(2025, 7, 1, 0, 0)), "EDT");
+        assert_eq!(
+            ny.format_rfc3339(ts(2025, 3, 9, 7, 0)),
+            "2025-03-09T03:00:00-04:00"
+        );
+        assert_eq!(
+            Tz::Utc.format_rfc3339(ts(2025, 3, 9, 7, 0)),
+            "2025-03-09T07:00:00Z"
+        );
+        let kathmandu = Tz::named("Asia/Kathmandu").unwrap();
+        assert_eq!(kathmandu.format_rfc3339(0), "1970-01-01T05:45:00+05:45");
+        assert_eq!(Tz::Fixed(-9000).abbreviation_at(0), "-0230");
+    }
+
+    #[test]
+    fn extreme_instants_clamp_instead_of_overflowing() {
+        let ny = Tz::named("America/New_York").unwrap();
+        assert_eq!(ny.to_local(i64::MAX).year(), 9999);
+        assert_eq!(ny.to_local(i64::MIN).year(), 1);
+        let _ = ny.next_transition(i64::MAX);
+        let _ = ny.prev_transition(i64::MIN);
+        assert_eq!(Tz::Fixed(3600).to_local(i64::MAX).year(), 9999);
     }
 }
