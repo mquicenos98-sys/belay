@@ -65,12 +65,17 @@ impl QueueEngine {
         let names: Vec<QueueName> = self.lock().st.queues.keys().cloned().collect();
 
         for name in &names {
-            let (moved, effects) = {
-                let mut core = self.lock();
-                self.promote_due(&mut core, std::slice::from_ref(name), now, batch)?
-            };
-            self.after(effects);
-            report.promoted += moved as u64;
+            loop {
+                let (moved, effects) = {
+                    let mut core = self.lock();
+                    self.promote_due(&mut core, std::slice::from_ref(name), now, batch)?
+                };
+                self.after(effects);
+                report.promoted += moved as u64;
+                if moved < batch {
+                    break;
+                }
+            }
         }
 
         for name in &names {

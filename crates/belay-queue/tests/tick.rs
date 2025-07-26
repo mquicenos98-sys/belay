@@ -48,6 +48,18 @@ fn scheduled_jobs_become_ready_exactly_at_run_at() {
 }
 
 #[test]
+fn promotion_runs_in_batches_until_everything_due_is_ready() {
+    let h = Harness::with_options(EngineOptions::new().batch_size(7));
+    for i in 0..50 {
+        h.enqueue(JobSpec::new("q", format!("k{i}")).delay(secs(1 + i % 5)));
+    }
+    h.secs(5);
+    assert_eq!(h.tick().promoted, 50);
+    assert_eq!(h.engine.queue_info(&q("q")).expect("info").counts.ready, 50);
+    h.assert_consistent();
+}
+
+#[test]
 fn expired_leases_retry_after_backoff_and_die_when_exhausted() {
     let h = Harness::new();
     let id = h.enqueue(
