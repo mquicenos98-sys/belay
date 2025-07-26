@@ -24,7 +24,6 @@ use crate::error::{CronError, Result};
 
 /// Largest accepted UTC offset magnitude: 24:59:59, the POSIX limit.
 pub(crate) const MAX_OFFSET: i32 = 24 * 3600 + 59 * 60 + 59;
-
 const DEFAULT_RULE_TIME: i32 = 2 * 3600;
 
 /// A parsed POSIX TZ rule such as `CET-1CEST,M3.5.0,M10.5.0/3`.
@@ -345,4 +344,448 @@ fn write_hms(f: &mut fmt::Formatter<'_>, secs: i32) -> fmt::Result {
         write!(f, ":{s:02}")?;
     }
     Ok(())
+}
+
+/// Recursive-descent parser over the bytes of a TZ string.
+struct Parser<'a> {
+    input: &'a str,
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl<'a> Parser<'a> {
+    fn new(input: &'a str) -> Self {
+        Parser {
+            input,
+            bytes: input.as_bytes(),
+            pos: 0,
+        }
+    }
+
+    fn error(&self, reason: &'static str) -> CronError {
+        self.error_at(self.pos, reason)
+    }
+
+    fn error_at(&self, pos: usize, reason: &'static str) -> CronError {
+        let column = self.input[..pos.min(self.input.len())].chars().count() + 1;
+        CronError::InvalidTz {
+            input: self.input.to_string(),
+            column,
+            reason,
+        }
+    }
+
+    fn peek(&self) -> Option<u8> {
+        self.bytes.get(self.pos).copied()
+    }
+
+    fn eat(&mut self, b: u8) -> bool {
+        if self.peek() == Some(b) {
+            self.pos += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn parse(mut self) -> Result<PosixTz> {
+        if self.bytes.is_empty() {
+            return Err(self.error("empty rule"));
+        }
+        let std_abbr = self.abbreviation()?;
+        if self.peek().is_none() {
+            return Err(self.error("expected a UTC offset after the abbreviation"));
+        }
+        let std_offset = -self.hms(24, true)?;
+        if self.peek().is_none() {
+            return Ok(PosixTz {
+                std_abbr,
+                std_offset,
+                dst: None,
+                name: None,
+            });
+        }
+        let dst_abbr = self.abbreviation()?;
+        let dst_offset = match self.peek() {
+            Some(b) if b == b'+' || b == b'-' || b.is_ascii_digit() => -self.hms(24, true)?,
+            _ => std_offset + 3600,
+        };
+        if self.peek().is_none() {
+            return Err(
+                self.error("daylight saving time needs start and end rules, as in ,M3.2.0,M11.1.0")
+            );
+        }
+        if !self.eat(b',') {
+            return Err(self.error("expected ',' before the daylight saving start rule"));
+        }
+        let start = self.rule_time()?;
+        if !self.eat(b',') {
+            return Err(self.error("expected ',' before the daylight saving end rule"));
+        }
+        let end = self.rule_time()?;
+        if self.peek().is_some() {
+            return Err(self.error("unexpected text after the end rule"));
+        }
+        Ok(PosixTz {
+            std_abbr,
+            std_offset,
+            dst: Some(DstRule {
+                abbr: dst_abbr,
+                offset: dst_offset,
+                start,
+                end,
+            }),
+            name: None,
+        })
+    }
+
+    fn abbreviation(&mut self) -> Result<String> {
+        let start = self.pos;
+        if self.eat(b'<') {
+            let inner_start = self.pos;
+            while let Some(b) = self.peek() {
+                if b.is_ascii_alphanumeric() || b == b'+' || b == b'-' {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
+            }
+            let inner = &self.input[inner_start..self.pos];
+            if !self.eat(b'>') {
+                return Err(self.error("expected '>' to close the quoted abbreviation"));
+            }
+            if inner.len() < 3 {
+                self.pos = start;
+                return Err(self.error("abbreviations need at least three characters"));
+            }
+            return Ok(inner.to_string());
+        }
+        while self.peek().is_some_and(|b| b.is_ascii_alphabetic()) {
+            self.pos += 1;
+        }
+        if self.pos - start < 3 {
+            self.pos = start;
+            return Err(
+                self.error("expected an abbreviation of at least three letters (or <...> quoted)")
+            );
+        }
+        Ok(self.input[start..self.pos].to_string())
+    }
+
+    /// `[+-]hh[:mm[:ss]]` in seconds, with the hour bounded by `max_hours`.
+    fn hms(&mut self, max_hours: u32, allow_sign: bool) -> Result<i32> {
+        let negative = if allow_sign && self.eat(b'-') {
+            true
+        } else {
+            if allow_sign {
+                self.eat(b'+');
+            }
+            false
+        };
+        let at = self.pos;
+        let hours = self.number(3).ok_or_else(|| self.error("expected hours"))?;
+        if hours > max_hours {
+            return Err(self.error_at(at, "hours out of range"));
+        }
+        let mut secs = hours * 3600;
+        for unit in [60, 1] {
+            if !self.eat(b':') {
+                break;
+            }
+            let at = self.pos;
+            let v = self
+                .number(2)
+                .filter(|_| self.pos - at == 2)
+                .ok_or_else(|| self.error_at(at, "expected two-digit minutes or seconds"))?;
+            if v > 59 {
+                return Err(self.error_at(at, "minutes and seconds must be 0-59"));
+            }
+            secs += v * unit;
+        }
+        let secs = secs as i32;
+        Ok(if negative { -secs } else { secs })
+    }
+
+    fn number(&mut self, max_digits: usize) -> Option<u32> {
+        let start = self.pos;
+        while self.pos - start < max_digits && self.peek().is_some_and(|b| b.is_ascii_digit()) {
+            self.pos += 1;
+        }
+        if self.pos == start {
+            return None;
+        }
+        self.input[start..self.pos].parse().ok()
+    }
+
+    fn rule_time(&mut self) -> Result<RuleTime> {
+        let date = self.rule_date()?;
+        let time = if self.eat(b'/') {
+            self.hms(167, true)?
+        } else {
+            DEFAULT_RULE_TIME
+        };
+        Ok(RuleTime { date, time })
+    }
+
+    fn rule_date(&mut self) -> Result<RuleDate> {
+        if self.eat(b'J') {
+            let at = self.pos;
+            let n = self
+                .number(3)
+                .ok_or_else(|| self.error("expected a day number after 'J'"))?;
+            if !(1..=365).contains(&n) {
+                return Err(self.error_at(at, "Julian day must be 1-365"));
+            }
+            return Ok(RuleDate::Julian(n as u16));
+        }
+        if self.eat(b'M') {
+            let at = self.pos;
+            let month = self
+                .number(2)
+                .ok_or_else(|| self.error("expected a month"))?;
+            if !(1..=12).contains(&month) {
+                return Err(self.error_at(at, "month must be 1-12"));
+            }
+            if !self.eat(b'.') {
+                return Err(self.error("expected '.' after the month"));
+            }
+            let at = self.pos;
+            let week = self
+                .number(1)
+                .ok_or_else(|| self.error("expected a week"))?;
+            if !(1..=5).contains(&week) {
+                return Err(self.error_at(at, "week must be 1-5"));
+            }
+            if !self.eat(b'.') {
+                return Err(self.error("expected '.' after the week"));
+            }
+            let at = self.pos;
+            let weekday = self
+                .number(1)
+                .ok_or_else(|| self.error("expected a weekday"))?;
+            if weekday > 6 {
+                return Err(self.error_at(at, "weekday must be 0-6"));
+            }
+            return Ok(RuleDate::MonthWeekDay {
+                month: month as u8,
+                week: week as u8,
+                weekday: weekday as u8,
+            });
+        }
+        let at = self.pos;
+        match self.number(3) {
+            Some(n) if n <= 365 => Ok(RuleDate::ZeroBased(n as u16)),
+            Some(_) => Err(self.error_at(at, "zero-based day must be 0-365")),
+            None => Err(self.error("expected a transition date (Jn, n or Mm.w.d)")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(y: i64, mo: u32, d: u32, h: i64, mi: i64) -> i64 {
+        days_from_civil(y, mo, d) * SECS_PER_DAY + h * 3600 + mi * 60
+    }
+
+    #[test]
+    fn parses_us_eastern_and_computes_2025_transitions() {
+        let tz = PosixTz::parse("EST5EDT,M3.2.0,M11.1.0").unwrap();
+        assert_eq!(tz.std_abbreviation(), "EST");
+        assert_eq!(tz.dst_abbreviation(), Some("EDT"));
+        // 2025-03-09 02:00 EST == 07:00 UTC; 2025-11-02 02:00 EDT == 06:00 UTC.
+        let start = ts(2025, 3, 9, 7, 0);
+        let end = ts(2025, 11, 2, 6, 0);
+        assert_eq!(tz.offset_at(start - 1), -5 * 3600);
+        assert_eq!(tz.offset_at(start), -4 * 3600);
+        assert_eq!(tz.offset_at(end - 1), -4 * 3600);
+        assert_eq!(tz.offset_at(end), -5 * 3600);
+        assert_eq!(tz.next_transition_at(start - 1), Some(start));
+        assert_eq!(tz.next_transition_at(start), Some(end));
+        assert_eq!(tz.prev_transition_at(start), Some(start));
+        assert_eq!(
+            tz.prev_transition_at(start - 1),
+            Some(ts(2024, 11, 3, 6, 0))
+        );
+        assert_eq!(tz.abbreviation_at(start), "EDT");
+    }
+
+    #[test]
+    fn southern_hemisphere_rule_is_dst_across_new_year() {
+        let tz = PosixTz::parse("AEST-10AEDT,M10.1.0,M4.1.0/3").unwrap();
+        assert_eq!(tz.offset_at(ts(2025, 1, 1, 0, 0)), 11 * 3600);
+        assert_eq!(tz.offset_at(ts(2024, 12, 31, 13, 30)), 11 * 3600);
+        assert_eq!(tz.offset_at(ts(2025, 7, 1, 0, 0)), 10 * 3600);
+        // Ends 2025-04-06 03:00 AEDT (16:00 UTC the day before), starts
+        // 2025-10-05 02:00 AEST (16:00 UTC the day before).
+        let end = ts(2025, 4, 5, 16, 0);
+        let start = ts(2025, 10, 4, 16, 0);
+        assert_eq!(tz.next_transition_at(ts(2025, 1, 1, 0, 0)), Some(end));
+        assert_eq!(tz.next_transition_at(end), Some(start));
+        assert!(tz.is_dst_at(start));
+        assert!(!tz.is_dst_at(end));
+    }
+
+    #[test]
+    fn negative_dst_rule_uses_the_lower_offset_in_winter() {
+        let tz = PosixTz::parse("IST-1GMT0,M10.5.0,M3.5.0/1").unwrap();
+        assert_eq!(tz.offset_at(ts(2025, 1, 15, 12, 0)), 0);
+        assert!(tz.is_dst_at(ts(2025, 1, 15, 12, 0)));
+        assert_eq!(tz.offset_at(ts(2025, 7, 15, 12, 0)), 3600);
+        assert_eq!(tz.abbreviation_at(ts(2025, 7, 15, 12, 0)), "IST");
+        // Same instants as London: 2025-03-30 and 2025-10-26 at 01:00 UTC.
+        assert_eq!(
+            tz.next_transition_at(ts(2025, 1, 1, 0, 0)),
+            Some(ts(2025, 3, 30, 1, 0))
+        );
+        assert_eq!(
+            tz.next_transition_at(ts(2025, 3, 30, 1, 0)),
+            Some(ts(2025, 10, 26, 1, 0))
+        );
+    }
+
+    #[test]
+    fn transition_times_may_be_negative_or_exceed_a_day() {
+        // America/Nuuk: -01:00 local on the Saturday before the last Sunday.
+        let nuuk = PosixTz::parse("<-02>2<-01>,M3.5.0/-1,M10.5.0/0").unwrap();
+        assert_eq!(
+            nuuk.next_transition_at(ts(2025, 1, 1, 0, 0)),
+            Some(ts(2025, 3, 30, 1, 0))
+        );
+        // Asia/Jerusalem: 26:00 on the fourth Thursday is Friday 02:00.
+        let jlm = PosixTz::parse("IST-2IDT,M3.4.4/26,M10.5.0").unwrap();
+        assert_eq!(
+            jlm.next_transition_at(ts(2025, 1, 1, 0, 0)),
+            Some(ts(2025, 3, 28, 0, 0))
+        );
+        // America/Santiago: Saturday 24:00.
+        let scl = PosixTz::parse("<-04>4<-03>,M9.1.6/24,M4.1.6/24").unwrap();
+        assert_eq!(
+            scl.next_transition_at(ts(2025, 1, 1, 0, 0)),
+            Some(ts(2025, 4, 6, 3, 0))
+        );
+        assert_eq!(
+            scl.next_transition_at(ts(2025, 4, 6, 3, 0)),
+            Some(ts(2025, 9, 7, 4, 0))
+        );
+    }
+
+    #[test]
+    fn julian_forms_count_leap_days_differently() {
+        let j = RuleDate::Julian(60);
+        let n = RuleDate::ZeroBased(59);
+        // J60 is always March 1; zero-based 59 is Feb 29 in a leap year.
+        assert_eq!(j.day_number(2024), days_from_civil(2024, 3, 1));
+        assert_eq!(j.day_number(2025), days_from_civil(2025, 3, 1));
+        assert_eq!(n.day_number(2024), days_from_civil(2024, 2, 29));
+        assert_eq!(n.day_number(2025), days_from_civil(2025, 3, 1));
+        assert_eq!(
+            RuleDate::Julian(365).day_number(2024),
+            days_from_civil(2024, 12, 31)
+        );
+    }
+
+    #[test]
+    fn permanent_dst_rule_never_transitions() {
+        // RFC 8536 §3.3.1's example of daylight saving all year round.
+        let tz = PosixTz::parse("EST5EDT,0/0,J365/25").unwrap();
+        for t in [
+            ts(2025, 1, 1, 0, 0),
+            ts(2025, 1, 1, 4, 59),
+            ts(2025, 6, 1, 0, 0),
+            ts(2025, 12, 31, 23, 0),
+            ts(2026, 1, 1, 5, 0),
+        ] {
+            assert_eq!(tz.offset_at(t), -4 * 3600, "at {t}");
+        }
+        assert_eq!(tz.next_transition_at(ts(2025, 6, 1, 0, 0)), None);
+        assert_eq!(tz.prev_transition_at(ts(2025, 6, 1, 0, 0)), None);
+    }
+
+    #[test]
+    fn display_normalises_and_round_trips() {
+        for (input, normal) in [
+            ("EST5EDT,M3.2.0,M11.1.0", "EST5EDT,M3.2.0,M11.1.0"),
+            ("EST+5EDT4,M3.2.0/2,M11.1.0/2:00", "EST5EDT,M3.2.0,M11.1.0"),
+            ("<+0330>-3:30", "<+0330>-3:30"),
+            ("<-03>3", "<-03>3"),
+            ("IST-5:30", "IST-5:30"),
+            (
+                "<+1245>-12:45<+1345>,M9.5.0/2:45,M4.1.0/3:45",
+                "<+1245>-12:45<+1345>,M9.5.0/2:45,M4.1.0/3:45",
+            ),
+            (
+                "<-02>2<-01>,M3.5.0/-1,M10.5.0/0",
+                "<-02>2<-01>,M3.5.0/-1,M10.5.0/0",
+            ),
+            ("AAA3BBB,J60/1:30:15,300/-2", "AAA3BBB,J60/1:30:15,300/-2"),
+            ("XYZ0ABC-2,M3.5.0,M10.5.0", "XYZ0ABC-2,M3.5.0,M10.5.0"),
+        ] {
+            let tz = PosixTz::parse(input).unwrap();
+            assert_eq!(tz.to_string(), normal, "{input}");
+            assert_eq!(PosixTz::parse(normal).unwrap(), tz, "{input}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_rules_with_column() {
+        let cases = [
+            ("", 1, "empty rule"),
+            (
+                "ES5",
+                1,
+                "expected an abbreviation of at least three letters (or <...> quoted)",
+            ),
+            ("EST", 4, "expected a UTC offset after the abbreviation"),
+            ("EST25", 4, "hours out of range"),
+            (
+                "EST5EDT",
+                8,
+                "daylight saving time needs start and end rules, as in ,M3.2.0,M11.1.0",
+            ),
+            ("EST5EDT,M3.2", 13, "expected '.' after the week"),
+            ("EST5EDT,M13.2.0,M11.1.0", 10, "month must be 1-12"),
+            ("EST5EDT,M3.6.0,M11.1.0", 12, "week must be 1-5"),
+            ("EST5EDT,M3.2.7,M11.1.0", 14, "weekday must be 0-6"),
+            ("EST5EDT,J0,M11.1.0", 10, "Julian day must be 1-365"),
+            ("EST5EDT,366,M11.1.0", 9, "zero-based day must be 0-365"),
+            ("EST5EDT,M3.2.0/168,M11.1.0", 16, "hours out of range"),
+            (
+                "EST5EDT,M3.2.0",
+                15,
+                "expected ',' before the daylight saving end rule",
+            ),
+            ("<+05-5", 7, "expected '>' to close the quoted abbreviation"),
+            ("<+5>-5", 1, "abbreviations need at least three characters"),
+            ("EST5:7", 6, "expected two-digit minutes or seconds"),
+            ("EST5:75", 6, "minutes and seconds must be 0-59"),
+            (
+                "EST5EDT,M3.2.0,M11.1.0x",
+                23,
+                "unexpected text after the end rule",
+            ),
+        ];
+        for (input, column, reason) in cases {
+            match PosixTz::parse(input) {
+                Err(CronError::InvalidTz {
+                    column: c,
+                    reason: r,
+                    ..
+                }) => {
+                    assert_eq!((c, r), (column, reason), "{input:?}");
+                }
+                other => panic!("{input:?}: expected InvalidTz, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_rule_has_no_transitions() {
+        let tz = PosixTz::parse("<+0545>-5:45").unwrap();
+        assert!(!tz.has_transitions());
+        assert_eq!(tz.offset_at(0), 5 * 3600 + 45 * 60);
+        assert_eq!(tz.next_transition_at(0), None);
+        assert!(!tz.is_dst_at(0));
+    }
 }
