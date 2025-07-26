@@ -321,3 +321,28 @@ impl fmt::Display for PosixTz {
         Ok(())
     }
 }
+
+fn write_abbr(f: &mut fmt::Formatter<'_>, abbr: &str) -> fmt::Result {
+    if abbr.bytes().all(|b| b.is_ascii_alphabetic()) {
+        f.write_str(abbr)
+    } else {
+        write!(f, "<{abbr}>")
+    }
+}
+
+/// Writes `[-]h[:mm[:ss]]`, the shortest POSIX spelling.
+fn write_hms(f: &mut fmt::Formatter<'_>, secs: i32) -> fmt::Result {
+    if secs < 0 {
+        f.write_str("-")?;
+    }
+    let secs = secs.unsigned_abs();
+    let (h, m, s) = (secs / 3600, secs / 60 % 60, secs % 60);
+    write!(f, "{h}")?;
+    if m != 0 || s != 0 {
+        write!(f, ":{m:02}")?;
+    }
+    if s != 0 {
+        write!(f, ":{s:02}")?;
+    }
+    Ok(())
+}
