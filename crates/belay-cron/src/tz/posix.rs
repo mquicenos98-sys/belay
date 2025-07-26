@@ -133,3 +133,191 @@ fn active_between((start, end): (i64, i64), utc: i64) -> bool {
 /// for well-formed rules; the extra year guards against rules whose extended
 /// transition times (RFC 8536 allows ±167 hours) spill into the next year.
 const WINDOW_YEARS: usize = 5;
+
+fn year_of(naive: i64) -> i64 {
+    civil_from_days(naive.div_euclid(SECS_PER_DAY)).0
+}
+
+impl PosixTz {
+    /// Parses a POSIX TZ string.
+    ///
+    /// ```
+    /// use belay_cron::PosixTz;
+    ///
+    /// let tz = PosixTz::parse("EST5EDT,M3.2.0,M11.1.0")?;
+    /// assert_eq!(tz.std_offset(), -5 * 3600);
+    /// assert_eq!(tz.dst_offset(), Some(-4 * 3600));
+    /// assert_eq!(PosixTz::parse("<+0330>-3:30")?.std_offset(), 12_600);
+    /// # Ok::<(), belay_cron::CronError>(())
+    /// ```
+    pub fn parse(input: &str) -> Result<PosixTz> {
+        Parser::new(input).parse()
+    }
+
+    pub(crate) fn with_name(mut self, name: &'static str) -> PosixTz {
+        self.name = Some(name);
+        self
+    }
+
+    /// The IANA zone name, for rules that came from the embedded table.
+    #[must_use]
+    pub fn name(&self) -> Option<&'static str> {
+        self.name
+    }
+
+    /// Abbreviation of standard time, e.g. `"EST"` or `"+0330"`.
+    #[must_use]
+    pub fn std_abbreviation(&self) -> &str {
+        &self.std_abbr
+    }
+
+    /// Standard-time offset in seconds east of UTC.
+    #[must_use]
+    pub fn std_offset(&self) -> i32 {
+        self.std_offset
+    }
+
+    /// Abbreviation of daylight saving time, if the rule has one.
+    #[must_use]
+    pub fn dst_abbreviation(&self) -> Option<&str> {
+        self.dst.as_ref().map(|d| d.abbr.as_str())
+    }
+
+    /// Daylight-saving offset in seconds east of UTC, if the rule has one.
+    #[must_use]
+    pub fn dst_offset(&self) -> Option<i32> {
+        self.dst.as_ref().map(|d| d.offset)
+    }
+
+    /// Whether the rule switches between two offsets during the year.
+    #[must_use]
+    pub fn has_transitions(&self) -> bool {
+        self.dst
+            .as_ref()
+            .is_some_and(|d| d.offset != self.std_offset)
+    }
+
+    /// Whether the rule's daylight-saving half is in force at `utc`.
+    ///
+    /// This is the rule's own flag: with a negative-DST rule such as
+    /// Europe/Dublin's `IST-1GMT0,…` it is set in winter.
+    #[must_use]
+    pub fn is_dst_at(&self, utc: i64) -> bool {
+        self.dst
+            .as_ref()
+            .is_some_and(|d| d.active_at(utc, self.std_offset))
+    }
+
+    /// UTC offset in seconds east at the instant `utc`.
+    #[must_use]
+    pub fn offset_at(&self, utc: i64) -> i32 {
+        match &self.dst {
+            Some(d) if d.active_at(utc, self.std_offset) => d.offset,
+            _ => self.std_offset,
+        }
+    }
+
+    /// Abbreviation in force at `utc`.
+    #[must_use]
+    pub fn abbreviation_at(&self, utc: i64) -> &str {
+        match &self.dst {
+            Some(d) if d.active_at(utc, self.std_offset) => &d.abbr,
+            _ => &self.std_abbr,
+        }
+    }
+
+    /// The last real transition at or before `utc` and the first one after
+    /// it.
+    ///
+    /// Candidates are each year's DST start and end, but not every candidate
+    /// changes the offset: `EST5EDT,0/0,J365/25` (daylight time all year)
+    /// ends one year at the instant it starts the next. A candidate counts
+    /// only if the offset really differs on either side of it, judged by the
+    /// same year-based rule as [`offset_at`](Self::offset_at).
+    ///
+    /// TODO(perf): iteration in zones with DST spends most of its time here
+    /// (about 0.5 µs a call); memoising the last window's transitions would
+    /// make consecutive `next_after` calls in the same year nearly free.
+    pub(crate) fn neighbours(&self, utc: i64) -> (Option<i64>, Option<i64>) {
+        let Some(dst) = self.dst.as_ref().filter(|d| d.offset != self.std_offset) else {
+            return (None, None);
+        };
+        let std = self.std_offset;
+        let first_year = year_of(utc + i64::from(std)) - (WINDOW_YEARS / 2) as i64;
+        let mut pairs = [(0i64, 0i64); WINDOW_YEARS];
+        for (i, pair) in pairs.iter_mut().enumerate() {
+            *pair = dst.transitions(first_year + i as i64, std);
+        }
+        let offset = |t: i64| {
+            let y = year_of(t + i64::from(std));
+            let pair = match usize::try_from(y - first_year) {
+                Ok(i) if i < WINDOW_YEARS => pairs[i],
+                _ => dst.transitions(y, std),
+            };
+            if active_between(pair, t) {
+                dst.offset
+            } else {
+                std
+            }
+        };
+        let changes = |c: i64| offset(c - 1) != offset(c);
+        let mut candidates = [0i64; 2 * WINDOW_YEARS];
+        for (i, (start, end)) in pairs.iter().enumerate() {
+            candidates[2 * i] = *start;
+            candidates[2 * i + 1] = *end;
+        }
+        candidates.sort_unstable();
+        let prev = candidates
+            .iter()
+            .rev()
+            .copied()
+            .filter(|&c| c <= utc)
+            .find(|&c| changes(c));
+        let next = candidates
+            .iter()
+            .copied()
+            .filter(|&c| c > utc)
+            .find(|&c| changes(c));
+        (prev, next)
+    }
+
+    /// First instant strictly after `utc` at which the offset changes.
+    pub(crate) fn next_transition_at(&self, utc: i64) -> Option<i64> {
+        self.neighbours(utc).1
+    }
+
+    /// Last instant at or before `utc` at which the offset changed.
+    pub(crate) fn prev_transition_at(&self, utc: i64) -> Option<i64> {
+        self.neighbours(utc).0
+    }
+}
+
+impl fmt::Display for PosixTz {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write_abbr(f, &self.std_abbr)?;
+        write_hms(f, -self.std_offset)?;
+        if let Some(dst) = &self.dst {
+            write_abbr(f, &dst.abbr)?;
+            if dst.offset != self.std_offset + 3600 {
+                write_hms(f, -dst.offset)?;
+            }
+            for rule in [dst.start, dst.end] {
+                f.write_str(",")?;
+                match rule.date {
+                    RuleDate::Julian(n) => write!(f, "J{n}")?,
+                    RuleDate::ZeroBased(n) => write!(f, "{n}")?,
+                    RuleDate::MonthWeekDay {
+                        month,
+                        week,
+                        weekday,
+                    } => write!(f, "M{month}.{week}.{weekday}")?,
+                }
+                if rule.time != DEFAULT_RULE_TIME {
+                    f.write_str("/")?;
+                    write_hms(f, rule.time)?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
