@@ -275,3 +275,140 @@ fn hours_qualifier(h: &Shape, hours: &[u32]) -> Option<String> {
         }
     }
 }
+
+/// The day phrase, and whether it already named the month.
+fn describe_days(e: &CronExpr, months: &[u32]) -> Option<(String, bool)> {
+    match (e.dom.is_restricted(), e.dow.is_restricted()) {
+        (false, false) => None,
+        (true, false) => {
+            // "on January 1" reads better than "on day 1 of the month in January".
+            if let ([month], Some(day)) = (months, single_day(&e.dom)) {
+                return Some((format!("on {} {day}", MONTHS[*month as usize - 1]), true));
+            }
+            Some((format!("on {}", dom_phrase(&e.dom)), false))
+        }
+        (false, true) => Some((format!("on {}", dow_phrase(&e.dow)), false)),
+        (true, true) => {
+            let dom = dom_phrase(&e.dom);
+            let dow = dow_phrase(&e.dow);
+            Some(match e.options.day_match() {
+                DayMatch::Either => (format!("on {dom} or on {dow}"), false),
+                DayMatch::Both => (format!("on {dom} if it falls on {dow}"), false),
+            })
+        }
+    }
+}
+
+fn single_day(dom: &DomSpec) -> Option<u32> {
+    (!dom.has_specials() && dom.days.count_ones() == 1).then(|| dom.days.trailing_zeros())
+}
+
+fn dom_phrase(dom: &DomSpec) -> String {
+    let days: Vec<u32> = bits(u64::from(dom.days)).collect();
+    let mut items = Vec::new();
+    if !days.is_empty() {
+        items.push(match Shape::of(&days, 1, 31) {
+            Shape::Single(d) => format!("day {d}"),
+            Shape::Range(a, b) => format!("days {a} through {b}"),
+            Shape::Step { start, step, end } if end + step > 31 => {
+                if start == 1 {
+                    format!("every {} day", ordinal(step))
+                } else {
+                    format!("every {} day from day {start}", ordinal(step))
+                }
+            }
+            _ => {
+                let list: Vec<String> = runs(&days)
+                    .map(|(a, b)| match b - a {
+                        0 => a.to_string(),
+                        1 => format!("{a}, {b}"),
+                        _ => format!("{a} through {b}"),
+                    })
+                    .collect();
+                format!("days {}", join_and(&list))
+            }
+        });
+    }
+    if dom.last {
+        items.push("the last day".to_string());
+    }
+    for n in bits(u64::from(dom.before_last)) {
+        items.push(format!("{n} {} before the last day", plural(n, "day")));
+    }
+    for n in bits(u64::from(dom.nearest)) {
+        items.push(format!("the weekday nearest day {n}"));
+    }
+    if dom.last_weekday {
+        items.push("the last weekday".to_string());
+    }
+    format!("{} of the month", join_and(&items))
+}
+
+fn dow_phrase(dow: &DowSpec) -> String {
+    let mut items: Vec<String> = Vec::new();
+    for (start, len) in weekday_runs(dow.days) {
+        let name = |i: u32| Weekday::from_index(start + i).name();
+        match len {
+            1 => items.push(name(0).to_string()),
+            2 => {
+                items.push(name(0).to_string());
+                items.push(name(1).to_string());
+            }
+            _ => items.push(format!("{} through {}", name(0), name(len - 1))),
+        }
+    }
+    let mut month_relative = Vec::new();
+    for d in bits(u64::from(dow.last)) {
+        month_relative.push(format!("the last {}", Weekday::from_index(d).name()));
+    }
+    for (d, nth) in dow.nth.iter().enumerate() {
+        if *nth != 0 {
+            let which: Vec<String> = bits(u64::from(*nth))
+                .map(|n| ordinal_word(n).to_string())
+                .collect();
+            month_relative.push(format!(
+                "the {} {}",
+                join_and(&which),
+                Weekday::from_index(d as u32).name()
+            ));
+        }
+    }
+    if !month_relative.is_empty() {
+        items.push(format!("{} of the month", join_and(&month_relative)));
+    }
+    join_and(&items)
+}
+
+fn month_list(months: &[u32]) -> String {
+    let items: Vec<String> = runs(months)
+        .flat_map(|(a, b)| {
+            let name = |m: u32| MONTHS[m as usize - 1];
+            match b - a {
+                0 => vec![name(a).to_string()],
+                1 => vec![name(a).to_string(), name(b).to_string()],
+                _ => vec![format!("{} through {}", name(a), name(b))],
+            }
+        })
+        .collect();
+    join_and(&items)
+}
+
+fn describe_years(years: &[u32]) -> String {
+    match Shape::of(years, crate::MIN_YEAR, crate::MAX_YEAR) {
+        Shape::Single(y) => format!("in {y}"),
+        Shape::Range(a, b) => format!("in {a} through {b}"),
+        Shape::Step { start, step, end } if end + step > crate::MAX_YEAR => {
+            format!("every {} year from {start}", ordinal(step))
+        }
+        _ => {
+            let list: Vec<String> = runs(years)
+                .map(|(a, b)| match b - a {
+                    0 => a.to_string(),
+                    1 => format!("{a}, {b}"),
+                    _ => format!("{a} through {b}"),
+                })
+                .collect();
+            format!("in {}", join_and(&list))
+        }
+    }
+}
