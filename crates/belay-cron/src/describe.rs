@@ -412,3 +412,214 @@ fn describe_years(years: &[u32]) -> String {
         }
     }
 }
+
+/// `HH:MM`, or `HH:MM:SS` when the second is not zero.
+fn clock(h: u32, m: u32, s: u32) -> String {
+    if s == 0 {
+        format!("{h:02}:{m:02}")
+    } else {
+        format!("{h:02}:{m:02}:{s:02}")
+    }
+}
+
+/// "every 5 minutes" when the step divides the cycle evenly, otherwise
+/// "every 7th minute" (the count restarts at the top of the cycle).
+fn every(step: u32, unit: &str, cycle: u32) -> String {
+    if cycle % step == 0 {
+        format!("every {step} {unit}s")
+    } else {
+        format!("every {} {unit}", ordinal(step))
+    }
+}
+
+fn ordinal(n: u32) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
+}
+
+fn ordinal_word(n: u32) -> &'static str {
+    match n {
+        1 => "first",
+        2 => "second",
+        3 => "third",
+        4 => "fourth",
+        _ => "fifth",
+    }
+}
+
+fn plural(n: u32, word: &str) -> String {
+    if n == 1 {
+        word.to_string()
+    } else {
+        format!("{word}s")
+    }
+}
+
+/// "a", "a and b", "a, b and c".
+fn join_and(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => one.clone(),
+        [init @ .., last] => format!("{} and {last}", init.join(", ")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ParseOptions;
+
+    fn d(s: &str) -> String {
+        CronExpr::parse(s).unwrap().describe()
+    }
+
+    #[test]
+    fn helpers_format_ordinals_and_lists() {
+        assert_eq!(ordinal(1), "1st");
+        assert_eq!(ordinal(2), "2nd");
+        assert_eq!(ordinal(3), "3rd");
+        assert_eq!(ordinal(11), "11th");
+        assert_eq!(ordinal(22), "22nd");
+        assert_eq!(ordinal(113), "113th");
+        assert_eq!(join_and(&["a".into()]), "a");
+        assert_eq!(join_and(&["a".into(), "b".into()]), "a and b");
+        assert_eq!(
+            join_and(&["a".into(), "b".into(), "c".into()]),
+            "a, b and c"
+        );
+    }
+
+    #[test]
+    fn periodic_times() {
+        assert_eq!(d("* * * * *"), "every minute");
+        assert_eq!(d("*/5 * * * *"), "every 5 minutes");
+        assert_eq!(d("0,30 * * * *"), "every 30 minutes");
+        assert_eq!(d("*/7 * * * *"), "every 7th minute");
+        assert_eq!(d("5/15 * * * *"), "every 15 minutes starting at minute 5");
+        assert_eq!(d("0 * * * *"), "every hour");
+        assert_eq!(d("30 * * * *"), "at 30 minutes past every hour");
+        assert_eq!(d("1 * * * *"), "at 1 minute past every hour");
+        assert_eq!(d("0 */2 * * *"), "every 2 hours");
+        assert_eq!(
+            d("0 */5 * * *"),
+            "at 00:00, 05:00, 10:00, 15:00 and 20:00 every day"
+        );
+        assert_eq!(d("0 */6 * * *"), "every 6 hours");
+        assert_eq!(d("0 */12 * * *"), "every 12 hours");
+        assert_eq!(d("0 1/2 * * *"), "every 2 hours starting at 01:00");
+        assert_eq!(d("15 */3 * * *"), "at 15 minutes past every 3rd hour");
+        assert_eq!(d("0 1/6 * * *"), "every 6 hours starting at 01:00");
+    }
+
+    #[test]
+    fn exact_times() {
+        assert_eq!(d("30 9 * * *"), "at 09:30 every day");
+        assert_eq!(d("0 9,17 * * *"), "at 09:00 and 17:00 every day");
+        assert_eq!(d("15 30 9 * * *"), "at 09:30:15 every day");
+        assert_eq!(d("@daily"), "at 00:00 every day");
+    }
+
+    #[test]
+    fn seconds() {
+        assert_eq!(d("* * * * * *"), "every second");
+        assert_eq!(d("*/10 * * * * *"), "every 10 seconds");
+        assert_eq!(d("30 * * * * *"), "every minute, at second 30");
+        assert_eq!(
+            d("*/5 30 9 * * *"),
+            "every 5 seconds between 09:30 and 09:30:59"
+        );
+    }
+
+    #[test]
+    fn days_of_month() {
+        assert_eq!(d("0 0 L * *"), "at 00:00 on the last day of the month");
+        assert_eq!(d("0 0 1 * *"), "at 00:00 on day 1 of the month");
+        assert_eq!(d("0 0 1,15 * *"), "at 00:00 on days 1 and 15 of the month");
+        assert_eq!(
+            d("0 0 1,2,15 * *"),
+            "at 00:00 on days 1, 2 and 15 of the month"
+        );
+        assert_eq!(
+            d("0 0 1-7 * *"),
+            "at 00:00 on days 1 through 7 of the month"
+        );
+        assert_eq!(
+            d("0 0 L-3 * *"),
+            "at 00:00 on 3 days before the last day of the month"
+        );
+        assert_eq!(
+            d("0 0 15W * *"),
+            "at 00:00 on the weekday nearest day 15 of the month"
+        );
+        assert_eq!(d("0 0 LW * *"), "at 00:00 on the last weekday of the month");
+        assert_eq!(
+            d("0 0 1,L * *"),
+            "at 00:00 on day 1 and the last day of the month"
+        );
+        assert_eq!(d("0 0 */2 * *"), "at 00:00 on every 2nd day of the month");
+    }
+
+    #[test]
+    fn days_of_week() {
+        assert_eq!(d("30 9 * * 1-5"), "at 09:30 on Monday through Friday");
+        assert_eq!(d("0 0 * * 0"), "at 00:00 on Sunday");
+        assert_eq!(
+            d("0 0 * * 1,3,5"),
+            "at 00:00 on Monday, Wednesday and Friday"
+        );
+        assert_eq!(d("0 0 * * FRI-MON"), "at 00:00 on Friday through Monday");
+        assert_eq!(
+            d("0 0 * * FRIL"),
+            "at 00:00 on the last Friday of the month"
+        );
+        assert_eq!(
+            d("0 0 * * MON#1,MON#3"),
+            "at 00:00 on the first and third Monday of the month"
+        );
+    }
+
+    #[test]
+    fn day_fields_combined() {
+        assert_eq!(
+            d("0 0 13 * FRI"),
+            "at 00:00 on day 13 of the month or on Friday"
+        );
+        let both = CronExpr::parse_with(
+            "0 0 13 * FRI",
+            ParseOptions::new().with_day_match(DayMatch::Both),
+        )
+        .unwrap();
+        assert_eq!(
+            both.describe(),
+            "at 00:00 on day 13 of the month if it falls on Friday"
+        );
+    }
+
+    #[test]
+    fn months_and_years() {
+        assert_eq!(d("0 0 1 1 *"), "at 00:00 on January 1");
+        assert_eq!(
+            d("0 12 * 6-8 *"),
+            "at 12:00 every day in June through August"
+        );
+        assert_eq!(
+            d("0 0 1 */3 *"),
+            "at 00:00 on day 1 of the month in January, April, July and October"
+        );
+        assert_eq!(d("0 0 0 1 1 * 2030"), "at 00:00 on January 1 in 2030");
+        assert_eq!(
+            d("0 0 0 * * MON 2025-2027"),
+            "at 00:00 on Monday in 2025 through 2027"
+        );
+        assert_eq!(
+            d("0 0 0 1 1 * 2030/5"),
+            "at 00:00 on January 1 every 5th year from 2030"
+        );
+    }
+}
