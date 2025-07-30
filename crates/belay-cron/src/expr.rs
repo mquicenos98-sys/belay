@@ -100,3 +100,165 @@ pub(crate) struct DowSpec {
 pub(crate) struct YearSet([u64; 4]);
 
 const YEAR_COUNT: u32 = MAX_YEAR - MIN_YEAR + 1;
+
+impl YearSet {
+    pub(crate) const ALL: YearSet = {
+        let mut words = [u64::MAX; 4];
+        // 230 years: the last word keeps its low 230 - 192 = 38 bits.
+        words[3] = (1 << (YEAR_COUNT - 192)) - 1;
+        YearSet(words)
+    };
+
+    pub(crate) const EMPTY: YearSet = YearSet([0; 4]);
+
+    pub(crate) fn insert(&mut self, year: u32) {
+        let i = year - MIN_YEAR;
+        self.0[(i / 64) as usize] |= 1 << (i % 64);
+    }
+
+    pub(crate) fn contains(&self, year: i64) -> bool {
+        if !(i64::from(MIN_YEAR)..=i64::from(MAX_YEAR)).contains(&year) {
+            return false;
+        }
+        let i = (year - i64::from(MIN_YEAR)) as u32;
+        self.0[(i / 64) as usize] & (1 << (i % 64)) != 0
+    }
+
+    pub(crate) fn is_all(&self) -> bool {
+        *self == YearSet::ALL
+    }
+
+    /// The first year in the set at or after `year`.
+    pub(crate) fn next_from(&self, year: i64) -> Option<i64> {
+        let start = year.max(i64::from(MIN_YEAR)) - i64::from(MIN_YEAR);
+        if start >= i64::from(YEAR_COUNT) {
+            return None;
+        }
+        let start = start as u32;
+        let first_word = (start / 64) as usize;
+        for w in first_word..4 {
+            let mut word = self.0[w];
+            if w == first_word {
+                word &= u64::MAX << (start % 64);
+            }
+            if word != 0 {
+                let bit = w as u32 * 64 + word.trailing_zeros();
+                return Some(i64::from(MIN_YEAR + bit));
+            }
+        }
+        None
+    }
+
+    /// The last year in the set at or before `year`.
+    pub(crate) fn prev_from(&self, year: i64) -> Option<i64> {
+        let end = year.min(i64::from(MAX_YEAR)) - i64::from(MIN_YEAR);
+        if end < 0 {
+            return None;
+        }
+        let end = end as u32;
+        let last_word = (end / 64) as usize;
+        for w in (0..=last_word).rev() {
+            let mut word = self.0[w];
+            if w == last_word {
+                word &= (1u64 << (end % 64 + 1)) - 1;
+            }
+            if word != 0 {
+                let bit = w as u32 * 64 + 63 - word.leading_zeros();
+                return Some(i64::from(MIN_YEAR + bit));
+            }
+        }
+        None
+    }
+
+    pub(crate) fn iter(&self) -> impl Iterator<Item = u32> + '_ {
+        (MIN_YEAR..=MAX_YEAR).filter(move |&y| self.contains(i64::from(y)))
+    }
+}
+
+impl DomSpec {
+    pub(crate) const ALL: DomSpec = DomSpec {
+        days: ALL_DAYS,
+        last: false,
+        before_last: 0,
+        nearest: 0,
+        last_weekday: false,
+    };
+
+    pub(crate) fn has_specials(&self) -> bool {
+        self.last || self.before_last != 0 || self.nearest != 0 || self.last_weekday
+    }
+
+    pub(crate) fn is_restricted(&self) -> bool {
+        self.days != ALL_DAYS
+    }
+
+    /// Matching days of a month with `dim` days whose 1st is weekday `first`.
+    fn mask(&self, dim: u32, first: u32) -> u32 {
+        let valid = month_days(dim);
+        let mut mask = self.days & valid;
+        if self.last {
+            mask |= 1 << dim;
+        }
+        for n in bits(u64::from(self.before_last)) {
+            if n < dim {
+                mask |= 1 << (dim - n);
+            }
+        }
+        for n in bits(u64::from(self.nearest)) {
+            if n <= dim {
+                mask |= 1 << nearest_weekday(n, dim, first);
+            }
+        }
+        if self.last_weekday {
+            let d = match weekday_of(dim, first) {
+                6 => dim - 1,
+                0 => dim - 2,
+                _ => dim,
+            };
+            mask |= 1 << d;
+        }
+        mask
+    }
+}
+
+impl DowSpec {
+    pub(crate) const ALL: DowSpec = DowSpec {
+        days: ALL_WEEKDAYS,
+        last: 0,
+        nth: [0; 7],
+    };
+
+    pub(crate) fn is_restricted(&self) -> bool {
+        self.days != ALL_WEEKDAYS
+    }
+
+    fn mask(&self, dim: u32, first: u32) -> u32 {
+        let mut mask = 0u32;
+        for wd in 0..7u32 {
+            // First day of the month falling on weekday `wd`.
+            let first_day = (wd + 7 - first) % 7 + 1;
+            if self.days & (1 << wd) != 0 {
+                let mut d = first_day;
+                while d <= dim {
+                    mask |= 1 << d;
+                    d += 7;
+                }
+            }
+            if self.last & (1 << wd) != 0 {
+                mask |= 1 << (first_day + (dim - first_day) / 7 * 7);
+            }
+            for n in bits(u64::from(self.nth[wd as usize])) {
+                let d = first_day + 7 * (n - 1);
+                if d <= dim {
+                    mask |= 1 << d;
+                }
+            }
+        }
+        mask
+    }
+}
+
+/// Bits 1..=dim.
+const fn month_days(dim: u32) -> u32 {
+    ((1u64 << (dim + 1)) - 2) as u32
+}
