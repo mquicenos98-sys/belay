@@ -143,6 +143,7 @@ fn panics_fail_the_attempt_retryably_and_the_executor_survives() {
 
     assert!(source.wait_until(PATIENCE, |v| v.failed() == 1));
     let req = failure(&source, &boom);
+    assert_eq!(req.error, "handler panicked: index out of bounds at step 2");
     assert_eq!(req.kind.as_deref(), Some(failure_kind::PANIC));
     assert!(req.retryable);
 

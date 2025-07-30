@@ -223,11 +223,12 @@ pub(crate) fn sanitize_kind(kind: &str) -> Option<String> {
     (!cleaned.is_empty()).then_some(cleaned)
 }
 
-/// The text of a panic payload.
+/// The text of a panic payload (`panic!` with a literal or a format).
 pub(crate) fn panic_message(payload: &(dyn Any + Send)) -> String {
     payload
         .downcast_ref::<&str>()
         .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "non-string panic payload".to_owned())
 }
 
@@ -275,6 +276,8 @@ mod tests {
     fn panic_payloads_become_text() {
         let literal: Box<dyn Any + Send> = Box::new("static text");
         assert_eq!(panic_message(&*literal), "static text");
+        let formatted: Box<dyn Any + Send> = Box::new(format!("index {}", 3));
+        assert_eq!(panic_message(&*formatted), "index 3");
         let other: Box<dyn Any + Send> = Box::new(42u8);
         assert_eq!(panic_message(&*other), "non-string panic payload");
     }
