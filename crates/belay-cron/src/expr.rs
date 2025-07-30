@@ -262,3 +262,37 @@ impl DowSpec {
 const fn month_days(dim: u32) -> u32 {
     ((1u64 << (dim + 1)) - 2) as u32
 }
+
+const fn weekday_of(day: u32, first: u32) -> u32 {
+    (first + day - 1) % 7
+}
+
+/// Quartz's `nW`: the Monday-Friday day nearest to `n`, never leaving the
+/// month (so `1W` on a Saturday is Monday the 3rd).
+fn nearest_weekday(n: u32, dim: u32, first: u32) -> u32 {
+    match weekday_of(n, first) {
+        6 if n == 1 => 3,
+        6 => n - 1,
+        0 if n == dim => n - 2,
+        0 => n + 1,
+        _ => n,
+    }
+}
+
+/// Indices of the set bits of `mask`, lowest first.
+pub(crate) fn bits(mut mask: u64) -> impl Iterator<Item = u32> {
+    std::iter::from_fn(move || {
+        if mask == 0 {
+            return None;
+        }
+        let b = mask.trailing_zeros();
+        mask &= mask - 1;
+        Some(b)
+    })
+}
+
+/// Index 0-13 identifying a year's calendar: `leap * 7 + weekday of Jan 1`.
+pub(crate) fn year_type(year: i64) -> usize {
+    let jan1 = weekday_from_days(days_from_civil(year, 1, 1));
+    usize::from(is_leap_year(year)) * 7 + jan1 as usize
+}
