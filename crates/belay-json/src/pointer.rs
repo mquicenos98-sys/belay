@@ -180,10 +180,19 @@ fn unescape(raw: &str) -> Result<Cow<'_, str>, usize> {
     Ok(Cow::Owned(out))
 }
 
-/// Parses an array index token. `-` (the position after the last
-/// element) never resolves.
+/// Parses an array index token: `0` or digits without a leading zero
+/// (RFC 6901 §4). `-` (the position after the last element) never resolves.
 fn array_index(token: &str) -> Option<usize> {
-    token.parse().ok()
+    let valid = match token.as_bytes() {
+        [b'0'] => true,
+        [b'1'..=b'9', rest @ ..] => rest.iter().all(u8::is_ascii_digit),
+        _ => false,
+    };
+    if valid {
+        token.parse().ok()
+    } else {
+        None
+    }
 }
 
 fn step<'v>(value: &'v Value, token: &str) -> Option<&'v Value> {
@@ -266,6 +275,18 @@ mod tests {
             assert_eq!(parsed.get(&doc), Some(&expected), "{pointer:?}");
             assert_eq!(parsed.to_string(), pointer, "display round-trips");
         }
+    }
+
+    #[test]
+    fn array_indices_are_strict() {
+        let doc = json!([10, 11, 12]);
+        assert_eq!(doc.pointer("/2"), Some(&json!(12)));
+        assert_eq!(doc.pointer("/3"), None);
+        assert_eq!(doc.pointer("/01"), None);
+        assert_eq!(doc.pointer("/-"), None);
+        assert_eq!(doc.pointer("/+1"), None);
+        assert_eq!(doc.pointer("/1.0"), None);
+        assert_eq!(doc.pointer("/99999999999999999999999"), None);
     }
 
     #[test]
