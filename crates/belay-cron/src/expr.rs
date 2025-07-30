@@ -68,3 +68,35 @@ pub struct CronExpr {
     /// Whether any year in the year set has a matching day.
     satisfiable: bool,
 }
+
+/// Day-of-month field: plain days plus special items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct DomSpec {
+    /// Bits 1-31.
+    pub days: u32,
+    /// `L`.
+    pub last: bool,
+    /// Bit `n` set for `L-n` (1-30).
+    pub before_last: u32,
+    /// Bit `n` set for `nW` (1-31).
+    pub nearest: u32,
+    /// `LW`.
+    pub last_weekday: bool,
+}
+
+/// Day-of-week field: plain weekdays plus special items.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct DowSpec {
+    /// Bits 0-6, 0 = Sunday.
+    pub days: u8,
+    /// Bit `d` set for `dL`, the last weekday `d` of the month.
+    pub last: u8,
+    /// `nth[d]` has bit `n` set for `d#n`.
+    pub nth: [u8; 7],
+}
+
+/// Years 1970-2199 as a bit set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct YearSet([u64; 4]);
+
+const YEAR_COUNT: u32 = MAX_YEAR - MIN_YEAR + 1;
