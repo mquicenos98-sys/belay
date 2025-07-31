@@ -296,3 +296,36 @@ pub(crate) fn year_type(year: i64) -> usize {
     let jan1 = weekday_from_days(days_from_civil(year, 1, 1));
     usize::from(is_leap_year(year)) * 7 + jan1 as usize
 }
+
+/// Days before the 1st of `month` in a year of the given leap-ness.
+fn days_before_month(month: u32, leap: bool) -> u32 {
+    const CUMULATIVE: [u32; 12] = [0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334];
+    CUMULATIVE[month as usize - 1] + u32::from(leap && month > 2)
+}
+
+/// Field sets as produced by the parser, before the derived tables exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct Fields {
+    pub seconds: u64,
+    pub minutes: u64,
+    pub hours: u32,
+    pub dom: DomSpec,
+    pub months: u16,
+    pub dow: DowSpec,
+    pub years: YearSet,
+}
+
+impl Default for Fields {
+    /// Every field unrestricted except seconds, which default to `0`.
+    fn default() -> Self {
+        Fields {
+            seconds: 1,
+            minutes: ALL_MINUTES,
+            hours: ALL_HOURS,
+            dom: DomSpec::ALL,
+            months: ALL_MONTHS,
+            dow: DowSpec::ALL,
+            years: YearSet::ALL,
+        }
+    }
+}
