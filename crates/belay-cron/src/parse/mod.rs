@@ -2,7 +2,6 @@
 //! then per-field lexing and parsing.
 
 mod field;
-
 mod lexer;
 
 pub(crate) use field::DAY_NAMES;
@@ -188,4 +187,157 @@ fn split_fields(input: &str) -> Vec<(&str, usize)> {
         fields.push((&input[s..], col));
     }
     fields
+}
+
+fn domain(field: Field, dialect: Dialect) -> Domain {
+    match field {
+        Field::Second => Domain::SECOND,
+        Field::Minute => Domain::MINUTE,
+        Field::Hour => Domain::HOUR,
+        Field::DayOfMonth => Domain::DAY_OF_MONTH,
+        Field::Month => Domain::MONTH,
+        Field::DayOfWeek => match dialect {
+            Dialect::Vixie => Domain::DAY_OF_WEEK,
+            Dialect::Quartz => Domain::DAY_OF_WEEK_QUARTZ,
+        },
+        Field::Year => Domain::YEAR,
+    }
+}
+
+/// Folds a parsed field into the bit sets.
+fn apply(out: &mut Fields, field: Field, parsed: ParsedField) {
+    // Years are stored in their own set; every other field fits in 64 bits.
+    let mask: u64 = if field == Field::Year {
+        0
+    } else {
+        parsed.values.iter().fold(0, |m, &v| m | 1 << v)
+    };
+    match field {
+        Field::Second => out.seconds = mask,
+        Field::Minute => out.minutes = mask,
+        Field::Hour => out.hours = mask as u32,
+        Field::Month => out.months = mask as u16,
+        Field::Year => {
+            let mut years = YearSet::EMPTY;
+            for &y in &parsed.values {
+                years.insert(y);
+            }
+            out.years = years;
+        }
+        Field::DayOfMonth => {
+            let mut dom = DomSpec {
+                days: mask as u32,
+                last: false,
+                before_last: 0,
+                nearest: 0,
+                last_weekday: false,
+            };
+            for special in parsed.specials {
+                match special {
+                    Special::LastDay => dom.last = true,
+                    Special::LastDayOffset(n) => dom.before_last |= 1 << n,
+                    Special::NearestWeekday(n) => dom.nearest |= 1 << n,
+                    Special::LastWeekday => dom.last_weekday = true,
+                    Special::LastOfWeekday(_) | Special::NthWeekday(..) => {}
+                }
+            }
+            out.dom = dom;
+        }
+        Field::DayOfWeek => {
+            let mut dow = DowSpec {
+                days: mask as u8,
+                last: 0,
+                nth: [0; 7],
+            };
+            for special in parsed.specials {
+                match special {
+                    Special::LastOfWeekday(d) => dow.last |= 1 << d,
+                    Special::NthWeekday(d, n) => dow.nth[d as usize] |= 1 << n,
+                    _ => {}
+                }
+            }
+            out.dow = dow;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_fields_and_tracks_columns() {
+        assert_eq!(
+            split_fields("  */5  1 * *\tMON "),
+            vec![("*/5", 3), ("1", 8), ("*", 10), ("*", 12), ("MON", 14)]
+        );
+        assert!(split_fields(" \t ").is_empty());
+    }
+
+    #[test]
+    fn five_six_and_seven_field_layouts() {
+        let five = parse("30 9 * * *", ParseOptions::new()).unwrap();
+        assert_eq!(five.seconds, 1);
+        let six = parse("15 30 9 * * *", ParseOptions::new()).unwrap();
+        assert_eq!(six.seconds, 1 << 15);
+        assert_eq!(six.minutes, 1 << 30);
+        let seven = parse("0 30 9 * * * 2030", ParseOptions::new()).unwrap();
+        assert!(seven.years.contains(2030));
+        assert!(!seven.years.contains(2031));
+    }
+
+    #[test]
+    fn field_count_errors_depend_on_dialect() {
+        assert_eq!(
+            parse("* * * *", ParseOptions::new())
+                .unwrap_err()
+                .to_string(),
+            "expected 5, 6 or 7 fields, found 4"
+        );
+        assert_eq!(
+            parse("* * * * *", ParseOptions::quartz())
+                .unwrap_err()
+                .to_string(),
+            "expected 6 or 7 fields, found 5"
+        );
+        assert_eq!(
+            parse("* * * * * * * *", ParseOptions::new()).unwrap_err(),
+            CronError::FieldCount {
+                found: 8,
+                expected: "5, 6 or 7"
+            }
+        );
+        assert_eq!(
+            parse("   ", ParseOptions::new()).unwrap_err(),
+            CronError::Empty
+        );
+    }
+
+    #[test]
+    fn columns_in_errors_count_from_the_expression_start() {
+        let err = parse("0 9 * * MON-FRY", ParseOptions::new()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unknown name \"FRY\" in day-of-week field at column 13"
+        );
+        let err = parse("0 0 25 * * *", ParseOptions::new()).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid value 25 in hour field (0-23) at column 5"
+        );
+    }
+
+    #[test]
+    fn options_builders_compose() {
+        let o = ParseOptions::quartz().with_day_match(DayMatch::Either);
+        assert_eq!(o.dialect(), Dialect::Quartz);
+        assert_eq!(o.day_match(), DayMatch::Either);
+        assert_eq!(ParseOptions::default(), ParseOptions::new());
+        assert_eq!(
+            ParseOptions::new()
+                .with_dialect(Dialect::Quartz)
+                .day_match(),
+            DayMatch::Either
+        );
+    }
 }
