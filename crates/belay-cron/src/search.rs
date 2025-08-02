@@ -51,3 +51,17 @@ fn prev_bit(mask: u64, from: u32) -> Option<u32> {
     };
     (rest != 0).then(|| 63 - rest.leading_zeros())
 }
+
+fn naive(year: i64, month: u32, day: u32, h: u32, m: u32, s: u32) -> i64 {
+    days_from_civil(year, month, day) * SECS_PER_DAY
+        + i64::from(h) * 3600
+        + i64::from(m) * 60
+        + i64::from(s)
+}
+
+/// Calendar position of a naive reading: `(year, month, day, h, m, s)`.
+fn split(reading: i64) -> (i64, u32, u32, u32, u32, u32) {
+    let (y, mo, d) = civil_from_days(reading.div_euclid(SECS_PER_DAY));
+    let sod = reading.rem_euclid(SECS_PER_DAY) as u32;
+    (y, mo, d, sod / 3600, sod / 60 % 60, sod % 60)
+}
