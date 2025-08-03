@@ -404,3 +404,22 @@ impl Iterator for Upcoming<'_> {
 }
 
 impl FusedIterator for Upcoming<'_> {}
+
+/// Iterator over past fire times, newest first; see [`CronExpr::preceding`].
+#[derive(Debug, Clone)]
+#[must_use = "iterators are lazy and do nothing unless consumed"]
+pub struct Preceding<'a> {
+    expr: &'a CronExpr,
+    tz: &'a Tz,
+    cursor: Option<i64>,
+}
+
+impl Iterator for Preceding<'_> {
+    type Item = i64;
+
+    fn next(&mut self) -> Option<i64> {
+        let prev = self.expr.prev_before(self.cursor?, self.tz);
+        self.cursor = prev;
+        prev
+    }
+}
