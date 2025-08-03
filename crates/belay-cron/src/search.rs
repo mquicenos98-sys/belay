@@ -392,3 +392,15 @@ pub struct Upcoming<'a> {
     tz: &'a Tz,
     cursor: Option<i64>,
 }
+
+impl Iterator for Upcoming<'_> {
+    type Item = i64;
+
+    fn next(&mut self) -> Option<i64> {
+        let next = self.expr.next_after(self.cursor?, self.tz);
+        self.cursor = next;
+        next
+    }
+}
+
+impl FusedIterator for Upcoming<'_> {}
