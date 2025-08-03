@@ -32,7 +32,6 @@ use crate::{MAX_YEAR, MIN_YEAR};
 
 /// Naive seconds of the first and last readings the search considers.
 const FIRST_READING: i64 = days_from_civil(MIN_YEAR as i64, 1, 1) * SECS_PER_DAY;
-
 const LAST_READING: i64 = days_from_civil(MAX_YEAR as i64 + 1, 1, 1) * SECS_PER_DAY - 1;
 
 fn next_bit(mask: u64, from: u32) -> Option<u32> {
@@ -421,5 +420,191 @@ impl Iterator for Preceding<'_> {
         let prev = self.expr.prev_before(self.cursor?, self.tz);
         self.cursor = prev;
         prev
+    }
+}
+
+impl FusedIterator for Preceding<'_> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn utc(y: i64, mo: u32, d: u32, h: u32, mi: u32, s: u32) -> i64 {
+        naive(y, mo, d, h, mi, s)
+    }
+
+    fn next(expr: &str, from: i64) -> Option<i64> {
+        CronExpr::parse(expr).unwrap().next_after(from, &Tz::Utc)
+    }
+
+    fn prev(expr: &str, from: i64) -> Option<i64> {
+        CronExpr::parse(expr).unwrap().prev_before(from, &Tz::Utc)
+    }
+
+    #[test]
+    fn bit_helpers_find_neighbours() {
+        let m = 0b1001_0010u64;
+        assert_eq!(next_bit(m, 0), Some(1));
+        assert_eq!(next_bit(m, 2), Some(4));
+        assert_eq!(next_bit(m, 8), None);
+        assert_eq!(next_bit(m, 64), None);
+        assert_eq!(prev_bit(m, 7), Some(7));
+        assert_eq!(prev_bit(m, 6), Some(4));
+        assert_eq!(prev_bit(m, 0), None);
+        assert_eq!(prev_bit(u64::MAX, 63), Some(63));
+        assert_eq!(prev_bit(1 << 63, 100), Some(63));
+    }
+
+    #[test]
+    fn next_is_strictly_after() {
+        let t = utc(2025, 1, 1, 0, 0, 0);
+        assert_eq!(next("0 0 * * *", t), Some(utc(2025, 1, 2, 0, 0, 0)));
+        assert_eq!(next("0 0 * * *", t - 1), Some(t));
+        assert_eq!(prev("0 0 * * *", t), Some(utc(2024, 12, 31, 0, 0, 0)));
+        assert_eq!(prev("0 0 * * *", t + 1), Some(t));
+    }
+
+    #[test]
+    fn carries_across_minute_hour_day_month_and_year() {
+        assert_eq!(
+            next("*/20 * * * * *", utc(2025, 12, 31, 23, 59, 45)),
+            Some(utc(2026, 1, 1, 0, 0, 0))
+        );
+        assert_eq!(
+            next("59 23 31 12 *", utc(2025, 12, 31, 23, 59, 0)),
+            Some(utc(2026, 12, 31, 23, 59, 0))
+        );
+        assert_eq!(
+            next("0 0 29 2 *", utc(2025, 3, 1, 0, 0, 0)),
+            Some(utc(2028, 2, 29, 0, 0, 0))
+        );
+        // 2100 is not a leap year: the next February 29 after 2096 is in 2104.
+        assert_eq!(
+            next("0 0 29 2 *", utc(2096, 3, 1, 0, 0, 0)),
+            Some(utc(2104, 2, 29, 0, 0, 0))
+        );
+        assert_eq!(
+            prev("0 0 29 2 *", utc(2104, 2, 29, 0, 0, 0)),
+            Some(utc(2096, 2, 29, 0, 0, 0))
+        );
+    }
+
+    #[test]
+    fn prev_walks_back_over_month_ends() {
+        assert_eq!(
+            prev("0 12 31 * *", utc(2025, 5, 1, 0, 0, 0)),
+            Some(utc(2025, 3, 31, 12, 0, 0))
+        );
+        assert_eq!(
+            prev("30 10 * * *", utc(2025, 3, 1, 10, 30, 0)),
+            Some(utc(2025, 2, 28, 10, 30, 0))
+        );
+        assert_eq!(
+            prev("*/15 * * * * *", utc(2025, 1, 1, 0, 0, 0)),
+            Some(utc(2024, 12, 31, 23, 59, 45))
+        );
+    }
+
+    #[test]
+    fn impossible_expressions_terminate_immediately() {
+        for never in ["0 0 30 2 *", "0 0 31 4 *", "0 0 0 29 2 ? 2025"] {
+            assert_eq!(next(never, 0), None, "{never}");
+            assert_eq!(prev(never, utc(2199, 1, 1, 0, 0, 0)), None, "{never}");
+        }
+    }
+
+    #[test]
+    fn search_stops_at_the_horizon() {
+        assert_eq!(next("0 0 1 1 *", utc(2199, 1, 1, 0, 0, 0)), None);
+        assert_eq!(
+            next("* * * * *", utc(2199, 12, 31, 23, 58, 0)),
+            Some(utc(2199, 12, 31, 23, 59, 0))
+        );
+        assert_eq!(next("* * * * *", utc(2199, 12, 31, 23, 59, 0)), None);
+        assert_eq!(prev("0 0 1 1 *", utc(1970, 1, 1, 0, 0, 0)), None);
+        assert_eq!(next("0 0 1 1 *", i64::MIN), Some(0));
+        assert_eq!(next("* * * * *", i64::MAX), None);
+        assert_eq!(prev("* * * * *", i64::MIN), None);
+        assert_eq!(
+            prev("* * * * *", i64::MAX),
+            Some(utc(2199, 12, 31, 23, 59, 0))
+        );
+    }
+
+    #[test]
+    fn year_field_limits_the_search() {
+        assert_eq!(
+            next("0 0 0 1 1 * 2030,2035", utc(2025, 6, 1, 0, 0, 0)),
+            Some(utc(2030, 1, 1, 0, 0, 0))
+        );
+        assert_eq!(
+            next("0 0 0 1 1 * 2030,2035", utc(2030, 1, 1, 0, 0, 0)),
+            Some(utc(2035, 1, 1, 0, 0, 0))
+        );
+        assert_eq!(
+            next("0 0 0 1 1 * 2030,2035", utc(2035, 1, 1, 0, 0, 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn iterators_chain_and_fuse() {
+        let expr = CronExpr::parse("0 0 1 * *").unwrap();
+        let tz = Tz::Utc;
+        let from = utc(2025, 1, 15, 0, 0, 0);
+        let up: Vec<i64> = expr.upcoming(from, &tz).take(3).collect();
+        assert_eq!(
+            up,
+            vec![
+                utc(2025, 2, 1, 0, 0, 0),
+                utc(2025, 3, 1, 0, 0, 0),
+                utc(2025, 4, 1, 0, 0, 0)
+            ]
+        );
+        let down: Vec<i64> = expr.preceding(from, &tz).take(2).collect();
+        assert_eq!(
+            down,
+            vec![utc(2025, 1, 1, 0, 0, 0), utc(2024, 12, 1, 0, 0, 0)]
+        );
+        let once = CronExpr::parse("0 0 0 1 1 * 2030").unwrap();
+        let mut it = once.upcoming(0, &tz);
+        assert_eq!(it.next(), Some(utc(2030, 1, 1, 0, 0, 0)));
+        assert_eq!(it.next(), None);
+        assert_eq!(it.next(), None);
+    }
+
+    #[test]
+    fn next_after_one_second_before_a_forward_transition_sees_the_gap() {
+        // Regression: starting the search in the segment that begins at the
+        // transition skipped the gap fire scheduled at that very instant.
+        let ny = Tz::named("America/New_York").unwrap();
+        let expr = CronExpr::parse("30 2 * * *").unwrap();
+        let transition = utc(2025, 3, 9, 7, 0, 0);
+        assert_eq!(expr.next_after(transition - 1, &ny), Some(transition));
+        assert!(expr.matches(transition, &ny));
+        assert_eq!(expr.prev_before(transition + 1, &ny), Some(transition));
+    }
+
+    #[test]
+    fn matches_checks_exact_fire_instants() {
+        let expr = CronExpr::parse("*/15 9 * * *").unwrap();
+        assert!(expr.matches(utc(2025, 1, 1, 9, 45, 0), &Tz::Utc));
+        assert!(!expr.matches(utc(2025, 1, 1, 9, 45, 1), &Tz::Utc));
+        assert!(!expr.matches(utc(2025, 1, 1, 10, 0, 0), &Tz::Utc));
+    }
+
+    #[test]
+    fn fixed_offsets_shift_readings() {
+        let kolkata = Tz::named("Asia/Kolkata").unwrap();
+        let expr = CronExpr::parse("0 9 * * *").unwrap();
+        // 09:00 IST is 03:30 UTC.
+        assert_eq!(
+            expr.next_after(utc(2025, 1, 1, 0, 0, 0), &kolkata),
+            Some(utc(2025, 1, 1, 3, 30, 0))
+        );
+        assert_eq!(
+            expr.prev_before(utc(2025, 1, 1, 0, 0, 0), &kolkata),
+            Some(utc(2024, 12, 31, 3, 30, 0))
+        );
     }
 }
