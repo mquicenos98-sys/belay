@@ -160,7 +160,7 @@ impl KeyBuf {
         self.bytes(v.as_bytes())
     }
 
-    /// Appends `v` *without* the terminator. Only useful as the
+    /// Appends `v` escaped but *without* the terminator. Only useful as the
     /// last element of a scan prefix: `KeyBuf::new().str("tag").str_prefix("pri")`
     /// covers every key whose second element starts with `"pri"`.
     #[must_use]
@@ -171,7 +171,7 @@ impl KeyBuf {
     /// Byte-string version of [`str_prefix`](Self::str_prefix).
     #[must_use]
     pub fn bytes_prefix(mut self, v: &[u8]) -> KeyBuf {
-        self.buf.extend_from_slice(v);
+        escape_into(&mut self.buf, v);
         self
     }
 
@@ -338,6 +338,16 @@ mod tests {
         );
         assert_eq!(KeyBuf::new().i32(i32::MIN).as_bytes(), &[0, 0, 0, 0]);
         assert_eq!(KeyBuf::new().u64_desc(0).as_bytes(), &[0xFF; 8]);
+    }
+
+    #[test]
+    fn strings_escape_zero_and_end_with_a_two_byte_terminator() {
+        assert_eq!(KeyBuf::new().str("").as_bytes(), &[0, 1]);
+        assert_eq!(
+            KeyBuf::new().bytes(b"a\0b").as_bytes(),
+            &[b'a', 0, 0xFF, b'b', 0, 1]
+        );
+        assert_eq!(KeyBuf::new().str_prefix("a\0").as_bytes(), &[b'a', 0, 0xFF]);
     }
 
     #[test]
