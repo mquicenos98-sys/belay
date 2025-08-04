@@ -90,3 +90,59 @@ pub(crate) fn progression(values: &[u32], min: u32, max: u32) -> Option<u32> {
     let tiles = values[0] == min && values[1] + step > max && (max - min + 1) % step == 0;
     tiles.then_some(step)
 }
+
+/// Maximal runs of consecutive values as inclusive `(start, end)` pairs.
+pub(crate) fn runs(values: &[u32]) -> impl Iterator<Item = (u32, u32)> + '_ {
+    let mut i = 0;
+    std::iter::from_fn(move || {
+        let start = *values.get(i)?;
+        let mut end = start;
+        i += 1;
+        while values.get(i) == Some(&(end + 1)) {
+            end += 1;
+            i += 1;
+        }
+        Some((start, end))
+    })
+}
+
+fn render_dom(dom: &DomSpec) -> String {
+    if !dom.is_restricted() {
+        return "*".to_string();
+    }
+    let mut items = Vec::new();
+    if dom.days != 0 {
+        items.push(render_mask(u64::from(dom.days), 1, 31));
+    }
+    if dom.last {
+        items.push("L".to_string());
+    }
+    items.extend(bits(u64::from(dom.before_last)).map(|n| format!("L-{n}")));
+    items.extend(bits(u64::from(dom.nearest)).map(|n| format!("{n}W")));
+    if dom.last_weekday {
+        items.push("LW".to_string());
+    }
+    items.join(",")
+}
+
+fn render_dow(dow: &DowSpec) -> String {
+    if !dow.is_restricted() {
+        return "*".to_string();
+    }
+    let mut items: Vec<String> = weekday_runs(dow.days)
+        .into_iter()
+        .map(|(a, len)| {
+            let name = |i: u32| DAY_NAMES[((a + i) % 7) as usize];
+            match len {
+                1 => name(0).to_string(),
+                2 => format!("{},{}", name(0), name(1)),
+                _ => format!("{}-{}", name(0), name(len - 1)),
+            }
+        })
+        .collect();
+    items.extend(bits(u64::from(dow.last)).map(|d| format!("{}L", DAY_NAMES[d as usize])));
+    for (d, nth) in dow.nth.iter().enumerate() {
+        items.extend(bits(u64::from(*nth)).map(|n| format!("{}#{n}", DAY_NAMES[d])));
+    }
+    items.join(",")
+}
