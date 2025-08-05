@@ -379,3 +379,180 @@ enum DowItem {
     LastOf(u32),
     Nth(u32, u32),
 }
+
+#[derive(Debug)]
+struct DateSpec {
+    dom: Vec<DomItem>,
+    months: Vec<u32>,
+    dow: Vec<DowItem>,
+    both: bool,
+}
+
+impl DateSpec {
+    fn random(rng: &mut Rng) -> DateSpec {
+        let mut dom = Vec::new();
+        if rng.chance(70) {
+            for _ in 0..rng.range(1, 3) {
+                dom.push(match rng.below(6) {
+                    0 => DomItem::Day(rng.range(1, 31)),
+                    1 => {
+                        let a = rng.range(1, 30);
+                        DomItem::Range(a, rng.range(a, 31))
+                    }
+                    2 => DomItem::Last,
+                    3 => DomItem::LastMinus(rng.range(1, 30)),
+                    4 => DomItem::Nearest(rng.range(1, 31)),
+                    _ => DomItem::LastWeekday,
+                });
+            }
+        }
+        let mut dow = Vec::new();
+        if rng.chance(60) {
+            for _ in 0..rng.range(1, 3) {
+                dow.push(match rng.below(4) {
+                    0 => DowItem::Day(rng.range(0, 6)),
+                    1 => {
+                        let a = rng.range(0, 5);
+                        DowItem::Range(a, rng.range(a, 6))
+                    }
+                    2 => DowItem::LastOf(rng.range(0, 6)),
+                    _ => DowItem::Nth(rng.range(0, 6), rng.range(1, 5)),
+                });
+            }
+        }
+        let months = if rng.chance(60) {
+            Vec::new()
+        } else {
+            let mut m: Vec<u32> = (0..rng.range(1, 4)).map(|_| rng.range(1, 12)).collect();
+            m.sort_unstable();
+            m.dedup();
+            m
+        };
+        DateSpec {
+            dom,
+            months,
+            dow,
+            both: rng.chance(40),
+        }
+    }
+
+    fn render(&self) -> String {
+        let dom = if self.dom.is_empty() {
+            "*".to_string()
+        } else {
+            let items: Vec<String> = self
+                .dom
+                .iter()
+                .map(|it| match *it {
+                    DomItem::Day(d) => d.to_string(),
+                    DomItem::Range(a, b) => format!("{a}-{b}"),
+                    DomItem::Last => "L".to_string(),
+                    DomItem::LastMinus(k) => format!("L-{k}"),
+                    DomItem::Nearest(n) => format!("{n}W"),
+                    DomItem::LastWeekday => "LW".to_string(),
+                })
+                .collect();
+            items.join(",")
+        };
+        let months = if self.months.is_empty() {
+            "*".to_string()
+        } else {
+            let items: Vec<String> = self.months.iter().map(u32::to_string).collect();
+            items.join(",")
+        };
+        let dow = if self.dow.is_empty() {
+            "?".to_string()
+        } else {
+            let items: Vec<String> = self
+                .dow
+                .iter()
+                .map(|it| match *it {
+                    DowItem::Day(d) => d.to_string(),
+                    DowItem::Range(a, b) => format!("{a}-{b}"),
+                    DowItem::LastOf(d) => format!("{d}L"),
+                    DowItem::Nth(d, n) => format!("{d}#{n}"),
+                })
+                .collect();
+            items.join(",")
+        };
+        format!("0 12 {dom} {months} {dow}")
+    }
+
+    fn matches(&self, y: i64, m: u32, d: u32) -> bool {
+        if !self.months.is_empty() && !self.months.contains(&m) {
+            return false;
+        }
+        let dim = ref_days_in_month(y, m);
+        let wd = |day: u32| ref_weekday(y, m, day);
+        let dom_ok = self.dom.iter().any(|it| match *it {
+            DomItem::Day(x) => d == x,
+            DomItem::Range(a, b) => (a..=b).contains(&d),
+            DomItem::Last => d == dim,
+            DomItem::LastMinus(k) => d + k == dim,
+            DomItem::Nearest(n) => {
+                n <= dim
+                    && d == match wd(n) {
+                        6 if n == 1 => 3,
+                        6 => n - 1,
+                        0 if n == dim => n - 2,
+                        0 => n + 1,
+                        _ => n,
+                    }
+            }
+            DomItem::LastWeekday => {
+                let mut last = dim;
+                while wd(last) == 0 || wd(last) == 6 {
+                    last -= 1;
+                }
+                d == last
+            }
+        });
+        let w = wd(d);
+        let dow_ok = self.dow.iter().any(|it| match *it {
+            DowItem::Day(x) => w == x,
+            DowItem::Range(a, b) => (a..=b).contains(&w),
+            DowItem::LastOf(x) => w == x && d + 7 > dim,
+            DowItem::Nth(x, n) => w == x && (d - 1) / 7 + 1 == n,
+        });
+        // A field is unrestricted when it lists nothing or covers every day.
+        let dom_restricted = !self.dom.is_empty()
+            && !(1..=31).all(|day| {
+                self.dom.iter().any(|it| match *it {
+                    DomItem::Day(x) => day == x,
+                    DomItem::Range(a, b) => (a..=b).contains(&day),
+                    _ => false,
+                })
+            });
+        let dow_restricted = !self.dow.is_empty()
+            && !(0..7).all(|x| {
+                self.dow.iter().any(|it| match *it {
+                    DowItem::Day(v) => v == x,
+                    DowItem::Range(a, b) => (a..=b).contains(&x),
+                    _ => false,
+                })
+            });
+        match (dom_restricted, dow_restricted) {
+            (false, false) => true,
+            (true, false) => dom_ok,
+            (false, true) => dow_ok,
+            (true, true) if self.both => dom_ok && dow_ok,
+            (true, true) => dom_ok || dow_ok,
+        }
+    }
+}
+
+fn ref_is_leap(y: i64) -> bool {
+    (y % 4 == 0 && y % 100 != 0) || y % 400 == 0
+}
+
+fn ref_days_in_month(y: i64, m: u32) -> u32 {
+    const DAYS: [u32; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    DAYS[m as usize - 1] + u32::from(m == 2 && ref_is_leap(y))
+}
+
+/// Sakamoto's algorithm, 0 = Sunday.
+fn ref_weekday(y: i64, m: u32, d: u32) -> u32 {
+    const T: [i64; 12] = [0, 3, 2, 5, 0, 3, 5, 1, 4, 6, 2, 4];
+    let y = if m < 3 { y - 1 } else { y };
+    ((y + y / 4 - y / 100 + y / 400 + T[m as usize - 1] + i64::from(d)) % 7) as u32
+}
