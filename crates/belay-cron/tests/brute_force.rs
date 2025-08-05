@@ -303,3 +303,79 @@ fn kolkata_half_hour_offset_matches_reference() {
         0
     );
 }
+
+#[test]
+fn bogota_without_dst_matches_reference() {
+    let cov = check_zone(&Tz::named("America/Bogota").unwrap(), 0x5EED_0006, 40);
+    assert_eq!(
+        cov.gap_fires + cov.second_pass_fires + cov.skipped_repeats,
+        0
+    );
+}
+
+#[test]
+fn unusual_rules_match_reference() {
+    // Thirty-minute DST, negative DST, midnight transitions, 26:00 rules.
+    for (i, name) in [
+        "Australia/Lord_Howe",
+        "Europe/Dublin",
+        "America/Santiago",
+        "Asia/Jerusalem",
+        "America/Havana",
+        "Pacific/Chatham",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let cov = check_zone(&Tz::named(name).unwrap(), 0x5EED_0100 + i as u64, 40);
+        assert!(cov.gap_fires + cov.second_pass_fires > 0, "{name}: {cov:?}");
+    }
+}
+
+#[test]
+fn seconds_fields_match_second_by_second_reference() {
+    let mut rng = Rng(0x5EED_0007);
+    for tz in [Tz::Utc, Tz::named("America/New_York").unwrap()] {
+        for case in 0..40 {
+            let text = random_seconds_expr(&mut rng);
+            let expr = CronExpr::parse(&text).unwrap();
+            let from = match tz.next_transition(1_600_000_000 + i64::from(rng.below(1 << 28))) {
+                Some(tr) => tr.at - i64::from(rng.range(1800, 5400)),
+                None => 1_700_000_000 + i64::from(rng.below(1 << 26)),
+            };
+            let to = from + 2 * 3600;
+            let expected = reference_fires(&expr, &tz, from, to, 1);
+            assert_eq!(
+                fast_fires(&expr, &tz, from, to),
+                expected,
+                "case {case}: `{text}` in {tz} from {from}"
+            );
+            assert_eq!(
+                fast_fires_backwards(&expr, &tz, from, to),
+                expected,
+                "case {case}: `{text}` in {tz} from {from} (backward)"
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Day fields against an independent model.
+
+#[derive(Debug, Clone, Copy)]
+enum DomItem {
+    Day(u32),
+    Range(u32, u32),
+    Last,
+    LastMinus(u32),
+    Nearest(u32),
+    LastWeekday,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DowItem {
+    Day(u32),
+    Range(u32, u32),
+    LastOf(u32),
+    Nth(u32, u32),
+}
