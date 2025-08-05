@@ -271,3 +271,35 @@ fn assert_dst_coverage(cov: &Coverage, tz: &str) {
         "{tz}: no skipped repeats in {cov:?}"
     );
 }
+
+#[test]
+fn utc_iteration_matches_minute_by_minute_reference() {
+    check_zone(&Tz::Utc, 0x5EED_0001, 150);
+}
+
+#[test]
+fn new_york_iteration_matches_reference_across_transitions() {
+    let cov = check_zone(&Tz::named("America/New_York").unwrap(), 0x5EED_0002, 70);
+    assert_dst_coverage(&cov, "America/New_York");
+}
+
+#[test]
+fn london_iteration_matches_reference_across_transitions() {
+    let cov = check_zone(&Tz::named("Europe/London").unwrap(), 0x5EED_0003, 70);
+    assert_dst_coverage(&cov, "Europe/London");
+}
+
+#[test]
+fn sydney_iteration_matches_reference_across_southern_transitions() {
+    let cov = check_zone(&Tz::named("Australia/Sydney").unwrap(), 0x5EED_0004, 70);
+    assert_dst_coverage(&cov, "Australia/Sydney");
+}
+
+#[test]
+fn kolkata_half_hour_offset_matches_reference() {
+    let cov = check_zone(&Tz::named("Asia/Kolkata").unwrap(), 0x5EED_0005, 40);
+    assert_eq!(
+        cov.gap_fires + cov.second_pass_fires + cov.skipped_repeats,
+        0
+    );
+}
