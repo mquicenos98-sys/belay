@@ -146,3 +146,105 @@ fn render_dow(dow: &DowSpec) -> String {
     }
     items.join(",")
 }
+
+/// Runs of consecutive weekdays as `(first, length)`. A run through
+/// Saturday into Sunday is joined into one (`FRI-MON`) when that makes it long
+/// enough to print as a range; otherwise the order is plain Sunday-first.
+pub(crate) fn weekday_runs(days: u8) -> Vec<(u32, u32)> {
+    let values: Vec<u32> = bits(u64::from(days)).collect();
+    let mut out: Vec<(u32, u32)> = runs(&values).map(|(a, b)| (a, b - a + 1)).collect();
+    if out.len() >= 2 {
+        let (first, last) = (out[0], out[out.len() - 1]);
+        if first.0 == 0 && last.0 + last.1 == 7 && first.1 + last.1 >= 3 {
+            out.remove(0);
+            let merged = out.len() - 1;
+            out[merged].1 += first.1;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CronExpr, ParseOptions};
+
+    fn canon(s: &str) -> String {
+        CronExpr::parse(s).unwrap().to_string()
+    }
+
+    #[test]
+    fn prints_steps_ranges_and_lists() {
+        assert_eq!(canon("0,15,30,45 * * * *"), "*/15 * * * *");
+        assert_eq!(canon("5,20,35,50 * * * *"), "5-59/15 * * * *");
+        assert_eq!(canon("10-50/20 * * * *"), "10-59/20 * * * *");
+        assert_eq!(canon("10-30/10 * * * *"), "10-30/10 * * * *");
+        assert_eq!(canon("0,30 * * * *"), "*/30 * * * *");
+        assert_eq!(canon("0,45 * * * *"), "0,45 * * * *");
+        assert_eq!(canon("1,2,3,7,8 * * * *"), "1-3,7,8 * * * *");
+        assert_eq!(canon("0 0-23 * * *"), "0 * * * *");
+        assert_eq!(canon("0 0 * 1,4,7,10 *"), "0 0 * */3 *");
+    }
+
+    #[test]
+    fn prints_weekdays_as_names_with_circular_runs() {
+        assert_eq!(canon("0 9 * * 1-5"), "0 9 * * MON-FRI");
+        assert_eq!(canon("0 9 * * 5-7"), "0 9 * * FRI-SUN");
+        assert_eq!(canon("0 9 * * 0,1,5,6"), "0 9 * * FRI-MON");
+        assert_eq!(canon("0 9 * * 6,0"), "0 9 * * SUN,SAT");
+        assert_eq!(canon("0 9 * * 0,1,3,5,6"), "0 9 * * WED,FRI-MON");
+        assert_eq!(canon("0 9 * * 1,3,5"), "0 9 * * MON,WED,FRI");
+        assert_eq!(canon("0 9 * * 0-6"), "0 9 * * *");
+    }
+
+    #[test]
+    fn prints_special_day_items() {
+        assert_eq!(canon("0 0 l * *"), "0 0 L * *");
+        assert_eq!(canon("0 0 1,15,L-3,15w,lw * *"), "0 0 1,15,L-3,15W,LW * *");
+        assert_eq!(canon("0 0 * * 5L,mon#2"), "0 0 * * FRIL,MON#2");
+        assert_eq!(canon("0 0 * * MON,FRIL"), "0 0 * * MON,FRIL");
+    }
+
+    #[test]
+    fn prints_seconds_and_years_only_when_needed() {
+        assert_eq!(canon("0 30 9 * * *"), "30 9 * * *");
+        assert_eq!(canon("*/10 30 9 * * *"), "*/10 30 9 * * *");
+        assert_eq!(canon("0 30 9 * * * *"), "30 9 * * *");
+        assert_eq!(canon("0 30 9 * * * 2025-2027"), "0 30 9 * * * 2025-2027");
+        assert_eq!(canon("@hourly"), "0 * * * *");
+        assert_eq!(canon("@yearly"), "0 0 1 1 *");
+    }
+
+    #[test]
+    fn quartz_output_keeps_seconds_and_question_marks() {
+        let q = |s: &str| {
+            CronExpr::parse_with(s, ParseOptions::quartz())
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(q("0 15 10 ? * 2-6"), "0 15 10 ? * MON-FRI");
+        assert_eq!(q("0 0 12 1 * ?"), "0 0 12 1 * ?");
+        assert_eq!(q("0 0 12 * * ?"), "0 0 12 * * ?");
+        assert_eq!(q("0 0 12 13 * 6"), "0 0 12 13 * FRI");
+    }
+
+    #[test]
+    fn weekday_runs_wrap_across_saturday() {
+        assert_eq!(weekday_runs(0b0110_0011), vec![(5, 4)]);
+        assert_eq!(weekday_runs(0b0011_1110), vec![(1, 5)]);
+        assert_eq!(
+            weekday_runs(0b0101_0101),
+            vec![(0, 1), (2, 1), (4, 1), (6, 1)]
+        );
+        assert_eq!(weekday_runs(0b0100_0001), vec![(0, 1), (6, 1)]);
+    }
+
+    #[test]
+    fn progression_requires_regular_steps() {
+        assert_eq!(progression(&[0, 20, 40], 0, 59), Some(20));
+        assert_eq!(progression(&[0, 20, 45], 0, 59), None);
+        assert_eq!(progression(&[1, 2, 3], 0, 59), None);
+        assert_eq!(progression(&[0, 12], 0, 23), Some(12));
+        assert_eq!(progression(&[5, 17], 0, 23), None);
+    }
+}
