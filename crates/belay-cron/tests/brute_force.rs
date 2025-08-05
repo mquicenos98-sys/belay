@@ -556,3 +556,158 @@ fn ref_weekday(y: i64, m: u32, d: u32) -> u32 {
     let y = if m < 3 { y - 1 } else { y };
     ((y + y / 4 - y / 100 + y / 400 + T[m as usize - 1] + i64::from(d)) % 7) as u32
 }
+
+#[test]
+fn day_fields_match_an_independent_model_over_eight_years() {
+    let mut rng = Rng(0x5EED_0008);
+    // 2023-12-31T12:00:00Z .. 2032-01-01T00:00:00Z.
+    let (from, to) = (1_704_024_000, 1_956_528_000);
+    for case in 0..250 {
+        let spec = DateSpec::random(&mut rng);
+        let text = spec.render();
+        let options = ParseOptions::new().with_day_match(if spec.both {
+            DayMatch::Both
+        } else {
+            DayMatch::Either
+        });
+        let expr = CronExpr::parse_with(&text, options).unwrap_or_else(|e| panic!("{text}: {e}"));
+        let mut expected = Vec::new();
+        for y in 2024..=2031 {
+            for m in 1..=12 {
+                for d in 1..=ref_days_in_month(y, m) {
+                    if spec.matches(y, m, d) {
+                        expected.push((y as i32, m, d));
+                    }
+                }
+            }
+        }
+        let actual: Vec<(i32, u32, u32)> = expr
+            .upcoming(from, &Tz::Utc)
+            .take_while(|&t| t < to)
+            .map(|t| {
+                let l = Tz::Utc.to_local(t);
+                assert_eq!((l.hour(), l.minute(), l.second()), (12, 0, 0));
+                (l.year(), l.month(), l.day())
+            })
+            .collect();
+        assert_eq!(actual, expected, "case {case}: `{text}` ({spec:?})");
+        if expected.is_empty() {
+            assert!(
+                !expr.is_satisfiable() || expr.next_after(from, &Tz::Utc).is_some(),
+                "case {case}: `{text}`"
+            );
+        }
+    }
+}
+
+#[test]
+fn display_round_trips_random_expressions() {
+    let mut rng = Rng(0x5EED_0009);
+    for _ in 0..500 {
+        let text = if rng.chance(50) {
+            random_expr(&mut rng)
+        } else {
+            random_seconds_expr(&mut rng)
+        };
+        let expr = CronExpr::parse(&text).unwrap();
+        let printed = expr.to_string();
+        let reparsed = CronExpr::parse(&printed)
+            .unwrap_or_else(|e| panic!("`{text}` printed as `{printed}`: {e}"));
+        assert_eq!(reparsed, expr, "`{text}` printed as `{printed}`");
+        assert_eq!(reparsed.to_string(), printed);
+    }
+}
+
+#[test]
+fn descriptions_exist_for_random_expressions() {
+    let mut rng = Rng(0x5EED_000A);
+    for _ in 0..300 {
+        let text = random_expr(&mut rng);
+        let description = CronExpr::parse(&text).unwrap().describe();
+        assert!(!description.is_empty(), "{text}");
+        assert!(!description.contains("  "), "{text}: {description}");
+        assert!(!description.ends_with(' '), "{text}: {description}");
+    }
+}
+
+/// Fire instants of `times` (hour, minute) on every date `spec` accepts,
+/// resolved one reading at a time with `Tz::from_local`: skipped readings
+/// move to the end of the gap, repeated ones take their first occurrence.
+/// Valid for non-periodic expressions only.
+fn day_level_reference(
+    spec: &DateSpec,
+    times: &[(u32, u32)],
+    tz: &Tz,
+    from: i64,
+    to: i64,
+) -> Vec<i64> {
+    let mut out = Vec::new();
+    for y in 2023..=2035 {
+        for m in 1..=12 {
+            for d in 1..=ref_days_in_month(y, m) {
+                if !spec.matches(y, m, d) {
+                    continue;
+                }
+                for &(h, mi) in times {
+                    let local = LocalDateTime::new(y as i32, m, d, h, mi, 0).unwrap();
+                    let t = tz.from_local(local).earliest();
+                    if t > from && t <= to {
+                        out.push(t);
+                    }
+                }
+            }
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+#[test]
+fn sparse_dates_in_dst_zones_match_day_level_reference() {
+    // Sparse date patterns leave months or years between fires, so the
+    // search has to skip many transitions at once.
+    let mut rng = Rng(0x5EED_000B);
+    let (from, to) = (1_703_937_600, 2_051_265_600); // 2023-12-30T12:00Z .. 2035-01-01T12:00Z
+    for name in [
+        "America/New_York",
+        "Europe/London",
+        "Australia/Sydney",
+        "Australia/Lord_Howe",
+        "America/Santiago",
+    ] {
+        let tz = Tz::named(name).unwrap();
+        for case in 0..30 {
+            let spec = DateSpec::random(&mut rng);
+            let (minute, hours) = match rng.below(4) {
+                0 => (30, vec![rng.range(0, 3)]),
+                1 => (0, vec![1, 2]),
+                2 => (rng.range(0, 59), vec![0]),
+                _ => (15, vec![2, 23]),
+            };
+            let times: Vec<(u32, u32)> = hours.iter().map(|&h| (h, minute)).collect();
+            let hours: Vec<String> = hours.iter().map(u32::to_string).collect();
+            let date_part = spec.render();
+            let text = format!(
+                "{minute} {} {}",
+                hours.join(","),
+                date_part.trim_start_matches("0 12 ")
+            );
+            let options = ParseOptions::new().with_day_match(if spec.both {
+                DayMatch::Both
+            } else {
+                DayMatch::Either
+            });
+            let expr = CronExpr::parse_with(&text, options).unwrap();
+            assert!(!expr.is_periodic(), "{text}");
+            let expected = day_level_reference(&spec, &times, &tz, from, to);
+            let forward = fast_fires(&expr, &tz, from, to);
+            assert_eq!(forward, expected, "case {case}: `{text}` in {name}");
+            let backward = fast_fires_backwards(&expr, &tz, from, to);
+            assert_eq!(
+                backward, expected,
+                "case {case}: `{text}` in {name} (backward)"
+            );
+        }
+    }
+}
