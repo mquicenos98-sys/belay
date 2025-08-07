@@ -39,8 +39,10 @@ impl TokenBucket {
     /// Takes a token if one is available at `now`.
     pub(crate) fn try_take(&mut self, now: Timestamp) -> bool {
         self.refill(now);
-        if self.tokens >= 1.0 {
-            self.tokens -= 1.0;
+        // A hair of tolerance so that 0.1 * 10 tokens accumulated in float
+        // steps still counts as a whole token.
+        if self.tokens >= 1.0 - 1e-9 {
+            self.tokens = (self.tokens - 1.0).max(0.0);
             true
         } else {
             false
@@ -57,7 +59,7 @@ impl TokenBucket {
     /// How long until a token is available, zero if one is now.
     pub(crate) fn wait_time(&self, now: Timestamp) -> Duration {
         let missing = 1.0 - self.available(now);
-        if missing <= 0.0 {
+        if missing <= 1e-9 {
             Duration::ZERO
         } else {
             // Round up to the next millisecond: waking a hair early would
@@ -105,6 +107,17 @@ mod tests {
         assert!(!b.try_take(at(500)));
         // Idle for a long time: capped at the burst.
         assert!((b.available(at(60_000)) - 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fractional_rates_accumulate_across_small_steps() {
+        let mut b = TokenBucket::new(RateLimit::new(0.1, 1), at(0));
+        assert!(b.try_take(at(0)));
+        for step in 1..10 {
+            assert!(!b.try_take(at(step * 1_000)), "step {step}");
+        }
+        assert!(b.try_take(at(10_000)));
+        assert_eq!(b.wait_time(at(10_000)), Duration::from_secs(10));
     }
 
     #[test]

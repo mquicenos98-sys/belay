@@ -303,7 +303,7 @@ impl<'s> Cursor<'s> {
     }
 
     /// In multi-line basic strings a backslash at the end of a line trims the
-    /// line ending and the indentation of the next line.
+    /// line ending and all whitespace (including newlines) that follows.
     fn line_ending_backslash(&mut self) -> PResult<bool> {
         let after = &self.rest()[1..];
         let tail = after.trim_start_matches([' ', '\t']);
@@ -311,9 +311,12 @@ impl<'s> Cursor<'s> {
             return Ok(false);
         }
         self.pos += 1 + after.len() - tail.len();
-        self.eat_newline()?;
-        self.skip_ws();
-        Ok(true)
+        loop {
+            self.skip_ws();
+            if !self.eat_newline()? {
+                return Ok(true);
+            }
+        }
     }
 
     fn escape(&mut self, out: &mut String) -> PResult<()> {
@@ -626,6 +629,28 @@ mod tests {
 
     fn scalar(src: &str) -> Result<Value, String> {
         Cursor::new(src).scalar().map_err(|d| d.message)
+    }
+
+    #[test]
+    fn strings_in_all_four_forms() {
+        let cases = [
+            (
+                r#""\"q\" \\ \u00e9\U0001F600 \b\f\r\n\t""#,
+                "\"q\" \\ \u{e9}\u{1F600} \u{8}\u{c}\r\n\t",
+            ),
+            (r"'C:\Users\belay'", r"C:\Users\belay"),
+            (
+                "\"\"\"\nThe quick \\\n\n   brown fox\r\njumps\"\"\"",
+                "The quick brown fox\njumps",
+            ),
+            // Up to two quotes may sit right before the closing delimiter.
+            ("\"\"\"a \"\"b\"\" c\"\"\"\"\"", "a \"\"b\"\" c\"\""),
+            ("'''it's'''''", "it's''"),
+            ("'''\r\nno \\escapes\r\n'''", "no \\escapes\n"),
+        ];
+        for (src, value) in cases {
+            assert_eq!(string(src).unwrap(), value, "{src}");
+        }
     }
 
     #[test]
