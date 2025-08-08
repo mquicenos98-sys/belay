@@ -11,7 +11,6 @@
 use belay_cron::{zone_names, LocalResult, Tz};
 
 const START_2027: i64 = 1_798_761_600;
-
 const START_2028: i64 = 1_830_297_600;
 
 #[rustfmt::skip]
@@ -207,4 +206,101 @@ fn every_table_zone_has_facts() {
     let names: Vec<&str> = zone_names().collect();
     let with_facts: Vec<&str> = FACTS_2027.iter().map(|(n, _, _)| *n).collect();
     assert_eq!(names, with_facts);
+}
+
+#[test]
+fn offsets_and_transitions_match_the_tz_database_in_2027() {
+    for &(name, initial, changes) in FACTS_2027 {
+        let tz = Tz::named(name).unwrap();
+        assert_eq!(
+            tz.offset_at(START_2027),
+            initial,
+            "{name} at the start of 2027"
+        );
+        let mut actual = Vec::new();
+        let mut cursor = START_2027;
+        while let Some(tr) = tz.next_transition(cursor) {
+            if tr.at >= START_2028 {
+                break;
+            }
+            assert_eq!(tz.offset_at(tr.at - 1), tr.offset_before, "{name}");
+            assert_eq!(tz.offset_at(tr.at), tr.offset_after, "{name}");
+            actual.push((tr.at, tr.offset_after));
+            cursor = tr.at;
+        }
+        assert_eq!(actual, changes, "{name} transitions in 2027");
+        assert_eq!(tz.has_transitions(), !changes.is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn local_readings_around_every_2027_transition_resolve_consistently() {
+    for &(name, _, changes) in FACTS_2027 {
+        let tz = Tz::named(name).unwrap();
+        for &(at, _) in changes {
+            let before = tz.offset_at(at - 1);
+            let after = tz.offset_at(at);
+            // The reading just after the transition always exists.
+            let first_after = tz.to_local(at);
+            assert_eq!(
+                tz.from_local(first_after).earliest(),
+                if after > before {
+                    at
+                } else {
+                    at - i64::from(before - after)
+                },
+                "{name} at {at}"
+            );
+            // Readings between the two clocks are skipped or repeated.
+            let middle = Tz::Utc.to_local(at + i64::from(before.min(after)) + 60);
+            match tz.from_local(middle) {
+                LocalResult::Gap {
+                    before: b,
+                    after: a,
+                } => {
+                    assert!(after > before, "{name}: gap on a backward change");
+                    assert_eq!((b, a), (at - 1, at), "{name}");
+                }
+                LocalResult::Ambiguous(first, second) => {
+                    assert!(after < before, "{name}: overlap on a forward change");
+                    assert_eq!(second - first, i64::from(before - after), "{name}");
+                    assert_eq!(tz.to_local(first), middle, "{name}");
+                    assert_eq!(tz.to_local(second), middle, "{name}");
+                }
+                LocalResult::Single(_) => panic!("{name}: {middle} should not be single"),
+            }
+        }
+    }
+}
+
+#[test]
+fn utc_aliases_resolve_to_utc() {
+    for name in [
+        "UTC",
+        "Etc/UTC",
+        "GMT",
+        "Etc/GMT",
+        "Etc/Universal",
+        "Etc/Zulu",
+    ] {
+        assert_eq!(Tz::named(name).unwrap(), Tz::Utc, "{name}");
+    }
+    assert_eq!(
+        Tz::named("Africa/Abidjan").unwrap().name(),
+        Some("Africa/Abidjan")
+    );
+}
+
+#[test]
+fn names_are_case_sensitive_and_errors_suggest_the_right_spelling() {
+    let err = Tz::named("europe/london").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unknown time zone \"europe/london\" (did you mean \"Europe/London\"?)"
+    );
+    let err = Tz::parse("Asia/Kolkatta").unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unknown time zone \"Asia/Kolkatta\" (did you mean \"Asia/Kolkata\"?)"
+    );
 }
