@@ -1,0 +1,20 @@
+[package]
+name = "belay-scheduler"
+description = "Cron schedules, business calendars and DAG workflows for belay, dispatched through a pluggable job dispatcher"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "belay_scheduler"
+path = "src/lib.rs"
+
+[dependencies]
+belay-common = { path = "../belay-common" }
+belay-json = { path = "../belay-json" }
+belay-proto = { path = "../belay-proto" }
+belay-cron = { path = "../belay-cron" }
+belay-store = { path = "../belay-store" }
