@@ -173,6 +173,42 @@ fn any_damaged_byte_in_a_sealed_segment_is_reported() {
 }
 
 #[test]
+fn damage_before_the_last_record_of_the_last_segment_is_corruption() {
+    let fs = MemFs::new();
+    let kv = open(opts(&fs));
+    for i in 1..=6 {
+        kv.write(batch(i)).expect("write");
+    }
+    kv.close().expect("close");
+    let seg = last_segment(&fs, &dir());
+    let records = inspect::read_segment(&fs, &seg, true)
+        .expect("dump")
+        .records;
+    let last = records.last().expect("records").clone();
+    let original = fs.read(&seg).expect("read");
+    for offset in 0..original.len() {
+        let damaged = fs.deep_copy();
+        damaged
+            .overwrite(&seg, offset, &[original[offset] ^ 0x01])
+            .expect("flip");
+        let result = LogKv::open(dir(), opts(&damaged));
+        if (offset as u64) < last.offset {
+            // Later records were written after this byte had been synced.
+            assert!(
+                matches!(result, Err(StoreError::Corrupt { .. })),
+                "offset {offset}: {result:?}"
+            );
+        } else {
+            // Damage confined to the final record looks exactly like a torn
+            // write, and is truncated as one.
+            let kv = result.expect("opens");
+            assert_eq!(kv.last_seq(), 5, "offset {offset}");
+            assert_eq!(kv.recovery().torn_tails, 1);
+        }
+    }
+}
+
+#[test]
 fn a_crash_after_any_io_operation_keeps_every_acknowledged_write() {
     let states = states(14);
     let mut finished = false;

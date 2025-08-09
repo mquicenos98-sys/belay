@@ -311,6 +311,24 @@ fn damage_in_a_sealed_segment_is_corruption() {
 }
 
 #[test]
+fn damage_that_later_records_prove_synced_is_corruption_even_in_the_last_segment() {
+    let fs = MemFs::new();
+    let kv = open(opts(&fs));
+    write_batches(&kv, 1..=5);
+    kv.close().expect("close");
+    let seg = support::last_segment(&fs, &dir());
+    let offsets = record_offsets(&fs, &seg);
+    fs.overwrite(&seg, offsets[1] as usize + 27, b"!")
+        .expect("damage");
+    match LogKv::open(dir(), opts(&fs)) {
+        Err(e @ StoreError::Corrupt { .. }) => {
+            assert!(e.to_string().contains("had been synced"), "{e}");
+        }
+        other => panic!("expected corruption, got {other:?}"),
+    }
+}
+
+#[test]
 fn damage_in_an_unsynced_group_is_a_torn_tail_even_with_intact_records_after_it() {
     // Out-of-order page writeback: batch 4's bytes never reached the disk
     // but batches 5 and 6, written later without a sync, did.

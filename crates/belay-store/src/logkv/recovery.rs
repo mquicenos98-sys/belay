@@ -184,7 +184,7 @@ impl Recovery<'_> {
         for event in RecordReader::new(&buf, start, before_first) {
             match event {
                 Event::Record(rec) => self.apply(path, rec, snapshot_seq, expected, table)?,
-                Event::Damage(d) if is_last => {
+                Event::Damage(d) if is_last && !d.proven => {
                     self.truncate_torn_tail(path, d.offset, buf.len(), &d.reason)?;
                     end = d.offset;
                     break;
