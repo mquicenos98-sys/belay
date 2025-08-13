@@ -81,11 +81,33 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
 mod dispatch;
-
 mod error;
-
 mod options;
-
 pub mod schedule;
-
 mod store;
+pub mod workflow;
+
+pub use dispatch::{DispatchError, DispatchOutcome, Dispatcher, MemoryDispatcher};
+pub use error::{Error, Result};
+pub use options::{SchedulerOptions, WorkflowOptions};
+pub use schedule::{
+    fire_key, jitter_offset, Fired, Scheduler, SkipReason, Skipped, TickError, TickErrorKind,
+    TickReport, Upserted, MAX_PREVIEW, META_TRIGGER,
+};
+pub use workflow::{step_key, WorkflowDetails, WorkflowEngine, WorkflowFilter, SWEEP_BATCH};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn shared_between_threads<T: Send + Sync>() {}
+
+    #[test]
+    fn engines_can_be_shared_between_threads() {
+        // belay-core keeps both engines in an Arc used by the HTTP workers,
+        // the tick loop and the queue's completion hook.
+        shared_between_threads::<Scheduler>();
+        shared_between_threads::<WorkflowEngine>();
+        shared_between_threads::<MemoryDispatcher>();
+    }
+}
