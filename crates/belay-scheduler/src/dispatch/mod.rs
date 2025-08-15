@@ -122,3 +122,99 @@ pub enum DispatchError {
     /// trouble, a remote queue out of reach); try again later.
     Unavailable(String),
 }
+
+impl DispatchError {
+    /// Whether the same dispatch may succeed later.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        matches!(self, DispatchError::Unavailable(_))
+    }
+
+    /// The explanation, without the classification.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            DispatchError::Rejected(m) | DispatchError::Unavailable(m) => m,
+        }
+    }
+}
+
+impl fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DispatchError::Rejected(m) => write!(f, "rejected: {m}"),
+            DispatchError::Unavailable(m) => write!(f, "unavailable: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for DispatchError {}
+
+/// Classifies an API error from a queue: the retryable codes and internal
+/// failures are [`Unavailable`](DispatchError::Unavailable), everything
+/// else is a [`Rejected`](DispatchError::Rejected) request.
+impl From<ApiError> for DispatchError {
+    fn from(e: ApiError) -> DispatchError {
+        if e.is_retryable() || e.is(ErrorCode::Internal) {
+            DispatchError::Unavailable(e.message)
+        } else {
+            DispatchError::Rejected(e.message)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct Refusing;
+
+    impl Dispatcher for Refusing {
+        fn dispatch(&self, _: &JobSpec) -> Result<DispatchOutcome, DispatchError> {
+            Err(DispatchError::Unavailable("draining".into()))
+        }
+
+        fn job_state(&self, _: &JobId) -> Option<JobState> {
+            Some(JobState::Ready)
+        }
+
+        fn cancel(&self, id: &JobId) -> Result<(), DispatchError> {
+            Err(DispatchError::Rejected(format!("job {id} not found")))
+        }
+    }
+
+    #[test]
+    fn dispatchers_work_through_smart_pointers_and_default_job_lookup() {
+        let spec = JobSpec::new("q", "k");
+        let id = JobId::generate();
+        let shared: Arc<dyn Dispatcher> = Arc::new(Refusing);
+        assert!(shared.dispatch(&spec).unwrap_err().is_transient());
+        let boxed: Box<dyn Dispatcher> = Box::new(Refusing);
+        assert_eq!(boxed.job_state(&id), Some(JobState::Ready));
+        let by_ref: &dyn Dispatcher = &Refusing;
+        assert!(!by_ref.cancel(&id).unwrap_err().is_transient());
+        assert_eq!(by_ref.job(&id), None);
+    }
+
+    #[test]
+    fn api_errors_map_onto_transient_and_permanent_failures() {
+        let cases = [
+            (ApiError::unavailable("shutting down"), true),
+            (ApiError::resource_exhausted("slow down"), true),
+            (ApiError::internal("disk full"), true),
+            (ApiError::invalid_argument("bad priority"), false),
+            (ApiError::conflict("unique key held"), false),
+        ];
+        for (api, transient) in cases {
+            let message = api.message.clone();
+            let e = DispatchError::from(api);
+            assert_eq!(e.is_transient(), transient, "{message}");
+            assert_eq!(e.message(), message);
+        }
+        assert_eq!(
+            DispatchError::Rejected("no such queue".into()).to_string(),
+            "rejected: no such queue"
+        );
+        assert!(DispatchOutcome::duplicate(JobId::from_ulid(belay_common::Ulid::nil())).duplicate);
+    }
+}
