@@ -178,3 +178,87 @@ impl fmt::Display for TickError {
         write!(f, ": {}", self.message)
     }
 }
+
+/// Kinds of [`TickError`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum TickErrorKind {
+    /// The dispatcher refused the job; the fire is dropped and the schedule
+    /// moves on.
+    DispatchRejected,
+    /// The dispatcher could not take the job right now; the schedule stays
+    /// at this fire and retries after the retry delay.
+    DispatchUnavailable,
+    /// Cancelling the previous job under `cancel_previous` failed; the new
+    /// fire went ahead anyway.
+    CancelFailed,
+    /// Saving the tick's bookkeeping failed; nothing was recorded and the
+    /// next tick repeats the work (its dispatches deduplicate).
+    Store,
+}
+
+impl TickErrorKind {
+    fn describe(self) -> &'static str {
+        match self {
+            TickErrorKind::DispatchRejected => "dispatch rejected",
+            TickErrorKind::DispatchUnavailable => "dispatcher unavailable",
+            TickErrorKind::CancelFailed => "cancelling the previous job failed",
+            TickErrorKind::Store => "saving schedules failed",
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn skipped(reason: SkipReason) -> Skipped {
+        Skipped {
+            schedule: ScheduleId::from_static("s"),
+            reason,
+            fire_time: Timestamp::EPOCH,
+            last_fire_time: Timestamp::EPOCH,
+            count: 1,
+        }
+    }
+
+    #[test]
+    fn summary_lists_skip_reasons_once() {
+        let mut report = TickReport::default();
+        assert!(report.is_empty());
+        assert_eq!(report.to_string(), "0 fired, 0 skipped, 0 errors");
+        report.skipped.push(skipped(SkipReason::Overlap));
+        report.skipped.push(skipped(SkipReason::Calendar));
+        report.skipped.push(skipped(SkipReason::Overlap));
+        report.errors.push(TickError {
+            schedule: Some(ScheduleId::from_static("s")),
+            fire_time: Some(Timestamp::EPOCH),
+            kind: TickErrorKind::DispatchUnavailable,
+            message: "draining".into(),
+        });
+        assert_eq!(
+            report.to_string(),
+            "0 fired, 3 skipped (calendar, overlap), 1 error"
+        );
+        assert_eq!(
+            report.errors[0].to_string(),
+            "dispatcher unavailable for schedule s at 1970-01-01T00:00:00.000Z: draining"
+        );
+        assert_eq!(report.skipped_for("s").len(), 3);
+        assert!(report.fired_for("s").is_empty());
+    }
+
+    #[test]
+    fn only_some_reasons_have_skip_events() {
+        assert_eq!(
+            SkipReason::Overlap.event_reason(),
+            Some(EventSkipReason::Overlap)
+        );
+        assert_eq!(
+            SkipReason::Calendar.event_reason(),
+            Some(EventSkipReason::Calendar)
+        );
+        assert_eq!(SkipReason::Misfire.event_reason(), None);
+        assert_eq!(SkipReason::Paused.event_reason(), None);
+        assert_eq!(format!("{:>8}", SkipReason::Paused), "  paused");
+    }
+}
