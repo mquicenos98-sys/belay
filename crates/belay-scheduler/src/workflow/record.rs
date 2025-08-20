@@ -81,3 +81,96 @@ pub struct WorkflowFilter {
     /// Listing order.
     pub order: SortOrder,
 }
+
+impl WorkflowFilter {
+    /// Every run, newest first, 100 per page.
+    #[must_use]
+    pub fn new() -> WorkflowFilter {
+        WorkflowFilter::default()
+    }
+
+    /// Only runs in `state`.
+    #[must_use]
+    pub fn state(mut self, state: WorkflowState) -> WorkflowFilter {
+        self.state = Some(state);
+        self
+    }
+
+    /// Only runs named `name`.
+    #[must_use]
+    pub fn name(mut self, name: impl Into<String>) -> WorkflowFilter {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// Continues after `cursor`.
+    #[must_use]
+    pub fn after(mut self, cursor: Cursor) -> WorkflowFilter {
+        self.cursor = Some(cursor);
+        self
+    }
+
+    /// Sets the page size.
+    #[must_use]
+    pub fn limit(mut self, limit: u32) -> WorkflowFilter {
+        self.limit = limit;
+        self
+    }
+
+    /// Sets the order.
+    #[must_use]
+    pub fn order(mut self, order: SortOrder) -> WorkflowFilter {
+        self.order = order;
+        self
+    }
+
+    /// The page size actually used.
+    #[must_use]
+    pub fn effective_limit(&self) -> u32 {
+        match self.limit {
+            0 => DEFAULT_PAGE_LIMIT,
+            n => n.min(MAX_PAGE_LIMIT),
+        }
+    }
+
+    /// Whether a run with this state and name passes the filter.
+    pub(crate) fn admits(&self, state: WorkflowState, name: &str) -> bool {
+        self.state.map_or(true, |s| s == state) && self.name.as_deref().map_or(true, |n| n == name)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_common::Timestamp;
+    use belay_proto::workflow::{StepSpec, WorkflowSpec};
+    use belay_proto::{JobSpec, WorkflowId};
+
+    #[test]
+    fn details_round_trip_and_omit_empty_errors() {
+        let spec = WorkflowSpec::new("etl").step(StepSpec::new("a", JobSpec::new("q", "k")));
+        let wf = Workflow::new(WorkflowId::generate(), spec, Timestamp::from_secs(10));
+        let mut details = WorkflowDetails::new(wf);
+        assert!(details.to_json().get("errors").is_none());
+        details
+            .errors
+            .insert("a".into(), "job 01J... is dead: boom".into());
+        let back = WorkflowDetails::from_json(&details.to_json()).unwrap();
+        assert_eq!(back, details);
+        assert_eq!(back.error("a"), Some("job 01J... is dead: boom"));
+        assert_eq!(back.error("b"), None);
+    }
+
+    #[test]
+    fn filter_limits_and_matching() {
+        assert_eq!(WorkflowFilter::new().effective_limit(), 100);
+        assert_eq!(WorkflowFilter::new().limit(5000).effective_limit(), 1000);
+        let f = WorkflowFilter::new()
+            .state(WorkflowState::Running)
+            .name("etl");
+        assert!(f.admits(WorkflowState::Running, "etl"));
+        assert!(!f.admits(WorkflowState::Failed, "etl"));
+        assert!(!f.admits(WorkflowState::Running, "other"));
+        assert!(WorkflowFilter::new().admits(WorkflowState::Cancelled, "x"));
+    }
+}
