@@ -362,7 +362,7 @@ impl TimeWindow {
             self.starts_on(date.weekday()) && self.start <= time && time < self.end
         } else {
             (self.starts_on(date.weekday()) && time >= self.start)
-                || (self.starts_on(date.weekday()) && time < self.end)
+                || (self.starts_on(date.pred().weekday()) && time < self.end)
         }
     }
 }
@@ -606,6 +606,40 @@ mod tests {
         assert!(err
             .to_string()
             .starts_with(r#"$[1]: invalid weekday set "xyz""#));
+    }
+
+    #[test]
+    fn windows_are_half_open_and_may_wrap_midnight() {
+        let office = TimeWindow::new("mon-fri".parse().unwrap(), time("09:00"), time("17:00"));
+        let monday = date("2025-03-03");
+        assert!(office.contains(monday, time("09:00")));
+        assert!(!office.contains(monday, time("17:00")));
+        assert!(
+            !office.contains(date("2025-03-08"), time("10:00")),
+            "saturday"
+        );
+
+        let night = TimeWindow::new("fri".parse().unwrap(), time("22:00"), time("06:00"));
+        let friday = date("2025-03-07");
+        let saturday = date("2025-03-08");
+        assert!(night.contains(friday, time("23:30")));
+        assert!(night.contains(saturday, time("05:59")));
+        assert!(!night.contains(saturday, time("06:00")));
+        assert!(
+            !night.contains(saturday, time("23:00")),
+            "starts on fridays only"
+        );
+        assert!(
+            !night.contains(friday, time("05:00")),
+            "thursday night is not included"
+        );
+
+        let all_day = TimeWindow::new(
+            WeekdaySet::EMPTY,
+            TimeOfDay::MIDNIGHT,
+            TimeOfDay::END_OF_DAY,
+        );
+        assert!(all_day.contains(saturday, time("23:59")));
     }
 
     #[test]
