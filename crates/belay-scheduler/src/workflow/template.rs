@@ -30,11 +30,8 @@ use std::fmt;
 use belay_json::{Pointer, Value};
 
 const OPEN: &str = "{{";
-
 const CLOSE: &str = "}}";
-
 const PREFIX: &str = "steps.";
-
 const ATTRIBUTE: &str = "result";
 
 /// A parsed placeholder.
@@ -174,4 +171,167 @@ fn walk_check(value: &Value, at: &Pointer, problems: &mut Vec<(Pointer, SyntaxEr
 /// Whether `payload` contains any placeholder.
 pub(crate) fn has_placeholders(payload: &Value) -> bool {
     !belay_proto::workflow::referenced_steps(payload).is_empty()
+}
+
+/// Replaces every placeholder in `payload`. `result_of(step)` returns the
+/// step's result, or why there is none; the first missing value aborts
+/// with a message naming its placeholder.
+pub(crate) fn render(
+    payload: &Value,
+    result_of: &mut dyn FnMut(&str) -> Result<Value, String>,
+) -> Result<Value, String> {
+    match payload {
+        Value::String(s) => render_string(s, result_of),
+        Value::Array(items) => items
+            .iter()
+            .map(|item| render(item, result_of))
+            .collect::<Result<Vec<_>, _>>()
+            .map(Value::Array),
+        Value::Object(map) => {
+            let mut out = map.clone();
+            for (_, item) in out.iter_mut() {
+                *item = render(item, result_of)?;
+            }
+            Ok(Value::Object(out))
+        }
+        other => Ok(other.clone()),
+    }
+}
+
+fn render_string(
+    s: &str,
+    result_of: &mut dyn FnMut(&str) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let pieces = scan(s).map_err(|e| e.to_string())?;
+    if let [Piece::Hole(hole)] = pieces.as_slice() {
+        return resolve(hole, result_of);
+    }
+    if !pieces.iter().any(|p| matches!(p, Piece::Hole(_))) {
+        return Ok(Value::String(s.to_owned()));
+    }
+    let mut out = String::with_capacity(s.len());
+    for piece in &pieces {
+        match piece {
+            Piece::Text(text) => out.push_str(text),
+            Piece::Hole(hole) => {
+                out.push_str(&belay_json::to_string(&resolve(hole, result_of)?));
+            }
+        }
+    }
+    Ok(Value::String(out))
+}
+
+fn resolve(
+    hole: &Placeholder,
+    result_of: &mut dyn FnMut(&str) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let result =
+        result_of(&hole.step).map_err(|why| format!("placeholder {}: {why}", hole.source))?;
+    hole.pointer.get(&result).cloned().ok_or_else(|| {
+        format!(
+            "placeholder {}: the result of step {:?} has no value at {}",
+            hole.source, hole.step, hole.pointer
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::json;
+
+    fn results(step: &str) -> Result<Value, String> {
+        match step {
+            "fetch" => {
+                Ok(json!({"url": "http://x/a", "items": [{"id": 7}, {"id": 8}], "a/b": true}))
+            }
+            "count" => Ok(json!(42)),
+            "nothing" => Ok(Value::Null),
+            other => Err(format!("step {other:?} was skipped, so it has no result")),
+        }
+    }
+
+    fn render_ok(payload: Value) -> Value {
+        render(&payload, &mut results).unwrap()
+    }
+
+    #[test]
+    fn whole_string_placeholders_keep_the_value_type() {
+        assert_eq!(render_ok(json!("{{steps.count.result}}")), json!(42));
+        assert_eq!(
+            render_ok(json!({"items": "{{ steps.fetch.result/items }}"})),
+            json!({"items": [{"id": 7}, {"id": 8}]})
+        );
+        assert_eq!(
+            render_ok(json!(["{{steps.nothing.result}}"])),
+            json!([null])
+        );
+    }
+
+    #[test]
+    fn dotted_paths_and_pointers_agree() {
+        let dotted = render_ok(json!("{{steps.fetch.result.items.1.id}}"));
+        let pointer = render_ok(json!("{{steps.fetch.result/items/1/id}}"));
+        assert_eq!(dotted, json!(8));
+        assert_eq!(pointer, dotted);
+        // A dotted segment containing '/' is escaped, not split.
+        assert_eq!(render_ok(json!("{{steps.fetch.result.a/b}}")), json!(true));
+        assert_eq!(render_ok(json!("{{steps.fetch.result/a~1b}}")), json!(true));
+    }
+
+    #[test]
+    fn other_braces_and_keys_are_left_alone() {
+        let payload = json!({
+            "{{steps.count.result}}": "key stays",
+            "mustache": "Hello {{ name }}",
+            "open": "{{steps.count.result",
+            "n": 5
+        });
+        assert_eq!(render_ok(payload.clone()), payload);
+        assert!(!has_placeholders(&json!({"a": "{{ name }}"})));
+        assert!(has_placeholders(&json!({"a": ["x", "{{steps.a.result}}"]})));
+    }
+
+    #[test]
+    fn missing_values_name_the_placeholder() {
+        let err = render(&json!({"x": "{{steps.fetch.result/nope}}"}), &mut results).unwrap_err();
+        assert_eq!(
+            err,
+            r#"placeholder {{steps.fetch.result/nope}}: the result of step "fetch" has no value at /nope"#
+        );
+        let err = render(&json!("id {{steps.load.result.id}}"), &mut results).unwrap_err();
+        assert_eq!(
+            err,
+            r#"placeholder {{steps.load.result.id}}: step "load" was skipped, so it has no result"#
+        );
+    }
+
+    #[test]
+    fn malformed_placeholders_are_found_with_their_location() {
+        let payload = json!({
+            "ok": "{{steps.a.result}}",
+            "list": ["fine", "{{steps.a.results}}"],
+            "deep": {"x": "{{steps..result}}", "y": "{{steps.a.result.x..y}}", "z": "{{steps.a.result~x}}"},
+            "bad_pointer": "{{steps.a.result/~2}}"
+        });
+        let found: Vec<String> = check(&payload)
+            .into_iter()
+            .map(|(at, e)| format!("{at}: {e}"))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                r#"/list/1: invalid placeholder {{steps.a.results}}: unexpected "s" after "result" (use /json/pointer or .dotted.keys)"#,
+                r#"/deep/x: invalid placeholder {{steps..result}}: expected a step name after "steps.""#,
+                "/deep/y: invalid placeholder {{steps.a.result.x..y}}: empty key in dotted path",
+                r#"/deep/z: invalid placeholder {{steps.a.result~x}}: unexpected "~x" after "result" (use /json/pointer or .dotted.keys)"#,
+                "/bad_pointer: invalid placeholder {{steps.a.result/~2}}: invalid JSON pointer at offset 1: '~' must be followed by '0' or '1'",
+            ]
+        );
+        let err = check(&json!("{{steps.fetch}}")).remove(0).1;
+        assert_eq!(
+            err.to_string(),
+            r#"invalid placeholder {{steps.fetch}}: expected "steps.fetch.result", optionally followed by a path"#
+        );
+    }
 }
