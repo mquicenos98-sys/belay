@@ -144,3 +144,111 @@ impl From<DispatchError> for Error {
         Error::Dispatch(e)
     }
 }
+
+/// How the HTTP API reports each error: validation problems as
+/// `invalid_argument` with the violation list, missing things as
+/// `not_found`, a calendar in use as `failed_precondition`, a busy
+/// dispatcher as `unavailable`, and storage trouble as `internal`.
+impl From<Error> for ApiError {
+    fn from(e: Error) -> ApiError {
+        match e {
+            Error::Invalid(v) => ApiError::from(v),
+            Error::NotFound { kind, id } => ApiError::not_found(kind, id),
+            Error::AlreadyExists { kind, id } => ApiError::already_exists(kind, id),
+            Error::CalendarInUse {
+                ref calendar,
+                ref schedules,
+            } => {
+                let names: Vec<&str> = schedules.iter().map(ScheduleId::as_str).collect();
+                let details = json!({"calendar": calendar.as_str(), "schedules": names});
+                ApiError::failed_precondition(e.to_string()).with_details(details)
+            }
+            Error::Dispatch(DispatchError::Unavailable(_)) => ApiError::unavailable(e.to_string()),
+            Error::Dispatch(DispatchError::Rejected(_)) => {
+                ApiError::failed_precondition(e.to_string())
+            }
+            Error::Store(_) | Error::Corrupt { .. } | Error::InvalidOptions(_) => {
+                ApiError::internal(e.to_string())
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::PathSegment;
+    use belay_proto::api::ErrorCode;
+
+    #[test]
+    fn messages_name_the_thing_concerned() {
+        assert_eq!(
+            Error::not_found("schedule", "nightly").to_string(),
+            r#"schedule "nightly" not found"#
+        );
+        assert_eq!(
+            Error::already_exists("calendar", "holidays").to_string(),
+            r#"calendar "holidays" already exists"#
+        );
+        let in_use = Error::CalendarInUse {
+            calendar: "workdays".into(),
+            schedules: vec![
+                ScheduleId::from_static("billing"),
+                ScheduleId::from_static("reports"),
+            ],
+        };
+        assert_eq!(
+            in_use.to_string(),
+            r#"calendar "workdays" is used by 2 schedules (billing, reports)"#
+        );
+        let invalid = Error::from(Violations::single(
+            &[PathSegment::Key("cron".into())],
+            "must not be empty",
+        ));
+        assert_eq!(invalid.to_string(), "$.cron: must not be empty");
+        assert!(invalid.violations().is_some());
+    }
+
+    #[test]
+    fn api_errors_carry_the_right_codes() {
+        let cases: Vec<(Error, ErrorCode)> = vec![
+            (Error::not_found("workflow", "x"), ErrorCode::NotFound),
+            (
+                Error::already_exists("schedule", "x"),
+                ErrorCode::AlreadyExists,
+            ),
+            (
+                Error::CalendarInUse {
+                    calendar: "c".into(),
+                    schedules: vec![ScheduleId::from_static("s")],
+                },
+                ErrorCode::FailedPrecondition,
+            ),
+            (
+                Error::Dispatch(DispatchError::Unavailable("draining".into())),
+                ErrorCode::Unavailable,
+            ),
+            (
+                Error::Dispatch(DispatchError::Rejected("bad queue".into())),
+                ErrorCode::FailedPrecondition,
+            ),
+            (
+                Error::Corrupt {
+                    key: "sched/x".into(),
+                    reason: "not JSON".into(),
+                },
+                ErrorCode::Internal,
+            ),
+        ];
+        for (error, code) in cases {
+            let text = error.to_string();
+            let api = ApiError::from(error);
+            assert_eq!(api.code, code, "{text}");
+        }
+        let api = ApiError::from(Error::CalendarInUse {
+            calendar: "c".into(),
+            schedules: vec![ScheduleId::from_static("s")],
+        });
+        assert_eq!(api.details.unwrap()["schedules"][0], "s");
+    }
+}
