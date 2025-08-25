@@ -76,3 +76,14 @@ pub(crate) enum Start {
     /// by recovery.
     Deferred(String),
 }
+
+/// The machine's hands.
+pub(crate) trait Effects {
+    /// Dispatches the job of `step`. `pending` holds results collected
+    /// during this advancement and not yet stored.
+    fn start(&mut self, workflow: &Workflow, step: &StepSpec, pending: &[(String, Value)])
+        -> Start;
+
+    /// Asks for `job` to be cancelled; failures are the effect's to log.
+    fn cancel(&mut self, job: JobId);
+}
