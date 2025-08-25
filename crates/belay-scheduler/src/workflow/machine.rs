@@ -31,3 +31,48 @@ pub(crate) enum Outcome {
     /// why.
     Failed(String),
 }
+
+impl Outcome {
+    /// The outcome of a finished job; `None` while it is still pending.
+    pub(crate) fn of_job(job: &Job) -> Option<Outcome> {
+        match job.state {
+            JobState::Succeeded => Some(Outcome::Succeeded(Some(
+                job.result.clone().unwrap_or(Value::Null),
+            ))),
+            JobState::Dead => {
+                let reason = job
+                    .last_error()
+                    .map_or_else(|| "no error recorded".to_owned(), |e| e.message.clone());
+                Some(Outcome::Failed(format!("job {} is dead: {reason}", job.id)))
+            }
+            JobState::Cancelled => Some(Outcome::Failed(format!("job {} was cancelled", job.id))),
+            _ => None,
+        }
+    }
+
+    /// The outcome known from a job's state alone.
+    pub(crate) fn of_state(id: JobId, state: JobState) -> Option<Outcome> {
+        match state {
+            JobState::Succeeded => Some(Outcome::Succeeded(None)),
+            JobState::Dead => Some(Outcome::Failed(format!("job {id} is dead"))),
+            JobState::Cancelled => Some(Outcome::Failed(format!("job {id} was cancelled"))),
+            _ => None,
+        }
+    }
+}
+
+/// What happened when a step's job was dispatched.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum Start {
+    /// The job is queued or running.
+    Running(JobId),
+    /// The dispatcher returned a job from an earlier attempt that has
+    /// already finished.
+    Finished(JobId, Outcome),
+    /// The step cannot run: its payload did not resolve or the dispatcher
+    /// rejected the job.
+    Failed(String),
+    /// The dispatcher is unavailable; the step stays pending and is retried
+    /// by recovery.
+    Deferred(String),
+}
