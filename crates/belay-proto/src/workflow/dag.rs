@@ -98,8 +98,8 @@ impl WorkflowSpec {
     }
 
     /// Step names in an order that runs every step after its dependencies,
-    /// preferring declaration order. On a cycle, returns the steps that
-    /// could not be placed.
+    /// preferring declaration order. On a cycle, returns the cycle as
+    /// [`find_cycle`](Self::find_cycle) reports it.
     pub fn topological_order(&self) -> Result<Vec<&str>, Vec<&str>> {
         let parents = self.parent_edges();
         let mut placed = vec![false; self.steps.len()];
@@ -114,10 +114,7 @@ impl WorkflowSpec {
                     placed[i] = true;
                     order.push(self.steps[i].name.as_str());
                 }
-                None => {
-                    let stuck = (0..self.steps.len()).filter(|&i| !placed[i]);
-                    return Err(stuck.map(|i| self.steps[i].name.as_str()).collect());
-                }
+                None => return Err(self.find_cycle().unwrap_or_default()),
             }
         }
         Ok(order)
@@ -379,6 +376,22 @@ mod tests {
         assert_eq!(wf.descendants("a"), set(&["b", "c", "d"]));
         assert!(wf.descendants("e").is_empty());
         assert!(wf.ancestors("missing").is_empty());
+    }
+
+    #[test]
+    fn cycle_path_starts_at_the_earliest_declared_step() {
+        let wf = workflow(vec![
+            step("start", &[]),
+            step("a", &["c"]),
+            step("b", &["a", "start"]),
+            step("c", &["b"]),
+        ]);
+        assert_eq!(wf.find_cycle().unwrap(), ["a", "c", "b", "a"]);
+        assert_eq!(wf.topological_order().unwrap_err(), ["a", "c", "b", "a"]);
+        assert_eq!(
+            problems(&wf),
+            ["$.steps: dependency cycle: a -> c -> b -> a (each step depends on the next)"]
+        );
     }
 
     #[test]
