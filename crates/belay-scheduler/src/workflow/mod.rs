@@ -80,3 +80,90 @@ use machine::{Effects, Machine, Outcome, Start};
 /// Most finished runs one [`WorkflowEngine::sweep`] call deletes, to keep
 /// its write batch bounded.
 pub const SWEEP_BATCH: usize = 1000;
+
+/// The unique key of the job for step `step` of run `id`.
+#[must_use]
+pub fn step_key(id: WorkflowId, step: &str) -> String {
+    format!("wf:{id}:{step}")
+}
+
+/// Runs DAG workflows over a [`Dispatcher`]. See the [module docs](self).
+///
+/// All methods take `&self`; one internal lock serialises them and is held
+/// while jobs are dispatched or cancelled, so the dispatcher must not call
+/// back into the engine, and `on_job_finished` must not be called while
+/// holding a lock the dispatcher needs.
+pub struct WorkflowEngine {
+    kv: Arc<dyn Kv>,
+    clock: SharedClock,
+    dispatcher: Arc<dyn Dispatcher>,
+    sink: Arc<dyn EventSink>,
+    options: WorkflowOptions,
+    ids: SyncUlidGenerator,
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
+    /// Runs still going, in full.
+    active: BTreeMap<WorkflowId, Run>,
+    /// Every stored run, for listing without reading the store.
+    index: BTreeMap<WorkflowId, Summary>,
+    /// Finished runs by finish time, for retention.
+    finished: BTreeSet<(Timestamp, WorkflowId)>,
+}
+
+#[derive(Clone)]
+struct Run {
+    details: WorkflowDetails,
+    /// Steps whose results some placeholder reads.
+    referenced: Arc<BTreeSet<String>>,
+}
+
+impl Run {
+    fn new(details: WorkflowDetails) -> Run {
+        let referenced = details
+            .workflow
+            .spec
+            .steps
+            .iter()
+            .flat_map(|s| referenced_steps(&s.job.payload))
+            .map(str::to_owned)
+            .collect();
+        Run {
+            details,
+            referenced: Arc::new(referenced),
+        }
+    }
+}
+
+struct Summary {
+    state: WorkflowState,
+    name: String,
+}
+
+impl State {
+    fn record(&mut self, details: &WorkflowDetails) {
+        let wf = &details.workflow;
+        self.index.insert(
+            wf.id,
+            Summary {
+                state: wf.state,
+                name: wf.spec.name.clone(),
+            },
+        );
+    }
+
+    /// Files a run under `active` or `finished` according to its state.
+    fn install(&mut self, run: Run) {
+        self.record(&run.details);
+        let wf = &run.details.workflow;
+        if wf.state.is_terminal() {
+            let finished_at = wf.finished_at.unwrap_or(wf.created_at);
+            self.finished.insert((finished_at, wf.id));
+            self.active.remove(&wf.id);
+        } else {
+            self.active.insert(wf.id, run);
+        }
+    }
+}
