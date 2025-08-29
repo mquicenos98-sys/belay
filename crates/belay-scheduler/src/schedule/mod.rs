@@ -42,3 +42,86 @@ mod calendar;
 mod plan;
 
 mod report;
+
+mod tick;
+
+pub use plan::jitter_offset;
+pub use report::{Fired, SkipReason, Skipped, TickError, TickErrorKind, TickReport};
+
+pub(crate) use calendar::CompiledCalendar;
+pub(crate) use plan::Plan;
+
+use std::collections::BTreeMap;
+use std::fmt;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use belay_common::sync::lock;
+use belay_common::{warn, SharedClock, Timestamp};
+use belay_json::{FromJsonError, PathSegment};
+use belay_proto::api::{Cursor, Page};
+use belay_proto::event::EventKind;
+use belay_proto::job::{META_FIRE_TIME, META_SCHEDULE};
+use belay_proto::validate::{Validate, Validator, Violations};
+use belay_proto::{
+    CalendarSpec, EventSink, JobSpec, Schedule, ScheduleId, ScheduleSpec, Unique, UniqueScope,
+};
+use belay_store::{Kv, WriteBatch};
+
+use crate::dispatch::Dispatcher;
+use crate::error::{Error, Result};
+use crate::options::SchedulerOptions;
+use crate::store;
+
+/// `meta` key marking jobs started by [`Scheduler::trigger_now`]; its
+/// value is `manual`.
+pub const META_TRIGGER: &str = "belay.trigger";
+
+/// Most fire times [`Scheduler::preview`] returns.
+pub const MAX_PREVIEW: usize = 1000;
+
+/// The unique key of the job for schedule `id`'s fire at `fire_time`.
+///
+/// ```
+/// use belay_common::Timestamp;
+/// use belay_proto::ScheduleId;
+///
+/// let key = belay_scheduler::fire_key(&ScheduleId::from_static("nightly"), Timestamp::from_secs(60));
+/// assert_eq!(key, "sched:nightly:60000");
+/// ```
+#[must_use]
+pub fn fire_key(id: &ScheduleId, fire_time: Timestamp) -> String {
+    format!("sched:{id}:{}", fire_time.as_millis())
+}
+
+/// What an upsert did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Upserted {
+    /// Nothing by that name existed; it was created.
+    Created,
+    /// It existed with a different definition, which was replaced.
+    Updated,
+    /// It existed with exactly this definition; nothing was written.
+    Unchanged,
+}
+
+/// Cron schedules and calendars. See the [module docs](self) for how
+/// schedules fire.
+///
+/// All methods take `&self`; one internal lock serialises them, and
+/// [`tick`](Self::tick) holds it while it dispatches, so the dispatcher
+/// must not call back into the scheduler.
+pub struct Scheduler {
+    kv: Arc<dyn Kv>,
+    clock: SharedClock,
+    dispatcher: Arc<dyn Dispatcher>,
+    sink: Arc<dyn EventSink>,
+    options: SchedulerOptions,
+    state: Mutex<State>,
+}
+
+#[derive(Default)]
+struct State {
+    schedules: BTreeMap<ScheduleId, Entry>,
+    calendars: BTreeMap<String, Arc<CompiledCalendar>>,
+}
