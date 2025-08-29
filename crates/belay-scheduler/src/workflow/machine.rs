@@ -330,3 +330,226 @@ impl<'a> Machine<'a> {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::json;
+    use belay_proto::workflow::{Condition, WorkflowSpec};
+    use belay_proto::{JobSpec, WorkflowId};
+
+    /// Starts every step with a fresh job, except those listed as failing
+    /// or deferred.
+    #[derive(Default)]
+    struct Fake {
+        started: Vec<String>,
+        cancelled: Vec<JobId>,
+        reject: Vec<&'static str>,
+        defer: Vec<&'static str>,
+    }
+
+    impl Effects for Fake {
+        fn start(&mut self, _: &Workflow, step: &StepSpec, _: &[(String, Value)]) -> Start {
+            if self.reject.contains(&step.name.as_str()) {
+                return Start::Failed("dispatch rejected: no such queue".into());
+            }
+            if self.defer.contains(&step.name.as_str()) {
+                return Start::Deferred("unavailable".into());
+            }
+            self.started.push(step.name.clone());
+            Start::Running(JobId::generate())
+        }
+
+        fn cancel(&mut self, job: JobId) {
+            self.cancelled.push(job);
+        }
+    }
+
+    fn step(name: &str, deps: &[&str]) -> StepSpec {
+        deps.iter()
+            .fold(StepSpec::new(name, JobSpec::new("q", "k")), |s, d| {
+                s.after(*d)
+            })
+    }
+
+    fn run(steps: Vec<StepSpec>) -> WorkflowDetails {
+        let spec = steps
+            .into_iter()
+            .fold(WorkflowSpec::new("wf"), WorkflowSpec::step);
+        WorkflowDetails::new(Workflow::new(
+            WorkflowId::generate(),
+            spec,
+            Timestamp::from_secs(100),
+        ))
+    }
+
+    fn states(run: &WorkflowDetails) -> Vec<(String, StepState)> {
+        run.workflow
+            .steps
+            .iter()
+            .map(|(k, v)| (k.clone(), v.state))
+            .collect()
+    }
+
+    fn job_of(run: &WorkflowDetails, step: &str) -> JobId {
+        run.workflow.steps[step].job.unwrap()
+    }
+
+    #[test]
+    fn roots_start_and_dependents_wait() {
+        let mut r = run(vec![step("a", &[]), step("b", &["a"]), step("c", &[])]);
+        let refs = BTreeSet::new();
+        let mut fx = Fake::default();
+        let mut m = Machine::new(&mut r, &refs, Timestamp::from_secs(101));
+        m.advance(&mut fx);
+        assert_eq!(fx.started, ["a", "c"]);
+        let job = job_of(&r, "a");
+        let mut m = Machine::new(&mut r, &refs, Timestamp::from_secs(102));
+        assert!(m.job_finished(&mut fx, "a", job, Outcome::Succeeded(Some(json!(1)))));
+        assert!(m.results.is_empty(), "unreferenced results are not kept");
+        assert_eq!(fx.started, ["a", "c", "b"]);
+        // A second report of the same completion changes nothing.
+        let mut m = Machine::new(&mut r, &refs, Timestamp::from_secs(103));
+        assert!(!m.job_finished(&mut fx, "a", job, Outcome::Succeeded(None)));
+        assert!(m.events.is_empty());
+    }
+
+    #[test]
+    fn a_failure_under_fail_workflow_cancels_the_rest() {
+        let mut r = run(vec![step("a", &[]), step("b", &[]), step("c", &["a"])]);
+        let refs = BTreeSet::new();
+        let mut fx = Fake::default();
+        Machine::new(&mut r, &refs, Timestamp::from_secs(1)).advance(&mut fx);
+        let (a, b) = (job_of(&r, "a"), job_of(&r, "b"));
+        let mut m = Machine::new(&mut r, &refs, Timestamp::from_secs(2));
+        m.job_finished(&mut fx, "a", a, Outcome::Failed("job is dead: boom".into()));
+        let names: Vec<&str> = m.events.iter().map(EventKind::type_name).collect();
+        assert_eq!(
+            names,
+            [
+                "workflow.step",
+                "workflow.step",
+                "workflow.step",
+                "workflow.finished"
+            ]
+        );
+        assert_eq!(fx.cancelled, [b]);
+        assert_eq!(r.workflow.state, WorkflowState::Failed);
+        assert_eq!(
+            states(&r),
+            [
+                ("a".into(), StepState::Failed),
+                ("b".into(), StepState::Cancelled),
+                ("c".into(), StepState::Cancelled)
+            ]
+        );
+        assert_eq!(r.error("a"), Some("job is dead: boom"));
+        assert_eq!(r.workflow.finished_at, Some(Timestamp::from_secs(2)));
+    }
+
+    #[test]
+    fn skipped_parents_propagate_through_default_conditions() {
+        let mut r = run(vec![
+            step("a", &[]),
+            step("b", &["a"]).when(Condition::AnyFailed),
+            step("c", &["b"]),
+            step("d", &["b"]).when(Condition::Always),
+        ]);
+        let refs = BTreeSet::new();
+        let mut fx = Fake::default();
+        Machine::new(&mut r, &refs, Timestamp::from_secs(1)).advance(&mut fx);
+        let a = job_of(&r, "a");
+        Machine::new(&mut r, &refs, Timestamp::from_secs(2)).job_finished(
+            &mut fx,
+            "a",
+            a,
+            Outcome::Succeeded(None),
+        );
+        // b's condition is false, c inherits the skip, d always runs.
+        assert_eq!(fx.started, ["a", "d"]);
+        assert_eq!(r.workflow.steps["b"].state, StepState::Skipped);
+        assert_eq!(r.workflow.steps["c"].state, StepState::Skipped);
+        assert_eq!(r.workflow.state, WorkflowState::Running);
+    }
+
+    #[test]
+    fn rejected_dispatches_fail_the_step_and_deferred_ones_wait() {
+        let mut r = run(vec![
+            step("a", &[]).on_failure(StepFailurePolicy::Continue),
+            step("b", &[]),
+            step("c", &["a"]).when(Condition::AnyFailed),
+        ]);
+        let refs = BTreeSet::new();
+        let mut fx = Fake {
+            reject: vec!["a"],
+            defer: vec!["b"],
+            ..Fake::default()
+        };
+        Machine::new(&mut r, &refs, Timestamp::from_secs(1)).advance(&mut fx);
+        assert_eq!(r.workflow.steps["a"].state, StepState::Failed);
+        assert_eq!(r.error("a"), Some("dispatch rejected: no such queue"));
+        assert_eq!(r.workflow.steps["b"].state, StepState::Pending);
+        assert_eq!(fx.started, ["c"], "the cleanup step runs after a's failure");
+        assert_eq!(r.workflow.state, WorkflowState::Running);
+    }
+
+    #[test]
+    fn lost_bookkeeping_is_adopted_from_the_job() {
+        let mut r = run(vec![step("a", &[]), step("b", &["a"])]);
+        let refs: BTreeSet<String> = ["a".to_owned()].into();
+        let mut fx = Fake::default();
+        let orphan = JobId::generate();
+        let mut m = Machine::new(&mut r, &refs, Timestamp::from_secs(1));
+        assert!(m.job_finished(
+            &mut fx,
+            "a",
+            orphan,
+            Outcome::Succeeded(Some(json!({"n": 3})))
+        ));
+        assert_eq!(m.results, [("a".to_owned(), json!({"n": 3}))]);
+        assert_eq!(r.workflow.steps["a"].job, Some(orphan));
+        assert_eq!(fx.started, ["b"]);
+        // b is not eligible until it has been dispatched and finished, so a
+        // job claiming to be b's before that is ignored.
+        let mut other = run(vec![step("a", &[]), step("b", &["a"])]);
+        let mut m = Machine::new(&mut other, &refs, Timestamp::from_secs(1));
+        assert!(!m.job_finished(&mut fx, "b", JobId::generate(), Outcome::Succeeded(None)));
+    }
+
+    #[test]
+    fn cancel_stops_running_jobs_once() {
+        let mut r = run(vec![step("a", &[]), step("b", &["a"])]);
+        let refs = BTreeSet::new();
+        let mut fx = Fake::default();
+        Machine::new(&mut r, &refs, Timestamp::from_secs(1)).advance(&mut fx);
+        let a = job_of(&r, "a");
+        let mut m = Machine::new(&mut r, &refs, Timestamp::from_secs(2));
+        assert!(m.cancel(&mut fx));
+        assert_eq!(fx.cancelled, [a]);
+        assert_eq!(r.workflow.state, WorkflowState::Cancelled);
+        let mut m = Machine::new(&mut r, &refs, Timestamp::from_secs(3));
+        assert!(!m.cancel(&mut fx));
+        assert!(!m.job_finished(&mut fx, "a", a, Outcome::Failed("cancelled".into())));
+    }
+
+    #[test]
+    fn outcomes_from_jobs_and_states() {
+        let id = JobId::generate();
+        assert_eq!(
+            Outcome::of_state(id, JobState::Succeeded),
+            Some(Outcome::Succeeded(None))
+        );
+        assert_eq!(Outcome::of_state(id, JobState::Retrying), None);
+        assert_eq!(
+            Outcome::of_state(id, JobState::Cancelled),
+            Some(Outcome::Failed(format!("job {id} was cancelled")))
+        );
+        let mut job = Job::new(id, JobSpec::new("q", "k"), Timestamp::from_secs(1));
+        assert_eq!(Outcome::of_job(&job), None);
+        job.state = JobState::Succeeded;
+        assert_eq!(
+            Outcome::of_job(&job),
+            Some(Outcome::Succeeded(Some(Value::Null)))
+        );
+    }
+}
