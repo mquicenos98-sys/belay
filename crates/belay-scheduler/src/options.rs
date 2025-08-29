@@ -148,3 +148,54 @@ impl WorkflowOptions {
         check_window(self.dedupe_window)
     }
 }
+
+fn check_window(window: Duration) -> Result<()> {
+    if window < MIN_DEDUPE_WINDOW || window > MAX_UNIQUE_FOR {
+        return Err(Error::InvalidOptions(format!(
+            "dedupe_window must be between {} and {}, got {}",
+            format_duration(MIN_DEDUPE_WINDOW),
+            format_duration(MAX_UNIQUE_FOR),
+            format_duration(window)
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_valid() {
+        assert!(SchedulerOptions::new().validate().is_ok());
+        assert!(WorkflowOptions::new().validate().is_ok());
+        assert_eq!(
+            SchedulerOptions::new().get_dedupe_window(),
+            Duration::from_secs(86_400)
+        );
+    }
+
+    #[test]
+    fn out_of_range_values_are_named() {
+        let err = SchedulerOptions::new()
+            .dedupe_window(Duration::from_secs(40 * 86_400))
+            .validate()
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid options: dedupe_window must be between 1s and 30d, got 40d"
+        );
+        let err = SchedulerOptions::new()
+            .retry_delay(Duration::ZERO)
+            .validate()
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid options: retry_delay must be positive"
+        );
+        assert!(WorkflowOptions::new()
+            .dedupe_window(Duration::from_millis(10))
+            .validate()
+            .is_err());
+    }
+}
