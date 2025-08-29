@@ -113,7 +113,10 @@ fn stage_enqueue(cx: &mut Ctx<'_>, mut spec: JobSpec) -> Result<EnqueueResult> {
     let mut replaced = false;
     if let Some(unique) = spec.unique.clone() {
         if let Some((claim, holder_state)) = live_claim(cx, &spec, &unique.key) {
-            let pending = !holder_state.is_terminal();
+            let pending = matches!(
+                holder_state,
+                JobState::Scheduled | JobState::Ready | JobState::Retrying
+            );
             match unique.on_conflict {
                 OnConflict::Reject => {
                     return Err(Error::UniqueConflict {

@@ -164,6 +164,19 @@ fn replace_cancels_a_pending_holder() {
 }
 
 #[test]
+fn replace_leaves_a_running_holder_alone() {
+    let h = Harness::new();
+    let spec = || keyed("k", UniqueScope::UntilFinished, OnConflict::Replace);
+    let id = h.enqueue(spec());
+    h.lease_one("q");
+    let result = h.engine.enqueue(spec()).expect("enqueue");
+    assert_eq!(
+        (result.id, result.status, result.state),
+        (id, EnqueueStatus::Duplicate, JobState::Running)
+    );
+}
+
+#[test]
 fn replace_takes_the_key_of_a_purged_pending_holder() {
     let h = Harness::new();
     let spec = || {
