@@ -38,11 +38,8 @@
 //!   back the jobs it already has.
 
 mod calendar;
-
 mod plan;
-
 mod report;
-
 mod tick;
 
 pub use plan::jitter_offset;
@@ -649,4 +646,78 @@ impl fmt::Debug for Scheduler {
             .field("options", &self.options)
             .finish_non_exhaustive()
     }
+}
+
+/// Validates `spec` against the known calendars and compiles it.
+///
+/// The cron expression and zone are checked by belay-cron, whose messages
+/// are more precise than the shape checks in belay-proto; everything else
+/// is belay-proto's validation.
+fn check_spec(state: &State, spec: &ScheduleSpec, now: Timestamp) -> Result<Plan> {
+    let mut v = Validator::new();
+    let expr = plan::parse_cron(&spec.cron)
+        .map_err(|problem| v.report("cron", problem))
+        .ok();
+    let tz = plan::parse_timezone(&spec.timezone)
+        .map_err(|problem| v.report("timezone", problem))
+        .ok();
+    let mut rest = spec.clone();
+    rest.cron = "* * * * *".to_owned();
+    rest.timezone = ScheduleSpec::DEFAULT_TIMEZONE.to_owned();
+    rest.validate_into(&mut v);
+    let calendar = match &spec.calendar {
+        Some(name) => {
+            let found = state.calendars.get(name).cloned();
+            // Names that break the naming rule were reported above.
+            if found.is_none() && ScheduleId::new(name.as_str()).is_ok() {
+                let known: Vec<&str> = state.calendars.keys().map(String::as_str).collect();
+                let e = FromJsonError::unknown_variant(name, "calendar", &known);
+                v.report("calendar", e.message());
+            }
+            found
+        }
+        None => None,
+    };
+    v.finish()?;
+    let expr = expr.expect("a clean validation implies the cron expression parsed");
+    let tz = tz.expect("a clean validation implies the zone parsed");
+    let plan = Plan::new(expr, tz, calendar, spec.starts_at, spec.ends_at);
+    if let (Some(name), Some(_)) = (&spec.calendar, plan.calendar()) {
+        if plan.next_fire(now).is_none() && plan.cron_matches_after(now) {
+            return Err(Error::Invalid(Violations::single(
+                &[PathSegment::Key("calendar".into())],
+                format!("no time matching the cron expression is allowed by calendar {name:?}"),
+            )));
+        }
+    }
+    Ok(plan)
+}
+
+/// Compiles a stored schedule without re-validating it.
+fn compile_stored(state: &State, spec: &ScheduleSpec) -> Result<Plan, String> {
+    let calendar = match &spec.calendar {
+        Some(name) => Some(
+            state
+                .calendars
+                .get(name)
+                .cloned()
+                .ok_or_else(|| format!("calendar {name:?} does not exist"))?,
+        ),
+        None => None,
+    };
+    Plan::compile(spec, calendar)
+}
+
+/// Validates a calendar and parses its zone. As for schedules, the zone is
+/// judged by belay-cron rather than by belay-proto's shape check.
+fn check_calendar(spec: &CalendarSpec) -> Result<CompiledCalendar> {
+    let mut v = Validator::new();
+    let mut rest = spec.clone();
+    rest.timezone = ScheduleSpec::DEFAULT_TIMEZONE.to_owned();
+    rest.validate_into(&mut v);
+    let compiled = CompiledCalendar::compile(spec.clone())
+        .map_err(|problem| v.report("timezone", problem))
+        .ok();
+    v.finish()?;
+    Ok(compiled.expect("a clean validation implies the zone parsed"))
 }
