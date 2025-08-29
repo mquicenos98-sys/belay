@@ -36,3 +36,28 @@ pub(crate) fn schedule_key(id: &ScheduleId) -> Vec<u8> {
 pub(crate) fn schedules() -> KeyRange {
     KeyRange::prefix(SCHEDULES)
 }
+
+pub(crate) fn calendar_key(name: &str) -> Vec<u8> {
+    format!("{CALENDARS}{name}").into_bytes()
+}
+
+pub(crate) fn calendars() -> KeyRange {
+    KeyRange::prefix(CALENDARS)
+}
+
+pub(crate) fn workflow_key(id: WorkflowId) -> Vec<u8> {
+    format!("{WORKFLOWS}{id}").into_bytes()
+}
+
+pub(crate) fn workflows() -> KeyRange {
+    KeyRange::prefix(WORKFLOWS)
+}
+
+pub(crate) fn result_key(id: WorkflowId, step: &str) -> Vec<u8> {
+    format!("{RESULTS}{id}/{step}").into_bytes()
+}
+
+/// Every stored result of run `id`.
+pub(crate) fn results_prefix(id: WorkflowId) -> Vec<u8> {
+    format!("{RESULTS}{id}/").into_bytes()
+}
