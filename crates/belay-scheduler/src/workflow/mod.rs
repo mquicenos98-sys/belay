@@ -47,9 +47,7 @@
 //! reads.
 
 mod machine;
-
 mod record;
-
 mod template;
 
 pub use record::{WorkflowDetails, WorkflowFilter};
@@ -505,5 +503,95 @@ fn probe(dispatcher: &dyn Dispatcher, job: JobId) -> Option<Outcome> {
     match dispatcher.job_state(&job) {
         Some(state) => Outcome::of_state(job, state),
         None => Some(Outcome::Failed(format!("job {job} no longer exists"))),
+    }
+}
+
+/// The machine's effects on the real dispatcher and store.
+struct Live<'e> {
+    engine: &'e WorkflowEngine,
+    id: WorkflowId,
+    kv: &'e dyn Kv,
+}
+
+impl Live<'_> {
+    /// The stored or just-collected result of `step`, or why there is none.
+    fn result_of(
+        &self,
+        wf: &Workflow,
+        step: &str,
+        pending: &[(String, Value)],
+    ) -> Result<Value, String> {
+        match wf.step_state(step) {
+            Some(StepState::Succeeded) => {}
+            Some(other) => return Err(format!("step {step:?} is {other}, so it has no result")),
+            None => return Err(format!("there is no step {step:?}")),
+        }
+        if let Some((_, value)) = pending.iter().find(|(name, _)| name == step) {
+            return Ok(value.clone());
+        }
+        match store::load::<Value>(self.kv, &store::result_key(self.id, step)) {
+            Ok(Some(value)) => Ok(value),
+            Ok(None) => Err(format!(
+                "the result of step {step:?} is not available (its completion was recovered without the job record)"
+            )),
+            Err(e) => Err(format!("reading the result of step {step:?} failed: {e}")),
+        }
+    }
+}
+
+impl Effects for Live<'_> {
+    fn start(&mut self, wf: &Workflow, step: &StepSpec, pending: &[(String, Value)]) -> Start {
+        let mut job = step.job.clone();
+        if template::has_placeholders(&job.payload) {
+            match template::render(&job.payload, &mut |name| self.result_of(wf, name, pending)) {
+                Ok(payload) => job.payload = payload,
+                Err(reason) => return Start::Failed(reason),
+            }
+        }
+        job.workflow = Some(WorkflowRef {
+            id: self.id,
+            step: step.name.clone(),
+        });
+        if job.unique.is_none() {
+            job.unique = Some(Unique::new(
+                step_key(self.id, &step.name),
+                UniqueScope::For(self.engine.options.get_dedupe_window()),
+            ));
+        }
+        let dispatcher = &*self.engine.dispatcher;
+        match dispatcher.dispatch(&job) {
+            Ok(outcome) if outcome.duplicate => {
+                // An earlier attempt at this step already has a job; it may
+                // even have finished while nobody was listening.
+                match probe(dispatcher, outcome.id) {
+                    Some(result) => Start::Finished(outcome.id, result),
+                    None => Start::Running(outcome.id),
+                }
+            }
+            Ok(outcome) => Start::Running(outcome.id),
+            Err(e) if e.is_transient() => {
+                warn!("dispatcher unavailable, the step waits for recovery";
+                    workflow = %self.id, step = %step.name, error = %e);
+                Start::Deferred(e.message().to_owned())
+            }
+            Err(e) => Start::Failed(format!("dispatch rejected: {}", e.message())),
+        }
+    }
+
+    fn cancel(&mut self, job: JobId) {
+        if let Err(e) = self.engine.dispatcher.cancel(&job) {
+            warn!("cancelling a step's job failed"; workflow = %self.id, job = %job, error = %e);
+        }
+    }
+}
+
+impl fmt::Debug for WorkflowEngine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = lock(&self.state);
+        f.debug_struct("WorkflowEngine")
+            .field("runs", &state.index.len())
+            .field("running", &state.active.len())
+            .field("options", &self.options)
+            .finish_non_exhaustive()
     }
 }
