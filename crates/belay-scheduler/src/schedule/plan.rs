@@ -32,3 +32,41 @@ pub(crate) const COUNT_LIMIT: u32 = 10_000;
 /// Calendar jumps one search may make before concluding that the cron
 /// expression and the calendar never meet again.
 const MAX_JUMPS: u32 = 2_000;
+
+/// Seed for jitter offsets; changing it would move every jittered job.
+const JITTER_SEED: u64 = 0x6265_6c61_795f_6a74;
+
+/// Parses a cron expression, with messages fit for a `cron` violation.
+pub(crate) fn parse_cron(text: &str) -> Result<CronExpr, String> {
+    if text.len() > MAX_CRON_LEN {
+        return Err(format!(
+            "must be at most {MAX_CRON_LEN} bytes, got {}",
+            text.len()
+        ));
+    }
+    let expr = CronExpr::parse(text).map_err(|e| e.to_string())?;
+    if !expr.is_satisfiable() {
+        return Err(format!(
+            "{text:?} can never match (no date satisfies its day and month fields)"
+        ));
+    }
+    Ok(expr)
+}
+
+/// Parses a time zone (IANA name, fixed offset or POSIX rule), with
+/// messages fit for a `timezone` violation.
+pub(crate) fn parse_timezone(text: &str) -> Result<Tz, String> {
+    if text.is_empty() {
+        return Err("must not be empty".to_owned());
+    }
+    if text.len() > MAX_TIMEZONE_LEN {
+        return Err(format!(
+            "must be at most {MAX_TIMEZONE_LEN} bytes, got {}",
+            text.len()
+        ));
+    }
+    if text.chars().any(|c| c.is_whitespace() || c.is_control()) {
+        return Err("must not contain spaces or control characters".to_owned());
+    }
+    Tz::parse(text).map_err(|e| e.to_string())
+}
