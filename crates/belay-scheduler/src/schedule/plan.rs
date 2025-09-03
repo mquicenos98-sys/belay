@@ -70,3 +70,43 @@ pub(crate) fn parse_timezone(text: &str) -> Result<Tz, String> {
     }
     Tz::parse(text).map_err(|e| e.to_string())
 }
+
+/// A run of consecutive times: vetoed matches, missed fires, fires that
+/// came due while paused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Span {
+    /// The first time in the run.
+    pub first: Timestamp,
+    /// The last time in the run.
+    pub last: Timestamp,
+    /// Times in the run, saturating at [`COUNT_LIMIT`].
+    pub count: u32,
+}
+
+impl Span {
+    pub(crate) fn new(t: Timestamp) -> Span {
+        Span {
+            first: t,
+            last: t,
+            count: 1,
+        }
+    }
+
+    /// Extends the run to `t`, returning the new count.
+    pub(crate) fn push(&mut self, t: Timestamp) -> u32 {
+        self.last = t;
+        self.count = (self.count + 1).min(COUNT_LIMIT);
+        self.count
+    }
+
+    /// Extends `span` to `t`, starting it if there is none.
+    pub(crate) fn extend(span: &mut Option<Span>, t: Timestamp) -> u32 {
+        match span {
+            Some(s) => s.push(t),
+            None => {
+                *span = Some(Span::new(t));
+                1
+            }
+        }
+    }
+}
