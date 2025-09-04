@@ -36,3 +36,275 @@ struct Due {
     /// The first fire time after the due ones.
     next: Next,
 }
+
+/// What processing one schedule produced.
+struct Processed {
+    entry: Entry,
+    events: Vec<EventKind>,
+}
+
+impl Scheduler {
+    /// Fires every schedule that is due at `now`.
+    ///
+    /// Call it whenever [`next_wakeup`](Self::next_wakeup) has passed
+    /// (calling it more often is harmless). `now` is normally the clock's
+    /// current time; passing it explicitly keeps tests exact.
+    pub fn tick(&self, now: Timestamp) -> TickReport {
+        self.tick_owned(now, &|_| true)
+    }
+
+    /// Like [`tick`](Self::tick) on a node that shares its schedules with
+    /// other nodes: only the schedules `owned` accepts fire. The others
+    /// move past their due fire times as if paused, without dispatching,
+    /// reporting or emitting anything, so that a node taking one over
+    /// continues from the present instead of catching up on fires that
+    /// another node already made.
+    pub fn tick_owned(&self, now: Timestamp, owned: &dyn Fn(&ScheduleId) -> bool) -> TickReport {
+        let mut state = lock(&self.state);
+        let mut report = TickReport::default();
+        let mut due: Vec<(Timestamp, ScheduleId)> = state
+            .schedules
+            .iter()
+            .filter_map(|(id, e)| e.wakeup().filter(|t| *t <= now).map(|t| (t, id.clone())))
+            .collect();
+        due.sort();
+
+        let mut results = Vec::with_capacity(due.len());
+        for (_, id) in due {
+            let Some(mut entry) = state.schedules.get(&id).cloned() else {
+                continue;
+            };
+            let paused = entry.schedule.spec.paused;
+            let foreign = !owned(&id);
+            entry.schedule.spec.paused |= foreign;
+            let mark = report.skipped.len();
+            if let Some(mut done) = self.process(entry, now, &mut report) {
+                if foreign {
+                    done.entry.schedule.spec.paused = paused;
+                    done.events.clear();
+                    report.skipped.truncate(mark);
+                }
+                results.push(done);
+            }
+        }
+
+        let mut batch = WriteBatch::new();
+        for done in &results {
+            let before = state.schedules.get(done.entry.schedule.id());
+            if before.map_or(true, |b| b.schedule != done.entry.schedule) {
+                batch.put(
+                    store::schedule_key(done.entry.schedule.id()),
+                    store::encode(&done.entry.schedule),
+                );
+            }
+        }
+        let saved = if batch.is_empty() {
+            Ok(())
+        } else {
+            self.kv.write(batch).map(|_| ())
+        };
+        match saved {
+            Ok(()) => {
+                for done in results {
+                    for event in done.events {
+                        self.sink.emit(event);
+                    }
+                    let id = done.entry.schedule.spec.id.clone();
+                    state.schedules.insert(id, done.entry);
+                }
+            }
+            Err(e) => {
+                warn!("saving the tick's schedule updates failed; the fires will be repeated"; error = %e);
+                report.errors.push(TickError {
+                    schedule: None,
+                    fire_time: None,
+                    kind: TickErrorKind::Store,
+                    message: e.to_string(),
+                });
+                let retry_at = now + self.options.get_retry_delay();
+                for done in results {
+                    if let Some(entry) = state.schedules.get_mut(done.entry.schedule.id()) {
+                        entry.retry_at = Some(retry_at);
+                    }
+                }
+            }
+        }
+        if !report.is_empty() {
+            debug!("scheduler tick: {report}"; at = now);
+        }
+        report
+    }
+
+    /// Handles the due fire times of one schedule. Returns the updated
+    /// entry and the events to emit once it is saved.
+    fn process(
+        &self,
+        mut entry: Entry,
+        now: Timestamp,
+        report: &mut TickReport,
+    ) -> Option<Processed> {
+        let plan = entry.plan.clone()?;
+        let first = entry.schedule.next_fire_at?;
+        let spec = entry.schedule.spec.clone();
+        let id = spec.id.clone();
+        let mut sched = entry.schedule.clone();
+        let mut events = Vec::new();
+
+        let keep = match spec.misfire {
+            MisfirePolicy::Skip => 1,
+            MisfirePolicy::FireOnce => 2,
+            MisfirePolicy::FireAll { max } => max as usize + 1,
+        };
+        let due = collect_due(
+            &plan,
+            first,
+            now,
+            spec.paused,
+            self.options.get_misfire_threshold(),
+            keep,
+        );
+
+        if let Some(span) = due.stale {
+            skip(report, &id, SkipReason::Calendar, span);
+            events.push(skipped_event(&id, span.first, EventSkipReason::Calendar));
+        }
+        if let Some(span) = due.paused {
+            skip(report, &id, SkipReason::Paused, span);
+        }
+
+        let mut fires: Vec<(Timestamp, bool)> = Vec::new();
+        if let Some(missed) = due.missed {
+            events.push(EventKind::ScheduleMisfired {
+                schedule: id.clone(),
+                fire_time: missed.first,
+                missed: missed.count,
+                policy: spec.misfire,
+            });
+            let allowed = match spec.misfire {
+                MisfirePolicy::Skip => 0,
+                MisfirePolicy::FireOnce => 1,
+                MisfirePolicy::FireAll { max } => max as usize,
+            };
+            let n = allowed.min(due.missed_head.len());
+            let caught_up: Vec<Timestamp> = match spec.misfire {
+                // One job stands for the whole lot, as of the latest miss.
+                MisfirePolicy::FireOnce => vec![missed.last],
+                _ => due.missed_head[..n].to_vec(),
+            };
+            fires.extend(caught_up.into_iter().map(|t| (t, true)));
+            if missed.count as usize > n {
+                let first_dropped = due.missed_head.get(n).copied().unwrap_or(missed.last);
+                let dropped = Span {
+                    first: first_dropped,
+                    last: missed.last,
+                    count: missed.count - n as u32,
+                };
+                skip(report, &id, SkipReason::Misfire, dropped);
+            }
+        }
+        fires.extend(due.on_time.iter().map(|t| (*t, false)));
+
+        for (fire_time, catch_up) in fires {
+            if self.overlap_blocks(&sched, fire_time, report, &mut events) {
+                continue;
+            }
+            let job = self.job_for(&spec, fire_time, true);
+            match self.dispatcher.dispatch(&job) {
+                Ok(outcome) => {
+                    let next = sched.next_fire_at;
+                    sched.record_fire(fire_time, outcome.id, next, now);
+                    events.push(EventKind::ScheduleFired {
+                        schedule: id.clone(),
+                        job: outcome.id,
+                        fire_time,
+                    });
+                    report.fired.push(Fired {
+                        schedule: id.clone(),
+                        fire_time,
+                        job: outcome.id,
+                        run_at: job.run_at,
+                        duplicate: outcome.duplicate,
+                        catch_up,
+                    });
+                }
+                Err(e) if e.is_transient() => {
+                    warn!("dispatcher unavailable, the fire will be retried"; schedule = %id, fire_time, error = %e);
+                    report.errors.push(TickError {
+                        schedule: Some(id.clone()),
+                        fire_time: Some(fire_time),
+                        kind: TickErrorKind::DispatchUnavailable,
+                        message: e.message().to_owned(),
+                    });
+                    // Stay at this fire; everything after it is redone
+                    // once the dispatcher is back.
+                    sched.next_fire_at = Some(fire_time);
+                    entry.retry_at = Some(now + self.options.get_retry_delay());
+                    return Some(finish(entry, sched, events));
+                }
+                Err(e) => {
+                    warn!("dispatch rejected, the fire is dropped"; schedule = %id, fire_time, error = %e);
+                    report.errors.push(TickError {
+                        schedule: Some(id.clone()),
+                        fire_time: Some(fire_time),
+                        kind: TickErrorKind::DispatchRejected,
+                        message: e.message().to_owned(),
+                    });
+                }
+            }
+        }
+
+        sched.next_fire_at = due.next.at;
+        sched.updated_at = now;
+        if let (Some(span), false) = (due.next.vetoed, spec.paused) {
+            skip(report, &id, SkipReason::Calendar, span);
+            events.push(skipped_event(&id, span.first, EventSkipReason::Calendar));
+        }
+        entry.retry_at = None;
+        Some(finish(entry, sched, events))
+    }
+
+    /// Applies the overlap policy before a fire. Returns whether the fire
+    /// must be skipped.
+    fn overlap_blocks(
+        &self,
+        sched: &Schedule,
+        fire_time: Timestamp,
+        report: &mut TickReport,
+        events: &mut Vec<EventKind>,
+    ) -> bool {
+        let policy = sched.spec.overlap;
+        if policy == OverlapPolicy::Allow {
+            return false;
+        }
+        let Some(previous) = sched.last_job else {
+            return false;
+        };
+        match self.dispatcher.job_state(&previous) {
+            Some(state) if !state.is_terminal() => {}
+            // Finished, or gone (deleted by retention): nothing overlaps.
+            _ => return false,
+        }
+        let id = &sched.spec.id;
+        match policy {
+            OverlapPolicy::Allow => false,
+            OverlapPolicy::Skip => {
+                skip(report, id, SkipReason::Overlap, Span::new(fire_time));
+                events.push(skipped_event(id, fire_time, EventSkipReason::Overlap));
+                true
+            }
+            OverlapPolicy::CancelPrevious => {
+                if let Err(e) = self.dispatcher.cancel(&previous) {
+                    warn!("cancelling the previous job failed; firing anyway";
+                        schedule = %id, job = %previous, error = %e);
+                    report.errors.push(TickError {
+                        schedule: Some(id.clone()),
+                        fire_time: Some(fire_time),
+                        kind: TickErrorKind::CancelFailed,
+                        message: e.message().to_owned(),
+                    });
+                }
+                false
+            }
+        }
+    }
+}
