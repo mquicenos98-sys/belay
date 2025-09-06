@@ -308,3 +308,8 @@ impl Scheduler {
         }
     }
 }
+
+fn finish(mut entry: Entry, sched: Schedule, events: Vec<EventKind>) -> Processed {
+    entry.schedule = sched;
+    Processed { entry, events }
+}
