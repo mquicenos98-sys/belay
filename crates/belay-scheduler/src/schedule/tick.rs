@@ -313,3 +313,91 @@ fn finish(mut entry: Entry, sched: Schedule, events: Vec<EventKind>) -> Processe
     entry.schedule = sched;
     Processed { entry, events }
 }
+
+/// Walks the due fire times of a schedule, from `first` up to `now`.
+///
+/// After [`COUNT_LIMIT`] times the rest of the missed backlog is jumped
+/// over (its count saturates, its last time stays exact); fire times
+/// within the misfire threshold of `now` are still visited one by one, so
+/// they fire on time however long the outage was.
+fn collect_due(
+    plan: &Plan,
+    first: Timestamp,
+    now: Timestamp,
+    paused: bool,
+    threshold: Duration,
+    keep_missed: usize,
+) -> Due {
+    let mut due = Due {
+        stale: None,
+        paused: None,
+        missed: None,
+        missed_head: Vec::new(),
+        on_time: Vec::new(),
+        next: Next {
+            at: Some(first),
+            vetoed: None,
+        },
+    };
+    // Fire times before the cutoff are missed.
+    let cutoff = now - threshold;
+    let mut jumped = false;
+    let mut examined = 0u32;
+    while let Some(t) = due.next.at.filter(|t| *t <= now) {
+        if !plan.allows(t) {
+            Span::extend(&mut due.stale, t);
+        } else if paused {
+            Span::extend(&mut due.paused, t);
+        } else if now.saturating_duration_since(t) > threshold {
+            Span::extend(&mut due.missed, t);
+            if due.missed_head.len() < keep_missed {
+                due.missed_head.push(t);
+            }
+        } else {
+            due.on_time.push(t);
+        }
+        examined += 1;
+        due.next = if examined >= COUNT_LIMIT && !jumped && t < cutoff {
+            jumped = true;
+            // The backlog jumped over counts as more of the same, up to the
+            // last fire time before the cutoff.
+            let before_cutoff = cutoff - Duration::from_millis(1);
+            let last = plan.last_fire_until(before_cutoff);
+            for span in [&mut due.missed, &mut due.paused].into_iter().flatten() {
+                span.count = COUNT_LIMIT;
+                span.last = last.map_or(span.last, |l| l.max(span.last));
+            }
+            plan.next_after(before_cutoff)
+        } else {
+            plan.next_after(t)
+        };
+    }
+    due
+}
+
+/// Adds a skip to the report, merging it into the previous entry when both
+/// are the same kind of skip of the same schedule (consecutive overlaps).
+fn skip(report: &mut TickReport, id: &ScheduleId, reason: SkipReason, span: Span) {
+    if let Some(last) = report.skipped.last_mut() {
+        if last.schedule == *id && last.reason == reason && reason == SkipReason::Overlap {
+            last.last_fire_time = span.last;
+            last.count = (last.count + span.count).min(COUNT_LIMIT);
+            return;
+        }
+    }
+    report.skipped.push(Skipped {
+        schedule: id.clone(),
+        reason,
+        fire_time: span.first,
+        last_fire_time: span.last,
+        count: span.count,
+    });
+}
+
+fn skipped_event(id: &ScheduleId, fire_time: Timestamp, reason: EventSkipReason) -> EventKind {
+    EventKind::ScheduleSkipped {
+        schedule: id.clone(),
+        fire_time,
+        reason,
+    }
+}
