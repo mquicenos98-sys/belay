@@ -100,3 +100,58 @@ fn a_time_inside_the_repeated_hour_fires_once() {
         ]
     );
 }
+
+#[test]
+fn periodic_schedules_fire_in_both_passes_of_the_repeated_hour() {
+    let h = Harness::new("2025-11-02T04:59:00Z");
+    h.scheduler
+        .create(spec("half-hourly", "*/30 * * * *").timezone("America/New_York"))
+        .unwrap();
+    let reports = h.run_until("2025-11-02T07:01:00Z");
+    // 01:00 and 01:30 EDT, then 01:00 and 01:30 EST, then 02:00 EST.
+    assert_eq!(
+        fired(&reports),
+        [
+            "2025-11-02T05:00:00.000Z",
+            "2025-11-02T05:30:00.000Z",
+            "2025-11-02T06:00:00.000Z",
+            "2025-11-02T06:30:00.000Z",
+            "2025-11-02T07:00:00.000Z",
+        ]
+    );
+}
+
+#[test]
+fn catching_up_across_the_gap_uses_the_shifted_fire_time() {
+    let h = Harness::new("2025-03-08T12:00:00Z");
+    h.scheduler
+        .create(
+            spec("nightly", "30 2 * * *")
+                .timezone("America/New_York")
+                .misfire(MisfirePolicy::FireAll { max: 10 }),
+        )
+        .unwrap();
+    let report = h.tick_at("2025-03-10T12:00:00Z");
+    let times: Vec<String> = report
+        .fired
+        .iter()
+        .map(|f| f.fire_time.to_string())
+        .collect();
+    assert_eq!(
+        times,
+        ["2025-03-09T07:00:00.000Z", "2025-03-10T06:30:00.000Z"]
+    );
+    assert!(report.fired.iter().all(|f| f.catch_up));
+}
+
+/// Weekdays 09:00-17:00 in Bogota (UTC-5 all year), closed on Christmas
+/// and New Year's Day.
+fn office() -> CalendarSpec {
+    belay_json::from_str(
+        r#"{"name": "office", "timezone": "America/Bogota",
+            "exclude_dates": ["2025-12-25", "2026-01-01"],
+            "windows": [{"days": "mon-fri", "start": "09:00", "end": "17:00"}],
+            "description": "Bogota office hours"}"#,
+    )
+    .unwrap()
+}
