@@ -155,3 +155,158 @@ fn office() -> CalendarSpec {
     )
     .unwrap()
 }
+
+#[test]
+fn business_hours_and_holidays_limit_an_hourly_schedule() {
+    // Wednesday 2025-12-24, 07:00 in Bogota.
+    let h = Harness::new("2025-12-24T12:00:00Z");
+    h.scheduler.put_calendar(office()).unwrap();
+    let created = h
+        .scheduler
+        .create(spec("sync", "0 * * * *").calendar("office"))
+        .unwrap();
+    // 13:00Z is 08:00 local, before opening.
+    assert_eq!(created.next_fire_at, Some(ts("2025-12-24T14:00:00Z")));
+    h.events();
+
+    let reports = h.run_until("2025-12-29T23:00:00Z");
+    let times = fired(&reports);
+    // Wednesday, Friday and Monday, 09:00 through 16:00 local: Christmas
+    // Thursday and the weekend are closed.
+    assert_eq!(times.len(), 24);
+    assert_eq!(times[0], "2025-12-24T14:00:00.000Z");
+    assert_eq!(times[7], "2025-12-24T21:00:00.000Z");
+    assert_eq!(times[8], "2025-12-26T14:00:00.000Z");
+    assert_eq!(times[16], "2025-12-29T14:00:00.000Z");
+
+    // Each closed stretch is reported once, when the scheduler moves past
+    // it, with its exact edges.
+    let skips = skipped(&reports);
+    let summary: Vec<(SkipReason, String, String, u32)> = skips
+        .iter()
+        .map(|s| {
+            (
+                s.reason,
+                s.fire_time.to_string(),
+                s.last_fire_time.to_string(),
+                s.count,
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            (
+                SkipReason::Calendar,
+                "2025-12-24T22:00:00.000Z".to_owned(),
+                "2025-12-26T13:00:00.000Z".to_owned(),
+                40
+            ),
+            (
+                SkipReason::Calendar,
+                "2025-12-26T22:00:00.000Z".to_owned(),
+                "2025-12-29T13:00:00.000Z".to_owned(),
+                64
+            ),
+            (
+                SkipReason::Calendar,
+                "2025-12-29T22:00:00.000Z".to_owned(),
+                "2025-12-30T13:00:00.000Z".to_owned(),
+                16
+            ),
+        ]
+    );
+    let calendar_events: Vec<EventKind> = h
+        .sink
+        .events()
+        .into_iter()
+        .filter(|e| e.type_name() == "schedule.skipped")
+        .collect();
+    assert_eq!(calendar_events.len(), 3);
+    assert!(matches!(
+        &calendar_events[0],
+        EventKind::ScheduleSkipped { reason: EventSkipReason::Calendar, fire_time, .. }
+            if *fire_time == ts("2025-12-24T22:00:00Z")
+    ));
+}
+
+#[test]
+fn a_calendar_is_read_in_its_own_zone() {
+    let h = Harness::new("2025-12-22T00:00:00Z");
+    h.scheduler.put_calendar(office()).unwrap();
+    // 15:00 in Madrid (UTC+1 in winter) is 09:00 in Bogota: open on
+    // weekdays. 23:00 in Madrid is 17:00 in Bogota: closed.
+    h.scheduler
+        .create(
+            spec("eu-sync", "0 15,23 * * *")
+                .timezone("Europe/Madrid")
+                .calendar("office"),
+        )
+        .unwrap();
+    let times: Vec<String> = h
+        .scheduler
+        .preview(&id("eu-sync"), 5)
+        .unwrap()
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+    assert_eq!(
+        times,
+        [
+            "2025-12-22T14:00:00.000Z",
+            "2025-12-23T14:00:00.000Z",
+            "2025-12-24T14:00:00.000Z",
+            "2025-12-26T14:00:00.000Z",
+            "2025-12-29T14:00:00.000Z",
+        ]
+    );
+}
+
+#[test]
+fn a_lunch_break_splits_the_business_day() {
+    let h = Harness::new("2025-12-22T13:00:00Z");
+    let mut split = office();
+    split.name = "split".into();
+    split.windows = belay_json::from_str(
+        r#"[{"days": "mon-fri", "start": "09:00", "end": "12:00"},
+            {"days": "mon-fri", "start": "14:00", "end": "17:00"}]"#,
+    )
+    .unwrap();
+    h.scheduler.put_calendar(split).unwrap();
+    h.scheduler
+        .create(
+            spec("poll", "*/30 * * * *")
+                .timezone("America/Bogota")
+                .calendar("split"),
+        )
+        .unwrap();
+    let local: Vec<String> = h
+        .scheduler
+        .preview(&id("poll"), 13)
+        .unwrap()
+        .iter()
+        // Bogota is UTC-5 all year; print local wall-clock times.
+        .map(|t| {
+            let local = *t - std::time::Duration::from_secs(5 * 3600);
+            local.to_string()[..16].to_owned()
+        })
+        .collect();
+    assert_eq!(
+        local,
+        [
+            "2025-12-22T09:00",
+            "2025-12-22T09:30",
+            "2025-12-22T10:00",
+            "2025-12-22T10:30",
+            "2025-12-22T11:00",
+            "2025-12-22T11:30",
+            "2025-12-22T14:00",
+            "2025-12-22T14:30",
+            "2025-12-22T15:00",
+            "2025-12-22T15:30",
+            "2025-12-22T16:00",
+            "2025-12-22T16:30",
+            "2025-12-23T09:00",
+        ]
+    );
+}
