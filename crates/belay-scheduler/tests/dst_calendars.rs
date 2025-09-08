@@ -310,3 +310,83 @@ fn a_lunch_break_splits_the_business_day() {
         ]
     );
 }
+
+#[test]
+fn adding_a_holiday_moves_the_next_fire() {
+    let h = Harness::new("2025-12-22T20:00:00Z");
+    h.scheduler.put_calendar(office()).unwrap();
+    h.scheduler
+        .create(
+            spec("standup", "30 9 * * *")
+                .timezone("America/Bogota")
+                .calendar("office"),
+        )
+        .unwrap();
+    assert_eq!(
+        h.scheduler.get(&id("standup")).unwrap().next_fire_at,
+        Some(ts("2025-12-23T14:30:00Z"))
+    );
+    let mut closed = office();
+    closed.exclude_dates.insert("2025-12-23".parse().unwrap());
+    h.scheduler.put_calendar(closed).unwrap();
+    assert_eq!(
+        h.scheduler.get(&id("standup")).unwrap().next_fire_at,
+        Some(ts("2025-12-24T14:30:00Z"))
+    );
+    assert!(h.tick_at("2025-12-23T14:30:00Z").is_empty());
+    assert_eq!(h.tick_at("2025-12-24T14:30:00Z").fired.len(), 1);
+}
+
+// Regression: a fire time computed against an older calendar (a record
+// written before the calendar changed) used to fire regardless.
+#[test]
+fn a_stale_fire_time_is_vetoed_at_fire_time() {
+    let h = Harness::new("2025-12-26T20:00:00Z");
+    h.scheduler.put_calendar(office()).unwrap();
+    h.scheduler
+        .create(
+            spec("standup", "30 9 * * *")
+                .timezone("America/Bogota")
+                .calendar("office"),
+        )
+        .unwrap();
+    // Rewrite the stored record so that it points at Saturday.
+    let mut stored: Schedule =
+        belay_json::from_bytes(&h.kv.get(b"sched/standup").unwrap().unwrap()).unwrap();
+    stored.next_fire_at = Some(ts("2025-12-27T14:30:00Z"));
+    h.kv.put(
+        b"sched/standup",
+        belay_json::to_string(&stored.to_json()).as_bytes(),
+    )
+    .unwrap();
+    let h = h.restart();
+    h.events();
+    let report = h.tick_at("2025-12-27T14:30:00Z");
+    assert!(report.fired.is_empty());
+    assert_eq!(report.skipped.len(), 2);
+    assert_eq!(report.skipped[0].reason, SkipReason::Calendar);
+    assert_eq!(report.skipped[0].fire_time, ts("2025-12-27T14:30:00Z"));
+    assert_eq!(report.skipped[0].count, 1);
+    // Moving on reports Sunday's veto too.
+    assert_eq!(report.skipped[1].fire_time, ts("2025-12-28T14:30:00Z"));
+    assert_eq!(h.events(), ["schedule.skipped", "schedule.skipped"]);
+    assert_eq!(
+        h.scheduler.get(&id("standup")).unwrap().next_fire_at,
+        Some(ts("2025-12-29T14:30:00Z"))
+    );
+}
+
+#[test]
+fn calendar_backed_schedules_survive_a_restart() {
+    let h = Harness::new("2025-12-22T00:00:00Z");
+    h.scheduler.put_calendar(office()).unwrap();
+    h.scheduler
+        .create(spec("sync", "0 * * * *").calendar("office"))
+        .unwrap();
+    let before = h.scheduler.preview(&id("sync"), 20).unwrap();
+    let kv: Arc<dyn Kv> = Arc::clone(&h.kv);
+    let h = h.restart();
+    assert_eq!(h.scheduler.preview(&id("sync"), 20).unwrap(), before);
+    assert_eq!(h.scheduler.get_calendar("office"), Some(office()));
+    assert!(kv.get(b"cal/office").unwrap().is_some());
+}
