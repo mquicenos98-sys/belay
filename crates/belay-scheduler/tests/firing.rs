@@ -285,3 +285,87 @@ fn paused_schedules_pass_their_fires_without_catching_up() {
     assert_eq!(fired_times(&report), ["2025-06-02T11:15:00.000Z"]);
     assert!(report.skipped.is_empty());
 }
+
+#[test]
+fn fires_stop_at_ends_at() {
+    let h = Harness::new(MONDAY);
+    h.scheduler
+        .create(spec("brief", "0 * * * *").between(None, Some(ts("2025-06-02T13:00:00Z"))))
+        .unwrap();
+    let reports = h.run_until("2025-06-03T00:00:00Z");
+    let times: Vec<String> = reports.iter().flat_map(fired_times).collect();
+    assert_eq!(
+        times,
+        ["2025-06-02T11:00:00.000Z", "2025-06-02T12:00:00.000Z"]
+    );
+    assert_eq!(h.scheduler.get(&id("brief")).unwrap().next_fire_at, None);
+    assert_eq!(h.scheduler.next_wakeup(), None);
+}
+
+#[test]
+fn jitter_delays_each_job_by_a_stable_offset_within_the_bound() {
+    let jitter = Duration::from_secs(600);
+    let run = || {
+        let h = Harness::new(MONDAY);
+        h.scheduler
+            .create(spec("report", "0 * * * *").jitter(jitter))
+            .unwrap();
+        let reports = h.run_until("2025-06-03T10:07:00Z");
+        let fired: Vec<_> = reports.into_iter().flat_map(|r| r.fired).collect();
+        (h, fired)
+    };
+    let (h, fired) = run();
+    assert_eq!(fired.len(), 24);
+    let mut offsets = Vec::new();
+    for f in &fired {
+        let offset = jitter_offset(&id("report"), f.fire_time, jitter);
+        assert!(offset < jitter);
+        assert_eq!(f.run_at, Some(f.fire_time + offset));
+        let job = h.queue.get(&f.job).unwrap();
+        assert_eq!(job.spec.run_at, f.run_at);
+        assert_eq!(job.state, JobState::Scheduled, "held until its run_at");
+        offsets.push(offset);
+    }
+    offsets.sort();
+    offsets.dedup();
+    assert!(offsets.len() > 20, "offsets vary between fires");
+    // A second, independent scheduler computes the very same delays.
+    let (_, again) = run();
+    let a: Vec<_> = fired.iter().map(|f| f.run_at).collect();
+    let b: Vec<_> = again.iter().map(|f| f.run_at).collect();
+    assert_eq!(a, b);
+}
+
+#[test]
+fn a_template_delay_is_added_to_the_jitter() {
+    let h = Harness::new(MONDAY);
+    let mut s = spec("slow", "0 * * * *").jitter(Duration::from_secs(60));
+    s.template = s.template.delay(Duration::from_secs(3600));
+    h.scheduler.create(s).unwrap();
+    let fired = &h.tick_at("2025-06-02T11:00:00Z").fired[0];
+    let offset = jitter_offset(&id("slow"), fired.fire_time, Duration::from_secs(60));
+    let job = h.queue.get(&fired.job).unwrap();
+    assert_eq!(job.spec.run_at, Some(ts("2025-06-02T12:00:00Z") + offset));
+    assert_eq!(job.spec.delay, None);
+}
+
+#[test]
+fn rejected_fires_are_dropped_and_reported() {
+    let h = Harness::new(MONDAY);
+    h.scheduler.create(spec("sync", "*/15 * * * *")).unwrap();
+    h.queue.fail_next(DispatchError::Rejected(
+        "queue jobs is being deleted".into(),
+    ));
+    let report = h.tick_at("2025-06-02T10:15:00Z");
+    assert!(report.fired.is_empty());
+    let error = &report.errors[0];
+    assert_eq!(error.kind, TickErrorKind::DispatchRejected);
+    assert_eq!(
+        error.to_string(),
+        "dispatch rejected for schedule sync at 2025-06-02T10:15:00.000Z: queue jobs is being deleted"
+    );
+    let schedule = h.scheduler.get(&id("sync")).unwrap();
+    assert_eq!(schedule.fire_count, 0);
+    assert_eq!(schedule.next_fire_at, Some(ts("2025-06-02T10:30:00Z")));
+    assert_eq!(h.tick_at("2025-06-02T10:30:00Z").fired.len(), 1);
+}
