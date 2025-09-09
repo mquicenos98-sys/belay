@@ -369,3 +369,137 @@ fn rejected_fires_are_dropped_and_reported() {
     assert_eq!(schedule.next_fire_at, Some(ts("2025-06-02T10:30:00Z")));
     assert_eq!(h.tick_at("2025-06-02T10:30:00Z").fired.len(), 1);
 }
+
+#[test]
+fn an_unavailable_dispatcher_is_retried_after_the_delay() {
+    let h = Harness::new(MONDAY);
+    h.scheduler.create(spec("sync", "*/15 * * * *")).unwrap();
+    h.queue
+        .fail_next(DispatchError::Unavailable("queue is restarting".into()));
+    let report = h.tick_at("2025-06-02T10:15:00Z");
+    assert_eq!(report.errors[0].kind, TickErrorKind::DispatchUnavailable);
+    assert_eq!(
+        h.scheduler.get(&id("sync")).unwrap().next_fire_at,
+        Some(ts("2025-06-02T10:15:00Z")),
+        "the fire is kept"
+    );
+    assert_eq!(h.scheduler.next_wakeup(), Some(ts("2025-06-02T10:15:05Z")));
+    assert!(h.tick_at("2025-06-02T10:15:03Z").is_empty(), "backing off");
+    let retried = h.tick_at("2025-06-02T10:15:05Z");
+    assert_eq!(fired_times(&retried), ["2025-06-02T10:15:00.000Z"]);
+    assert!(!retried.fired[0].catch_up);
+    assert_eq!(h.queue.dispatch_calls(), 2);
+}
+
+#[test]
+fn trigger_now_fires_at_once_and_is_marked_manual() {
+    let h = Harness::new(MONDAY);
+    h.scheduler.create(spec("sync", "*/15 * * * *")).unwrap();
+    h.scheduler.pause(&id("sync")).unwrap();
+    h.events();
+    let fired = h.scheduler.trigger_now(&id("sync")).unwrap();
+    assert_eq!(fired.fire_time, ts(MONDAY));
+    let job = h.queue.get(&fired.job).unwrap();
+    assert_eq!(job.spec.meta[META_TRIGGER], "manual");
+    assert_eq!(job.spec.meta[META_FIRE_TIME], "2025-06-02T10:07:00.000Z");
+    assert_eq!(
+        job.spec.unique.unwrap().key,
+        "sched:sync:1748858820000:manual"
+    );
+    let schedule = h.scheduler.get(&id("sync")).unwrap();
+    assert_eq!(schedule.fire_count, 1);
+    assert_eq!(schedule.last_job, Some(fired.job));
+    assert_eq!(schedule.next_fire_at, Some(ts("2025-06-02T10:15:00Z")));
+    assert_eq!(h.events(), ["schedule.fired"]);
+
+    assert!(h
+        .scheduler
+        .trigger_now(&id("ghost"))
+        .unwrap_err()
+        .is_not_found());
+    h.queue.fail_next(DispatchError::Unavailable("busy".into()));
+    let err = h.scheduler.trigger_now(&id("sync")).unwrap_err();
+    assert!(matches!(
+        err,
+        Error::Dispatch(DispatchError::Unavailable(_))
+    ));
+    assert_eq!(h.scheduler.get(&id("sync")).unwrap().fire_count, 1);
+}
+
+#[test]
+fn a_crash_between_dispatch_and_save_does_not_fire_twice() {
+    let flaky = FlakyKv::new(Arc::new(MemKv::new()));
+    let h = Harness::with(MONDAY, flaky.clone(), SchedulerOptions::new());
+    h.scheduler
+        .create(spec("sync", "*/15 * * * *").jitter(Duration::from_secs(90)))
+        .unwrap();
+    flaky.refuse_writes(true);
+    let first = h.tick_at("2025-06-02T10:15:00Z");
+    assert_eq!(first.fired.len(), 1);
+    assert_eq!(first.errors[0].kind, TickErrorKind::Store);
+    let job = first.fired[0].job;
+
+    // The process dies here: the job exists, the bookkeeping does not.
+    flaky.refuse_writes(false);
+    let h = h.restart();
+    let reloaded = h.scheduler.get(&id("sync")).unwrap();
+    assert_eq!((reloaded.fire_count, reloaded.last_job), (0, None));
+
+    let retry = h.tick_at("2025-06-02T10:15:02Z");
+    assert_eq!(retry.fired.len(), 1);
+    assert!(retry.fired[0].duplicate);
+    assert_eq!(retry.fired[0].job, job);
+    assert_eq!(retry.fired[0].run_at, first.fired[0].run_at);
+    assert_eq!(h.queue.job_count(), 1);
+    let saved = h.scheduler.get(&id("sync")).unwrap();
+    assert_eq!(saved.fire_count, 1);
+    assert_eq!(saved.last_job, Some(job));
+    assert_eq!(saved.next_fire_at, Some(ts("2025-06-02T10:30:00Z")));
+}
+
+#[test]
+fn a_failed_save_is_retried_by_the_same_scheduler() {
+    let flaky = FlakyKv::new(Arc::new(MemKv::new()));
+    let h = Harness::with(MONDAY, flaky.clone(), SchedulerOptions::new());
+    h.scheduler.create(spec("sync", "*/15 * * * *")).unwrap();
+    h.events();
+    flaky.refuse_writes(true);
+    let failed = h.tick_at("2025-06-02T10:15:00Z");
+    assert_eq!(failed.errors.len(), 1);
+    assert!(
+        h.events().is_empty(),
+        "nothing is announced before it is saved"
+    );
+    assert_eq!(h.scheduler.next_wakeup(), Some(ts("2025-06-02T10:15:05Z")));
+    flaky.refuse_writes(false);
+    let retried = h.tick_at("2025-06-02T10:15:05Z");
+    assert!(retried.fired[0].duplicate);
+    assert_eq!(h.events(), ["schedule.fired"]);
+    assert_eq!(h.scheduler.get(&id("sync")).unwrap().fire_count, 1);
+    assert_eq!(h.queue.job_count(), 1);
+    assert_eq!(
+        h.queue.job_state(&retried.fired[0].job),
+        Some(JobState::Ready)
+    );
+}
+
+#[test]
+fn concurrent_ticks_never_fire_the_same_time_twice() {
+    let h = Harness::new(MONDAY);
+    for i in 0..8 {
+        h.scheduler
+            .create(spec(&format!("s{i}"), "*/15 * * * *"))
+            .unwrap();
+    }
+    h.clock.set(ts("2025-06-02T10:15:00Z"));
+    let now = h.now();
+    let fired: usize = std::thread::scope(|scope| {
+        let ticks: Vec<_> = (0..4)
+            .map(|_| scope.spawn(|| h.scheduler.tick(now).fired.len()))
+            .collect();
+        ticks.into_iter().map(|t| t.join().unwrap()).sum()
+    });
+    assert_eq!(fired, 8);
+    assert_eq!(h.queue.job_count(), 8);
+    assert_eq!(h.queue.dispatch_calls(), 8);
+}
