@@ -208,3 +208,144 @@ fn recover_picks_up_a_completion_missed_while_down() {
 
 /// A dispatcher that only knows job states, not job records.
 struct StatesOnly(Arc<MemoryDispatcher>);
+
+impl Dispatcher for StatesOnly {
+    fn dispatch(&self, spec: &JobSpec) -> Result<DispatchOutcome, DispatchError> {
+        self.0.dispatch(spec)
+    }
+
+    fn job_state(&self, id: &JobId) -> Option<JobState> {
+        self.0.job_state(id)
+    }
+
+    fn cancel(&self, id: &JobId) -> Result<(), DispatchError> {
+        self.0.cancel(id)
+    }
+}
+
+#[test]
+fn recovery_without_job_records_cannot_feed_placeholders() {
+    quiet();
+    let clock = ManualClock::new(ts("2025-05-05T10:00:00Z"));
+    let queue = Arc::new(MemoryDispatcher::new(clock.shared()));
+    let kv: Arc<dyn Kv> = Arc::new(MemKv::new());
+    let open = || {
+        WorkflowEngine::open(
+            Arc::clone(&kv),
+            clock.shared(),
+            Arc::new(StatesOnly(queue.clone())),
+            Arc::new(CollectingSink::new()),
+        )
+        .unwrap()
+    };
+    let mut spec = workflow("etl", vec![step("a", &[]), step("b", &["a"])]);
+    spec.steps[1].job.payload = json!({"rows": "{{steps.a.result.rows}}"});
+    let run = open().submit(spec).unwrap();
+    let a = queue.find_step(run.id, "a").unwrap();
+    queue.succeed(&a.id, json!({"rows": 12})).unwrap();
+    let engine = open();
+    assert_eq!(engine.recover().unwrap(), 1);
+    let details = engine.details(run.id).unwrap().unwrap();
+    assert_eq!(details.workflow.steps["a"].state, StepState::Succeeded);
+    assert_eq!(details.workflow.steps["b"].state, StepState::Failed);
+    assert_eq!(
+        details.error("b"),
+        Some(
+            r#"placeholder {{steps.a.result.rows}}: the result of step "a" is not available (its completion was recovered without the job record)"#
+        )
+    );
+}
+
+#[test]
+fn recover_fails_steps_whose_jobs_vanished() {
+    let f = Flow::new();
+    let run = f.submit(workflow("etl", vec![step("a", &[])]));
+    let a = f.job(run.id, "a").id;
+    f.queue.forget(&a);
+    assert_eq!(f.engine.recover().unwrap(), 1);
+    let details = f.engine.details(run.id).unwrap().unwrap();
+    assert_eq!(details.workflow.state, WorkflowState::Failed);
+    assert_eq!(
+        details.error("a"),
+        Some(format!("job {a} no longer exists").as_str())
+    );
+}
+
+#[test]
+fn a_crash_between_dispatch_and_save_is_recovered_without_a_second_job() {
+    let flaky = FlakyKv::new(Arc::new(MemKv::new()));
+    let f = Flow::with(flaky.clone());
+    let run = f.submit(workflow("etl", vec![step("a", &[]), step("b", &["a"])]));
+    let a = f
+        .queue
+        .succeed(&f.job(run.id, "a").id, Value::Null)
+        .unwrap();
+    // b is dispatched, then saving fails: the process dies here.
+    flaky.refuse_writes(true);
+    assert!(f.engine.on_job_finished(&a).is_err());
+    let b = f.job(run.id, "b").id;
+    flaky.refuse_writes(false);
+
+    let f = f.restart();
+    assert_eq!(
+        f.get(run.id).steps["a"].state,
+        StepState::Running,
+        "nothing was saved"
+    );
+    assert_eq!(f.engine.recover().unwrap(), 1);
+    let after = f.get(run.id);
+    assert_eq!(after.steps["a"].state, StepState::Succeeded);
+    assert_eq!(after.steps["b"].state, StepState::Running);
+    assert_eq!(
+        after.steps["b"].job,
+        Some(b),
+        "the original job was adopted"
+    );
+    assert_eq!(f.queue.job_count(), 2);
+}
+
+#[test]
+fn a_run_interrupted_during_submit_is_finished_by_recovery() {
+    let flaky = FlakyKv::new(Arc::new(MemKv::new()));
+    let f = Flow::with(flaky.clone());
+    // The run is saved, its root is dispatched, then the process dies.
+    flaky.fail_after(1);
+    assert!(f
+        .engine
+        .submit(workflow("etl", vec![step("a", &[])]))
+        .is_err());
+    let job: Job = f.queue.last().unwrap();
+    let run = job.spec.workflow.clone().unwrap().id;
+    flaky.refuse_writes(false);
+
+    let f = f.restart();
+    assert_eq!(f.get(run).steps["a"].state, StepState::Pending);
+    assert_eq!(f.engine.recover().unwrap(), 1);
+    assert_eq!(f.get(run).steps["a"].job, Some(job.id));
+    assert_eq!(f.queue.job_count(), 1);
+    f.clock.advance(Duration::from_secs(1));
+    let done = f.succeed(run, "a", Value::Null);
+    assert_eq!(done.state, WorkflowState::Succeeded);
+}
+
+#[test]
+fn a_duplicate_that_already_finished_is_taken_as_finished() {
+    let flaky = FlakyKv::new(Arc::new(MemKv::new()));
+    let f = Flow::with(flaky.clone());
+    flaky.fail_after(1);
+    assert!(f
+        .engine
+        .submit(workflow("etl", vec![step("a", &[]), step("b", &["a"])]))
+        .is_err());
+    let a = f.queue.last().unwrap();
+    let run = a.spec.workflow.clone().unwrap().id;
+    // The job even finished before belay came back.
+    f.queue.succeed(&a.id, json!("done")).unwrap();
+    flaky.refuse_writes(false);
+
+    let f = f.restart();
+    assert_eq!(f.engine.recover().unwrap(), 1);
+    let after = f.get(run);
+    assert_eq!(after.steps["a"].state, StepState::Succeeded);
+    assert_eq!(after.steps["b"].state, StepState::Running);
+}
