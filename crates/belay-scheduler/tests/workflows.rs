@@ -298,3 +298,108 @@ fn a_placeholder_on_a_failed_step_fails_its_reader() {
         )
     );
 }
+
+#[test]
+fn cancel_stops_running_steps_and_marks_pending_ones() {
+    let f = Flow::new();
+    let run = f.submit(workflow("etl", vec![step("a", &[]), step("b", &["a"])]));
+    let a = f.job(run.id, "a").id;
+    f.queue.start(&a);
+    f.events();
+    let cancelled = f.engine.cancel(run.id).unwrap();
+    assert_eq!(cancelled.state, WorkflowState::Cancelled);
+    assert_eq!(cancelled.steps["a"].state, StepState::Cancelled);
+    assert_eq!(cancelled.steps["b"].state, StepState::Cancelled);
+    assert_eq!(f.queue.cancel_requests(), [a]);
+    assert_eq!(
+        f.events(),
+        ["workflow.step", "workflow.step", "workflow.finished"]
+    );
+    // Cancelling again, or the worker acknowledging, changes nothing.
+    assert_eq!(f.engine.cancel(run.id).unwrap(), cancelled);
+    let acknowledged = f.queue.finish(&a, JobState::Cancelled, None, None).unwrap();
+    assert_eq!(f.engine.on_job_finished(&acknowledged).unwrap(), None);
+    assert!(f
+        .engine
+        .cancel(WorkflowId::generate())
+        .unwrap_err()
+        .is_not_found());
+}
+
+#[test]
+fn on_job_finished_ignores_repeats_strangers_and_unfinished_jobs() {
+    let f = Flow::new();
+    let run = f.submit(workflow("etl", vec![step("a", &[]), step("b", &["a"])]));
+    let job = f
+        .queue
+        .succeed(&f.job(run.id, "a").id, Value::Null)
+        .unwrap();
+    assert!(f.engine.on_job_finished(&job).unwrap().is_some());
+    assert_eq!(f.engine.on_job_finished(&job).unwrap(), None, "repeat");
+
+    let plain = f.queue.dispatch(&JobSpec::new("etl", "x")).unwrap().id;
+    let plain = f.queue.succeed(&plain, Value::Null).unwrap();
+    assert_eq!(
+        f.engine.on_job_finished(&plain).unwrap(),
+        None,
+        "no workflow"
+    );
+
+    let running = f.queue.start(&f.job(run.id, "b").id).unwrap();
+    assert_eq!(
+        f.engine.on_job_finished(&running).unwrap(),
+        None,
+        "not finished"
+    );
+
+    let mut stranger: Job = job.clone();
+    stranger.spec.workflow.as_mut().unwrap().id = WorkflowId::generate();
+    assert_eq!(
+        f.engine.on_job_finished(&stranger).unwrap(),
+        None,
+        "unknown run"
+    );
+}
+
+#[test]
+fn a_rejected_dispatch_fails_the_step() {
+    let f = Flow::new();
+    f.queue.fail_next(DispatchError::Rejected(
+        "queue etl does not accept jobs".into(),
+    ));
+    let run = f.submit(workflow("etl", vec![step("a", &[]), step("b", &["a"])]));
+    assert_eq!(run.state, WorkflowState::Failed);
+    assert_eq!(
+        f.engine.details(run.id).unwrap().unwrap().error("a"),
+        Some("dispatch rejected: queue etl does not accept jobs")
+    );
+}
+
+#[test]
+fn an_unavailable_dispatcher_defers_the_step_until_recovery() {
+    let f = Flow::new();
+    f.queue
+        .fail_next(DispatchError::Unavailable("queue restarting".into()));
+    let run = f.submit(workflow("etl", vec![step("a", &[]), step("b", &["a"])]));
+    assert_eq!(run.state, WorkflowState::Running);
+    assert_eq!(run.steps["a"].state, StepState::Pending);
+    assert_eq!(f.queue.job_count(), 0);
+    assert_eq!(f.engine.recover().unwrap(), 1);
+    assert_eq!(state_of(&f, run.id, "a"), StepState::Running);
+    assert_eq!(f.engine.recover().unwrap(), 0, "nothing left to do");
+}
+
+#[test]
+fn a_step_with_its_own_unique_key_keeps_it() {
+    let f = Flow::new();
+    let mut spec = workflow("etl", vec![step("a", &[])]);
+    spec.steps[0].job = spec.steps[0]
+        .job
+        .clone()
+        .unique("tenant-7:export", UniqueScope::UntilFinished);
+    let run = f.submit(spec);
+    assert_eq!(
+        f.job(run.id, "a").spec.unique.unwrap().key,
+        "tenant-7:export"
+    );
+}
