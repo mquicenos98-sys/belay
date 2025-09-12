@@ -57,3 +57,187 @@ pub struct FlakyKv {
     /// Writes still allowed before refusing; negative for no limit.
     budget: AtomicI64,
 }
+
+impl FlakyKv {
+    pub fn new(inner: Arc<dyn Kv>) -> Arc<FlakyKv> {
+        Arc::new(FlakyKv {
+            inner,
+            refuse: AtomicBool::new(false),
+            budget: AtomicI64::new(-1),
+        })
+    }
+
+    pub fn refuse_writes(&self, refuse: bool) {
+        self.refuse.store(refuse, Ordering::SeqCst);
+        self.budget.store(-1, Ordering::SeqCst);
+    }
+
+    /// Allows `n` more writes, then refuses the rest.
+    pub fn fail_after(&self, n: i64) {
+        self.budget.store(n, Ordering::SeqCst);
+    }
+
+    fn admit(&self) -> bool {
+        if self.refuse.load(Ordering::SeqCst) {
+            return false;
+        }
+        let left = self.budget.load(Ordering::SeqCst);
+        if left < 0 {
+            return true;
+        }
+        if left == 0 {
+            self.refuse.store(true, Ordering::SeqCst);
+            return false;
+        }
+        self.budget.store(left - 1, Ordering::SeqCst);
+        true
+    }
+}
+
+impl Kv for FlakyKv {
+    fn get(&self, key: &[u8]) -> belay_store::Result<Option<Vec<u8>>> {
+        self.inner.get(key)
+    }
+
+    fn scan(&self, range: KeyRange) -> belay_store::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.inner.scan(range)
+    }
+
+    fn write(&self, batch: WriteBatch) -> belay_store::Result<u64> {
+        if !self.admit() {
+            return Err(StoreError::Failed {
+                reason: "simulated crash before the write".into(),
+            });
+        }
+        self.inner.write(batch)
+    }
+
+    fn flush(&self) -> belay_store::Result<()> {
+        self.inner.flush()
+    }
+
+    fn stats(&self) -> KvStats {
+        self.inner.stats()
+    }
+
+    fn checkpoint(&self) -> belay_store::Result<CheckpointInfo> {
+        self.inner.checkpoint()
+    }
+}
+
+/// A scheduler over a manual clock and an in-memory dispatcher.
+pub struct Harness {
+    pub clock: ManualClock,
+    pub queue: Arc<MemoryDispatcher>,
+    pub sink: Arc<CollectingSink>,
+    pub kv: Arc<dyn Kv>,
+    pub scheduler: Scheduler,
+}
+
+impl Harness {
+    /// Starts at `start` on an empty in-memory store.
+    pub fn new(start: &str) -> Harness {
+        Harness::with(start, Arc::new(MemKv::new()), SchedulerOptions::new())
+    }
+
+    pub fn with(start: &str, kv: Arc<dyn Kv>, options: SchedulerOptions) -> Harness {
+        quiet();
+        let clock = ManualClock::new(ts(start));
+        let queue = Arc::new(MemoryDispatcher::new(clock.shared()));
+        let sink = Arc::new(CollectingSink::new());
+        let scheduler = Scheduler::open_with(
+            Arc::clone(&kv),
+            clock.shared(),
+            queue.clone(),
+            sink.clone(),
+            options,
+        )
+        .expect("opening the scheduler");
+        Harness {
+            clock,
+            queue,
+            sink,
+            kv,
+            scheduler,
+        }
+    }
+
+    /// Simulates a restart: a new scheduler over the same store, queue and
+    /// clock.
+    pub fn restart(self) -> Harness {
+        self.restart_with(SchedulerOptions::new())
+    }
+
+    pub fn restart_with(self, options: SchedulerOptions) -> Harness {
+        let Harness {
+            clock,
+            queue,
+            sink,
+            kv,
+            scheduler,
+        } = self;
+        drop(scheduler);
+        let scheduler = Scheduler::open_with(
+            Arc::clone(&kv),
+            clock.shared(),
+            queue.clone(),
+            sink.clone(),
+            options,
+        )
+        .expect("reopening the scheduler");
+        Harness {
+            clock,
+            queue,
+            sink,
+            kv,
+            scheduler,
+        }
+    }
+
+    pub fn now(&self) -> Timestamp {
+        self.clock.now()
+    }
+
+    /// Moves the clock to `t` and ticks.
+    pub fn tick_at(&self, t: &str) -> TickReport {
+        self.clock.set(ts(t));
+        self.scheduler.tick(self.clock.now())
+    }
+
+    /// Advances the clock by `d` and ticks.
+    pub fn tick_after(&self, d: Duration) -> TickReport {
+        let now = self.clock.advance(d);
+        self.scheduler.tick(now)
+    }
+
+    /// Ticks at every wakeup up to `until`, collecting the reports.
+    pub fn run_until(&self, until: &str) -> Vec<TickReport> {
+        let until = ts(until);
+        let mut reports = Vec::new();
+        while let Some(wake) = self.scheduler.next_wakeup() {
+            if wake > until {
+                break;
+            }
+            self.clock.set(wake.max(self.clock.now()));
+            reports.push(self.scheduler.tick(self.clock.now()));
+        }
+        self.clock.set(until);
+        reports
+    }
+
+    /// Event type names emitted since the last call.
+    pub fn events(&self) -> Vec<&'static str> {
+        let names = self.sink.type_names();
+        self.sink.take();
+        names
+    }
+}
+
+/// A workflow engine over a manual clock and an in-memory dispatcher.
+pub struct Flow {
+    pub clock: ManualClock,
+    pub queue: Arc<MemoryDispatcher>,
+    pub sink: Arc<CollectingSink>,
+    pub kv: Arc<dyn Kv>,
+    pub engine: WorkflowEngine,
+}
