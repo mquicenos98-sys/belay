@@ -33,3 +33,27 @@ pub fn ts(s: &str) -> Timestamp {
 pub fn id(s: &str) -> ScheduleId {
     s.parse().expect("test schedule ids are valid")
 }
+
+/// A schedule firing `work` jobs on queue `jobs`.
+pub fn spec(name: &str, cron: &str) -> ScheduleSpec {
+    ScheduleSpec::new(id(name), cron, JobSpec::new("jobs", "work"))
+}
+
+/// Fire times of a report, as RFC 3339 text.
+pub fn fired_times(report: &TickReport) -> Vec<String> {
+    report
+        .fired
+        .iter()
+        .map(|f| f.fire_time.to_string())
+        .collect()
+}
+
+/// A store that can be told to refuse writes, as if the process died just
+/// before saving.
+#[derive(Debug)]
+pub struct FlakyKv {
+    inner: Arc<dyn Kv>,
+    refuse: AtomicBool,
+    /// Writes still allowed before refusing; negative for no limit.
+    budget: AtomicI64,
+}
