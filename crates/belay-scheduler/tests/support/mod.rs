@@ -241,3 +241,122 @@ pub struct Flow {
     pub kv: Arc<dyn Kv>,
     pub engine: WorkflowEngine,
 }
+
+impl Flow {
+    pub fn new() -> Flow {
+        Flow::with(Arc::new(MemKv::new()))
+    }
+
+    pub fn with(kv: Arc<dyn Kv>) -> Flow {
+        quiet();
+        let clock = ManualClock::new(ts("2025-05-05T10:00:00Z"));
+        let queue = Arc::new(MemoryDispatcher::new(clock.shared()));
+        let sink = Arc::new(CollectingSink::new());
+        let engine = WorkflowEngine::open_with(
+            Arc::clone(&kv),
+            clock.shared(),
+            queue.clone(),
+            sink.clone(),
+            WorkflowOptions::new(),
+        )
+        .expect("opening the workflow engine");
+        Flow {
+            clock,
+            queue,
+            sink,
+            kv,
+            engine,
+        }
+    }
+
+    /// A new engine over the same store, queue and clock.
+    pub fn restart(self) -> Flow {
+        let Flow {
+            clock,
+            queue,
+            sink,
+            kv,
+            engine,
+        } = self;
+        drop(engine);
+        let engine =
+            WorkflowEngine::open(Arc::clone(&kv), clock.shared(), queue.clone(), sink.clone())
+                .expect("reopening the workflow engine");
+        Flow {
+            clock,
+            queue,
+            sink,
+            kv,
+            engine,
+        }
+    }
+
+    pub fn submit(&self, spec: WorkflowSpec) -> Workflow {
+        self.engine.submit(spec).expect("submitting the workflow")
+    }
+
+    /// The job dispatched for `step` of `run`.
+    pub fn job(&self, run: WorkflowId, step: &str) -> Job {
+        self.queue
+            .find_step(run, step)
+            .unwrap_or_else(|| panic!("no job was dispatched for step {step}"))
+    }
+
+    /// Whether a job was dispatched for `step`.
+    pub fn dispatched(&self, run: WorkflowId, step: &str) -> bool {
+        self.queue.find_step(run, step).is_some()
+    }
+
+    /// Completes `step`'s job with `result` and reports it to the engine.
+    pub fn succeed(&self, run: WorkflowId, step: &str, result: Value) -> Workflow {
+        self.clock.advance(Duration::from_secs(1));
+        let job = self
+            .queue
+            .succeed(&self.job(run, step).id, result)
+            .expect("the step's job was still pending");
+        self.engine
+            .on_job_finished(&job)
+            .expect("advancing the workflow")
+            .expect("the completion changed the workflow")
+    }
+
+    /// Kills `step`'s job with `message` and reports it to the engine.
+    pub fn fail(&self, run: WorkflowId, step: &str, message: &str) -> Workflow {
+        self.clock.advance(Duration::from_secs(1));
+        let job = self
+            .queue
+            .fail(&self.job(run, step).id, message)
+            .expect("the step's job was still pending");
+        self.engine
+            .on_job_finished(&job)
+            .expect("advancing the workflow")
+            .expect("the failure changed the workflow")
+    }
+
+    pub fn get(&self, run: WorkflowId) -> Workflow {
+        self.engine
+            .get(run)
+            .expect("reading the workflow")
+            .expect("the workflow exists")
+    }
+
+    pub fn events(&self) -> Vec<&'static str> {
+        let names = self.sink.type_names();
+        self.sink.take();
+        names
+    }
+}
+
+/// A step running `kind` on queue `etl`, after `deps`.
+pub fn step(name: &str, deps: &[&str]) -> StepSpec {
+    deps.iter()
+        .fold(StepSpec::new(name, JobSpec::new("etl", name)), |s, d| {
+            s.after(*d)
+        })
+}
+
+pub fn workflow(name: &str, steps: Vec<StepSpec>) -> WorkflowSpec {
+    steps
+        .into_iter()
+        .fold(WorkflowSpec::new(name), WorkflowSpec::step)
+}
