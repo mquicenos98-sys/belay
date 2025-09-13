@@ -403,3 +403,122 @@ fn a_step_with_its_own_unique_key_keeps_it() {
         "tenant-7:export"
     );
 }
+
+#[test]
+fn list_filters_by_state_and_pages_newest_first() {
+    let f = Flow::new();
+    let mut runs = Vec::new();
+    for i in 0..5 {
+        f.clock.advance(Duration::from_secs(1));
+        let mut spec = workflow("batch", vec![step("only", &[])]);
+        if i == 4 {
+            spec.name = "other".into();
+        }
+        runs.push(f.submit(spec).id);
+    }
+    f.fail(runs[1], "only", "x");
+    f.fail(runs[3], "only", "x");
+
+    let ids = |page: &belay_proto::api::Page<belay_proto::Workflow>| -> Vec<WorkflowId> {
+        page.items.iter().map(|w| w.id).collect()
+    };
+    let failed = f
+        .engine
+        .list(&WorkflowFilter::new().state(WorkflowState::Failed))
+        .unwrap();
+    assert_eq!(ids(&failed), [runs[3], runs[1]]);
+
+    let first = f.engine.list(&WorkflowFilter::new().limit(2)).unwrap();
+    assert_eq!(ids(&first), [runs[4], runs[3]]);
+
+    let oldest = f
+        .engine
+        .list(
+            &WorkflowFilter::new()
+                .order(SortOrder::Asc)
+                .name("batch")
+                .limit(10),
+        )
+        .unwrap();
+    assert_eq!(ids(&oldest), runs[..4]);
+    assert_eq!(f.engine.len(), 5);
+}
+
+#[test]
+fn sweep_deletes_old_finished_runs_with_their_results() {
+    let f = Flow::new();
+    let mut spec = workflow("crawl", vec![step("fetch", &[]), step("use", &["fetch"])]);
+    spec.steps[1].job.payload = json!("{{steps.fetch.result}}");
+    let done = f.submit(spec);
+    f.succeed(done.id, "fetch", json!(1));
+    f.succeed(done.id, "use", Value::Null);
+    let finished_at = f.get(done.id).finished_at.unwrap();
+    let running = f.submit(workflow("long", vec![step("a", &[])]));
+
+    let hour = Duration::from_secs(3600);
+    assert_eq!(f.engine.sweep(finished_at + hour / 2, hour).unwrap(), 0);
+    assert_eq!(f.engine.sweep(finished_at + hour, hour).unwrap(), 1);
+    assert_eq!(f.engine.get(done.id).unwrap(), None);
+    assert!(
+        f.engine.get(running.id).unwrap().is_some(),
+        "running runs stay"
+    );
+    assert_eq!(f.kv.count(KeyRange::prefix("wfr/")).unwrap(), 0);
+    assert_eq!(f.kv.count(KeyRange::prefix("wf/")).unwrap(), 1);
+    assert_eq!(f.engine.len(), 1);
+}
+
+#[test]
+fn step_events_name_the_job() {
+    let f = Flow::new();
+    let run = f.submit(workflow("one", vec![step("only", &[])]));
+    let job = f.job(run.id, "only").id;
+    f.succeed(run.id, "only", Value::Null);
+    let events = f.sink.take();
+    assert!(matches!(
+        &events[0],
+        EventKind::WorkflowStarted { workflow, name } if *workflow == run.id && name == "one"
+    ));
+    assert!(matches!(
+        &events[1],
+        EventKind::WorkflowStep { step, state: StepState::Running, job: Some(j), .. }
+            if step == "only" && *j == job
+    ));
+    assert!(matches!(
+        &events[2],
+        EventKind::WorkflowStep {
+            state: StepState::Succeeded,
+            ..
+        }
+    ));
+    assert!(matches!(
+        &events[3],
+        EventKind::WorkflowFinished {
+            state: WorkflowState::Succeeded,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn concurrent_completions_start_the_join_exactly_once() {
+    let f = Flow::new();
+    let shards: Vec<String> = (0..8).map(|i| format!("shard-{i}")).collect();
+    let mut steps: Vec<_> = shards.iter().map(|s| step(s, &[])).collect();
+    let names: Vec<&str> = shards.iter().map(String::as_str).collect();
+    steps.push(step("merge", &names));
+    let run = f.submit(workflow("fan-in", steps));
+    let finished: Vec<Job> = shards
+        .iter()
+        .map(|s| f.queue.succeed(&f.job(run.id, s).id, json!(s)).unwrap())
+        .collect();
+    std::thread::scope(|scope| {
+        for job in &finished {
+            let engine = &f.engine;
+            scope.spawn(move || engine.on_job_finished(job).unwrap());
+        }
+    });
+    let after = f.get(run.id);
+    assert_eq!(after.steps["merge"].state, StepState::Running);
+    assert_eq!(f.queue.job_count(), 9, "eight shards and one merge");
+}
