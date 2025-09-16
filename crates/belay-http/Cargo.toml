@@ -1,0 +1,15 @@
+[package]
+name = "belay-http"
+description = "Threaded HTTP/1.1 server and client on std::net for belay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "belay_http"
+path = "src/lib.rs"
+
+[dependencies]
