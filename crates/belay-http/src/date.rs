@@ -107,3 +107,16 @@ fn digits(b: &[u8]) -> Option<u32> {
         c.is_ascii_digit().then(|| acc * 10 + u32::from(c - b'0'))
     })
 }
+
+fn is_leap(year: u32) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+}
+
+fn days_in_month(year: u32, month: u32) -> u32 {
+    match month {
+        2 if is_leap(year) => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    }
+}
