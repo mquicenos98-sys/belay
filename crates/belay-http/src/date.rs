@@ -10,7 +10,6 @@ use std::cell::RefCell;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const WEEKDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
@@ -118,5 +117,97 @@ fn days_in_month(year: u32, month: u32) -> u32 {
         2 => 28,
         4 | 6 | 9 | 11 => 30,
         _ => 31,
+    }
+}
+
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    (year, month, day)
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let yoe = year.rem_euclid(400);
+    let month = i64::from(month);
+    let doy = (153 * (if month > 2 { month - 3 } else { month + 9 }) + 2) / 5 + i64::from(day) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn at(secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn formats_known_instants() {
+        assert_eq!(fmt_http_date(at(0)), "Thu, 01 Jan 1970 00:00:00 GMT");
+        assert_eq!(
+            fmt_http_date(at(951_782_400)),
+            "Tue, 29 Feb 2000 00:00:00 GMT"
+        );
+        assert_eq!(
+            fmt_http_date(at(1_709_251_199)),
+            "Thu, 29 Feb 2024 23:59:59 GMT"
+        );
+        assert_eq!(
+            fmt_http_date(at(4_102_444_800)),
+            "Fri, 01 Jan 2100 00:00:00 GMT"
+        );
+    }
+
+    #[test]
+    fn clamps_pre_epoch_times() {
+        let before = UNIX_EPOCH - Duration::from_secs(10);
+        assert_eq!(fmt_http_date(before), "Thu, 01 Jan 1970 00:00:00 GMT");
+    }
+
+    #[test]
+    fn parse_inverts_format_across_a_range_of_days() {
+        // One sample every ~37 days for 150 years covers every month,
+        // weekday and leap-year rule.
+        let mut secs = 0u64;
+        while secs < 150 * 365 * 86_400 {
+            let text = fmt_http_date(at(secs));
+            assert_eq!(parse_http_date(&text), Some(at(secs)), "{text}");
+            secs += 37 * 86_400 + 3_607;
+        }
+    }
+
+    #[test]
+    fn rejects_other_formats_and_impossible_dates() {
+        for bad in [
+            "Sunday, 06-Nov-94 08:49:37 GMT",
+            "Sun Nov  6 08:49:37 1994",
+            "Sun, 06 Nov 1994 08:49:37 UTC",
+            "Sun, 31 Apr 2024 00:00:00 GMT",
+            "Sun, 29 Feb 2023 00:00:00 GMT",
+            "Sun, 06 Nov 1994 24:00:00 GMT",
+            "Xyz, 06 Nov 1994 08:49:37 GMT",
+            "Sun, 06 Nov 1969 08:49:37 GMT",
+            "Sun, 0a Nov 1994 08:49:37 GMT",
+            "",
+        ] {
+            assert_eq!(parse_http_date(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn cached_date_has_the_fixed_length() {
+        let first = now_http_date();
+        assert_eq!(first.len(), 29);
+        assert!(parse_http_date(&first).is_some());
     }
 }
