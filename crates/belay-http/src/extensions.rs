@@ -91,3 +91,42 @@ impl fmt::Debug for Extensions {
             .finish()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, PartialEq, Clone)]
+    struct Tenant(&'static str);
+
+    #[test]
+    fn insert_returns_previous_value_of_same_type() {
+        let mut ext = Extensions::new();
+        assert_eq!(ext.insert(Tenant("a")), None);
+        assert_eq!(ext.insert(Tenant("b")), Some(Tenant("a")));
+        assert_eq!(ext.len(), 1);
+    }
+
+    #[test]
+    fn types_do_not_collide() {
+        let mut ext = Extensions::new();
+        ext.insert(7u32);
+        ext.insert(7u64);
+        ext.insert(Tenant("t"));
+        assert_eq!(ext.get::<u32>(), Some(&7));
+        assert_eq!(ext.get::<u64>(), Some(&7));
+        assert_eq!(ext.len(), 3);
+    }
+
+    #[test]
+    fn get_mut_and_remove() {
+        let mut ext = Extensions::new();
+        ext.insert(vec![1, 2]);
+        if let Some(v) = ext.get_mut::<Vec<i32>>() {
+            v.push(3);
+        }
+        assert_eq!(ext.remove::<Vec<i32>>(), Some(vec![1, 2, 3]));
+        assert!(!ext.contains::<Vec<i32>>());
+        assert!(ext.is_empty());
+    }
+}
