@@ -188,3 +188,62 @@ impl Headers {
         Ok(())
     }
 }
+
+impl fmt::Debug for Headers {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_map().entries(self.iter()).finish()
+    }
+}
+
+impl<'a> IntoIterator for &'a Headers {
+    type Item = (&'a str, &'a str);
+    type IntoIter = Box<dyn Iterator<Item = (&'a str, &'a str)> + 'a>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        Box::new(self.iter())
+    }
+}
+
+impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for Headers {
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        let mut headers = Headers::new();
+        headers.extend(iter);
+        headers
+    }
+}
+
+impl<K: Into<String>, V: Into<String>> Extend<(K, V)> for Headers {
+    fn extend<I: IntoIterator<Item = (K, V)>>(&mut self, iter: I) {
+        for (name, value) in iter {
+            self.append(name, value);
+        }
+    }
+}
+
+/// `tchar` from RFC 9110 §5.6.2: the characters allowed in tokens such as
+/// header names and methods.
+pub(crate) fn is_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+/// Whether `name` is a syntactically valid field name (a non-empty token).
+pub fn is_valid_name(name: &str) -> bool {
+    !name.is_empty() && name.bytes().all(is_tchar)
+}
