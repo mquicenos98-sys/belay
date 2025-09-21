@@ -247,3 +247,95 @@ pub(crate) fn is_tchar(b: u8) -> bool {
 pub fn is_valid_name(name: &str) -> bool {
     !name.is_empty() && name.bytes().all(is_tchar)
 }
+
+/// Whether `value` can be written as a field value: no control characters
+/// other than horizontal tab, which in particular rules out CR, LF and NUL.
+pub fn is_valid_value(value: &str) -> bool {
+    value.bytes().all(is_field_byte)
+}
+
+pub(crate) fn is_field_byte(b: u8) -> bool {
+    b == b'\t' || (b >= 0x20 && b != 0x7f)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lookups_ignore_ascii_case() {
+        let headers: Headers = [("Content-Type", "text/plain")].into_iter().collect();
+        assert_eq!(headers.get("content-type"), Some("text/plain"));
+        assert_eq!(headers.get("CONTENT-TYPE"), Some("text/plain"));
+        assert!(headers.contains("Content-type"));
+        assert_eq!(headers.get("content-length"), None);
+    }
+
+    #[test]
+    fn insert_replaces_all_values_in_place() {
+        let mut headers = Headers::new();
+        headers.append("A", "1");
+        headers.append("X-Tag", "a");
+        headers.append("B", "2");
+        headers.append("x-tag", "b");
+        headers.insert("X-TAG", "c");
+        let pairs: Vec<_> = headers.iter().collect();
+        assert_eq!(pairs, [("A", "1"), ("X-TAG", "c"), ("B", "2")]);
+    }
+
+    #[test]
+    fn remove_returns_first_value_and_drops_all() {
+        let mut headers = Headers::new();
+        headers.append("Via", "a");
+        headers.append("Host", "h");
+        headers.append("via", "b");
+        assert_eq!(headers.remove("VIA"), Some("a".into()));
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers.remove("via"), None);
+    }
+
+    #[test]
+    fn tokens_split_lists_across_fields() {
+        let mut headers = Headers::new();
+        headers.append("Connection", "keep-alive, Upgrade");
+        headers.append("connection", " ,close ,");
+        let tokens: Vec<_> = headers.tokens("connection").collect();
+        assert_eq!(tokens, ["keep-alive", "Upgrade", "close"]);
+        assert!(headers.has_token("Connection", "CLOSE"));
+        assert!(!headers.has_token("Connection", "clos"));
+    }
+
+    #[test]
+    fn name_validation_requires_tokens() {
+        assert!(is_valid_name("X-Request-Id"));
+        assert!(is_valid_name("weird!#$%&'*+.^_`|~"));
+        for bad in ["", "Bad Name", "Colon:", "Tab\t", "Non-\u{e9}"] {
+            assert!(!is_valid_name(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn value_validation_rejects_line_breaks() {
+        assert!(is_valid_value("text/plain; charset=utf-8"));
+        assert!(is_valid_value("tab\tseparated"));
+        assert!(is_valid_value("caf\u{e9}"));
+        for bad in ["a\r\nInjected: yes", "nul\0", "bell\x07", "del\x7f"] {
+            assert!(!is_valid_value(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn validate_names_the_offending_header() {
+        let mut headers = Headers::new();
+        headers.append("Ok", "fine");
+        headers.append("X-Evil", "a\nb");
+        let err = headers.validate().expect_err("newline must be rejected");
+        assert!(err.contains("X-Evil"), "{err}");
+    }
+
+    #[test]
+    fn debug_renders_as_map() {
+        let headers: Headers = [("A", "1")].into_iter().collect();
+        assert_eq!(format!("{headers:?}"), r#"{"A": "1"}"#);
+    }
+}
