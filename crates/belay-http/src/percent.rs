@@ -84,3 +84,35 @@ pub fn encode(input: &str, set: EncodeSet) -> String {
     }
     out
 }
+
+/// Shorthand for [`encode`] with [`EncodeSet::Component`].
+pub fn encode_component(input: &str) -> String {
+    encode(input, EncodeSet::Component)
+}
+
+pub(crate) fn push_escape(out: &mut String, b: u8) {
+    out.push('%');
+    out.push(HEX[usize::from(b >> 4)] as char);
+    out.push(HEX[usize::from(b & 0x0f)] as char);
+}
+
+pub(crate) fn hex_value(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Why strict decoding failed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// A `%` not followed by two hex digits, at this byte offset.
+    InvalidEscape {
+        /// Offset of the `%`.
+        offset: usize,
+    },
+    /// The decoded bytes are not UTF-8.
+    InvalidUtf8,
+}
