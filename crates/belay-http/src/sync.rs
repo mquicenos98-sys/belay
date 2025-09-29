@@ -114,3 +114,76 @@ impl ShutdownSignal {
         }
     }
 }
+
+impl fmt::Debug for ShutdownSignal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ShutdownSignal")
+            .field("triggered", &self.is_triggered())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    #[test]
+    fn wait_timeout_returns_false_when_not_triggered() {
+        let signal = ShutdownSignal::new();
+        let start = Instant::now();
+        assert!(!signal.wait_timeout(Duration::from_millis(20)));
+        assert!(start.elapsed() >= Duration::from_millis(20));
+    }
+
+    #[test]
+    fn trigger_wakes_waiters_on_other_threads() {
+        let signal = ShutdownSignal::new();
+        let waiter = {
+            let signal = signal.clone();
+            std::thread::spawn(move || signal.wait_timeout(Duration::from_secs(10)))
+        };
+        std::thread::sleep(Duration::from_millis(10));
+        signal.trigger();
+        assert!(waiter.join().expect("waiter thread panicked"));
+        assert!(signal.is_triggered());
+    }
+
+    #[test]
+    fn wakers_run_exactly_once() {
+        let signal = ShutdownSignal::new();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        signal.on_trigger(Box::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+        signal.trigger();
+        signal.trigger();
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn waker_registered_after_trigger_runs_immediately() {
+        let signal = ShutdownSignal::new();
+        signal.trigger();
+        let count = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&count);
+        signal.on_trigger(Box::new(move || {
+            c.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn lock_recovers_from_poisoning() {
+        let mutex = Arc::new(Mutex::new(5));
+        let m = Arc::clone(&mutex);
+        let _ = std::thread::spawn(move || {
+            let _guard = m.lock().expect("fresh mutex");
+            panic!("poison the mutex");
+        })
+        .join();
+        assert!(mutex.is_poisoned());
+        assert_eq!(*lock(&mutex), 5);
+    }
+}
