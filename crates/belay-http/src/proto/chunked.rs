@@ -220,3 +220,15 @@ pub(crate) fn encode_chunk(out: &mut Vec<u8>, data: &[u8]) {
     out.extend_from_slice(data);
     out.extend_from_slice(b"\r\n");
 }
+
+/// The last chunk with an empty trailer section.
+pub(crate) const LAST_CHUNK: &[u8] = b"0\r\n\r\n";
+
+/// A chunked body read through an [`InBuf`] that may already hold some of
+/// its bytes; decoded data is staged in `pending` between reads.
+#[derive(Debug)]
+pub(crate) struct ChunkedBody {
+    decoder: ChunkedDecoder,
+    pending: Vec<u8>,
+    pos: usize,
+}
