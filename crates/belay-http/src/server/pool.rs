@@ -38,3 +38,24 @@ pub(crate) struct Rejected<J> {
     pub(crate) job: J,
     pub(crate) reason: RejectReason,
 }
+
+struct State<J> {
+    queue: VecDeque<J>,
+    /// Jobs queued or running.
+    active: usize,
+    threads: usize,
+    busy: usize,
+    closing: bool,
+    handles: Vec<JoinHandle<()>>,
+    spawned: usize,
+}
+
+struct Inner<J> {
+    state: Mutex<State<J>>,
+    work: Condvar,
+    finished: Condvar,
+    run: Box<dyn Fn(J) + Send + Sync>,
+    max_active: usize,
+    thread_idle: Duration,
+    name: String,
+}
