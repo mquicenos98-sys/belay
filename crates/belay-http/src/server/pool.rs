@@ -212,3 +212,128 @@ fn worker_loop<J>(inner: &Inner<J>) {
     }
     state.threads -= 1;
 }
+
+impl<J> fmt::Debug for WorkerPool<J> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = lock(&self.inner.state);
+        f.debug_struct("WorkerPool")
+            .field("active", &state.active)
+            .field("threads", &state.threads)
+            .field("busy", &state.busy)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    type Gate = mpsc::Sender<()>;
+
+    fn pool_with_gate(max: usize) -> (WorkerPool<u32>, Gate, mpsc::Receiver<u32>) {
+        let (gate_tx, gate_rx) = mpsc::channel::<()>();
+        let gate_rx = Mutex::new(gate_rx);
+        let (done_tx, done_rx) = mpsc::channel();
+        let done_tx = Mutex::new(done_tx);
+        let pool = WorkerPool::new("test-pool", max, Duration::from_secs(5), move |job: u32| {
+            // Every job blocks until the test opens the gate once for it.
+            let _ = lock(&gate_rx).recv();
+            let _ = lock(&done_tx).send(job);
+        });
+        (pool, gate_tx, done_rx)
+    }
+
+    #[test]
+    fn long_jobs_do_not_block_new_ones() {
+        let (pool, gate, done) = pool_with_gate(4);
+        for job in 0..3 {
+            pool.try_execute(job).expect("capacity available");
+        }
+        assert_eq!(pool.active(), 3);
+        for _ in 0..3 {
+            gate.send(()).expect("workers listening");
+        }
+        let mut finished: Vec<u32> = (0..3)
+            .map(|_| {
+                done.recv_timeout(Duration::from_secs(5))
+                    .expect("job finished")
+            })
+            .collect();
+        finished.sort_unstable();
+        assert_eq!(finished, [0, 1, 2]);
+        assert!(pool.wait_idle(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn rejects_beyond_capacity_and_hands_the_job_back() {
+        let (pool, gate, done) = pool_with_gate(2);
+        pool.try_execute(1).expect("first fits");
+        pool.try_execute(2).expect("second fits");
+        let rejected = pool.try_execute(3).expect_err("pool is full");
+        assert_eq!(rejected.job, 3);
+        assert!(matches!(rejected.reason, RejectReason::Saturated));
+        gate.send(()).expect("workers listening");
+        done.recv_timeout(Duration::from_secs(5))
+            .expect("one job finished");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while pool.active() > 1 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        pool.try_execute(4).expect("capacity after a job finished");
+        gate.send(()).expect("workers listening");
+        gate.send(()).expect("workers listening");
+        assert!(pool.wait_idle(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn idle_threads_are_reused() {
+        let (pool, gate, done) = pool_with_gate(8);
+        for job in 0..5 {
+            gate.send(()).expect("buffered");
+            pool.try_execute(job).expect("capacity");
+            done.recv_timeout(Duration::from_secs(5))
+                .expect("job finished");
+            assert!(pool.wait_idle(Duration::from_secs(5)));
+        }
+        let threads = lock(&pool.inner.state).threads;
+        assert_eq!(threads, 1, "sequential jobs should share one thread");
+    }
+
+    #[test]
+    fn closed_pool_rejects_and_joins() {
+        let (pool, gate, _done) = pool_with_gate(2);
+        pool.try_execute(1).expect("capacity");
+        gate.send(()).expect("buffered");
+        pool.close();
+        assert!(matches!(
+            pool.try_execute(2).expect_err("closed").reason,
+            RejectReason::Closed
+        ));
+        assert!(pool.wait_idle(Duration::from_secs(5)));
+        pool.join();
+        assert_eq!(lock(&pool.inner.state).threads, 0);
+    }
+
+    #[test]
+    fn panicking_jobs_do_not_leak_slots() {
+        let pool = WorkerPool::new("panicky", 1, Duration::from_secs(5), |fail: bool| {
+            if fail {
+                panic!("job failed");
+            }
+        });
+        pool.try_execute(true).expect("capacity");
+        assert!(pool.wait_idle(Duration::from_secs(5)));
+        pool.try_execute(false).expect("slot was released");
+        assert!(pool.wait_idle(Duration::from_secs(5)));
+    }
+
+    #[test]
+    fn wait_idle_times_out_while_jobs_run() {
+        let (pool, gate, _done) = pool_with_gate(1);
+        pool.try_execute(1).expect("capacity");
+        assert!(!pool.wait_idle(Duration::from_millis(20)));
+        gate.send(()).expect("worker listening");
+        assert!(pool.wait_idle(Duration::from_secs(5)));
+    }
+}
