@@ -400,3 +400,213 @@ fn is_reg_name_byte(b: u8) -> bool {
 fn is_literal_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/?".contains(&b)
 }
+
+/// Percent-encodes everything that may not appear literally, keeping
+/// well-formed `%XX` escapes as they are.
+fn normalize(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        let valid_escape = b == b'%'
+            && bytes.get(i + 1).copied().and_then(hex_value).is_some()
+            && bytes.get(i + 2).copied().and_then(hex_value).is_some();
+        if is_literal_byte(b) || valid_escape {
+            out.push(b as char);
+        } else {
+            push_escape(&mut out, b);
+        }
+        i += 1;
+    }
+    out
+}
+
+/// RFC 3986 §5.2.4.
+fn remove_dot_segments(path: &str) -> String {
+    let mut input = path;
+    let mut output: Vec<&str> = Vec::new();
+    while !input.is_empty() {
+        if let Some(rest) = input.strip_prefix("../") {
+            input = rest;
+        } else if let Some(rest) = input.strip_prefix("./") {
+            input = rest;
+        } else if input.starts_with("/./") {
+            input = &input[2..];
+        } else if input == "/." {
+            input = "/";
+        } else if input.starts_with("/../") {
+            input = &input[3..];
+            output.pop();
+        } else if input == "/.." {
+            input = "/";
+            output.pop();
+        } else if input == "." || input == ".." {
+            input = "";
+        } else {
+            let skip = usize::from(input.starts_with('/'));
+            let end = input[skip..].find('/').map_or(input.len(), |i| i + skip);
+            output.push(&input[..end]);
+            input = &input[end..];
+        }
+    }
+    output.concat()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url(s: &str) -> Url {
+        Url::parse(s).unwrap_or_else(|e| panic!("{s:?} should parse: {e}"))
+    }
+
+    #[test]
+    fn parses_all_components() {
+        let u = url("HTTP://user:pw@Host.Example:81/a/b?x=1&y#frag");
+        assert_eq!(u.scheme(), "http");
+        assert_eq!(u.userinfo(), Some("user:pw"));
+        assert_eq!(u.host(), "host.example");
+        assert_eq!(u.port(), Some(81));
+        assert_eq!(u.path(), "/a/b");
+        assert_eq!(u.query(), Some("x=1&y"));
+        assert_eq!(u.fragment(), Some("frag"));
+        assert_eq!(
+            u.to_string(),
+            "http://user:pw@host.example:81/a/b?x=1&y#frag"
+        );
+    }
+
+    #[test]
+    fn empty_path_becomes_root() {
+        assert_eq!(url("http://h").path(), "/");
+        assert_eq!(url("http://h?q").request_target(), "/?q");
+        assert_eq!(url("http://h:").port(), None);
+    }
+
+    #[test]
+    fn ipv6_hosts_are_bracketed_on_output() {
+        let u = url("http://[::1]:9000/x");
+        assert_eq!(u.host(), "::1");
+        assert_eq!(u.authority(), "[::1]:9000");
+        assert_eq!(u.to_string(), "http://[::1]:9000/x");
+        assert_eq!(url("http://[2001:DB8::1]/").host(), "2001:db8::1");
+    }
+
+    #[test]
+    fn authority_omits_default_port() {
+        assert_eq!(url("http://h:80/").authority(), "h");
+        assert_eq!(url("http://h:8080/").authority(), "h:8080");
+        assert_eq!(url("https://h/").port_or_default(), Some(443));
+        assert_eq!(url("ftp://h/").port_or_default(), None);
+    }
+
+    #[test]
+    fn disallowed_characters_are_encoded() {
+        let u = url("http://h/a b/\u{e9}?q=a b&r=\"x\"");
+        assert_eq!(u.path(), "/a%20b/%C3%A9");
+        assert_eq!(u.query(), Some("q=a%20b&r=%22x%22"));
+        assert_eq!(url("http://h/100%").path(), "/100%25");
+        assert_eq!(url("http://h/%41").path(), "/%41");
+    }
+
+    #[test]
+    fn rejects_malformed_urls() {
+        let cases = [
+            ("", UrlError::Empty),
+            ("   ", UrlError::Empty),
+            ("/relative/path", UrlError::MissingScheme),
+            ("1http://h/", UrlError::InvalidScheme("1http".into())),
+            ("mailto:someone", UrlError::MissingAuthority),
+            ("http:///path", UrlError::InvalidHost("".into())),
+            ("http://h:99999/", UrlError::InvalidPort("99999".into())),
+            ("http://h:8o/", UrlError::InvalidPort("8o".into())),
+            ("http://[::1/", UrlError::InvalidHost("[::1".into())),
+            ("http://[zz]/", UrlError::InvalidHost("[zz]".into())),
+            ("http://ho st/", UrlError::InvalidHost("ho st".into())),
+            (
+                "http://h/\ninjected",
+                UrlError::InvalidCharacter { position: 9 },
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(Url::parse(input), Err(expected), "{input:?}");
+        }
+    }
+
+    #[test]
+    fn resolves_rfc_3986_normal_examples() {
+        let base = url("http://a/b/c/d;p?q");
+        let cases = [
+            ("g", "http://a/b/c/g"),
+            ("./g", "http://a/b/c/g"),
+            ("g/", "http://a/b/c/g/"),
+            ("/g", "http://a/g"),
+            // RFC result is "http://g"; this type always has a non-empty path.
+            ("//g", "http://g/"),
+            ("?y", "http://a/b/c/d;p?y"),
+            ("g?y", "http://a/b/c/g?y"),
+            ("#s", "http://a/b/c/d;p?q#s"),
+            ("g#s", "http://a/b/c/g#s"),
+            ("g?y#s", "http://a/b/c/g?y#s"),
+            (";x", "http://a/b/c/;x"),
+            ("g;x", "http://a/b/c/g;x"),
+            ("g;x?y#s", "http://a/b/c/g;x?y#s"),
+            ("", "http://a/b/c/d;p?q"),
+            (".", "http://a/b/c/"),
+            ("./", "http://a/b/c/"),
+            ("..", "http://a/b/"),
+            ("../", "http://a/b/"),
+            ("../g", "http://a/b/g"),
+            ("../..", "http://a/"),
+            ("../../", "http://a/"),
+            ("../../g", "http://a/g"),
+        ];
+        for (reference, expected) in cases {
+            let joined = base.join(reference).expect("valid reference");
+            assert_eq!(joined.to_string(), expected, "reference {reference:?}");
+        }
+    }
+
+    #[test]
+    fn resolves_rfc_3986_abnormal_examples() {
+        let base = url("http://a/b/c/d;p?q");
+        let cases = [
+            ("../../../g", "http://a/g"),
+            ("../../../../g", "http://a/g"),
+            ("/./g", "http://a/g"),
+            ("/../g", "http://a/g"),
+            ("g.", "http://a/b/c/g."),
+            (".g", "http://a/b/c/.g"),
+            ("g..", "http://a/b/c/g.."),
+            ("..g", "http://a/b/c/..g"),
+            ("./../g", "http://a/b/g"),
+            ("./g/.", "http://a/b/c/g/"),
+            ("g/./h", "http://a/b/c/g/h"),
+            ("g/../h", "http://a/b/c/h"),
+            ("g;x=1/./y", "http://a/b/c/g;x=1/y"),
+            ("g;x=1/../y", "http://a/b/c/y"),
+            ("http://other:81/x/../y", "http://other:81/y"),
+        ];
+        for (reference, expected) in cases {
+            let joined = base.join(reference).expect("valid reference");
+            assert_eq!(joined.to_string(), expected, "reference {reference:?}");
+        }
+    }
+
+    #[test]
+    fn with_query_encodes_pairs() {
+        let query: Query = [("state", "ready"), ("tag", "a b")].into_iter().collect();
+        let u = url("http://h/v1/jobs").with_query(&query);
+        assert_eq!(u.to_string(), "http://h/v1/jobs?state=ready&tag=a%20b");
+        assert_eq!(u.query_pairs().get("tag"), Some("a b"));
+        assert_eq!(u.with_query(&Query::new()).query(), None);
+    }
+
+    #[test]
+    fn set_path_adds_leading_slash() {
+        let mut u = url("http://h/old?q=1");
+        u.set_path("v1/new path");
+        assert_eq!(u.to_string(), "http://h/v1/new%20path?q=1");
+    }
+}
