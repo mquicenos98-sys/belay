@@ -327,3 +327,76 @@ fn check_controls(s: &str) -> Result<(), UrlError> {
         None => Ok(()),
     }
 }
+
+/// Byte index of the `:` ending a valid scheme, if `s` starts with one.
+fn scheme_end(s: &str) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if !bytes.first()?.is_ascii_alphabetic() {
+        return None;
+    }
+    for (i, &b) in bytes.iter().enumerate().skip(1) {
+        match b {
+            b':' => return Some(i),
+            b if b.is_ascii_alphanumeric() || matches!(b, b'+' | b'-' | b'.') => {}
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn split_off(s: &str, delimiter: char) -> (&str, Option<&str>) {
+    match s.split_once(delimiter) {
+        Some((before, after)) => (before, Some(after)),
+        None => (s, None),
+    }
+}
+
+fn parse_host_port(input: &str) -> Result<(String, Option<u16>), UrlError> {
+    let (host, port) = if let Some(bracketed) = input.strip_prefix('[') {
+        let close = bracketed
+            .find(']')
+            .ok_or_else(|| UrlError::InvalidHost(input.to_owned()))?;
+        let literal = &bracketed[..close];
+        let addr: Ipv6Addr = literal
+            .parse()
+            .map_err(|_| UrlError::InvalidHost(input.to_owned()))?;
+        let after = &bracketed[close + 1..];
+        let port = match after {
+            "" => None,
+            _ => Some(
+                after
+                    .strip_prefix(':')
+                    .ok_or_else(|| UrlError::InvalidPort(after.to_owned()))?,
+            ),
+        };
+        (addr.to_string(), port)
+    } else {
+        let (host, port) = split_off(input, ':');
+        if host.is_empty() || !host.bytes().all(is_reg_name_byte) {
+            return Err(UrlError::InvalidHost(host.to_owned()));
+        }
+        (host.to_ascii_lowercase(), port)
+    };
+    let port = match port {
+        None | Some("") => None,
+        Some(digits) => {
+            if !digits.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(UrlError::InvalidPort(digits.to_owned()));
+            }
+            Some(
+                digits
+                    .parse::<u16>()
+                    .map_err(|_| UrlError::InvalidPort(digits.to_owned()))?,
+            )
+        }
+    };
+    Ok((host, port))
+}
+
+fn is_reg_name_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=%".contains(&b)
+}
+
+fn is_literal_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b"-._~!$&'()*+,;=:@/?".contains(&b)
+}
