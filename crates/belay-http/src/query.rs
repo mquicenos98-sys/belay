@@ -213,3 +213,76 @@ impl fmt::Display for QueryError {
         }
     }
 }
+
+impl std::error::Error for QueryError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_pairs_in_order_with_duplicates() {
+        let query = Query::parse("?a=1&b=2&a=3");
+        let pairs: Vec<_> = query.iter().collect();
+        assert_eq!(pairs, [("a", "1"), ("b", "2"), ("a", "3")]);
+    }
+
+    #[test]
+    fn keys_without_values_and_empty_pieces() {
+        let query = Query::parse("flag&&x=&=orphan");
+        assert!(query.contains("flag"));
+        assert_eq!(query.get("flag"), Some(""));
+        assert_eq!(query.get("x"), Some(""));
+        assert_eq!(query.get(""), Some("orphan"));
+        assert_eq!(query.len(), 3);
+    }
+
+    #[test]
+    fn values_are_form_decoded() {
+        let query = Query::parse("q=a+b%26c&name=caf%C3%A9&bad=%zz");
+        assert_eq!(query.get("q"), Some("a b&c"));
+        assert_eq!(query.get("name"), Some("café"));
+        assert_eq!(query.get("bad"), Some("%zz"));
+    }
+
+    #[test]
+    fn value_containing_equals_splits_on_first() {
+        let query = Query::parse("expr=a=b");
+        assert_eq!(query.get("expr"), Some("a=b"));
+    }
+
+    #[test]
+    fn typed_lookup_errors_name_the_parameter() {
+        let query = Query::parse("limit=ten&n=");
+        let err = query.parse_value::<u32>("limit").expect_err("not a number");
+        assert_eq!(err.key, "limit");
+        assert_eq!(
+            err.to_string(),
+            "invalid value \"ten\" for query parameter `limit`: invalid digit found in string"
+        );
+        assert_eq!(query.parse_value::<u32>("n"), Ok(None));
+        assert_eq!(
+            query
+                .require::<u32>("cursor")
+                .expect_err("absent")
+                .to_string(),
+            "missing query parameter `cursor`"
+        );
+    }
+
+    #[test]
+    fn list_accepts_commas_and_repeats() {
+        let query = Query::parse("types=job.succeeded,job.failed&types=queue.paused&types=");
+        let types: Vec<_> = query.list("types").collect();
+        assert_eq!(types, ["job.succeeded", "job.failed", "queue.paused"]);
+    }
+
+    #[test]
+    fn set_and_remove() {
+        let mut query = Query::parse("a=1&a=2&b=3");
+        query.set("a", "9");
+        query.remove("b");
+        query.append("c", "x y");
+        assert_eq!(query.to_query_string(), "a=9&c=x%20y");
+    }
+}
