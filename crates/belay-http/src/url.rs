@@ -272,3 +272,58 @@ impl Url {
         }
     }
 }
+
+impl fmt::Display for Url {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}://", self.scheme)?;
+        if let Some(userinfo) = &self.userinfo {
+            write!(f, "{userinfo}@")?;
+        }
+        f.write_str(&self.bracketed_host())?;
+        if let Some(port) = self.port {
+            write!(f, ":{port}")?;
+        }
+        f.write_str(&self.path)?;
+        if let Some(query) = &self.query {
+            write!(f, "?{query}")?;
+        }
+        if let Some(fragment) = &self.fragment {
+            write!(f, "#{fragment}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for Url {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Url({self})")
+    }
+}
+
+impl FromStr for Url {
+    type Err = UrlError;
+
+    fn from_str(s: &str) -> Result<Self, UrlError> {
+        Url::parse(s)
+    }
+}
+
+/// The well-known port for `scheme`.
+pub fn default_port(scheme: &str) -> Option<u16> {
+    match scheme {
+        "http" | "ws" => Some(80),
+        "https" | "wss" => Some(443),
+        _ => None,
+    }
+}
+
+fn trim(s: &str) -> &str {
+    s.trim_matches(|c: char| c.is_ascii_whitespace())
+}
+
+fn check_controls(s: &str) -> Result<(), UrlError> {
+    match s.bytes().position(|b| b < 0x20 || b == 0x7f) {
+        Some(position) => Err(UrlError::InvalidCharacter { position }),
+        None => Ok(()),
+    }
+}
