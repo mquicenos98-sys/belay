@@ -147,3 +147,55 @@ pub(crate) fn connect(host: &str, port: u16, timeout: Duration) -> Result<TcpStr
         )),
     })
 }
+
+/// A connection in use for one exchange.
+pub(crate) struct Conn {
+    pub(crate) stream: TcpStream,
+    pub(crate) buf: InBuf,
+    pub(crate) key: PoolKey,
+    /// Taken from the pool rather than freshly connected.
+    pub(crate) reused: bool,
+}
+
+impl Conn {
+    pub(crate) fn new(stream: TcpStream, key: PoolKey, reused: bool) -> Self {
+        Conn {
+            stream,
+            buf: InBuf::new(),
+            key,
+            reused,
+        }
+    }
+}
+
+/// One outgoing request.
+pub(crate) struct Outgoing<'a> {
+    pub(crate) method: &'a Method,
+    pub(crate) url: &'a Url,
+    pub(crate) headers: &'a Headers,
+    pub(crate) body: &'a [u8],
+    pub(crate) user_agent: &'a str,
+    /// Ask the server to close the connection afterwards.
+    pub(crate) close: bool,
+    pub(crate) read_timeout: Option<Duration>,
+    pub(crate) write_timeout: Option<Duration>,
+    pub(crate) max_head_bytes: usize,
+}
+
+/// A failed exchange. `stale` means the failure happened on a reused
+/// connection before any response byte arrived, the signature of a
+/// connection the server closed while it sat in the pool; such requests
+/// can be retried on a fresh connection if they are idempotent.
+pub(crate) struct Failure {
+    pub(crate) error: Error,
+    pub(crate) stale: bool,
+}
+
+impl Failure {
+    fn fatal(error: impl Into<Error>) -> Self {
+        Failure {
+            error: error.into(),
+            stale: false,
+        }
+    }
+}
