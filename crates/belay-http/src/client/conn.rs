@@ -199,3 +199,118 @@ impl Failure {
         }
     }
 }
+
+fn non_zero(timeout: Option<Duration>) -> Option<Duration> {
+    timeout.filter(|t| !t.is_zero())
+}
+
+/// Sends the request and reads the final response head, skipping interim
+/// 1xx responses.
+pub(crate) fn exchange(conn: &mut Conn, out: &Outgoing<'_>) -> Result<ResponseHead, Failure> {
+    conn.stream
+        .set_read_timeout(non_zero(out.read_timeout))
+        .map_err(Failure::fatal)?;
+    conn.stream
+        .set_write_timeout(non_zero(out.write_timeout))
+        .map_err(Failure::fatal)?;
+
+    let mut wire = Vec::with_capacity(256 + out.body.len().min(INLINE_BODY_LIMIT));
+    encode_request_head(
+        &mut wire,
+        out.method,
+        &out.url.request_target(),
+        &out.url.authority(),
+        out.user_agent,
+        out.headers,
+        out.body.len(),
+    )
+    .map_err(Failure::fatal)?;
+    if out.close && !out.headers.contains(CONNECTION) {
+        // Splice `Connection: close` in before the blank line.
+        wire.truncate(wire.len() - 2);
+        push_field(&mut wire, CONNECTION, "close").map_err(Failure::fatal)?;
+        wire.extend_from_slice(b"\r\n");
+    }
+    let inline = out.body.len() <= INLINE_BODY_LIMIT;
+    if inline {
+        wire.extend_from_slice(out.body);
+    }
+    let mut written = (&conn.stream).write_all(&wire);
+    if written.is_ok() && !inline {
+        written = (&conn.stream).write_all(out.body);
+    }
+    if let Err(e) = written {
+        let timed_out = matches!(
+            e.kind(),
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+        );
+        return Err(Failure {
+            stale: conn.reused && !timed_out,
+            error: Error::from_io(e, "write"),
+        });
+    }
+
+    let limits = HeadLimits {
+        start_line: out.max_head_bytes,
+        head: out.max_head_bytes,
+        headers: 256,
+    };
+    let mut received_any = false;
+    loop {
+        let mut parser = ResponseParser::new(limits);
+        let head = loop {
+            if !conn.buf.is_empty() {
+                if let Some((head, len)) =
+                    parser.parse(conn.buf.as_slice()).map_err(Failure::fatal)?
+                {
+                    conn.buf.consume(len);
+                    break head;
+                }
+            }
+            match conn.buf.read_from(&mut &conn.stream, READ_CHUNK) {
+                Ok(0) => {
+                    return Err(Failure {
+                        error: Error::ConnectionClosed,
+                        stale: conn.reused && !received_any,
+                    })
+                }
+                Ok(_) => received_any = true,
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => {
+                    let timed_out = matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    );
+                    return Err(Failure {
+                        stale: conn.reused && !received_any && !timed_out,
+                        error: Error::from_io(e, "read"),
+                    });
+                }
+            }
+        };
+        if head.status.is_informational() && head.status != StatusCode::SWITCHING_PROTOCOLS {
+            continue;
+        }
+        return Ok(head);
+    }
+}
+
+enum Framing {
+    Length(u64),
+    Chunked(ChunkedBody),
+    UntilClose,
+    Done,
+}
+
+/// A response body being read from the connection.
+///
+/// Implements [`Read`]. When the body has been read to the end and the
+/// connection may be reused, it goes back to the client's pool; dropping a
+/// partially read body closes the connection instead.
+pub struct ResponseBody {
+    conn: Option<Conn>,
+    framing: Framing,
+    keep_alive: bool,
+    pool: Arc<Pool>,
+    limit: u64,
+}
