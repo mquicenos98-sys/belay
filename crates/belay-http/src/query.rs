@@ -154,3 +154,62 @@ impl Query {
         out
     }
 }
+
+impl fmt::Display for Query {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.to_query_string())
+    }
+}
+
+impl fmt::Debug for Query {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_list().entries(self.iter()).finish()
+    }
+}
+
+impl<K: Into<String>, V: Into<String>> FromIterator<(K, V)> for Query {
+    fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
+        Query {
+            pairs: iter
+                .into_iter()
+                .map(|(k, v)| (k.into(), v.into()))
+                .collect(),
+        }
+    }
+}
+
+/// A query parameter that was missing or failed to parse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueryError {
+    /// The parameter name.
+    pub key: String,
+    /// What went wrong.
+    pub kind: QueryErrorKind,
+}
+
+/// The two ways a typed query lookup fails.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QueryErrorKind {
+    /// The parameter was required but absent.
+    Missing,
+    /// The value did not parse.
+    Invalid {
+        /// The raw (decoded) value.
+        value: String,
+        /// The parser's explanation.
+        reason: String,
+    },
+}
+
+impl fmt::Display for QueryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            QueryErrorKind::Missing => write!(f, "missing query parameter `{}`", self.key),
+            QueryErrorKind::Invalid { value, reason } => write!(
+                f,
+                "invalid value {value:?} for query parameter `{}`: {reason}",
+                self.key
+            ),
+        }
+    }
+}
