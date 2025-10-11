@@ -23,7 +23,6 @@ use crate::sync::lock;
 use crate::url::Url;
 
 const READ_CHUNK: usize = 16 * 1024;
-
 /// Bodies up to this size go out in the same write as the head.
 const INLINE_BODY_LIMIT: usize = 64 * 1024;
 
@@ -313,4 +312,273 @@ pub struct ResponseBody {
     keep_alive: bool,
     pool: Arc<Pool>,
     limit: u64,
+}
+
+impl ResponseBody {
+    pub(crate) fn new(
+        conn: Conn,
+        framing: BodyFraming,
+        keep_alive: bool,
+        pool: Arc<Pool>,
+        limit: u64,
+    ) -> Self {
+        let framing = match framing {
+            BodyFraming::Empty => Framing::Done,
+            BodyFraming::Length(n) => Framing::Length(n),
+            BodyFraming::Chunked => Framing::Chunked(ChunkedBody::new(limit)),
+            BodyFraming::UntilClose => Framing::UntilClose,
+        };
+        let mut body = ResponseBody {
+            conn: Some(conn),
+            framing,
+            keep_alive,
+            pool,
+            limit,
+        };
+        if matches!(body.framing, Framing::Done) {
+            body.finish();
+        }
+        body
+    }
+
+    /// The declared length, when the response has a `Content-Length`.
+    pub fn content_length(&self) -> Option<u64> {
+        match self.framing {
+            Framing::Length(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Whether the whole body has been read.
+    pub fn is_complete(&self) -> bool {
+        matches!(self.framing, Framing::Done)
+    }
+
+    /// Reads the rest of the body into memory, up to the client's
+    /// response-size limit.
+    pub fn read_to_vec(&mut self) -> Result<Vec<u8>> {
+        if let Framing::Length(n) = self.framing {
+            if n > self.limit {
+                return Err(Error::BodyTooLarge { limit: self.limit });
+            }
+        }
+        let initial = self.content_length().unwrap_or(0).min(1 << 20) as usize;
+        let mut body = Vec::with_capacity(initial);
+        let mut chunk = [0u8; READ_CHUNK];
+        loop {
+            let n = self.read(&mut chunk).map_err(body_error)?;
+            if n == 0 {
+                return Ok(body);
+            }
+            if (body.len() + n) as u64 > self.limit {
+                return Err(Error::BodyTooLarge { limit: self.limit });
+            }
+            body.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// Reads and discards up to `max` bytes so a small unwanted body (a
+    /// redirect's, say) does not cost the connection.
+    pub(crate) fn discard(mut self, max: usize) {
+        let mut chunk = [0u8; 4096];
+        let mut total = 0;
+        while total < max {
+            match self.read(&mut chunk) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => total += n,
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        let complete = !matches!(self.framing, Framing::UntilClose);
+        self.framing = Framing::Done;
+        if let Some(conn) = self.conn.take() {
+            // Leftover bytes would be mistaken for the next response.
+            if self.keep_alive && complete && conn.buf.is_empty() {
+                self.pool.checkin(conn.key, conn.stream);
+            }
+        }
+    }
+}
+
+impl Read for ResponseBody {
+    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let Some(conn) = self.conn.as_mut() else {
+            return Ok(0);
+        };
+        let (n, complete) = match &mut self.framing {
+            Framing::Done => (0, true),
+            Framing::Length(remaining) => {
+                if *remaining == 0 {
+                    (0, true)
+                } else {
+                    if conn.buf.is_empty()
+                        && conn.buf.read_from(&mut &conn.stream, READ_CHUNK)? == 0
+                    {
+                        return Err(io::ErrorKind::UnexpectedEof.into());
+                    }
+                    // Bounded by the buffer length, so it fits in usize.
+                    let n = (conn.buf.len() as u64)
+                        .min(*remaining)
+                        .min(out.len() as u64) as usize;
+                    out[..n].copy_from_slice(&conn.buf.as_slice()[..n]);
+                    conn.buf.consume(n);
+                    *remaining -= n as u64;
+                    (n, *remaining == 0)
+                }
+            }
+            Framing::Chunked(body) => {
+                let n = body.read(&mut &conn.stream, &mut conn.buf, out)?;
+                (n, body.is_done())
+            }
+            Framing::UntilClose => {
+                let n = if conn.buf.is_empty() {
+                    (&conn.stream).read(out)?
+                } else {
+                    let n = conn.buf.len().min(out.len());
+                    out[..n].copy_from_slice(&conn.buf.as_slice()[..n]);
+                    conn.buf.consume(n);
+                    n
+                };
+                (n, n == 0)
+            }
+        };
+        if complete {
+            self.finish();
+        }
+        Ok(n)
+    }
+}
+
+impl fmt::Debug for ResponseBody {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResponseBody")
+            .field("complete", &self.is_complete())
+            .field("content_length", &self.content_length())
+            .finish()
+    }
+}
+
+/// Maps a body read error: framing errors surface as
+/// [`Error::Protocol`], timeouts as [`Error::Timeout`].
+pub(crate) fn body_error(err: io::Error) -> Error {
+    if err.kind() == io::ErrorKind::InvalidData {
+        if let Some(parse) = err
+            .get_ref()
+            .and_then(|inner| inner.downcast_ref::<ParseError>())
+        {
+            return match parse {
+                ParseError::BodyTooLarge { limit } => Error::BodyTooLarge { limit: *limit },
+                other => Error::Protocol(other.clone()),
+            };
+        }
+    }
+    Error::from_io(err, "read")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpListener;
+    use std::thread;
+
+    fn pair() -> (TcpStream, TcpStream) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+        let (server, _) = listener.accept().expect("accept");
+        (client, server)
+    }
+
+    fn key() -> PoolKey {
+        ("127.0.0.1".to_owned(), 1)
+    }
+
+    #[test]
+    fn pool_hands_out_live_connections_lifo() {
+        let pool = Pool::new(4, Duration::from_secs(60));
+        let (a, _a_peer) = pair();
+        let (b, _b_peer) = pair();
+        let b_port = b.local_addr().expect("addr").port();
+        pool.checkin(key(), a);
+        pool.checkin(key(), b);
+        assert_eq!(pool.idle_count(), 2);
+        let first = pool.checkout(&key()).expect("live connection");
+        assert_eq!(first.local_addr().expect("addr").port(), b_port);
+        assert_eq!(pool.idle_count(), 1);
+    }
+
+    #[test]
+    fn pool_discards_connections_closed_by_the_peer() {
+        let pool = Pool::new(4, Duration::from_secs(60));
+        let (conn, peer) = pair();
+        pool.checkin(key(), conn);
+        drop(peer);
+        // Give the FIN a moment to arrive.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut result = pool.checkout(&key());
+        while result.is_some() && Instant::now() < deadline {
+            pool.checkin(key(), result.take().expect("checked above"));
+            thread::sleep(Duration::from_millis(5));
+            result = pool.checkout(&key());
+        }
+        assert!(result.is_none(), "closed connection must not be reused");
+        assert_eq!(pool.idle_count(), 0);
+    }
+
+    #[test]
+    fn pool_discards_connections_with_unsolicited_data() {
+        let pool = Pool::new(4, Duration::from_secs(60));
+        let (conn, mut peer) = pair();
+        peer.write_all(b"HTTP/1.1 408 Request Timeout\r\n\r\n")
+            .expect("write");
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut probe = [0u8; 1];
+        while conn.peek(&mut probe).unwrap_or(0) == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        pool.checkin(key(), conn);
+        assert!(pool.checkout(&key()).is_none());
+    }
+
+    #[test]
+    fn pool_respects_limits_and_expiry() {
+        let pool = Pool::new(1, Duration::from_secs(60));
+        let (a, _pa) = pair();
+        let (b, _pb) = pair();
+        pool.checkin(key(), a);
+        pool.checkin(key(), b);
+        assert_eq!(pool.idle_count(), 1);
+
+        let expired = Pool::new(4, Duration::ZERO);
+        let (c, _pc) = pair();
+        expired.checkin(key(), c);
+        assert!(expired.checkout(&key()).is_none());
+
+        let disabled = Pool::new(0, Duration::from_secs(60));
+        let (d, _pd) = pair();
+        disabled.checkin(key(), d);
+        assert_eq!(disabled.idle_count(), 0);
+    }
+
+    #[test]
+    fn body_errors_are_classified() {
+        let chunk = io::Error::new(io::ErrorKind::InvalidData, ParseError::InvalidChunk("x"));
+        assert!(matches!(
+            body_error(chunk),
+            Error::Protocol(ParseError::InvalidChunk("x"))
+        ));
+        let big = io::Error::new(
+            io::ErrorKind::InvalidData,
+            ParseError::BodyTooLarge { limit: 3 },
+        );
+        assert!(matches!(body_error(big), Error::BodyTooLarge { limit: 3 }));
+        let eof = io::Error::from(io::ErrorKind::UnexpectedEof);
+        assert!(matches!(body_error(eof), Error::ConnectionClosed));
+        let slow = io::Error::from(io::ErrorKind::TimedOut);
+        assert!(body_error(slow).is_timeout());
+    }
 }
