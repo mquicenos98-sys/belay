@@ -100,3 +100,158 @@ enum Opened {
     Stream(ResponseBody),
     NoContent,
 }
+
+/// An event-stream subscription; iterate to receive events.
+///
+/// Blocking: `next` waits for the next event, reconnecting (with
+/// `Last-Event-ID`) whenever the connection drops. Iteration ends with
+/// `None` when the server answers `204 No Content` (the standard way to
+/// tell a client to stop), after a fatal error (yielded once as `Err`), or
+/// after [`close`](Self::close).
+///
+/// ```no_run
+/// use belay_http::{Client, SseOptions};
+///
+/// let client = Client::default();
+/// let events = client.sse_with(
+///     "http://127.0.0.1:7070/v1/events?types=job.failed",
+///     SseOptions::default().header("Authorization", "Bearer s3cret"),
+/// )?;
+/// for event in events {
+///     let event = event?;
+///     println!("{} {}: {}", event.id.as_deref().unwrap_or("-"), event.event_type(), event.data);
+/// }
+/// # Ok::<(), belay_http::Error>(())
+/// ```
+pub struct EventStream {
+    client: Client,
+    url: Url,
+    options: SseOptions,
+    parser: SseParser,
+    body: Option<ResponseBody>,
+    pending: VecDeque<SseEvent>,
+    delay: Duration,
+    failures: u32,
+    last_error: Option<Error>,
+    closed: bool,
+    buf: Vec<u8>,
+}
+
+impl EventStream {
+    pub(crate) fn connect(client: Client, url: Url, options: SseOptions) -> Result<EventStream> {
+        let parser = SseParser::new().with_max_event_bytes(options.max_event_bytes);
+        let mut stream = EventStream {
+            client,
+            url,
+            delay: options.reconnect_delay,
+            options,
+            parser,
+            body: None,
+            pending: VecDeque::new(),
+            failures: 0,
+            last_error: None,
+            closed: false,
+            buf: vec![0; 8 * 1024],
+        };
+        match stream.open()? {
+            Opened::Stream(body) => stream.body = Some(body),
+            Opened::NoContent => stream.closed = true,
+        }
+        Ok(stream)
+    }
+
+    /// The id of the last event received (or the one resumed from).
+    pub fn last_event_id(&self) -> Option<&str> {
+        self.parser.last_event_id()
+    }
+
+    /// The stream's URL.
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+
+    /// The current reconnection delay (possibly set by the server).
+    pub fn reconnect_delay(&self) -> Duration {
+        self.delay
+    }
+
+    /// Closes the connection; iteration then ends.
+    pub fn close(&mut self) {
+        self.closed = true;
+        self.body = None;
+    }
+
+    /// Whether the stream has ended.
+    pub fn is_closed(&self) -> bool {
+        self.closed
+    }
+
+    fn open(&mut self) -> Result<Opened> {
+        let mut req = Request::new(Method::Get, self.url.to_string());
+        req.headers = self.options.headers.clone();
+        req.headers.insert(ACCEPT, "text/event-stream");
+        req.headers.insert(CACHE_CONTROL, "no-cache");
+        if let Some(id) = self.parser.last_event_id() {
+            req.headers.insert(LAST_EVENT_ID, id);
+        }
+        let options = RequestOptions {
+            read_timeout: self.options.read_timeout,
+            redirects: None,
+        };
+        let mut response = self.client.stream_with(req, &options)?;
+        match response.status {
+            StatusCode::NO_CONTENT => return Ok(Opened::NoContent),
+            StatusCode::OK => {}
+            status => {
+                let body = response.body.read_to_vec().unwrap_or_default();
+                let end = body.len().min(512);
+                return Err(Error::Status {
+                    status,
+                    body: String::from_utf8_lossy(&body[..end]).trim_end().to_owned(),
+                });
+            }
+        }
+        let content_type = response.header(CONTENT_TYPE).unwrap_or("");
+        let media_type = content_type.split(';').next().unwrap_or("").trim();
+        if !media_type.eq_ignore_ascii_case("text/event-stream") {
+            return Err(Error::UnexpectedContentType {
+                expected: "text/event-stream",
+                found: content_type.to_owned(),
+            });
+        }
+        self.parser.reset();
+        Ok(Opened::Stream(response.body))
+    }
+
+    /// Replaces the current connection, after the reconnection delay.
+    /// Returns an item to yield when the stream has ended.
+    fn reconnect(&mut self) -> Option<Option<Result<SseEvent>>> {
+        if let Some(max) = self.options.max_reconnects {
+            if self.failures >= max {
+                self.closed = true;
+                let error = self.last_error.take().unwrap_or(Error::ConnectionClosed);
+                return Some(Some(Err(error)));
+            }
+        }
+        self.failures += 1;
+        std::thread::sleep(self.delay);
+        match self.open() {
+            Ok(Opened::Stream(body)) => {
+                self.body = Some(body);
+                None
+            }
+            Ok(Opened::NoContent) => {
+                self.closed = true;
+                Some(None)
+            }
+            Err(error) if is_fatal(&error) => {
+                self.closed = true;
+                Some(Some(Err(error)))
+            }
+            Err(error) => {
+                self.last_error = Some(error);
+                None
+            }
+        }
+    }
+}
