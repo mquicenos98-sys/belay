@@ -255,3 +255,105 @@ impl EventStream {
         }
     }
 }
+
+fn is_fatal(error: &Error) -> bool {
+    match error {
+        Error::Status { status, .. } => !matches!(status.as_u16(), 502..=504),
+        Error::UnexpectedContentType { .. }
+        | Error::Url(_)
+        | Error::UnsupportedScheme(_)
+        | Error::InvalidHeader(_)
+        | Error::InvalidMethod(_)
+        | Error::BodyTooLarge { .. } => true,
+        _ => false,
+    }
+}
+
+impl Iterator for EventStream {
+    type Item = Result<SseEvent>;
+
+    fn next(&mut self) -> Option<Result<SseEvent>> {
+        loop {
+            if let Some(event) = self.pending.pop_front() {
+                self.failures = 0;
+                self.last_error = None;
+                return Some(Ok(event));
+            }
+            if self.closed {
+                return None;
+            }
+            let read = match self.body.as_mut() {
+                Some(body) => body.read(&mut self.buf),
+                None => {
+                    if let Some(item) = self.reconnect() {
+                        return item;
+                    }
+                    continue;
+                }
+            };
+            match read {
+                Ok(n) if n > 0 => {
+                    let pending = &mut self.pending;
+                    if let Err(error) = self.parser.feed(&self.buf[..n], |e| pending.push_back(e)) {
+                        self.close();
+                        return Some(Err(error));
+                    }
+                    if let Some(retry) = self.parser.retry() {
+                        self.delay = retry;
+                    }
+                }
+                // End of stream, a read timeout (no heartbeat in time) or a
+                // reset: all mean reconnect. A partial event is discarded,
+                // as the spec requires.
+                Ok(_) | Err(_) => {
+                    self.body = None;
+                    self.parser.reset();
+                }
+            }
+        }
+    }
+}
+
+impl fmt::Debug for EventStream {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EventStream")
+            .field("url", &self.url)
+            .field("last_event_id", &self.last_event_id())
+            .field("connected", &self.body.is_some())
+            .field("closed", &self.closed)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transient_statuses_are_retried() {
+        let status = |code| Error::Status {
+            status: StatusCode::from_u16(code).expect("valid"),
+            body: String::new(),
+        };
+        assert!(!is_fatal(&status(503)));
+        assert!(!is_fatal(&status(502)));
+        assert!(is_fatal(&status(401)));
+        assert!(is_fatal(&status(500)));
+        assert!(!is_fatal(&Error::ConnectionClosed));
+        assert!(!is_fatal(&Error::Timeout("read")));
+    }
+
+    #[test]
+    fn option_builders() {
+        let options = SseOptions::default()
+            .header("Authorization", "Bearer t")
+            .last_event_id("41")
+            .reconnect_delay(Duration::from_millis(5))
+            .max_reconnects(2)
+            .read_timeout(None);
+        assert_eq!(options.headers.get("authorization"), Some("Bearer t"));
+        assert_eq!(options.last_event_id.as_deref(), Some("41"));
+        assert_eq!(options.max_reconnects, Some(2));
+        assert_eq!(options.read_timeout, None);
+    }
+}
