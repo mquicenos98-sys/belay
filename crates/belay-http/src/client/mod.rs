@@ -200,3 +200,262 @@ impl StreamingResponse {
         })
     }
 }
+
+struct ClientInner {
+    config: ClientConfig,
+    pool: Arc<Pool>,
+}
+
+/// An HTTP client. Cheap to clone; clones share the connection pool.
+///
+/// Connections are pooled per host and port. A pooled connection is probed
+/// (non-blocking peek) before reuse, and an idempotent request that fails
+/// on a reused connection before any response byte arrives is retried once
+/// on a fresh one: that is the signature of a connection the server closed
+/// while it sat idle. Non-idempotent requests (POST, PATCH) are never
+/// retried, since the server may have acted on them. A response is only
+/// pooled once its body has been read to the end.
+///
+/// There is no TLS support: `https://` URLs are rejected with
+/// [`Error::UnsupportedScheme`]. DNS resolution uses the system resolver
+/// through `ToSocketAddrs`, which has no timeout of its own;
+/// [`ClientConfig::connect_timeout`] applies per resolved address.
+///
+/// ```no_run
+/// use belay_http::{Client, ClientConfig};
+///
+/// let client = Client::new(ClientConfig::default());
+/// let jobs = client
+///     .get("http://127.0.0.1:7070/v1/jobs?state=ready", &[("Authorization", "Bearer s3cret")])?
+///     .error_for_status()?;
+/// println!("{}", jobs.text()?);
+/// # Ok::<(), belay_http::Error>(())
+/// ```
+#[derive(Clone)]
+pub struct Client {
+    inner: Arc<ClientInner>,
+}
+
+impl Default for Client {
+    fn default() -> Self {
+        Client::new(ClientConfig::default())
+    }
+}
+
+impl Client {
+    /// A client with the given settings.
+    pub fn new(config: ClientConfig) -> Client {
+        let pool = Arc::new(Pool::new(config.max_idle_per_host, config.idle_timeout));
+        Client {
+            inner: Arc::new(ClientInner { config, pool }),
+        }
+    }
+
+    /// The settings.
+    pub fn config(&self) -> &ClientConfig {
+        &self.inner.config
+    }
+
+    /// Idle connections currently pooled.
+    pub fn idle_connections(&self) -> usize {
+        self.inner.pool.idle_count()
+    }
+
+    /// Closes every idle pooled connection.
+    pub fn clear_idle(&self) {
+        self.inner.pool.clear();
+    }
+
+    /// Sends `req`, whose target must be an absolute `http://` URL, and
+    /// reads the whole response.
+    pub fn request(&self, req: Request) -> Result<ClientResponse> {
+        self.request_with(req, &RequestOptions::default())
+    }
+
+    /// [`request`](Self::request) with per-request overrides.
+    pub fn request_with(&self, req: Request, options: &RequestOptions) -> Result<ClientResponse> {
+        self.stream_with(req, options)?.collect()
+    }
+
+    /// Sends `req` and returns as soon as the response head has arrived.
+    pub fn stream(&self, req: Request) -> Result<StreamingResponse> {
+        self.stream_with(req, &RequestOptions::default())
+    }
+
+    /// [`stream`](Self::stream) with per-request overrides.
+    pub fn stream_with(&self, req: Request, options: &RequestOptions) -> Result<StreamingResponse> {
+        let mut url = Url::parse(&req.target)?;
+        check_scheme(&url)?;
+        let Request {
+            mut method,
+            mut headers,
+            mut body,
+            ..
+        } = req;
+        let config = &self.inner.config;
+        let policy = options.redirects.unwrap_or(config.redirects);
+        let read_timeout = options.read_timeout.or(config.read_timeout);
+        let mut hops = 0;
+        loop {
+            let response = self.execute(&method, &url, &headers, &body, read_timeout)?;
+            let status = response.status;
+            let followed = matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308);
+            let location = match response.header(LOCATION) {
+                Some(location) if followed && policy.max_hops > 0 => location.to_owned(),
+                _ => return Ok(response),
+            };
+            if hops == policy.max_hops {
+                return Err(Error::TooManyRedirects {
+                    max: policy.max_hops,
+                });
+            }
+            hops += 1;
+            let next = url.join(&location)?;
+            check_scheme(&next)?;
+            response.body.discard(REDIRECT_DRAIN_LIMIT);
+            // RFC 9110 §15.4: 303 always switches to GET; 301/302 do so for
+            // POST by long-standing convention. 307/308 preserve everything.
+            let to_get = status == StatusCode::SEE_OTHER
+                || (matches!(status.as_u16(), 301 | 302) && method == Method::Post);
+            if to_get {
+                if method != Method::Head {
+                    method = Method::Get;
+                }
+                body.clear();
+                headers.remove(CONTENT_TYPE);
+            }
+            let same_origin = next.host() == url.host();
+            if !same_origin && !policy.forward_credentials {
+                headers.remove(AUTHORIZATION);
+                headers.remove(COOKIE);
+            }
+            url = next;
+        }
+    }
+
+    /// One request/response exchange, retrying once on a fresh connection
+    /// when a pooled one turns out to be stale.
+    fn execute(
+        &self,
+        method: &Method,
+        url: &Url,
+        headers: &Headers,
+        body: &[u8],
+        read_timeout: Option<Duration>,
+    ) -> Result<StreamingResponse> {
+        let config = &self.inner.config;
+        let port = url.port_or_default().unwrap_or(80);
+        let key = (url.host().to_owned(), port);
+        let outgoing = Outgoing {
+            method,
+            url,
+            headers,
+            body,
+            user_agent: &config.user_agent,
+            close: config.max_idle_per_host == 0,
+            read_timeout,
+            write_timeout: config.write_timeout,
+            max_head_bytes: config.max_head_bytes,
+        };
+        if let Some(stream) = self.inner.pool.checkout(&key) {
+            let mut conn = Conn::new(stream, key.clone(), true);
+            match exchange(&mut conn, &outgoing) {
+                Ok(head) => return self.respond(conn, head, &outgoing),
+                Err(failure) if failure.stale => {}
+                Err(failure) => return Err(failure.error),
+            }
+        }
+        let stream = connect(&key.0, key.1, config.connect_timeout)?;
+        let mut conn = Conn::new(stream, key, false);
+        match exchange(&mut conn, &outgoing) {
+            Ok(head) => self.respond(conn, head, &outgoing),
+            Err(failure) => Err(failure.error),
+        }
+    }
+
+    fn respond(
+        &self,
+        conn: Conn,
+        head: crate::proto::parse::ResponseHead,
+        outgoing: &Outgoing<'_>,
+    ) -> Result<StreamingResponse> {
+        let framing = response_framing(outgoing.method, head.status, &head.headers)?;
+        let keep_alive = !outgoing.close
+            && !outgoing.headers.has_token(CONNECTION, "close")
+            && wants_keep_alive(head.version, &head.headers)
+            && framing != BodyFraming::UntilClose;
+        let body = ResponseBody::new(
+            conn,
+            framing,
+            keep_alive,
+            Arc::clone(&self.inner.pool),
+            self.inner.config.max_response_bytes,
+        );
+        Ok(StreamingResponse {
+            status: head.status,
+            version: head.version,
+            headers: head.headers,
+            url: outgoing.url.clone(),
+            body,
+        })
+    }
+
+    /// `GET url`.
+    pub fn get(&self, url: &str, headers: &[(&str, &str)]) -> Result<ClientResponse> {
+        self.request(build(Method::Get, url, headers, Vec::new()))
+    }
+
+    /// `HEAD url`.
+    pub fn head(&self, url: &str, headers: &[(&str, &str)]) -> Result<ClientResponse> {
+        self.request(build(Method::Head, url, headers, Vec::new()))
+    }
+
+    /// `DELETE url`.
+    pub fn delete(&self, url: &str, headers: &[(&str, &str)]) -> Result<ClientResponse> {
+        self.request(build(Method::Delete, url, headers, Vec::new()))
+    }
+
+    /// `POST url` with `body`.
+    pub fn post(
+        &self,
+        url: &str,
+        body: impl Into<Vec<u8>>,
+        headers: &[(&str, &str)],
+    ) -> Result<ClientResponse> {
+        self.request(build(Method::Post, url, headers, body.into()))
+    }
+
+    /// `PUT url` with `body`.
+    pub fn put(
+        &self,
+        url: &str,
+        body: impl Into<Vec<u8>>,
+        headers: &[(&str, &str)],
+    ) -> Result<ClientResponse> {
+        self.request(build(Method::Put, url, headers, body.into()))
+    }
+
+    /// `PATCH url` with `body`.
+    pub fn patch(
+        &self,
+        url: &str,
+        body: impl Into<Vec<u8>>,
+        headers: &[(&str, &str)],
+    ) -> Result<ClientResponse> {
+        self.request(build(Method::Patch, url, headers, body.into()))
+    }
+
+    /// Opens an event stream with default options; see [`EventStream`].
+    pub fn sse(&self, url: &str) -> Result<EventStream> {
+        self.sse_with(url, SseOptions::default())
+    }
+
+    /// Opens an event stream. The first connection is made before this
+    /// returns, so a refused connection or an error status (401, 404, …)
+    /// is reported here rather than retried.
+    pub fn sse_with(&self, url: &str, options: SseOptions) -> Result<EventStream> {
+        let url = Url::parse(url)?;
+        check_scheme(&url)?;
+        EventStream::connect(self.clone(), url, options)
+    }
+}
