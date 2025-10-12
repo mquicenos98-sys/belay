@@ -119,3 +119,84 @@ pub struct RequestOptions {
     /// Replaces [`ClientConfig::redirects`].
     pub redirects: Option<RedirectPolicy>,
 }
+
+/// A complete response.
+#[derive(Clone, Debug)]
+pub struct ClientResponse {
+    /// Status code.
+    pub status: StatusCode,
+    /// Version the server answered with.
+    pub version: Version,
+    /// Header fields.
+    pub headers: Headers,
+    /// The body.
+    pub body: Vec<u8>,
+    /// The URL that produced this response (after redirects).
+    pub url: Url,
+}
+
+impl ClientResponse {
+    /// The first value of header `name`.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name)
+    }
+
+    /// The body as UTF-8 text.
+    pub fn text(&self) -> Result<&str> {
+        std::str::from_utf8(&self.body).map_err(Error::Utf8)
+    }
+
+    /// Whether the status is 2xx.
+    pub fn is_success(&self) -> bool {
+        self.status.is_success()
+    }
+
+    /// Turns 4xx and 5xx responses into [`Error::Status`], carrying the
+    /// first 512 bytes of the body.
+    pub fn error_for_status(self) -> Result<ClientResponse> {
+        if self.status.is_client_error() || self.status.is_server_error() {
+            let end = self.body.len().min(512);
+            return Err(Error::Status {
+                status: self.status,
+                body: String::from_utf8_lossy(&self.body[..end])
+                    .trim_end()
+                    .to_owned(),
+            });
+        }
+        Ok(self)
+    }
+}
+
+/// A response whose body has not been read yet.
+#[derive(Debug)]
+pub struct StreamingResponse {
+    /// Status code.
+    pub status: StatusCode,
+    /// Version the server answered with.
+    pub version: Version,
+    /// Header fields.
+    pub headers: Headers,
+    /// The URL that produced this response (after redirects).
+    pub url: Url,
+    /// The body, readable incrementally.
+    pub body: ResponseBody,
+}
+
+impl StreamingResponse {
+    /// The first value of header `name`.
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name)
+    }
+
+    /// Reads the rest of the body into a [`ClientResponse`].
+    pub fn collect(mut self) -> Result<ClientResponse> {
+        let body = self.body.read_to_vec()?;
+        Ok(ClientResponse {
+            status: self.status,
+            version: self.version,
+            headers: self.headers,
+            body,
+            url: self.url,
+        })
+    }
+}
