@@ -73,3 +73,83 @@ pub enum Error {
 
 /// `Result` with this crate's [`Error`] as the default error type.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// Returns `true` for failures worth retrying on a fresh connection:
+    /// socket errors, timeouts and connections closed mid-message.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Error::Io(_) | Error::Timeout(_) | Error::ConnectionClosed
+        )
+    }
+
+    /// Returns `true` if a deadline elapsed.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Error::Timeout(_))
+    }
+
+    /// Maps an I/O error from a socket operation, turning the platform's
+    /// timeout kinds (`WouldBlock` on Unix, `TimedOut` on Windows) into
+    /// [`Error::Timeout`].
+    pub(crate) fn from_io(err: io::Error, phase: &'static str) -> Error {
+        match err.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Error::Timeout(phase),
+            io::ErrorKind::UnexpectedEof => Error::ConnectionClosed,
+            _ => Error::Io(err),
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Io(e) => write!(f, "i/o error: {e}"),
+            Error::Timeout(phase) => write!(f, "{phase} timed out"),
+            Error::Bind { addr, source } => write!(f, "cannot listen on {addr}: {source}"),
+            Error::Url(e) => write!(f, "invalid url: {e}"),
+            Error::UnsupportedScheme(s) => {
+                write!(f, "unsupported url scheme `{s}` (only http is supported)")
+            }
+            Error::InvalidMethod(m) => write!(f, "invalid method {m:?}"),
+            Error::InvalidStatus(code) => {
+                write!(f, "invalid status code {code}, expected 100-999")
+            }
+            Error::InvalidHeader(msg) => f.write_str(msg),
+            Error::Protocol(e) => write!(f, "malformed http message: {e}"),
+            Error::ConnectionClosed => {
+                f.write_str("connection closed before a complete message was received")
+            }
+            Error::BodyTooLarge { limit } => write!(f, "body exceeds the {limit} byte limit"),
+            Error::Utf8(e) => write!(f, "body is not valid utf-8: {e}"),
+            Error::TooManyRedirects { max } => write!(f, "gave up after {max} redirects"),
+            Error::Status { status, body } => {
+                if body.is_empty() {
+                    write!(f, "server responded {status}")
+                } else {
+                    write!(f, "server responded {status}: {body}")
+                }
+            }
+            Error::UnexpectedContentType { expected, found } => {
+                if found.is_empty() {
+                    write!(f, "expected content-type {expected}, got none")
+                } else {
+                    write!(f, "expected content-type {expected}, got {found}")
+                }
+            }
+            Error::Config(msg) => write!(f, "invalid configuration: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) | Error::Bind { source: e, .. } => Some(e),
+            Error::Url(e) => Some(e),
+            Error::Protocol(e) => Some(e),
+            Error::Utf8(e) => Some(e),
+            _ => None,
+        }
+    }
+}
