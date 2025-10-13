@@ -3,7 +3,6 @@
 //! behaviour is documented on [`Client`].
 
 mod conn;
-
 mod event_source;
 
 use std::fmt;
@@ -457,5 +456,88 @@ impl Client {
         let url = Url::parse(url)?;
         check_scheme(&url)?;
         EventStream::connect(self.clone(), url, options)
+    }
+}
+
+impl fmt::Debug for Client {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Client")
+            .field("config", &self.inner.config)
+            .field("pool", &self.inner.pool)
+            .finish()
+    }
+}
+
+fn build(method: Method, url: &str, headers: &[(&str, &str)], body: Vec<u8>) -> Request {
+    let mut req = Request::new(method, url).with_body(body);
+    req.headers.extend(headers.iter().copied());
+    req
+}
+
+fn check_scheme(url: &Url) -> Result<()> {
+    if url.scheme() == "http" {
+        Ok(())
+    } else {
+        Err(Error::UnsupportedScheme(url.scheme().to_owned()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_non_http_urls_before_connecting() {
+        let client = Client::default();
+        assert!(matches!(
+            client.get("https://example.com/", &[]),
+            Err(Error::UnsupportedScheme(s)) if s == "https"
+        ));
+        assert!(matches!(client.get("not a url", &[]), Err(Error::Url(_))));
+        assert!(matches!(
+            client.sse("ftp://h/"),
+            Err(Error::UnsupportedScheme(_))
+        ));
+    }
+
+    #[test]
+    fn connection_refused_is_an_io_error() {
+        // Bind and drop to find a port nobody listens on.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|l| l.local_addr())
+            .expect("ephemeral port")
+            .port();
+        let client = Client::new(ClientConfig {
+            connect_timeout: Duration::from_millis(500),
+            ..ClientConfig::default()
+        });
+        let err = client
+            .get(&format!("http://127.0.0.1:{port}/"), &[])
+            .expect_err("nothing listens there");
+        assert!(err.is_transient(), "{err}");
+    }
+
+    #[test]
+    fn error_for_status_keeps_a_body_excerpt() {
+        let response = ClientResponse {
+            status: StatusCode::CONFLICT,
+            version: Version::Http11,
+            headers: Headers::new(),
+            body: b"schedule nightly already exists\n".to_vec(),
+            url: Url::parse("http://h/").expect("valid"),
+        };
+        let err = response.error_for_status().expect_err("409 is an error");
+        assert_eq!(
+            err.to_string(),
+            "server responded 409 Conflict: schedule nightly already exists"
+        );
+    }
+
+    #[test]
+    fn redirect_policy_builders() {
+        assert_eq!(RedirectPolicy::default(), RedirectPolicy::none());
+        let policy = RedirectPolicy::limited(3).with_forwarded_credentials(true);
+        assert_eq!(policy.max_hops, 3);
+        assert!(policy.forward_credentials);
     }
 }
