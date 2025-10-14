@@ -153,3 +153,21 @@ impl std::error::Error for Error {
         }
     }
 }
+
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Self {
+        Error::Io(err)
+    }
+}
+
+impl From<UrlError> for Error {
+    fn from(err: UrlError) -> Self {
+        Error::Url(err)
+    }
+}
+
+impl From<ParseError> for Error {
+    fn from(err: ParseError) -> Self {
+        Error::Protocol(err)
+    }
+}
