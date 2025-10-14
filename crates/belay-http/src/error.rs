@@ -73,3 +73,157 @@ pub enum Error {
 
 /// `Result` with this crate's [`Error`] as the default error type.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// Returns `true` for failures worth retrying on a fresh connection:
+    /// socket errors, timeouts and connections closed mid-message.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self,
+            Error::Io(_) | Error::Timeout(_) | Error::ConnectionClosed
+        )
+    }
+
+    /// Returns `true` if a deadline elapsed.
+    pub fn is_timeout(&self) -> bool {
+        matches!(self, Error::Timeout(_))
+    }
+
+    /// Maps an I/O error from a socket operation, turning the platform's
+    /// timeout kinds (`WouldBlock` on Unix, `TimedOut` on Windows) into
+    /// [`Error::Timeout`].
+    pub(crate) fn from_io(err: io::Error, phase: &'static str) -> Error {
+        match err.kind() {
+            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut => Error::Timeout(phase),
+            io::ErrorKind::UnexpectedEof => Error::ConnectionClosed,
+            _ => Error::Io(err),
+        }
+    }
+}
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Io(e) => write!(f, "i/o error: {e}"),
+            Error::Timeout(phase) => write!(f, "{phase} timed out"),
+            Error::Bind { addr, source } => write!(f, "cannot listen on {addr}: {source}"),
+            Error::Url(e) => write!(f, "invalid url: {e}"),
+            Error::UnsupportedScheme(s) => {
+                write!(f, "unsupported url scheme `{s}` (only http is supported)")
+            }
+            Error::InvalidMethod(m) => write!(f, "invalid method {m:?}"),
+            Error::InvalidStatus(code) => {
+                write!(f, "invalid status code {code}, expected 100-999")
+            }
+            Error::InvalidHeader(msg) => f.write_str(msg),
+            Error::Protocol(e) => write!(f, "malformed http message: {e}"),
+            Error::ConnectionClosed => {
+                f.write_str("connection closed before a complete message was received")
+            }
+            Error::BodyTooLarge { limit } => write!(f, "body exceeds the {limit} byte limit"),
+            Error::Utf8(e) => write!(f, "body is not valid utf-8: {e}"),
+            Error::TooManyRedirects { max } => write!(f, "gave up after {max} redirects"),
+            Error::Status { status, body } => {
+                if body.is_empty() {
+                    write!(f, "server responded {status}")
+                } else {
+                    write!(f, "server responded {status}: {body}")
+                }
+            }
+            Error::UnexpectedContentType { expected, found } => {
+                if found.is_empty() {
+                    write!(f, "expected content-type {expected}, got none")
+                } else {
+                    write!(f, "expected content-type {expected}, got {found}")
+                }
+            }
+            Error::Config(msg) => write!(f, "invalid configuration: {msg}"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Io(e) | Error::Bind { source: e, .. } => Some(e),
+            Error::Url(e) => Some(e),
+            Error::Protocol(e) => Some(e),
+            Error::Utf8(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Self {
+        Error::Io(err)
+    }
+}
+
+impl From<UrlError> for Error {
+    fn from(err: UrlError) -> Self {
+        Error::Url(err)
+    }
+}
+
+impl From<ParseError> for Error {
+    fn from(err: ParseError) -> Self {
+        Error::Protocol(err)
+    }
+}
+
+impl From<std::str::Utf8Error> for Error {
+    fn from(err: std::str::Utf8Error) -> Self {
+        Error::Utf8(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_timeouts_map_to_timeout_on_every_platform() {
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::TimedOut] {
+            let err = Error::from_io(io::Error::from(kind), "read");
+            assert!(err.is_timeout(), "{kind:?} should be a timeout");
+            assert_eq!(err.to_string(), "read timed out");
+        }
+    }
+
+    #[test]
+    fn transient_errors_are_classified() {
+        assert!(Error::ConnectionClosed.is_transient());
+        assert!(Error::Timeout("connect").is_transient());
+        assert!(!Error::InvalidStatus(42).is_transient());
+        assert!(!Error::TooManyRedirects { max: 3 }.is_transient());
+    }
+
+    #[test]
+    fn messages_are_lowercase_and_specific() {
+        assert_eq!(
+            Error::InvalidStatus(1000).to_string(),
+            "invalid status code 1000, expected 100-999"
+        );
+        assert_eq!(
+            Error::UnsupportedScheme("https".into()).to_string(),
+            "unsupported url scheme `https` (only http is supported)"
+        );
+        let status = Error::Status {
+            status: StatusCode::NOT_FOUND,
+            body: "no such job".into(),
+        };
+        assert_eq!(
+            status.to_string(),
+            "server responded 404 Not Found: no such job"
+        );
+    }
+
+    #[test]
+    fn source_exposes_wrapped_errors() {
+        use std::error::Error as _;
+        let err = Error::from(io::Error::new(io::ErrorKind::Other, "boom"));
+        assert_eq!(err.source().map(|s| s.to_string()), Some("boom".into()));
+        assert!(Error::ConnectionClosed.source().is_none());
+    }
+}
