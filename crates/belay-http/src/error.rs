@@ -171,3 +171,59 @@ impl From<ParseError> for Error {
         Error::Protocol(err)
     }
 }
+
+impl From<std::str::Utf8Error> for Error {
+    fn from(err: std::str::Utf8Error) -> Self {
+        Error::Utf8(err)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn socket_timeouts_map_to_timeout_on_every_platform() {
+        for kind in [io::ErrorKind::WouldBlock, io::ErrorKind::TimedOut] {
+            let err = Error::from_io(io::Error::from(kind), "read");
+            assert!(err.is_timeout(), "{kind:?} should be a timeout");
+            assert_eq!(err.to_string(), "read timed out");
+        }
+    }
+
+    #[test]
+    fn transient_errors_are_classified() {
+        assert!(Error::ConnectionClosed.is_transient());
+        assert!(Error::Timeout("connect").is_transient());
+        assert!(!Error::InvalidStatus(42).is_transient());
+        assert!(!Error::TooManyRedirects { max: 3 }.is_transient());
+    }
+
+    #[test]
+    fn messages_are_lowercase_and_specific() {
+        assert_eq!(
+            Error::InvalidStatus(1000).to_string(),
+            "invalid status code 1000, expected 100-999"
+        );
+        assert_eq!(
+            Error::UnsupportedScheme("https".into()).to_string(),
+            "unsupported url scheme `https` (only http is supported)"
+        );
+        let status = Error::Status {
+            status: StatusCode::NOT_FOUND,
+            body: "no such job".into(),
+        };
+        assert_eq!(
+            status.to_string(),
+            "server responded 404 Not Found: no such job"
+        );
+    }
+
+    #[test]
+    fn source_exposes_wrapped_errors() {
+        use std::error::Error as _;
+        let err = Error::from(io::Error::new(io::ErrorKind::Other, "boom"));
+        assert_eq!(err.source().map(|s| s.to_string()), Some("boom".into()));
+        assert!(Error::ConnectionClosed.source().is_none());
+    }
+}
