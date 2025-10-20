@@ -144,3 +144,18 @@ impl StatusCode {
         self.is_informational() || self.0 == 204 || self.0 == 304
     }
 }
+
+impl fmt::Display for StatusCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.canonical_reason() {
+            Some(reason) => write!(f, "{} {}", self.0, reason),
+            None => write!(f, "{}", self.0),
+        }
+    }
+}
+
+impl From<StatusCode> for u16 {
+    fn from(status: StatusCode) -> u16 {
+        status.0
+    }
+}
