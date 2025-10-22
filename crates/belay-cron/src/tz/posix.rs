@@ -84,7 +84,7 @@ impl RuleDate {
                 let offset = (u32::from(weekday) + 7 - first_wd) % 7;
                 let mut day = offset + 7 * (u32::from(week) - 1);
                 // Week 5 means "the last one", which may be the fourth.
-                while day > days_in_month(year, month) {
+                while day >= days_in_month(year, month) {
                     day -= 7;
                 }
                 first + i64::from(day)
@@ -683,6 +683,26 @@ mod tests {
         assert_eq!(
             RuleDate::Julian(365).day_number(2024),
             days_from_civil(2024, 12, 31)
+        );
+    }
+
+    #[test]
+    fn week_five_selects_the_last_weekday_of_the_month() {
+        let last_sunday = RuleDate::MonthWeekDay {
+            month: 3,
+            week: 5,
+            weekday: 0,
+        };
+        assert_eq!(last_sunday.day_number(2025), days_from_civil(2025, 3, 30));
+        assert_eq!(last_sunday.day_number(2024), days_from_civil(2024, 3, 31));
+        let fifth_saturday_feb = RuleDate::MonthWeekDay {
+            month: 2,
+            week: 5,
+            weekday: 6,
+        };
+        assert_eq!(
+            fifth_saturday_feb.day_number(2025),
+            days_from_civil(2025, 2, 22)
         );
     }
 

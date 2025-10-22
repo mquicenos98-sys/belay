@@ -130,3 +130,68 @@ pub enum Version {
     /// HTTP/1.1.
     Http11,
 }
+
+impl Version {
+    /// The version as it appears in a start line.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Version::Http10 => "HTTP/1.0",
+            Version::Http11 => "HTTP/1.1",
+        }
+    }
+}
+
+impl fmt::Display for Version {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn standard_methods_round_trip() {
+        for name in [
+            "GET", "HEAD", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "TRACE", "CONNECT",
+        ] {
+            let method = Method::parse(name).expect("standard method");
+            assert!(!matches!(method, Method::Extension(_)), "{name}");
+            assert_eq!(method.to_string(), name);
+        }
+    }
+
+    #[test]
+    fn method_names_are_case_sensitive() {
+        assert_eq!(
+            Method::parse("get").expect("valid token"),
+            Method::Extension("get".into())
+        );
+        assert_ne!(Method::parse("get").expect("valid token"), Method::Get);
+    }
+
+    #[test]
+    fn rejects_methods_that_are_not_tokens() {
+        for bad in ["", "GE T", "GET\r", "(GET)", "G\u{e9}T"] {
+            assert!(Method::parse(bad).is_err(), "{bad:?} should be rejected");
+        }
+    }
+
+    #[test]
+    fn idempotency_follows_rfc_9110() {
+        assert!(Method::Put.is_idempotent());
+        assert!(Method::Delete.is_idempotent());
+        assert!(!Method::Put.is_safe());
+        assert!(!Method::Post.is_idempotent());
+        assert!(!Method::Patch.is_idempotent());
+        assert!(!Method::Extension("PURGE".into()).is_idempotent());
+    }
+
+    #[test]
+    fn version_display() {
+        assert_eq!(Version::Http10.to_string(), "HTTP/1.0");
+        assert_eq!(Version::Http11.as_str(), "HTTP/1.1");
+        assert!(Version::Http10 < Version::Http11);
+    }
+}
