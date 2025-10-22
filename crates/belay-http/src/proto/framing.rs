@@ -46,3 +46,76 @@ pub(crate) fn content_length(headers: &Headers) -> Result<Option<u64>, ParseErro
     }
     Ok(found)
 }
+
+/// Framing of a request body.
+pub(crate) fn request_framing(head: &RequestHead) -> Result<BodyFraming, ParseError> {
+    let length = content_length(&head.headers)?;
+    if !head.headers.contains(TRANSFER_ENCODING) {
+        return Ok(match length {
+            None | Some(0) => BodyFraming::Empty,
+            Some(n) => BodyFraming::Length(n),
+        });
+    }
+    if head.version == Version::Http10 {
+        return Err(ParseError::InvalidTransferEncoding);
+    }
+    let codings: Vec<&str> = head.headers.tokens(TRANSFER_ENCODING).collect();
+    match codings.last() {
+        Some(last) if last.eq_ignore_ascii_case("chunked") => {
+            if codings.len() == 1 {
+                Ok(BodyFraming::Chunked)
+            } else if codings[..codings.len() - 1]
+                .iter()
+                .any(|c| c.eq_ignore_ascii_case("chunked"))
+            {
+                // Chunked applied twice is never valid (RFC 9112 §6.1).
+                Err(ParseError::InvalidTransferEncoding)
+            } else {
+                Err(ParseError::UnsupportedTransferEncoding(codings.join(", ")))
+            }
+        }
+        _ => Err(ParseError::InvalidTransferEncoding),
+    }
+}
+
+/// Framing of a response body, given the request method it answers.
+pub(crate) fn response_framing(
+    request_method: &Method,
+    status: StatusCode,
+    headers: &Headers,
+) -> Result<BodyFraming, ParseError> {
+    if *request_method == Method::Head || status.forbids_body() {
+        return Ok(BodyFraming::Empty);
+    }
+    if headers.contains(TRANSFER_ENCODING) {
+        let codings: Vec<&str> = headers.tokens(TRANSFER_ENCODING).collect();
+        return match codings.last() {
+            Some(last) if last.eq_ignore_ascii_case("chunked") => {
+                if codings.len() == 1 {
+                    Ok(BodyFraming::Chunked)
+                } else {
+                    Err(ParseError::UnsupportedTransferEncoding(codings.join(", ")))
+                }
+            }
+            // A response may end a non-chunked coding by closing (§6.3 rule 4).
+            _ => Ok(BodyFraming::UntilClose),
+        };
+    }
+    Ok(match content_length(headers)? {
+        Some(0) => BodyFraming::Empty,
+        Some(n) => BodyFraming::Length(n),
+        None => BodyFraming::UntilClose,
+    })
+}
+
+/// Whether the sender of a message with these headers expects the
+/// connection to stay open afterwards.
+pub(crate) fn wants_keep_alive(version: Version, headers: &Headers) -> bool {
+    if headers.has_token(CONNECTION, "close") {
+        return false;
+    }
+    match version {
+        Version::Http11 => true,
+        Version::Http10 => headers.has_token(CONNECTION, "keep-alive"),
+    }
+}
