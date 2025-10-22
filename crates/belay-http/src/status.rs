@@ -159,3 +159,95 @@ impl From<StatusCode> for u16 {
         status.0
     }
 }
+
+impl TryFrom<u16> for StatusCode {
+    type Error = Error;
+
+    fn try_from(code: u16) -> Result<Self, Error> {
+        StatusCode::from_u16(code)
+    }
+}
+
+impl PartialEq<u16> for StatusCode {
+    fn eq(&self, other: &u16) -> bool {
+        self.0 == *other
+    }
+}
+
+impl PartialEq<StatusCode> for u16 {
+    fn eq(&self, other: &StatusCode) -> bool {
+        *self == other.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_codes_outside_three_digits() {
+        assert!(StatusCode::from_u16(99).is_err());
+        assert!(StatusCode::from_u16(1000).is_err());
+        assert_eq!(StatusCode::from_u16(100).map(u16::from).ok(), Some(100));
+        assert_eq!(StatusCode::from_u16(999).map(u16::from).ok(), Some(999));
+    }
+
+    #[test]
+    fn classes_are_disjoint() {
+        let cases = [
+            (StatusCode::CONTINUE, "info"),
+            (StatusCode::NO_CONTENT, "success"),
+            (StatusCode::PERMANENT_REDIRECT, "redirect"),
+            (StatusCode::TOO_MANY_REQUESTS, "client"),
+            (StatusCode::SERVICE_UNAVAILABLE, "server"),
+        ];
+        for (status, class) in cases {
+            let flags = [
+                status.is_informational(),
+                status.is_success(),
+                status.is_redirection(),
+                status.is_client_error(),
+                status.is_server_error(),
+            ];
+            assert_eq!(
+                flags.iter().filter(|f| **f).count(),
+                1,
+                "{status} ({class})"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_codes_display_without_reason() {
+        let status = StatusCode::from_u16(599).expect("in range");
+        assert_eq!(status.canonical_reason(), None);
+        assert_eq!(status.to_string(), "599");
+        assert!(status.is_server_error());
+    }
+
+    #[test]
+    fn reason_phrases_follow_rfc_9110() {
+        assert_eq!(
+            StatusCode::CONTENT_TOO_LARGE.to_string(),
+            "413 Content Too Large"
+        );
+        assert_eq!(StatusCode::PAYLOAD_TOO_LARGE, 413);
+        assert_eq!(
+            StatusCode::UNPROCESSABLE_CONTENT.canonical_reason(),
+            Some("Unprocessable Content")
+        );
+        assert_eq!(
+            StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE.to_string(),
+            "431 Request Header Fields Too Large"
+        );
+    }
+
+    #[test]
+    fn bodiless_statuses() {
+        assert!(StatusCode::CONTINUE.forbids_body());
+        assert!(StatusCode::NO_CONTENT.forbids_body());
+        assert!(StatusCode::NOT_MODIFIED.forbids_body());
+        assert!(!StatusCode::OK.forbids_body());
+        assert!(!StatusCode::RESET_CONTENT.forbids_body());
+    }
+}
