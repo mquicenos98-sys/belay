@@ -278,3 +278,49 @@ pub(crate) struct ResponseHead {
     pub status: StatusCode,
     pub headers: Headers,
 }
+
+/// Scans and parses request heads.
+#[derive(Debug)]
+pub(crate) struct RequestParser {
+    scanner: HeadScanner,
+}
+
+impl RequestParser {
+    pub(crate) fn new(limits: HeadLimits) -> Self {
+        RequestParser {
+            scanner: HeadScanner::new(StartLine::Request, limits),
+        }
+    }
+
+    /// Returns the head and the number of bytes it occupied once complete.
+    pub(crate) fn parse(&mut self, buf: &[u8]) -> Result<Option<(RequestHead, usize)>, ParseError> {
+        match self.scanner.scan(buf)? {
+            None => Ok(None),
+            Some((start, end)) => Ok(Some((parse_request_head(&buf[start..end])?, end))),
+        }
+    }
+}
+
+/// Scans and parses response heads.
+#[derive(Debug)]
+pub(crate) struct ResponseParser {
+    scanner: HeadScanner,
+}
+
+impl ResponseParser {
+    pub(crate) fn new(limits: HeadLimits) -> Self {
+        ResponseParser {
+            scanner: HeadScanner::new(StartLine::Response, limits),
+        }
+    }
+
+    pub(crate) fn parse(
+        &mut self,
+        buf: &[u8],
+    ) -> Result<Option<(ResponseHead, usize)>, ParseError> {
+        match self.scanner.scan(buf)? {
+            None => Ok(None),
+            Some((start, end)) => Ok(Some((parse_response_head(&buf[start..end])?, end))),
+        }
+    }
+}
