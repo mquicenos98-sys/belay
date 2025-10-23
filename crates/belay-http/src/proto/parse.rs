@@ -324,3 +324,58 @@ impl ResponseParser {
         }
     }
 }
+
+/// Splits a complete head into lines without their terminators, rejecting
+/// bare CRs, and stops at the blank line.
+fn lines(head: &[u8]) -> impl Iterator<Item = Result<&[u8], ParseError>> {
+    head.split(|&b| b == b'\n')
+        .map(|line| {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.contains(&b'\r') {
+                Err(ParseError::BareCarriageReturn)
+            } else {
+                Ok(line)
+            }
+        })
+        .take_while(|line| !matches!(line, Ok(l) if l.is_empty()))
+}
+
+fn parse_request_head(head: &[u8]) -> Result<RequestHead, ParseError> {
+    let mut lines = lines(head);
+    let first = lines.next().ok_or(ParseError::InvalidRequestLine)??;
+    let (method, target, version) = parse_request_line(first)?;
+    let headers = parse_fields(lines)?;
+    Ok(RequestHead {
+        method,
+        target,
+        version,
+        headers,
+    })
+}
+
+fn parse_request_line(line: &[u8]) -> Result<(Method, String, Version), ParseError> {
+    let mut parts = line.splitn(3, |&b| b == b' ');
+    let method = parts.next().ok_or(ParseError::InvalidRequestLine)?;
+    let target = parts.next().ok_or(ParseError::InvalidRequestLine)?;
+    let version = parts.next().ok_or(ParseError::InvalidRequestLine)?;
+    let method = Method::from_token(method).ok_or(ParseError::InvalidMethod)?;
+    if target.is_empty()
+        || !target
+            .iter()
+            .all(|&b| (0x21..=0x7e).contains(&b) && b != b'#')
+    {
+        return Err(ParseError::InvalidTarget);
+    }
+    let version = parse_version(version)?;
+    // Visible ASCII only, so the conversion is lossless.
+    let target = String::from_utf8_lossy(target).into_owned();
+    let form_ok = target.starts_with('/')
+        || target == "*"
+        || starts_with_ignore_case(&target, "http://")
+        || starts_with_ignore_case(&target, "https://")
+        || method == Method::Connect;
+    if !form_ok {
+        return Err(ParseError::InvalidTarget);
+    }
+    Ok((method, target, version))
+}
