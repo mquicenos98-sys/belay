@@ -136,3 +136,145 @@ impl fmt::Display for ParseError {
         }
     }
 }
+
+impl std::error::Error for ParseError {}
+
+/// Size limits applied while scanning a head.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeadLimits {
+    /// Maximum bytes in the start line (without CRLF).
+    pub start_line: usize,
+    /// Maximum bytes in the whole head, including leading blank lines.
+    pub head: usize,
+    /// Maximum number of header field lines.
+    pub headers: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StartLine {
+    Request,
+    Response,
+}
+
+/// Finds the end of a head in a buffer that grows between calls.
+#[derive(Debug)]
+pub(crate) struct HeadScanner {
+    kind: StartLine,
+    limits: HeadLimits,
+    /// Next byte to examine.
+    pos: usize,
+    line_start: usize,
+    /// Where the start line begins (after skipped blank lines).
+    head_start: usize,
+    start_line_done: bool,
+    /// Whether the method token of a request line has ended (seen SP).
+    method_done: bool,
+    header_lines: usize,
+}
+
+impl HeadScanner {
+    pub(crate) fn new(kind: StartLine, limits: HeadLimits) -> Self {
+        HeadScanner {
+            kind,
+            limits,
+            pos: 0,
+            line_start: 0,
+            head_start: 0,
+            start_line_done: false,
+            method_done: false,
+            header_lines: 0,
+        }
+    }
+
+    /// Continues scanning `buf`, which must extend the buffer passed to the
+    /// previous call. Returns `(start, end)` once the head is complete:
+    /// `buf[start..end]` is the head including its blank line, and `end`
+    /// bytes should be consumed.
+    pub(crate) fn scan(&mut self, buf: &[u8]) -> Result<Option<(usize, usize)>, ParseError> {
+        while self.pos < buf.len() {
+            let b = buf[self.pos];
+            self.pos += 1;
+            if b != b'\n' {
+                if self.kind == StartLine::Request && !self.start_line_done && !self.method_done {
+                    if b == b' ' {
+                        self.method_done = true;
+                    } else if b != b'\r' && !is_tchar(b) {
+                        return Err(ParseError::InvalidMethod);
+                    }
+                }
+                continue;
+            }
+            let mut end = self.pos - 1;
+            if end > self.line_start && buf[end - 1] == b'\r' {
+                end -= 1;
+            }
+            if end == self.line_start {
+                if !self.start_line_done {
+                    // RFC 9112 §2.2: ignore empty lines before the start line.
+                    self.line_start = self.pos;
+                    self.head_start = self.pos;
+                    continue;
+                }
+                let start = self.head_start;
+                let end = self.pos;
+                self.reset();
+                return Ok(Some((start, end)));
+            }
+            if !self.start_line_done {
+                if end - self.line_start > self.limits.start_line {
+                    return Err(self.start_line_error());
+                }
+                self.start_line_done = true;
+            } else {
+                self.header_lines += 1;
+                if self.header_lines > self.limits.headers {
+                    return Err(ParseError::TooManyHeaders {
+                        limit: self.limits.headers,
+                    });
+                }
+            }
+            self.line_start = self.pos;
+        }
+        if !self.start_line_done && buf.len() - self.head_start > self.limits.start_line {
+            return Err(self.start_line_error());
+        }
+        if buf.len() > self.limits.head {
+            return Err(ParseError::HeadTooLarge {
+                limit: self.limits.head,
+            });
+        }
+        Ok(None)
+    }
+
+    fn start_line_error(&self) -> ParseError {
+        match self.kind {
+            StartLine::Request => ParseError::UriTooLong {
+                limit: self.limits.start_line,
+            },
+            StartLine::Response => ParseError::HeadTooLarge {
+                limit: self.limits.start_line,
+            },
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = HeadScanner::new(self.kind, self.limits);
+    }
+}
+
+/// A parsed request line plus header fields.
+#[derive(Debug)]
+pub(crate) struct RequestHead {
+    pub method: Method,
+    pub target: String,
+    pub version: Version,
+    pub headers: Headers,
+}
+
+/// A parsed status line plus header fields.
+#[derive(Debug)]
+pub(crate) struct ResponseHead {
+    pub version: Version,
+    pub status: StatusCode,
+    pub headers: Headers,
+}
