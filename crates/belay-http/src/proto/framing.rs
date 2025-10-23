@@ -119,3 +119,158 @@ pub(crate) fn wants_keep_alive(version: Version, headers: &Headers) -> bool {
         Version::Http10 => headers.has_token(CONNECTION, "keep-alive"),
     }
 }
+
+/// RFC 9112 §3.2: an HTTP/1.1 request must carry exactly one `Host`.
+pub(crate) fn check_host(head: &RequestHead) -> Result<(), ParseError> {
+    match head.headers.get_all(HOST).count() {
+        0 if head.version == Version::Http11 => Err(ParseError::MissingHost),
+        0 | 1 => Ok(()),
+        _ => Err(ParseError::MultipleHost),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn head(version: Version, headers: &[(&str, &str)]) -> RequestHead {
+        RequestHead {
+            method: Method::Post,
+            target: "/".into(),
+            version,
+            headers: headers.iter().copied().collect(),
+        }
+    }
+
+    fn framing(headers: &[(&str, &str)]) -> Result<BodyFraming, ParseError> {
+        request_framing(&head(Version::Http11, headers))
+    }
+
+    #[test]
+    fn content_length_variants() {
+        assert_eq!(framing(&[]), Ok(BodyFraming::Empty));
+        assert_eq!(framing(&[("Content-Length", "0")]), Ok(BodyFraming::Empty));
+        assert_eq!(
+            framing(&[("Content-Length", "42")]),
+            Ok(BodyFraming::Length(42))
+        );
+        assert_eq!(
+            framing(&[("Content-Length", "7"), ("content-length", "7, 7")]),
+            Ok(BodyFraming::Length(7))
+        );
+    }
+
+    #[test]
+    fn rejects_bad_content_length() {
+        for value in [
+            "",
+            "-1",
+            "+5",
+            "0x10",
+            "1 2",
+            "5, 6",
+            "99999999999999999999999",
+        ] {
+            assert_eq!(
+                framing(&[("Content-Length", value)]),
+                Err(ParseError::InvalidContentLength),
+                "{value:?}"
+            );
+        }
+        assert_eq!(
+            framing(&[("Content-Length", "5"), ("Content-Length", "6")]),
+            Err(ParseError::InvalidContentLength)
+        );
+    }
+
+    #[test]
+    fn chunked_is_recognised_case_insensitively() {
+        assert_eq!(
+            framing(&[("Transfer-Encoding", "Chunked")]),
+            Ok(BodyFraming::Chunked)
+        );
+    }
+
+    #[test]
+    fn unsupported_and_invalid_codings() {
+        let err = framing(&[("Transfer-Encoding", "gzip, chunked")]).unwrap_err();
+        assert_eq!(err.status(), StatusCode::NOT_IMPLEMENTED);
+        assert_eq!(
+            framing(&[("Transfer-Encoding", "gzip")]),
+            Err(ParseError::InvalidTransferEncoding)
+        );
+        assert_eq!(
+            framing(&[
+                ("Transfer-Encoding", "chunked"),
+                ("Transfer-Encoding", "chunked")
+            ]),
+            Err(ParseError::InvalidTransferEncoding)
+        );
+        assert_eq!(
+            request_framing(&head(Version::Http10, &[("Transfer-Encoding", "chunked")])),
+            Err(ParseError::InvalidTransferEncoding)
+        );
+    }
+
+    #[test]
+    fn response_framing_rules() {
+        let none = Headers::new();
+        let cl: Headers = [("Content-Length", "3")].into_iter().collect();
+        let te: Headers = [("Transfer-Encoding", "chunked")].into_iter().collect();
+        let gzip: Headers = [("Transfer-Encoding", "gzip")].into_iter().collect();
+        let ok = StatusCode::OK;
+        assert_eq!(
+            response_framing(&Method::Head, ok, &cl),
+            Ok(BodyFraming::Empty)
+        );
+        assert_eq!(
+            response_framing(&Method::Get, StatusCode::NO_CONTENT, &cl),
+            Ok(BodyFraming::Empty)
+        );
+        assert_eq!(
+            response_framing(&Method::Get, StatusCode::NOT_MODIFIED, &te),
+            Ok(BodyFraming::Empty)
+        );
+        assert_eq!(
+            response_framing(&Method::Get, ok, &cl),
+            Ok(BodyFraming::Length(3))
+        );
+        assert_eq!(
+            response_framing(&Method::Get, ok, &te),
+            Ok(BodyFraming::Chunked)
+        );
+        assert_eq!(
+            response_framing(&Method::Get, ok, &gzip),
+            Ok(BodyFraming::UntilClose)
+        );
+        assert_eq!(
+            response_framing(&Method::Get, ok, &none),
+            Ok(BodyFraming::UntilClose)
+        );
+    }
+
+    #[test]
+    fn keep_alive_defaults_depend_on_version() {
+        let none = Headers::new();
+        let close: Headers = [("Connection", "Close")].into_iter().collect();
+        let keep: Headers = [("Connection", "keep-alive")].into_iter().collect();
+        assert!(wants_keep_alive(Version::Http11, &none));
+        assert!(!wants_keep_alive(Version::Http11, &close));
+        assert!(!wants_keep_alive(Version::Http10, &none));
+        assert!(wants_keep_alive(Version::Http10, &keep));
+    }
+
+    #[test]
+    fn host_rules() {
+        assert_eq!(
+            check_host(&head(Version::Http11, &[])),
+            Err(ParseError::MissingHost)
+        );
+        assert_eq!(check_host(&head(Version::Http10, &[])), Ok(()));
+        assert_eq!(check_host(&head(Version::Http11, &[("Host", "a")])), Ok(()));
+        assert_eq!(
+            check_host(&head(Version::Http11, &[("Host", "a"), ("host", "b")])),
+            Err(ParseError::MultipleHost)
+        );
+    }
+}
