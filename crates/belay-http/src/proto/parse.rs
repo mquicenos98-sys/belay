@@ -379,3 +379,85 @@ fn parse_request_line(line: &[u8]) -> Result<(Method, String, Version), ParseErr
     }
     Ok((method, target, version))
 }
+
+fn parse_version(v: &[u8]) -> Result<Version, ParseError> {
+    match v {
+        b"HTTP/1.1" => Ok(Version::Http11),
+        b"HTTP/1.0" => Ok(Version::Http10),
+        [b'H', b'T', b'T', b'P', b'/', major, b'.', minor]
+            if major.is_ascii_digit() && minor.is_ascii_digit() =>
+        {
+            // Minor versions are backwards compatible (RFC 9110 §2.5):
+            // answer HTTP/1.2+ as 1.1.
+            if *major == b'1' {
+                Ok(Version::Http11)
+            } else {
+                Err(ParseError::UnsupportedVersion)
+            }
+        }
+        _ => Err(ParseError::InvalidVersion),
+    }
+}
+
+fn parse_response_head(head: &[u8]) -> Result<ResponseHead, ParseError> {
+    let mut lines = lines(head);
+    let first = lines.next().ok_or(ParseError::InvalidStatusLine)??;
+    if first.len() < 12 || first[8] != b' ' {
+        return Err(ParseError::InvalidStatusLine);
+    }
+    let version = parse_version(&first[..8]).map_err(|e| match e {
+        ParseError::UnsupportedVersion => e,
+        _ => ParseError::InvalidStatusLine,
+    })?;
+    let code = &first[9..12];
+    if !code.iter().all(u8::is_ascii_digit) || (first.len() > 12 && first[12] != b' ') {
+        return Err(ParseError::InvalidStatusLine);
+    }
+    let code = code
+        .iter()
+        .fold(0u16, |acc, &d| acc * 10 + u16::from(d - b'0'));
+    let status = StatusCode::from_u16(code).map_err(|_| ParseError::InvalidStatusLine)?;
+    let headers = parse_fields(lines)?;
+    Ok(ResponseHead {
+        version,
+        status,
+        headers,
+    })
+}
+
+fn parse_fields<'a>(
+    lines: impl Iterator<Item = Result<&'a [u8], ParseError>>,
+) -> Result<Headers, ParseError> {
+    let mut headers = Headers::new();
+    for line in lines {
+        let line = line?;
+        if line[0] == b' ' || line[0] == b'\t' {
+            return Err(ParseError::ObsoleteLineFolding);
+        }
+        let colon = line
+            .iter()
+            .position(|&b| b == b':')
+            .ok_or(ParseError::InvalidHeaderName)?;
+        let name = &line[..colon];
+        if name.is_empty() || !name.iter().all(|&b| is_tchar(b)) {
+            return Err(ParseError::InvalidHeaderName);
+        }
+        let name = String::from_utf8_lossy(name).into_owned();
+        let value = trim_ows(&line[colon + 1..]);
+        if !value.iter().all(|&b| is_field_byte(b)) {
+            return Err(ParseError::InvalidHeaderValue(name));
+        }
+        headers.append(name, field_value_to_string(value));
+    }
+    Ok(headers)
+}
+
+fn trim_ows(mut v: &[u8]) -> &[u8] {
+    while let [b' ' | b'\t', rest @ ..] = v {
+        v = rest;
+    }
+    while let [rest @ .., b' ' | b'\t'] = v {
+        v = rest;
+    }
+    v
+}
