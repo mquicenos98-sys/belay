@@ -36,3 +36,22 @@ pub(crate) struct ResponseMeta<'a> {
     pub date: Option<&'a str>,
     pub server: Option<&'a str>,
 }
+
+pub(crate) fn push_field(out: &mut Vec<u8>, name: &str, value: &str) -> Result<(), Error> {
+    if !is_valid_name(name) {
+        return Err(Error::InvalidHeader(format!(
+            "invalid header name {name:?}"
+        )));
+    }
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(b": ");
+    out.extend_from_slice(value.as_bytes());
+    out.extend_from_slice(b"\r\n");
+    Ok(())
+}
+
+fn is_framing_field(name: &str) -> bool {
+    [CONTENT_LENGTH, TRANSFER_ENCODING, CONNECTION, KEEP_ALIVE]
+        .iter()
+        .any(|f| name.eq_ignore_ascii_case(f))
+}
