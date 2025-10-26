@@ -173,3 +173,100 @@ impl Request {
         self.header(LAST_EVENT_ID)
     }
 }
+
+impl fmt::Debug for Request {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Request")
+            .field("method", &self.method)
+            .field("target", &self.target)
+            .field("version", &self.version)
+            .field("headers", &self.headers)
+            .field("body_len", &self.body.len())
+            .field("params", &self.params)
+            .field("remote_addr", &self.remote_addr)
+            .finish()
+    }
+}
+
+/// Splits a request target into its (still encoded) path and raw query.
+fn split_target(target: &str) -> (String, &str) {
+    let mut rest = target;
+    for scheme in ["http://", "https://"] {
+        if starts_with_ignore_case(rest, scheme) {
+            let after = &rest[scheme.len()..];
+            rest = after.find(&['/', '?'][..]).map_or("", |i| &after[i..]);
+            break;
+        }
+    }
+    let rest = rest.split('#').next().unwrap_or("");
+    let (path, query) = rest.split_once('?').unwrap_or((rest, ""));
+    let path = if path.is_empty() { "/" } else { path };
+    (path.to_owned(), query)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn splits_origin_form_targets() {
+        let req = Request::new(Method::Get, "/v1/jobs/01H%20X?limit=5&state=ready");
+        assert_eq!(req.path, "/v1/jobs/01H%20X");
+        assert_eq!(req.query.get("limit"), Some("5"));
+        assert_eq!(req.query.len(), 2);
+    }
+
+    #[test]
+    fn splits_absolute_form_targets() {
+        let req = Request::new(Method::Get, "HTTP://example.com:8080/a/b?c=d#frag");
+        assert_eq!(req.path, "/a/b");
+        assert_eq!(req.query.get("c"), Some("d"));
+        let bare = Request::new(Method::Get, "http://example.com");
+        assert_eq!(bare.path, "/");
+        let query_only = Request::new(Method::Get, "http://example.com?x=1");
+        assert_eq!(query_only.path, "/");
+        assert_eq!(query_only.query.get("x"), Some("1"));
+    }
+
+    #[test]
+    fn asterisk_target_keeps_its_path() {
+        assert_eq!(Request::new(Method::Options, "*").path, "*");
+    }
+
+    #[test]
+    fn bearer_token_parsing() {
+        let req = Request::new(Method::Get, "/").with_header("Authorization", "bearer  s3cret ");
+        assert_eq!(req.bearer_token(), Some("s3cret"));
+        let basic = Request::new(Method::Get, "/").with_header("Authorization", "Basic abc");
+        assert_eq!(basic.bearer_token(), None);
+        let empty = Request::new(Method::Get, "/").with_header("Authorization", "Bearer ");
+        assert_eq!(empty.bearer_token(), None);
+    }
+
+    #[test]
+    fn content_type_strips_parameters() {
+        let req = Request::new(Method::Post, "/").with_header("content-type", " text/plain ;q=1");
+        assert_eq!(req.content_type(), Some("text/plain"));
+        let blank = Request::new(Method::Post, "/").with_header("content-type", ";x");
+        assert_eq!(blank.content_type(), None);
+    }
+
+    #[test]
+    fn body_str_reports_invalid_utf8() {
+        let req = Request::new(Method::Post, "/").with_body(vec![0xff, 0xfe]);
+        assert!(matches!(req.body_str(), Err(Error::Utf8(_))));
+        let ok = Request::new(Method::Post, "/").with_body("héllo");
+        assert_eq!(ok.body_str().ok(), Some("héllo"));
+    }
+
+    #[test]
+    fn params_lookup() {
+        let params = Params::from_vec(vec![
+            ("id".into(), "7".into()),
+            ("rest".into(), "a/b".into()),
+        ]);
+        assert_eq!(params.get("rest"), Some("a/b"));
+        assert_eq!(params.get("missing"), None);
+        assert_eq!(params.iter().count(), 2);
+    }
+}
