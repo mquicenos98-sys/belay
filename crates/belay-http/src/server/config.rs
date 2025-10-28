@@ -208,3 +208,79 @@ impl ServerConfig {
         }
     }
 }
+
+impl fmt::Debug for ServerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerConfig")
+            .field("max_connections", &self.max_connections)
+            .field("keep_alive_timeout", &self.keep_alive_timeout)
+            .field("header_timeout", &self.header_timeout)
+            .field("body_timeout", &self.body_timeout)
+            .field("write_timeout", &self.write_timeout)
+            .field("max_request_line", &self.max_request_line)
+            .field("max_head_bytes", &self.max_head_bytes)
+            .field("max_headers", &self.max_headers)
+            .field("max_body_bytes", &self.max_body_bytes)
+            .field(
+                "max_requests_per_connection",
+                &self.max_requests_per_connection,
+            )
+            .field("shutdown_grace", &self.shutdown_grace)
+            .field("poll_interval", &self.poll_interval)
+            .field("thread_idle_timeout", &self.thread_idle_timeout)
+            .field("server_header", &self.server_header)
+            .field("error_hook", &self.error_hook.is_some())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_are_valid() {
+        assert!(ServerConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn rejects_zero_timeouts_and_limits() {
+        let zero_poll = ServerConfig {
+            poll_interval: Duration::ZERO,
+            ..ServerConfig::default()
+        };
+        assert_eq!(
+            zero_poll.validate().unwrap_err().to_string(),
+            "invalid configuration: poll_interval must be greater than zero"
+        );
+        let no_conns = ServerConfig {
+            max_connections: 0,
+            ..ServerConfig::default()
+        };
+        assert!(no_conns.validate().is_err());
+        let inverted = ServerConfig {
+            max_request_line: 4096,
+            max_head_bytes: 1024,
+            ..ServerConfig::default()
+        };
+        assert!(inverted.validate().is_err());
+    }
+
+    #[test]
+    fn zero_keep_alive_is_allowed() {
+        let config = ServerConfig {
+            keep_alive_timeout: Duration::ZERO,
+            ..ServerConfig::default()
+        };
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn debug_hides_the_hook() {
+        let config = ServerConfig {
+            error_hook: Some(Arc::new(|_: &ServerError| {})),
+            ..ServerConfig::default()
+        };
+        assert!(format!("{config:?}").contains("error_hook: true"));
+    }
+}
