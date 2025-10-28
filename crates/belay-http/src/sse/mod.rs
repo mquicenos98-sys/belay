@@ -31,3 +31,68 @@ pub struct SseEvent {
     /// The payload. May contain newlines.
     pub data: String,
 }
+
+impl SseEvent {
+    /// An unnamed event carrying `data`.
+    pub fn new(data: impl Into<String>) -> Self {
+        SseEvent {
+            id: None,
+            event: None,
+            data: data.into(),
+        }
+    }
+
+    /// Sets the event type (builder style).
+    #[must_use]
+    pub fn event(mut self, name: impl Into<String>) -> Self {
+        self.event = Some(name.into());
+        self
+    }
+
+    /// Sets the id (builder style).
+    #[must_use]
+    pub fn id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    /// The event type, `message` when none was given.
+    pub fn event_type(&self) -> &str {
+        self.event.as_deref().unwrap_or("message")
+    }
+
+    /// Serializes the event, rejecting ids and types that contain line
+    /// breaks (they would split into separate fields) and ids with NUL
+    /// (which clients ignore).
+    pub fn encode(&self, out: &mut Vec<u8>) -> io::Result<()> {
+        if let Some(id) = &self.id {
+            if id.contains(|c| c == '\r' || c == '\n' || c == '\0') {
+                return Err(invalid("event id must not contain line breaks or nul"));
+            }
+            push_field(out, "id", id);
+        }
+        if let Some(event) = &self.event {
+            if event.contains(|c| c == '\r' || c == '\n') {
+                return Err(invalid("event type must not contain line breaks"));
+            }
+            push_field(out, "event", event);
+        }
+        for line in split_lines(&self.data) {
+            push_field(out, "data", line);
+        }
+        out.push(b'\n');
+        Ok(())
+    }
+}
+
+impl std::fmt::Display for SseEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut out = Vec::new();
+        self.encode(&mut out).map_err(|_| std::fmt::Error)?;
+        f.write_str(&String::from_utf8_lossy(&out))
+    }
+}
+
+fn invalid(msg: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, msg)
+}
