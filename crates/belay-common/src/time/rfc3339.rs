@@ -135,7 +135,7 @@ pub(super) fn parse(s: &str) -> Result<Timestamp, TimeError> {
             }
             // Only the first three digits matter; the rest are truncated.
             if index < 3 {
-                millis = millis * 10 + i64::from(b - b'0');
+                millis += i64::from(b - b'0') * [100, 10, 1][index];
             }
             cur.pos += 1;
         }
@@ -228,6 +228,16 @@ mod tests {
         let expected = p("2025-03-04T05:06:07Z");
         assert_eq!(p("2025-03-04t05:06:07z"), expected);
         assert_eq!(p("2025-03-04 05:06:07Z"), expected);
+    }
+
+    #[test]
+    fn fractional_seconds_are_truncated_to_milliseconds() {
+        assert_eq!(p("1970-01-01T00:00:00.1Z").as_millis(), 100);
+        assert_eq!(p("1970-01-01T00:00:00.12Z").as_millis(), 120);
+        assert_eq!(p("1970-01-01T00:00:00.123Z").as_millis(), 123);
+        assert_eq!(p("1970-01-01T00:00:00.1239Z").as_millis(), 123);
+        assert_eq!(p("1970-01-01T00:00:00.999999999Z").as_millis(), 999);
+        assert_eq!(p("1970-01-01T00:00:00.000000001Z").as_millis(), 0);
     }
 
     #[test]
