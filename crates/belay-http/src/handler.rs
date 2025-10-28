@@ -56,3 +56,79 @@ pub trait Middleware: Send + Sync {
     /// Handles `req`, typically by calling `next.run(req)` somewhere.
     fn handle(&self, req: &mut Request, next: Next<'_>) -> Response;
 }
+
+impl<F> Middleware for F
+where
+    F: Fn(&mut Request, Next<'_>) -> Response + Send + Sync,
+{
+    fn handle(&self, req: &mut Request, next: Next<'_>) -> Response {
+        self(req, next)
+    }
+}
+
+/// The remainder of a middleware chain.
+///
+/// Consumed by [`run`](Next::run), so a middleware can call the rest of the
+/// chain at most once.
+pub struct Next<'a> {
+    chain: &'a [Arc<dyn Middleware>],
+    endpoint: &'a dyn Handler,
+}
+
+impl<'a> Next<'a> {
+    pub(crate) fn new(chain: &'a [Arc<dyn Middleware>], endpoint: &'a dyn Handler) -> Self {
+        Next { chain, endpoint }
+    }
+
+    /// Runs the remaining middleware and then the handler.
+    pub fn run(self, req: &mut Request) -> Response {
+        match self.chain.split_first() {
+            Some((first, rest)) => first.handle(req, Next::new(rest, self.endpoint)),
+            None => self.endpoint.call(req),
+        }
+    }
+}
+
+impl fmt::Debug for Next<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Next")
+            .field("remaining_middleware", &self.chain.len())
+            .finish()
+    }
+}
+
+/// A handler wrapped in middleware; itself a [`Handler`].
+///
+/// Layers run in the order they were added: the first `with` is the
+/// outermost, seeing the request first and the response last.
+#[derive(Clone)]
+pub struct Stack {
+    middleware: Vec<Arc<dyn Middleware>>,
+    endpoint: Arc<dyn Handler>,
+}
+
+impl Stack {
+    /// A stack with no middleware yet.
+    pub fn new(endpoint: impl Handler + 'static) -> Stack {
+        Stack::from_arc(Arc::new(endpoint))
+    }
+
+    pub(crate) fn from_arc(endpoint: Arc<dyn Handler>) -> Stack {
+        Stack {
+            middleware: Vec::new(),
+            endpoint,
+        }
+    }
+
+    /// Adds a layer inside the ones already added.
+    #[must_use]
+    pub fn with(mut self, middleware: impl Middleware + 'static) -> Stack {
+        self.middleware.push(Arc::new(middleware));
+        self
+    }
+
+    pub(crate) fn with_arc(mut self, middleware: Arc<dyn Middleware>) -> Stack {
+        self.middleware.push(middleware);
+        self
+    }
+}
