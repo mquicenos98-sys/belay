@@ -96,3 +96,34 @@ impl std::fmt::Display for SseEvent {
 fn invalid(msg: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, msg)
 }
+
+fn push_field(out: &mut Vec<u8>, name: &str, value: &str) {
+    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(b": ");
+    out.extend_from_slice(value.as_bytes());
+    out.push(b'\n');
+}
+
+/// Splits on CRLF, CR or LF, the three line terminators the format allows;
+/// always yields at least one (possibly empty) line.
+fn split_lines(text: &str) -> impl Iterator<Item = &str> {
+    let mut rest = Some(text);
+    std::iter::from_fn(move || {
+        let current = rest?;
+        match current.find(|c| c == '\r' || c == '\n') {
+            Some(i) => {
+                let skip = if current[i..].starts_with("\r\n") {
+                    2
+                } else {
+                    1
+                };
+                rest = Some(&current[i + skip..]);
+                Some(&current[..i])
+            }
+            None => {
+                rest = None;
+                Some(current)
+            }
+        }
+    })
+}
