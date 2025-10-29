@@ -127,3 +127,133 @@ fn split_lines(text: &str) -> impl Iterator<Item = &str> {
         }
     })
 }
+
+/// Default interval between keep-alive comments.
+pub const DEFAULT_HEARTBEAT: Duration = Duration::from_secs(15);
+
+/// Writes an event stream from a server handler.
+///
+/// Each method writes one complete field block and flushes it, so events
+/// reach the client immediately. Use [`Response::sse`] to get one:
+///
+/// ```
+/// use std::sync::mpsc;
+/// use belay_http::{Response, SseEvent};
+///
+/// let (tx, rx) = mpsc::channel::<String>();
+/// let response = Response::sse(move |sse| {
+///     sse.retry(std::time::Duration::from_secs(2))?;
+///     while sse.is_open() {
+///         match rx.recv_timeout(sse.until_heartbeat()) {
+///             Ok(json) => sse.send(&SseEvent::new(json).event("job.succeeded"))?,
+///             Err(mpsc::RecvTimeoutError::Timeout) => sse.heartbeat_if_due()?,
+///             Err(mpsc::RecvTimeoutError::Disconnected) => break,
+///         }
+///     }
+///     Ok(())
+/// });
+/// tx.send("{}".into()).unwrap();
+/// drop(tx);
+/// let body = response.body.into_bytes()?;
+/// assert_eq!(body, b"retry: 2000\n\nevent: job.succeeded\ndata: {}\n\n");
+/// # Ok::<(), std::io::Error>(())
+/// ```
+#[derive(Debug)]
+pub struct SseWriter<'w, 'a> {
+    out: &'w mut BodyWriter<'a>,
+    scratch: Vec<u8>,
+    heartbeat: Duration,
+    last_write: Instant,
+}
+
+impl<'w, 'a> SseWriter<'w, 'a> {
+    /// Wraps a body writer.
+    pub fn new(out: &'w mut BodyWriter<'a>) -> Self {
+        SseWriter {
+            out,
+            scratch: Vec::new(),
+            heartbeat: DEFAULT_HEARTBEAT,
+            last_write: Instant::now(),
+        }
+    }
+
+    /// Changes the keep-alive interval used by
+    /// [`heartbeat_if_due`](Self::heartbeat_if_due).
+    pub fn set_heartbeat_interval(&mut self, interval: Duration) {
+        self.heartbeat = interval;
+    }
+
+    /// Sends an event.
+    pub fn send(&mut self, event: &SseEvent) -> io::Result<()> {
+        self.scratch.clear();
+        event.encode(&mut self.scratch)?;
+        self.flush_scratch()
+    }
+
+    /// Sends an unnamed event with `data`.
+    pub fn data(&mut self, data: &str) -> io::Result<()> {
+        self.send(&SseEvent::new(data))
+    }
+
+    /// Sends a named event with `data`.
+    pub fn event(&mut self, name: &str, data: &str) -> io::Result<()> {
+        self.send(&SseEvent::new(data).event(name))
+    }
+
+    /// Sends a comment, which clients ignore; each line is prefixed with
+    /// `:`.
+    pub fn comment(&mut self, text: &str) -> io::Result<()> {
+        self.scratch.clear();
+        for line in split_lines(text) {
+            self.scratch.push(b':');
+            if !line.is_empty() {
+                self.scratch.push(b' ');
+                self.scratch.extend_from_slice(line.as_bytes());
+            }
+            self.scratch.push(b'\n');
+        }
+        self.scratch.push(b'\n');
+        self.flush_scratch()
+    }
+
+    /// Tells the client how long to wait before reconnecting.
+    pub fn retry(&mut self, delay: Duration) -> io::Result<()> {
+        self.scratch.clear();
+        self.scratch
+            .extend_from_slice(format!("retry: {}\n\n", delay.as_millis()).as_bytes());
+        self.flush_scratch()
+    }
+
+    /// Sends a keep-alive comment. Besides keeping proxies from timing the
+    /// connection out, the write is how a vanished client gets detected.
+    pub fn heartbeat(&mut self) -> io::Result<()> {
+        self.comment("")
+    }
+
+    /// Sends a heartbeat if nothing has been written for the heartbeat
+    /// interval.
+    pub fn heartbeat_if_due(&mut self) -> io::Result<()> {
+        if self.last_write.elapsed() >= self.heartbeat {
+            self.heartbeat()?;
+        }
+        Ok(())
+    }
+
+    /// Time left until the next heartbeat is due: a good timeout for
+    /// blocking on the event source.
+    pub fn until_heartbeat(&self) -> Duration {
+        self.heartbeat.saturating_sub(self.last_write.elapsed())
+    }
+
+    /// `false` once the client has disconnected or the server is shutting
+    /// down; the stream should then return.
+    pub fn is_open(&self) -> bool {
+        !self.out.is_shutting_down() && self.out.is_client_connected()
+    }
+
+    fn flush_scratch(&mut self) -> io::Result<()> {
+        self.out.send(&self.scratch)?;
+        self.last_write = Instant::now();
+        Ok(())
+    }
+}
