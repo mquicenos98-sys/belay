@@ -257,3 +257,118 @@ impl<'w, 'a> SseWriter<'w, 'a> {
         Ok(())
     }
 }
+
+impl Response {
+    /// `200 OK` with an event stream driven by `stream`.
+    ///
+    /// Sets `Content-Type: text/event-stream`, `Cache-Control: no-cache` and
+    /// `X-Accel-Buffering: no` (which stops nginx from buffering the stream).
+    pub fn sse<F>(mut stream: F) -> Response
+    where
+        F: FnMut(&mut SseWriter<'_, '_>) -> io::Result<()> + Send + 'static,
+    {
+        Response::stream("text/event-stream", move |out: &mut BodyWriter<'_>| {
+            let mut writer = SseWriter::new(out);
+            stream(&mut writer)
+        })
+        .header(CACHE_CONTROL, "no-cache")
+        .header("X-Accel-Buffering", "no")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn written(f: impl FnOnce(&mut SseWriter<'_, '_>) -> io::Result<()>) -> String {
+        let mut wire = Vec::new();
+        {
+            let mut out = BodyWriter::new(&mut wire);
+            let mut sse = SseWriter::new(&mut out);
+            f(&mut sse).expect("writes to a vec succeed");
+        }
+        String::from_utf8(wire).expect("utf-8 output")
+    }
+
+    #[test]
+    fn multi_line_data_becomes_multiple_fields() {
+        let text = written(|sse| sse.data("line one\nline two\r\nline three\rend"));
+        assert_eq!(
+            text,
+            "data: line one\ndata: line two\ndata: line three\ndata: end\n\n"
+        );
+    }
+
+    #[test]
+    fn empty_data_still_produces_a_data_field() {
+        assert_eq!(written(|sse| sse.data("")), "data: \n\n");
+        assert_eq!(
+            written(|sse| sse.data("trailing\n")),
+            "data: trailing\ndata: \n\n"
+        );
+    }
+
+    #[test]
+    fn comments_and_retry() {
+        assert_eq!(written(|sse| sse.comment("a\nb")), ": a\n: b\n\n");
+        assert_eq!(written(|sse| sse.heartbeat()), ":\n\n");
+        assert_eq!(
+            written(|sse| sse.retry(Duration::from_millis(1500))),
+            "retry: 1500\n\n"
+        );
+    }
+
+    #[test]
+    fn rejects_fields_that_would_split() {
+        let mut out = Vec::new();
+        let err = SseEvent::new("x").id("1\n2").encode(&mut out).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(SseEvent::new("x").event("a\rb").encode(&mut out).is_err());
+        assert!(SseEvent::new("x").id("nul\0").encode(&mut out).is_err());
+    }
+
+    #[test]
+    fn heartbeat_only_when_due() {
+        let text = written(|sse| {
+            sse.set_heartbeat_interval(Duration::from_secs(60));
+            sse.heartbeat_if_due()?;
+            assert!(sse.until_heartbeat() > Duration::from_secs(59));
+            sse.set_heartbeat_interval(Duration::ZERO);
+            assert_eq!(sse.until_heartbeat(), Duration::ZERO);
+            sse.heartbeat_if_due()
+        });
+        assert_eq!(text, ":\n\n");
+    }
+
+    #[test]
+    fn sse_response_headers() {
+        let resp = Response::sse(|_| Ok(()));
+        assert_eq!(resp.headers.get("content-type"), Some("text/event-stream"));
+        assert_eq!(resp.headers.get("cache-control"), Some("no-cache"));
+        assert!(resp.body.is_stream());
+    }
+
+    #[test]
+    fn writer_output_round_trips_through_the_parser() {
+        let events = vec![
+            SseEvent::new("plain"),
+            SseEvent::new("a\nb").event("multi").id("7"),
+            SseEvent::new(" leading space").id("8"),
+            SseEvent::new(""),
+        ];
+        let text = written(|sse| events.iter().try_for_each(|e| sse.send(e)));
+        let mut parser = SseParser::new();
+        let mut parsed = Vec::new();
+        parser
+            .feed(text.as_bytes(), |e| parsed.push(e))
+            .expect("within limits");
+        // Ids persist across events per the spec; the last id stays in force.
+        let expected = vec![
+            SseEvent::new("plain"),
+            SseEvent::new("a\nb").event("multi").id("7"),
+            SseEvent::new(" leading space").id("8"),
+            SseEvent::new("").id("8"),
+        ];
+        assert_eq!(parsed, expected);
+    }
+}
