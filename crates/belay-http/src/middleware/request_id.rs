@@ -114,3 +114,104 @@ fn is_acceptable(id: &str) -> bool {
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-_.:/+=@".contains(&b))
 }
+
+/// Mints an id by pushing a per-process counter through the SplitMix64
+/// finalizer. The finalizer is a bijection and the counter is offset by a
+/// random per-process seed, so ids never repeat within a process and do not
+/// reveal request counts.
+fn generate() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    static SEED: OnceLock<u64> = OnceLock::new();
+    let seed = *SEED.get_or_init(|| {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let mut hasher = RandomState::new().build_hasher();
+        hasher.write_u64(nanos);
+        hasher.write_u32(std::process::id());
+        hasher.finish()
+    });
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!(
+        "{:016x}",
+        mix(seed.wrapping_add(n.wrapping_mul(0x9e37_79b9_7f4a_7c15)))
+    )
+}
+
+fn mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::{Handler, Stack};
+    use crate::method::Method;
+    use std::collections::HashSet;
+
+    fn app(layer: SetRequestId) -> Stack {
+        Stack::new(|req: &mut Request| {
+            Response::text(
+                req.extensions
+                    .get::<RequestId>()
+                    .map(|id| id.to_string())
+                    .unwrap_or_default(),
+            )
+        })
+        .with(layer)
+    }
+
+    #[test]
+    fn generates_unique_hex_ids() {
+        let ids: HashSet<String> = (0..2_000).map(|_| generate()).collect();
+        assert_eq!(ids.len(), 2_000);
+        assert!(ids
+            .iter()
+            .all(|id| id.len() == 16 && id.bytes().all(|b| b.is_ascii_hexdigit())));
+    }
+
+    #[test]
+    fn replaces_malformed_incoming_ids() {
+        let app = app(SetRequestId::new());
+        let long = "x".repeat(129);
+        for bad in ["", "has space", "line\u{2028}break", long.as_str()] {
+            let mut req = Request::new(Method::Get, "/").with_header("X-Request-Id", bad);
+            let resp = app.call(&mut req);
+            let id = resp.headers.get("x-request-id").expect("id header");
+            assert_ne!(id, bad);
+            assert_eq!(id.len(), 16);
+        }
+    }
+
+    #[test]
+    fn untrusted_mode_ignores_incoming_ids() {
+        let app = app(SetRequestId::new().trust_incoming(false));
+        let mut req = Request::new(Method::Get, "/").with_header("X-Request-Id", "from-client");
+        let resp = app.call(&mut req);
+        assert_ne!(resp.headers.get("x-request-id"), Some("from-client"));
+    }
+
+    #[test]
+    fn custom_header_name() {
+        let app = app(SetRequestId::new().header("X-Trace"));
+        let mut req = Request::new(Method::Get, "/").with_header("x-trace", "t-1");
+        let resp = app.call(&mut req);
+        assert_eq!(resp.headers.get("X-Trace"), Some("t-1"));
+        assert!(!resp.headers.contains("X-Request-Id"));
+    }
+
+    #[test]
+    fn handler_set_header_is_kept() {
+        let app =
+            Stack::new(|_: &mut Request| Response::no_content().header("X-Request-Id", "mine"))
+                .with(SetRequestId::new());
+        let resp = app.call(&mut Request::new(Method::Get, "/"));
+        assert_eq!(
+            resp.headers.get_all("x-request-id").collect::<Vec<_>>(),
+            ["mine"]
+        );
+    }
+}
