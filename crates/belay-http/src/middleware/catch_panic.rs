@@ -45,3 +45,33 @@ pub struct CatchPanic {
     on_panic: Option<PanicHook>,
     respond: Option<MakeResponse>,
 }
+
+impl CatchPanic {
+    /// Answers panics with a plain-text `500 Internal Server Error`.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Calls `hook` with the request and the panic message.
+    #[must_use]
+    pub fn on_panic(mut self, hook: impl Fn(&Request, &str) + Send + Sync + 'static) -> Self {
+        self.on_panic = Some(Arc::new(hook));
+        self
+    }
+
+    /// Uses `make` to build the response sent after a panic.
+    #[must_use]
+    pub fn respond_with(mut self, make: impl Fn() -> Response + Send + Sync + 'static) -> Self {
+        self.respond = Some(Arc::new(make));
+        self
+    }
+}
+
+impl fmt::Debug for CatchPanic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CatchPanic")
+            .field("on_panic", &self.on_panic.is_some())
+            .field("custom_response", &self.respond.is_some())
+            .finish()
+    }
+}
