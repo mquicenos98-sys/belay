@@ -304,3 +304,40 @@ fn invoke(route: &Route, captures: Captures, req: &mut Request) -> Response {
     }
     Response::no_content().header(ALLOW, route.allow_header())
 }
+
+fn split_path(path: &str) -> Result<Vec<String>, percent::DecodeError> {
+    let trimmed = path.strip_prefix('/').unwrap_or(path);
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    trimmed.split('/').map(percent::decode).collect()
+}
+
+/// Routing happens inside router-wide middleware, so it needs to be a
+/// handler of its own.
+struct Dispatch<'r>(&'r Router);
+
+impl Handler for Dispatch<'_> {
+    fn call(&self, req: &mut Request) -> Response {
+        self.0.dispatch(req)
+    }
+}
+
+impl Handler for Router {
+    fn call(&self, req: &mut Request) -> Response {
+        if self.middleware.is_empty() {
+            self.dispatch(req)
+        } else {
+            Next::new(&self.middleware, &Dispatch(self)).run(req)
+        }
+    }
+}
+
+impl fmt::Debug for Router {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Router")
+            .field("middleware", &self.middleware.len())
+            .field("trailing_slash", &self.trailing_slash)
+            .finish()
+    }
+}
