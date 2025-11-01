@@ -226,6 +226,7 @@ fn placeholders_pass_results_downstream() {
     spec.steps[1].job.payload = json!({
         "url": "{{steps.fetch.result.url}}",
         "first": "{{ steps.fetch.result/items/0 }}",
+        "summary": "got {{steps.fetch.result.count}} items from {{steps.fetch.result.url}}",
         "greeting": "Hello {{ user }}",
         "fixed": 7
     });
@@ -240,6 +241,7 @@ fn placeholders_pass_results_downstream() {
         json!({
             "url": "http://example.com/feed",
             "first": {"id": 1},
+            "summary": "got 2 items from http://example.com/feed",
             "greeting": "Hello {{ user }}",
             "fixed": 7
         })
