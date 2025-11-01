@@ -89,3 +89,28 @@ impl SetRequestId {
         self
     }
 }
+
+impl Middleware for SetRequestId {
+    fn handle(&self, req: &mut Request, next: Next<'_>) -> Response {
+        let incoming = if self.trust_incoming {
+            req.header(&self.header).filter(|id| is_acceptable(id))
+        } else {
+            None
+        };
+        let id = incoming.map_or_else(generate, str::to_owned);
+        req.extensions.insert(RequestId(id.clone()));
+        let mut response = next.run(req);
+        if !response.headers.contains(&self.header) {
+            response.headers.append(self.header.clone(), id);
+        }
+        response
+    }
+}
+
+fn is_acceptable(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"-_.:/+=@".contains(&b))
+}
