@@ -132,3 +132,77 @@ impl Stack {
         self
     }
 }
+
+impl Handler for Stack {
+    fn call(&self, req: &mut Request) -> Response {
+        Next::new(&self.middleware, self.endpoint.as_ref()).run(req)
+    }
+}
+
+impl fmt::Debug for Stack {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Stack")
+            .field("middleware", &self.middleware.len())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::method::Method;
+    use crate::status::StatusCode;
+    use std::sync::Mutex;
+
+    fn tracing_layer(name: &'static str, log: Arc<Mutex<Vec<String>>>) -> impl Middleware {
+        move |req: &mut Request, next: Next<'_>| {
+            log.lock().expect("test lock").push(format!("{name} in"));
+            let resp = next.run(req);
+            log.lock().expect("test lock").push(format!("{name} out"));
+            resp
+        }
+    }
+
+    #[test]
+    fn first_layer_added_is_outermost() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let inner_log = Arc::clone(&log);
+        let stack = Stack::new(move |_: &mut Request| {
+            inner_log.lock().expect("test lock").push("handler".into());
+            Response::no_content()
+        })
+        .with(tracing_layer("a", Arc::clone(&log)))
+        .with(tracing_layer("b", Arc::clone(&log)));
+        stack.call(&mut Request::new(Method::Get, "/"));
+        let log = log.lock().expect("test lock").clone();
+        assert_eq!(log, ["a in", "b in", "handler", "b out", "a out"]);
+    }
+
+    #[test]
+    fn middleware_can_short_circuit() {
+        let stack = Stack::new(|_: &mut Request| -> Response { panic!("must not be reached") })
+            .with(|_: &mut Request, _: Next<'_>| Response::new(StatusCode::FORBIDDEN));
+        assert_eq!(stack.call(&mut Request::new(Method::Get, "/")).status, 403);
+    }
+
+    #[test]
+    fn middleware_can_modify_request_and_response() {
+        let stack = Stack::new(|req: &mut Request| {
+            Response::text(req.header("x-user").unwrap_or("?").to_owned())
+        })
+        .with(|req: &mut Request, next: Next<'_>| {
+            req.headers.insert("X-User", "alice");
+            next.run(req).header("X-Seen", "1")
+        });
+        let resp = stack.call(&mut Request::new(Method::Get, "/"));
+        assert_eq!(resp.body_bytes(), Some(&b"alice"[..]));
+        assert_eq!(resp.headers.get("x-seen"), Some("1"));
+    }
+
+    #[test]
+    fn empty_stack_calls_the_handler() {
+        let stack = Stack::new(|_: &mut Request| Response::text("direct"));
+        assert_eq!(stack.call(&mut Request::new(Method::Get, "/")).status, 200);
+        assert_eq!(format!("{stack:?}"), "Stack { middleware: 0 }");
+    }
+}
