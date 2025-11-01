@@ -341,3 +341,12 @@ impl fmt::Debug for Router {
             .finish()
     }
 }
+
+type PendingRoute = (Method, String, Arc<dyn Handler>);
+
+/// Routes sharing a prefix and middleware; see [`Router::group`].
+pub struct Group {
+    prefix: String,
+    middleware: Vec<Arc<dyn Middleware>>,
+    routes: Vec<PendingRoute>,
+}
