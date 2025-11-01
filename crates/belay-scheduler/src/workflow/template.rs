@@ -213,9 +213,10 @@ fn render_string(
     for piece in &pieces {
         match piece {
             Piece::Text(text) => out.push_str(text),
-            Piece::Hole(hole) => {
-                out.push_str(&belay_json::to_string(&resolve(hole, result_of)?));
-            }
+            Piece::Hole(hole) => match resolve(hole, result_of)? {
+                Value::String(text) => out.push_str(&text),
+                other => out.push_str(&belay_json::to_string(&other)),
+            },
         }
     }
     Ok(Value::String(out))
@@ -277,6 +278,18 @@ mod tests {
         // A dotted segment containing '/' is escaped, not split.
         assert_eq!(render_ok(json!("{{steps.fetch.result.a/b}}")), json!(true));
         assert_eq!(render_ok(json!("{{steps.fetch.result/a~1b}}")), json!(true));
+    }
+
+    #[test]
+    fn placeholders_inside_text_are_interpolated() {
+        assert_eq!(
+            render_ok(json!("GET {{steps.fetch.result.url}} ({{steps.count.result}} rows, {{steps.nothing.result}})")),
+            json!("GET http://x/a (42 rows, null)")
+        );
+        assert_eq!(
+            render_ok(json!("first: {{steps.fetch.result/items/0}}")),
+            json!(r#"first: {"id":7}"#)
+        );
     }
 
     #[test]
