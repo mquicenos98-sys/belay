@@ -116,3 +116,54 @@ impl Route {
         methods.join(", ")
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Segment<'p> {
+    Static(&'p str),
+    Param(&'p str),
+    Wildcard(&'p str),
+}
+
+/// Splits a pattern such as `/v1/queues/:name/pause` or `/static/*path`.
+pub(super) fn parse_pattern(pattern: &str) -> Result<Vec<Segment<'_>>, RouteError> {
+    let invalid = |reason| RouteError::InvalidPattern {
+        pattern: pattern.to_owned(),
+        reason,
+    };
+    let rest = pattern
+        .strip_prefix('/')
+        .ok_or_else(|| invalid("must start with '/'"))?;
+    if rest.is_empty() {
+        return Ok(Vec::new());
+    }
+    let parts: Vec<&str> = rest.split('/').collect();
+    let mut segments = Vec::with_capacity(parts.len());
+    let mut names: Vec<&str> = Vec::new();
+    for (i, part) in parts.iter().enumerate() {
+        let last = i + 1 == parts.len();
+        let segment = if let Some(name) = part.strip_prefix(':') {
+            Segment::Param(name)
+        } else if let Some(name) = part.strip_prefix('*') {
+            if !last {
+                return Err(invalid("a wildcard must be the last segment"));
+            }
+            Segment::Wildcard(name)
+        } else {
+            if part.is_empty() && !last {
+                return Err(invalid("empty path segment"));
+            }
+            Segment::Static(part)
+        };
+        if let Segment::Param(name) | Segment::Wildcard(name) = segment {
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_') {
+                return Err(invalid("parameter names must be [A-Za-z0-9_]+"));
+            }
+            if names.contains(&name) {
+                return Err(invalid("duplicate parameter name"));
+            }
+            names.push(name);
+        }
+        segments.push(segment);
+    }
+    Ok(segments)
+}
