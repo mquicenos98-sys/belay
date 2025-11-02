@@ -167,3 +167,21 @@ pub(super) fn parse_pattern(pattern: &str) -> Result<Vec<Segment<'_>>, RouteErro
     }
     Ok(segments)
 }
+
+pub(super) type Captures = Vec<(String, String)>;
+
+/// Result of looking a path up.
+pub(super) enum Lookup<'n> {
+    Found(&'n Route, Captures),
+    /// The path exists but no route there accepts the method.
+    MethodNotAllowed(&'n Route),
+    NotFound,
+}
+
+#[derive(Default)]
+pub(super) struct Node {
+    statics: Vec<(String, Node)>,
+    param: Option<(String, Box<Node>)>,
+    wildcard: Option<(String, Route)>,
+    route: Option<Route>,
+}
