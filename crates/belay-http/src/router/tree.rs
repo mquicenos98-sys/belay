@@ -185,3 +185,267 @@ pub(super) struct Node {
     wildcard: Option<(String, Route)>,
     route: Option<Route>,
 }
+
+impl Node {
+    pub(super) fn insert(
+        &mut self,
+        segments: &[Segment<'_>],
+        pattern: &str,
+        method: Method,
+        handler: Arc<dyn Handler>,
+    ) -> Result<(), RouteError> {
+        let Some((first, rest)) = segments.split_first() else {
+            return self
+                .route
+                .get_or_insert_with(|| Route::new(pattern))
+                .add(method, handler, pattern);
+        };
+        match *first {
+            Segment::Static(literal) => {
+                let index = match self.statics.iter().position(|(s, _)| s == literal) {
+                    Some(index) => index,
+                    None => {
+                        self.statics.push((literal.to_owned(), Node::default()));
+                        self.statics.len() - 1
+                    }
+                };
+                self.statics[index].1.insert(rest, pattern, method, handler)
+            }
+            Segment::Param(name) => {
+                let (existing, child) = self
+                    .param
+                    .get_or_insert_with(|| (name.to_owned(), Box::default()));
+                if existing != name {
+                    return Err(RouteError::ConflictingParam {
+                        pattern: pattern.to_owned(),
+                        existing: existing.clone(),
+                    });
+                }
+                child.insert(rest, pattern, method, handler)
+            }
+            Segment::Wildcard(name) => {
+                let (existing, route) = self
+                    .wildcard
+                    .get_or_insert_with(|| (name.to_owned(), Route::new(pattern)));
+                if existing != name {
+                    return Err(RouteError::ConflictingParam {
+                        pattern: pattern.to_owned(),
+                        existing: existing.clone(),
+                    });
+                }
+                route.add(method, handler, pattern)
+            }
+        }
+    }
+
+    /// Looks up decoded path segments.
+    pub(super) fn lookup<'n>(&'n self, segments: &[String], method: &Method) -> Lookup<'n> {
+        let mut captures = Vec::new();
+        let mut fallback = None;
+        match self.find(segments, method, &mut captures, &mut fallback) {
+            Some(route) => Lookup::Found(route, captures),
+            None => match fallback {
+                Some(route) => Lookup::MethodNotAllowed(route),
+                None => Lookup::NotFound,
+            },
+        }
+    }
+
+    fn find<'n>(
+        &'n self,
+        segments: &[String],
+        method: &Method,
+        captures: &mut Captures,
+        fallback: &mut Option<&'n Route>,
+    ) -> Option<&'n Route> {
+        let Some((first, rest)) = segments.split_first() else {
+            let route = self.route.as_ref()?;
+            if route.allows(method) {
+                return Some(route);
+            }
+            fallback.get_or_insert(route);
+            return None;
+        };
+        if let Some((_, child)) = self.statics.iter().find(|(s, _)| s == first) {
+            if let Some(route) = child.find(rest, method, captures, fallback) {
+                return Some(route);
+            }
+        }
+        if let Some((name, child)) = &self.param {
+            // A parameter never matches an empty segment: `/jobs/` is not a
+            // job id.
+            if !first.is_empty() {
+                captures.push((name.clone(), first.clone()));
+                if let Some(route) = child.find(rest, method, captures, fallback) {
+                    return Some(route);
+                }
+                captures.pop();
+            }
+        }
+        if let Some((name, route)) = &self.wildcard {
+            if route.allows(method) {
+                captures.push((name.clone(), segments.join("/")));
+                return Some(route);
+            }
+            fallback.get_or_insert(route);
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::request::Request;
+    use crate::response::Response;
+
+    fn handler() -> Arc<dyn Handler> {
+        Arc::new(|_: &mut Request| Response::no_content())
+    }
+
+    fn tree(routes: &[(Method, &str)]) -> Node {
+        let mut root = Node::default();
+        for (method, pattern) in routes {
+            let segments = parse_pattern(pattern).expect("valid pattern");
+            root.insert(&segments, pattern, method.clone(), handler())
+                .expect("no conflict");
+        }
+        root
+    }
+
+    fn segs(path: &str) -> Vec<String> {
+        let trimmed = path.strip_prefix('/').unwrap_or(path);
+        if trimmed.is_empty() {
+            Vec::new()
+        } else {
+            trimmed.split('/').map(str::to_owned).collect()
+        }
+    }
+
+    fn found(root: &Node, method: Method, path: &str) -> Option<(String, Captures)> {
+        match root.lookup(&segs(path), &method) {
+            Lookup::Found(route, captures) => Some((route.pattern.to_string(), captures)),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn parses_patterns() {
+        assert!(parse_pattern("/").expect("root").is_empty());
+        assert_eq!(
+            parse_pattern("/v1/jobs/:id/cancel").expect("valid"),
+            [
+                Segment::Static("v1"),
+                Segment::Static("jobs"),
+                Segment::Param("id"),
+                Segment::Static("cancel")
+            ]
+        );
+        assert_eq!(
+            parse_pattern("/static/*path").expect("valid"),
+            [Segment::Static("static"), Segment::Wildcard("path")]
+        );
+        assert_eq!(
+            parse_pattern("/dir/").expect("trailing slash"),
+            [Segment::Static("dir"), Segment::Static("")]
+        );
+    }
+
+    #[test]
+    fn rejects_bad_patterns() {
+        for (pattern, reason) in [
+            ("v1/jobs", "must start with '/'"),
+            ("/a//b", "empty path segment"),
+            ("/*rest/more", "a wildcard must be the last segment"),
+            ("/:", "parameter names must be [A-Za-z0-9_]+"),
+            ("/:a-b", "parameter names must be [A-Za-z0-9_]+"),
+            ("/:id/x/:id", "duplicate parameter name"),
+        ] {
+            assert_eq!(
+                parse_pattern(pattern),
+                Err(RouteError::InvalidPattern {
+                    pattern: pattern.into(),
+                    reason
+                }),
+                "{pattern}"
+            );
+        }
+    }
+
+    #[test]
+    fn static_segments_beat_parameters() {
+        let root = tree(&[(Method::Get, "/jobs/:id"), (Method::Get, "/jobs/stats")]);
+        assert_eq!(
+            found(&root, Method::Get, "/jobs/stats").map(|f| f.0),
+            Some("/jobs/stats".into())
+        );
+        let (pattern, captures) = found(&root, Method::Get, "/jobs/42").expect("param route");
+        assert_eq!(pattern, "/jobs/:id");
+        assert_eq!(captures, [("id".to_string(), "42".to_string())]);
+    }
+
+    #[test]
+    fn backtracks_from_a_dead_end_static_branch() {
+        let root = tree(&[(Method::Get, "/a/b/c"), (Method::Get, "/a/:x/d")]);
+        let (pattern, captures) = found(&root, Method::Get, "/a/b/d").expect("param branch");
+        assert_eq!(pattern, "/a/:x/d");
+        assert_eq!(captures, [("x".to_string(), "b".to_string())]);
+    }
+
+    #[test]
+    fn prefers_a_route_that_allows_the_method() {
+        let root = tree(&[(Method::Get, "/jobs/active"), (Method::Delete, "/jobs/:id")]);
+        let (pattern, _) = found(&root, Method::Delete, "/jobs/active").expect("delete by id");
+        assert_eq!(pattern, "/jobs/:id");
+        assert!(matches!(
+            root.lookup(&segs("/jobs/active"), &Method::Post),
+            Lookup::MethodNotAllowed(route) if &*route.pattern == "/jobs/active"
+        ));
+    }
+
+    #[test]
+    fn wildcard_captures_the_rest() {
+        let root = tree(&[(Method::Get, "/static/*path")]);
+        let (_, captures) = found(&root, Method::Get, "/static/css/app.css").expect("match");
+        assert_eq!(captures, [("path".to_string(), "css/app.css".to_string())]);
+        assert!(found(&root, Method::Get, "/static").is_none());
+    }
+
+    #[test]
+    fn parameters_do_not_match_empty_segments() {
+        let root = tree(&[(Method::Get, "/jobs/:id")]);
+        assert!(found(&root, Method::Get, "/jobs/").is_none());
+    }
+
+    #[test]
+    fn head_and_options_are_implied() {
+        let root = tree(&[(Method::Get, "/x"), (Method::Post, "/x")]);
+        assert!(found(&root, Method::Head, "/x").is_some());
+        assert!(found(&root, Method::Options, "/x").is_some());
+        match root.lookup(&segs("/x"), &Method::Get) {
+            Lookup::Found(route, _) => assert_eq!(route.allow_header(), "GET, POST, HEAD, OPTIONS"),
+            _ => panic!("GET /x should match"),
+        }
+    }
+
+    #[test]
+    fn registration_conflicts_are_reported() {
+        let mut root = tree(&[(Method::Get, "/jobs/:id")]);
+        let dup = parse_pattern("/jobs/:id").expect("valid");
+        assert_eq!(
+            root.insert(&dup, "/jobs/:id", Method::Get, handler()),
+            Err(RouteError::Duplicate {
+                method: Method::Get,
+                pattern: "/jobs/:id".into()
+            })
+        );
+        let conflict = parse_pattern("/jobs/:job/cancel").expect("valid");
+        let err = root
+            .insert(&conflict, "/jobs/:job/cancel", Method::Post, handler())
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "route pattern \"/jobs/:job/cancel\" conflicts with parameter :id registered at the same position"
+        );
+    }
+}
