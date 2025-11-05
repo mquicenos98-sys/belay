@@ -201,3 +201,26 @@ impl Server {
         }
     }
 }
+
+impl fmt::Debug for Server {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Server")
+            .field("local_addr", &self.local_addr)
+            .field("config", &self.config)
+            .finish()
+    }
+}
+
+/// A connection to the listener's own address, used to wake `accept`.
+/// Unspecified addresses (`0.0.0.0`, `::`) are not connectable everywhere,
+/// so they are replaced by loopback.
+fn wake_address(addr: SocketAddr) -> SocketAddr {
+    let ip = match addr.ip() {
+        IpAddr::V4(ip) if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ip => ip,
+    };
+    SocketAddr::new(ip, addr.port())
+}
+
+type Job = (TcpStream, SocketAddr);
