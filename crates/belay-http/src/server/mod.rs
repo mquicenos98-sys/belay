@@ -224,3 +224,77 @@ fn wake_address(addr: SocketAddr) -> SocketAddr {
 }
 
 type Job = (TcpStream, SocketAddr);
+
+struct Engine {
+    listener: TcpListener,
+    shared: Arc<Shared>,
+    pool: WorkerPool<Job>,
+}
+
+impl Engine {
+    fn serve(self) -> Drain {
+        let Engine {
+            listener,
+            shared,
+            pool,
+        } = self;
+        accept_loop(&listener, &shared, &pool);
+        // Closing the listener makes further connection attempts fail fast
+        // instead of queueing in the backlog.
+        drop(listener);
+        pool.close();
+        if pool.wait_idle(shared.config.shutdown_grace) {
+            pool.join();
+            Drain::Complete
+        } else {
+            Drain::TimedOut {
+                remaining: pool.active(),
+            }
+        }
+    }
+}
+
+fn accept_loop(listener: &TcpListener, shared: &Shared, pool: &WorkerPool<Job>) {
+    while !shared.shutdown.is_triggered() {
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                if shared.shutdown.is_triggered() {
+                    break;
+                }
+                shared.counters.accepted.fetch_add(1, Ordering::Relaxed);
+                if let Err(rejected) = pool.try_execute((stream, peer)) {
+                    shared.counters.rejected.fetch_add(1, Ordering::Relaxed);
+                    if let RejectReason::Spawn(e) = rejected.reason {
+                        shared.config.report(ServerError::Spawn(e));
+                    }
+                    conn::refuse(rejected.job.0);
+                }
+            }
+            Err(e) => match e.kind() {
+                // Per-connection failures: the client gave up during the
+                // handshake. Nothing to do.
+                io::ErrorKind::Interrupted
+                | io::ErrorKind::ConnectionAborted
+                | io::ErrorKind::ConnectionReset
+                | io::ErrorKind::WouldBlock => {}
+                _ => {
+                    shared.config.report(ServerError::Accept(e));
+                    shared.shutdown.wait_timeout(ACCEPT_BACKOFF);
+                }
+            },
+        }
+    }
+}
+
+/// Controls a server started with [`Server::spawn`].
+///
+/// Dropping the handle shuts the server down and waits for it, like
+/// [`shutdown_and_join`](Self::shutdown_and_join); call
+/// [`join`](Self::join) instead to keep serving until the signal is
+/// triggered elsewhere.
+pub struct ServerHandle {
+    local_addr: SocketAddr,
+    signal: ShutdownSignal,
+    shared: Arc<Shared>,
+    thread: Option<JoinHandle<Drain>>,
+}
