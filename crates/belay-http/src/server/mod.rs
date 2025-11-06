@@ -2,9 +2,7 @@
 //! graceful shutdown. The concurrency model is documented on [`Server`].
 
 mod config;
-
 mod conn;
-
 mod pool;
 
 use std::fmt;
@@ -297,4 +295,145 @@ pub struct ServerHandle {
     signal: ShutdownSignal,
     shared: Arc<Shared>,
     thread: Option<JoinHandle<Drain>>,
+}
+
+impl ServerHandle {
+    /// The bound address.
+    pub fn local_addr(&self) -> SocketAddr {
+        self.local_addr
+    }
+
+    /// Starts a graceful shutdown and returns immediately.
+    pub fn shutdown(&self) {
+        self.signal.trigger();
+    }
+
+    /// The server's shutdown signal.
+    pub fn shutdown_signal(&self) -> ShutdownSignal {
+        self.signal.clone()
+    }
+
+    /// Current counters.
+    pub fn stats(&self) -> ServerStats {
+        let c = &self.shared.counters;
+        ServerStats {
+            active_connections: c.active.load(Ordering::Relaxed),
+            accepted: c.accepted.load(Ordering::Relaxed),
+            rejected: c.rejected.load(Ordering::Relaxed),
+            requests: c.requests.load(Ordering::Relaxed),
+            protocol_errors: c.protocol_errors.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Waits until the server has stopped (after a shutdown triggered by
+    /// any means) and drained.
+    pub fn join(mut self) -> Drain {
+        match self.thread.take().map(JoinHandle::join) {
+            Some(Ok(drain)) => drain,
+            Some(Err(panic)) => std::panic::resume_unwind(panic),
+            None => Drain::Complete,
+        }
+    }
+
+    /// Shuts down and waits for the drain.
+    pub fn shutdown_and_join(self) -> Drain {
+        self.shutdown();
+        self.join()
+    }
+}
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            self.signal.trigger();
+            let _ = thread.join();
+        }
+    }
+}
+
+impl fmt::Debug for ServerHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerHandle")
+            .field("local_addr", &self.local_addr)
+            .field("stats", &self.stats())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::request::Request;
+    use crate::response::Response;
+    use std::io::{Read, Write};
+    use std::time::Instant;
+
+    #[test]
+    fn wake_address_replaces_unspecified_ips() {
+        let v4: SocketAddr = "0.0.0.0:8080".parse().expect("literal");
+        assert_eq!(wake_address(v4), "127.0.0.1:8080".parse().expect("literal"));
+        let v6: SocketAddr = "[::]:9".parse().expect("literal");
+        assert_eq!(wake_address(v6), "[::1]:9".parse().expect("literal"));
+        let fixed: SocketAddr = "10.1.2.3:80".parse().expect("literal");
+        assert_eq!(wake_address(fixed), fixed);
+    }
+
+    #[test]
+    fn bind_reports_the_address_on_failure() {
+        let taken = TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+        let addr = taken.local_addr().expect("bound");
+        let err = Server::bind(addr, ServerConfig::default()).expect_err("port in use");
+        assert!(
+            err.to_string()
+                .starts_with(&format!("cannot listen on {addr}")),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn invalid_config_is_rejected_at_bind() {
+        let config = ServerConfig {
+            max_connections: 0,
+            ..ServerConfig::default()
+        };
+        assert!(matches!(
+            Server::bind("127.0.0.1:0", config),
+            Err(Error::Config(_))
+        ));
+    }
+
+    #[test]
+    fn run_returns_when_the_signal_triggers() {
+        let server = Server::bind("127.0.0.1:0", ServerConfig::default()).expect("bind");
+        let signal = server.shutdown_signal();
+        let addr = server.local_addr();
+        let runner = thread::spawn(move || server.run(|_: &mut Request| Response::text("hi")));
+
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        stream
+            .write_all(b"GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            .expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read");
+        assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+
+        let start = Instant::now();
+        signal.trigger();
+        assert_eq!(runner.join().expect("server thread"), Drain::Complete);
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn dropping_the_handle_stops_the_server() {
+        let handle = Server::bind("127.0.0.1:0", ServerConfig::default())
+            .expect("bind")
+            .spawn(|_: &mut Request| Response::text("hi"))
+            .expect("spawn");
+        let addr = handle.local_addr();
+        drop(handle);
+        // Refused (or, on hosts that silently drop, timed out): either way
+        // nobody is listening any more.
+        let attempt = TcpStream::connect_timeout(&addr, Duration::from_millis(300));
+        assert!(attempt.is_err(), "listener should be closed");
+    }
 }
