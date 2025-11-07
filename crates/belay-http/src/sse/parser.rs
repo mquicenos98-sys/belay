@@ -202,3 +202,136 @@ impl SseParser {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(input: &[u8]) -> Vec<SseEvent> {
+        let mut parser = SseParser::new();
+        let mut events = Vec::new();
+        parser
+            .feed(input, |e| events.push(e))
+            .expect("within limits");
+        events
+    }
+
+    #[test]
+    fn handles_all_three_line_terminators() {
+        let expected = vec![SseEvent::new("a\nb")];
+        assert_eq!(parse(b"data: a\ndata: b\n\n"), expected);
+        assert_eq!(parse(b"data: a\r\ndata: b\r\n\r\n"), expected);
+        assert_eq!(parse(b"data: a\rdata: b\r\r"), expected);
+    }
+
+    #[test]
+    fn crlf_split_across_feeds_is_one_terminator() {
+        let mut parser = SseParser::new();
+        let mut events = Vec::new();
+        parser.feed(b"data: x\r", |e| events.push(e)).expect("ok");
+        parser.feed(b"\n\r", |e| events.push(e)).expect("ok");
+        parser.feed(b"\n", |e| events.push(e)).expect("ok");
+        assert_eq!(events, [SseEvent::new("x")]);
+    }
+
+    #[test]
+    fn byte_by_byte_feeding() {
+        let input = b"event: a\ndata: 1\n\nid: 9\ndata: 2\n\n";
+        let mut parser = SseParser::new();
+        let mut events = Vec::new();
+        for b in input.iter() {
+            parser
+                .feed(std::slice::from_ref(b), |e| events.push(e))
+                .expect("ok");
+        }
+        assert_eq!(
+            events,
+            [SseEvent::new("1").event("a"), SseEvent::new("2").id("9")]
+        );
+    }
+
+    #[test]
+    fn strips_only_one_leading_space_and_accepts_bare_fields() {
+        assert_eq!(parse(b"data:  two\n\n"), [SseEvent::new(" two")]);
+        assert_eq!(parse(b"data:none\n\n"), [SseEvent::new("none")]);
+        // A field name without a colon has an empty value.
+        assert_eq!(parse(b"data\ndata\n\n"), [SseEvent::new("\n")]);
+    }
+
+    #[test]
+    fn events_without_data_are_not_dispatched() {
+        assert!(parse(b"event: lonely\n\n").is_empty());
+        // The event type does not leak into the next event.
+        assert_eq!(parse(b"event: lonely\n\ndata: x\n\n"), [SseEvent::new("x")]);
+    }
+
+    #[test]
+    fn comments_and_unknown_fields_are_ignored() {
+        assert_eq!(
+            parse(b": hello\nfoo: bar\ndata: y\n\n"),
+            [SseEvent::new("y")]
+        );
+    }
+
+    #[test]
+    fn id_rules() {
+        // An id containing NUL is ignored; an empty id resets it.
+        let events = parse(b"id: 1\ndata: a\n\nid: bad\0\ndata: b\n\nid\ndata: c\n\n");
+        assert_eq!(events[0].id.as_deref(), Some("1"));
+        assert_eq!(events[1].id.as_deref(), Some("1"));
+        assert_eq!(events[2].id, None);
+    }
+
+    #[test]
+    fn retry_requires_digits() {
+        let mut parser = SseParser::new();
+        parser
+            .feed(b"retry: 250\n\nretry: 1s\n\nretry:\n\n", |_| {})
+            .expect("ok");
+        assert_eq!(parser.retry(), Some(Duration::from_millis(250)));
+    }
+
+    #[test]
+    fn strips_a_leading_bom_once() {
+        assert_eq!(parse(b"\xef\xbb\xbfdata: x\n\n"), [SseEvent::new("x")]);
+        let events = parse(b"data: x\n\n\xef\xbb\xbfdata: y\n\n");
+        assert_eq!(events.len(), 1, "a BOM mid-stream makes the field unknown");
+    }
+
+    #[test]
+    fn incomplete_event_is_dropped_on_reset() {
+        let mut parser = SseParser::new();
+        let mut events = Vec::new();
+        parser
+            .feed(b"id: 5\ndata: partial\n\ndata: cut", |e| events.push(e))
+            .expect("ok");
+        parser.reset();
+        parser
+            .feed(b"data: fresh\n\n", |e| events.push(e))
+            .expect("ok");
+        assert_eq!(
+            events,
+            [
+                SseEvent::new("partial").id("5"),
+                SseEvent::new("fresh").id("5")
+            ]
+        );
+    }
+
+    #[test]
+    fn enforces_the_size_limit() {
+        let mut parser = SseParser::new().with_max_event_bytes(16);
+        let err = parser.feed(&[b'x'; 17], |_| {}).unwrap_err();
+        assert!(matches!(err, Error::BodyTooLarge { limit: 16 }), "{err}");
+        let mut parser = SseParser::new().with_max_event_bytes(16);
+        let err = parser
+            .feed(b"data: 01234567\ndata: 01234567\n", |_| {})
+            .unwrap_err();
+        assert!(matches!(err, Error::BodyTooLarge { .. }), "{err}");
+    }
+
+    #[test]
+    fn invalid_utf8_is_replaced() {
+        assert_eq!(parse(b"data: \xff\n\n"), [SseEvent::new("\u{fffd}")]);
+    }
+}
