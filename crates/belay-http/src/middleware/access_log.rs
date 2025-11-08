@@ -118,3 +118,103 @@ impl fmt::Debug for AccessLog {
         f.write_str("AccessLog")
     }
 }
+
+impl Middleware for AccessLog {
+    fn handle(&self, req: &mut Request, next: Next<'_>) -> Response {
+        let start = Instant::now();
+        let response = next.run(req);
+        let entry = AccessEntry {
+            method: &req.method,
+            path: &req.path,
+            route: req
+                .extensions
+                .get::<MatchedRoute>()
+                .map(MatchedRoute::as_str),
+            status: response.status,
+            duration: start.elapsed(),
+            remote_addr: req.remote_addr,
+            request_id: req.extensions.get::<RequestId>().map(RequestId::as_str),
+            request_bytes: req.body.len(),
+            response_bytes: response.body.known_len(),
+        };
+        (self.sink)(&entry);
+        response
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::handler::{Handler, Stack};
+    use crate::middleware::SetRequestId;
+    use crate::router::Router;
+    use std::sync::Mutex;
+
+    #[test]
+    fn records_route_status_and_request_id() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&lines);
+        let mut router = Router::new();
+        router
+            .wrap(SetRequestId::new())
+            .wrap(AccessLog::new(move |entry| {
+                sink.lock().expect("test lock").push(entry.to_string());
+            }))
+            .get("/v1/jobs/:id", |_: &mut Request| Response::text("12345"));
+        let mut req = Request::new(Method::Get, "/v1/jobs/7")
+            .with_header("X-Request-Id", "req-1")
+            .with_body("xy");
+        router.call(&mut req);
+        router.call(&mut Request::new(Method::Get, "/nope"));
+        let lines = lines.lock().expect("test lock");
+        assert!(
+            lines[0].starts_with(
+                "method=GET path=/v1/jobs/7 route=/v1/jobs/:id status=200 duration_ms="
+            ),
+            "{}",
+            lines[0]
+        );
+        assert!(
+            lines[0].ends_with(" request_id=req-1 bytes_in=2 bytes_out=5"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[1].contains("path=/nope status=404"), "{}", lines[1]);
+        assert!(!lines[1].contains("route="), "{}", lines[1]);
+    }
+
+    #[test]
+    fn quotes_values_that_would_break_logfmt() {
+        let entry = AccessEntry {
+            method: &Method::Get,
+            path: "/a=b",
+            route: None,
+            status: StatusCode::OK,
+            duration: Duration::from_micros(1500),
+            remote_addr: None,
+            request_id: Some("has \"quote\""),
+            request_bytes: 0,
+            response_bytes: None,
+        };
+        assert_eq!(
+            entry.to_string(),
+            r#"method=GET path="/a=b" status=200 duration_ms=1.500 request_id="has \"quote\"" bytes_in=0"#
+        );
+    }
+
+    #[test]
+    fn streaming_responses_have_unknown_size() {
+        let seen = Arc::new(Mutex::new(None));
+        let sink = Arc::clone(&seen);
+        let app = Stack::new(|_: &mut Request| {
+            Response::stream("text/plain", |_: &mut crate::response::BodyWriter<'_>| {
+                Ok(())
+            })
+        })
+        .with(AccessLog::new(move |entry| {
+            *sink.lock().expect("test lock") = Some(entry.response_bytes);
+        }));
+        app.call(&mut Request::new(Method::Get, "/"));
+        assert_eq!(*seen.lock().expect("test lock"), Some(None));
+    }
+}
