@@ -83,3 +83,38 @@ fn write_value(f: &mut fmt::Formatter<'_>, value: &str) -> fmt::Result {
 }
 
 type Sink = Arc<dyn Fn(&AccessEntry<'_>) + Send + Sync>;
+
+/// Middleware that reports every request to a callback after the handler
+/// has produced a response.
+///
+/// ```
+/// use std::sync::{Arc, Mutex};
+/// use belay_http::middleware::AccessLog;
+/// use belay_http::{Handler, Method, Request, Response, Stack};
+///
+/// let lines = Arc::new(Mutex::new(Vec::new()));
+/// let sink = Arc::clone(&lines);
+/// let app = Stack::new(|_: &mut Request| Response::text("ok"))
+///     .with(AccessLog::new(move |entry| sink.lock().unwrap().push(entry.to_string())));
+/// app.call(&mut Request::new(Method::Get, "/healthz"));
+/// assert!(lines.lock().unwrap()[0].starts_with("method=GET path=/healthz status=200"));
+/// ```
+#[derive(Clone)]
+pub struct AccessLog {
+    sink: Sink,
+}
+
+impl AccessLog {
+    /// Calls `sink` once per request.
+    pub fn new(sink: impl Fn(&AccessEntry<'_>) + Send + Sync + 'static) -> Self {
+        AccessLog {
+            sink: Arc::new(sink),
+        }
+    }
+}
+
+impl fmt::Debug for AccessLog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("AccessLog")
+    }
+}
