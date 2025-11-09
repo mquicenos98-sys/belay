@@ -67,3 +67,60 @@ pub(crate) struct Shared {
     pub(crate) shutdown: ShutdownSignal,
     pub(crate) counters: Counters,
 }
+
+impl Shared {
+    /// More than 7/8 of the connection slots are taken: stop offering
+    /// keep-alive so idle connections release their slots.
+    fn under_pressure(&self) -> bool {
+        let max = self.config.max_connections;
+        self.counters.active.load(Ordering::Relaxed) > max - max / 8
+    }
+}
+
+/// Serves one accepted connection until it closes.
+pub(crate) fn serve(stream: TcpStream, peer: SocketAddr, shared: &Shared) {
+    shared.counters.active.fetch_add(1, Ordering::Relaxed);
+    if let Ok(conn) = Connection::new(stream, peer, shared) {
+        conn.run();
+    }
+    shared.counters.active.fetch_sub(1, Ordering::Relaxed);
+}
+
+enum Outcome {
+    /// Wait for the next request.
+    KeepAlive,
+    /// Response complete; close gracefully.
+    Close,
+    /// An error response was sent while the client may still be sending;
+    /// drain briefly before closing.
+    Linger,
+    /// The connection is unusable (I/O error, peer gone, idle timeout).
+    Abort,
+}
+
+enum Fill {
+    Data,
+    Eof,
+    Timeout,
+    Shutdown,
+}
+
+enum BodyError {
+    Parse(ParseError),
+    Timeout,
+    Closed,
+}
+
+struct Connection<'s> {
+    stream: TcpStream,
+    peer: SocketAddr,
+    shared: &'s Shared,
+    buf: InBuf,
+    served: usize,
+}
+
+fn deadline_after(timeout: Duration) -> Instant {
+    let now = Instant::now();
+    now.checked_add(timeout)
+        .unwrap_or_else(|| now + Duration::from_secs(365 * 86_400))
+}
