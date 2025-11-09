@@ -327,7 +327,10 @@ impl<W: io::Write + ?Sized> fmt::Write for IoSink<'_, W> {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.buf.extend_from_slice(s.as_bytes());
         if self.buf.len() >= Self::CHUNK {
-            self.drain().map_err(|_| fmt::Error)?;
+            if let Err(e) = self.drain() {
+                self.error = Some(e);
+                return Err(fmt::Error);
+            }
         }
         Ok(())
     }
@@ -337,6 +340,26 @@ impl<W: io::Write + ?Sized> fmt::Write for IoSink<'_, W> {
 mod tests {
     use super::*;
     use crate::json;
+
+    /// Fails after accepting `limit` bytes.
+    struct FailingWriter {
+        written: usize,
+        limit: usize,
+    }
+
+    impl io::Write for FailingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.written + buf.len() > self.limit {
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, "peer went away"));
+            }
+            self.written += buf.len();
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn escapes_quotes_backslashes_and_control_characters() {
@@ -403,5 +426,22 @@ mod tests {
         let mut pretty = Vec::new();
         write_pretty_to(&mut pretty, &v).unwrap();
         assert_eq!(String::from_utf8(pretty).unwrap(), to_string_pretty(&v));
+    }
+
+    #[test]
+    fn io_errors_are_propagated() {
+        let v = json!({"big": "x".repeat(20_000)});
+        let mut w = FailingWriter {
+            written: 0,
+            limit: 100,
+        };
+        let err = write_to(&mut w, &v).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::BrokenPipe);
+        // Small documents fail on the final drain instead.
+        let mut w = FailingWriter {
+            written: 0,
+            limit: 2,
+        };
+        assert!(write_to(&mut w, &json!([1, 2, 3])).is_err());
     }
 }
