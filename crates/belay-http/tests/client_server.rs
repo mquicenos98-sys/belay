@@ -126,3 +126,66 @@ fn round_trips_every_method() {
     );
     assert_eq!(server.stats().accepted, 1);
 }
+
+#[test]
+fn query_strings_and_encoded_params_reach_the_handler() {
+    let server = serve(api());
+    let resp = client()
+        .get(
+            &url(&server, "/v1/queues/team%2Femails?state=ready%20now"),
+            &[],
+        )
+        .expect("get");
+    assert_eq!(resp.text().ok(), Some("team/emails|ready now"));
+    assert_eq!(resp.url.path(), "/v1/queues/team%2Femails");
+}
+
+#[test]
+fn pooled_connection_is_reused_across_requests_and_clones() {
+    let server = serve(api());
+    let client = client();
+    let first = client.get(&url(&server, "/peer"), &[]).expect("first");
+    assert_eq!(client.idle_connections(), 1);
+    let clone = client.clone();
+    let second = clone.get(&url(&server, "/peer"), &[]).expect("second");
+    assert_eq!(first.text().ok(), second.text().ok());
+    assert_eq!(server.stats().accepted, 1);
+    client.clear_idle();
+    assert_eq!(clone.idle_connections(), 0);
+}
+
+#[test]
+fn disabled_pooling_asks_the_server_to_close() {
+    let server = serve(api());
+    let client = Client::new(ClientConfig {
+        max_idle_per_host: 0,
+        ..ClientConfig::default()
+    });
+    for _ in 0..2 {
+        let resp = client.get(&url(&server, "/connection"), &[]).expect("get");
+        assert_eq!(resp.text().ok(), Some("close"));
+    }
+    assert_eq!(client.idle_connections(), 0);
+    assert_eq!(server.stats().accepted, 2);
+}
+
+#[test]
+fn large_bodies_round_trip() {
+    let server = serve(api());
+    let client = client();
+    let payload: Vec<u8> = (0..3 * 1024 * 1024).map(|i| (i % 253) as u8).collect();
+    let resp = client
+        .post(&url(&server, "/bytes"), payload.clone(), &[])
+        .expect("large post");
+    assert_eq!(resp.body.len(), payload.len());
+    assert!(resp.body == payload, "echoed body differs");
+
+    let chunked = client
+        .get(&url(&server, "/chunks/20"), &[])
+        .expect("chunked get");
+    assert_eq!(chunked.header("transfer-encoding"), Some("chunked"));
+    assert_eq!(chunked.body.len(), 20 * 64 * 1024);
+    assert_eq!(chunked.body[64 * 1024 * 3], 3);
+    // The chunked response was fully read, so its connection is reusable.
+    assert_eq!(client.idle_connections(), 1);
+}
