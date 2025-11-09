@@ -189,3 +189,118 @@ fn large_bodies_round_trip() {
     // The chunked response was fully read, so its connection is reusable.
     assert_eq!(client.idle_connections(), 1);
 }
+
+#[test]
+fn streaming_response_is_readable_before_it_ends() {
+    let mut router = Router::new();
+    let (hold_tx, hold_rx) = mpsc::channel::<()>();
+    let hold_rx = Arc::new(Mutex::new(hold_rx));
+    router.get("/held", move |_: &mut Request| {
+        let hold_rx = Arc::clone(&hold_rx);
+        Response::stream("text/plain", move |out: &mut BodyWriter<'_>| {
+            out.send(b"first;")?;
+            let _ = hold_rx
+                .lock()
+                .expect("test lock")
+                .recv_timeout(Duration::from_secs(5));
+            out.send(b"second;")?;
+            Ok(())
+        })
+    });
+    let server = serve(router);
+    let client = client();
+    let mut resp = client
+        .stream(Request::new(Method::Get, url(&server, "/held")))
+        .expect("stream");
+    let mut buf = [0u8; 64];
+    let n = resp.body.read(&mut buf).expect("first chunk");
+    assert_eq!(&buf[..n], b"first;");
+    assert!(!resp.body.is_complete());
+    hold_tx.send(()).expect("server waiting");
+    let rest = resp.collect().expect("rest of body");
+    assert_eq!(rest.text().ok(), Some("second;"));
+}
+
+#[test]
+fn read_timeout_is_reported_and_can_be_extended_per_request() {
+    let server = serve(api());
+    let client = Client::new(ClientConfig {
+        read_timeout: Some(Duration::from_millis(100)),
+        ..ClientConfig::default()
+    });
+    let err = client
+        .get(&url(&server, "/slow"), &[])
+        .expect_err("too slow");
+    assert!(err.is_timeout(), "{err}");
+
+    let options = RequestOptions {
+        read_timeout: Some(Duration::from_secs(5)),
+        ..RequestOptions::default()
+    };
+    let resp = client
+        .request_with(Request::new(Method::Get, url(&server, "/slow")), &options)
+        .expect("long-poll style request");
+    assert_eq!(resp.text().ok(), Some("finally"));
+}
+
+#[test]
+fn response_size_limit_is_enforced() {
+    let server = serve(api());
+    let client = Client::new(ClientConfig {
+        max_response_bytes: 1000,
+        ..ClientConfig::default()
+    });
+    assert!(client.get(&url(&server, "/big/1000"), &[]).is_ok());
+    for path in ["/big/1001", "/chunks/1"] {
+        let err = client
+            .get(&url(&server, path), &[])
+            .expect_err("over the limit");
+        assert!(
+            matches!(err, Error::BodyTooLarge { limit: 1000 }),
+            "{path}: {err}"
+        );
+    }
+}
+
+#[test]
+fn error_for_status_surfaces_the_server_message() {
+    let server = serve(api());
+    let err = client()
+        .get(&url(&server, "/conflict"), &[])
+        .and_then(|r| r.error_for_status())
+        .expect_err("409");
+    assert_eq!(
+        err.to_string(),
+        "server responded 409 Conflict: queue emails is paused"
+    );
+}
+
+fn redirecting_server(other: Option<SocketAddr>) -> belay_http::ServerHandle {
+    let mut router = Router::new();
+    router
+        .get("/hop/:n", |req: &mut Request| {
+            let n: u32 = req.param("n").and_then(|n| n.parse().ok()).unwrap_or(0);
+            if n == 0 {
+                Response::text("arrived")
+            } else {
+                Response::redirect(StatusCode::TEMPORARY_REDIRECT, &format!("/hop/{}", n - 1))
+            }
+        })
+        .post("/submit", |_: &mut Request| {
+            Response::redirect(StatusCode::SEE_OTHER, "landing?from=submit")
+        })
+        .post("/moved", |_: &mut Request| {
+            Response::redirect(StatusCode::PERMANENT_REDIRECT, "/landing")
+        })
+        .get("/landing", echo)
+        .post("/landing", echo)
+        .get("/auth", |req: &mut Request| {
+            Response::text(req.header("authorization").unwrap_or("none").to_owned())
+        });
+    if let Some(other) = other {
+        router.get("/elsewhere", move |_: &mut Request| {
+            Response::redirect(StatusCode::FOUND, &format!("http://{other}/auth"))
+        });
+    }
+    serve(router)
+}
