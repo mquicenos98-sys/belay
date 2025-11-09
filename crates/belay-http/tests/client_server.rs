@@ -304,3 +304,89 @@ fn redirecting_server(other: Option<SocketAddr>) -> belay_http::ServerHandle {
     }
     serve(router)
 }
+
+#[test]
+fn redirects_are_returned_unless_enabled() {
+    let server = redirecting_server(None);
+    let resp = client().get(&url(&server, "/hop/2"), &[]).expect("get");
+    assert_eq!(resp.status, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(resp.header("location"), Some("/hop/1"));
+
+    let following = Client::new(ClientConfig {
+        redirects: RedirectPolicy::limited(5),
+        ..ClientConfig::default()
+    });
+    let resp = following
+        .get(&url(&server, "/hop/3"), &[])
+        .expect("followed");
+    assert_eq!(resp.text().ok(), Some("arrived"));
+    assert_eq!(resp.url.path(), "/hop/0");
+    // Every hop reused the same pooled connection.
+    assert_eq!(server.stats().accepted, 2);
+}
+
+#[test]
+fn redirect_hop_limit_is_enforced() {
+    let server = redirecting_server(None);
+    let client = Client::new(ClientConfig {
+        redirects: RedirectPolicy::limited(2),
+        ..ClientConfig::default()
+    });
+    assert!(client.get(&url(&server, "/hop/2"), &[]).is_ok());
+    let err = client
+        .get(&url(&server, "/hop/3"), &[])
+        .expect_err("three hops");
+    assert!(matches!(err, Error::TooManyRedirects { max: 2 }), "{err}");
+}
+
+#[test]
+fn see_other_turns_post_into_get_but_308_keeps_it() {
+    let server = redirecting_server(None);
+    let client = Client::new(ClientConfig {
+        redirects: RedirectPolicy::limited(3),
+        ..ClientConfig::default()
+    });
+    let resp = client
+        .post(
+            &url(&server, "/submit"),
+            "payload",
+            &[("Content-Type", "text/plain")],
+        )
+        .expect("303");
+    assert_eq!(resp.text().ok(), Some("GET /landing 0"));
+    assert_eq!(resp.header("x-content-type"), Some("none"));
+    assert_eq!(resp.url.query(), Some("from=submit"));
+
+    let resp = client
+        .post(&url(&server, "/moved"), "payload", &[])
+        .expect("308");
+    assert_eq!(resp.text().ok(), Some("POST /landing 7"));
+}
+
+/// Reads one request (head plus `Content-Length` body) from a raw socket.
+fn read_request(stream: &mut TcpStream) -> Option<String> {
+    let mut data = Vec::new();
+    let mut chunk = [0u8; 4096];
+    let head_end = loop {
+        if let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos + 4;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => data.extend_from_slice(&chunk[..n]),
+        }
+    };
+    let head = String::from_utf8_lossy(&data[..head_end]).into_owned();
+    let length: usize = head
+        .lines()
+        .find_map(|l| l.strip_prefix("Content-Length: "))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    while data.len() < head_end + length {
+        match stream.read(&mut chunk) {
+            Ok(0) | Err(_) => return None,
+            Ok(n) => data.extend_from_slice(&chunk[..n]),
+        }
+    }
+    Some(head)
+}
