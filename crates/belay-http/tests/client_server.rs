@@ -390,3 +390,107 @@ fn read_request(stream: &mut TcpStream) -> Option<String> {
     }
     Some(head)
 }
+
+/// A server that answers the first request on its first connection with
+/// keep-alive, then closes that connection when the second request arrives
+/// without answering it: exactly what a server that timed out the idle
+/// connection concurrently with the client's reuse looks like. Later
+/// connections are answered normally. Returns the number of connections.
+fn closes_reused_connections(connections: usize) -> (SocketAddr, JoinHandle<usize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let handle = thread::spawn(move || {
+        let (mut first, _) = listener.accept().expect("first connection");
+        read_request(&mut first).expect("first request");
+        first
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst")
+            .expect("respond");
+        read_request(&mut first);
+        drop(first);
+        for _ in 1..connections {
+            let (mut next, _) = listener.accept().expect("retry connection");
+            read_request(&mut next).expect("retried request");
+            next.write_all(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\nConnection: close\r\n\r\nsecond",
+            )
+            .expect("respond");
+        }
+        connections
+    });
+    (addr, handle)
+}
+
+#[test]
+fn idempotent_request_is_retried_on_a_stale_pooled_connection() {
+    let (addr, server) = closes_reused_connections(2);
+    let client = client();
+    let base = format!("http://{addr}");
+    assert_eq!(
+        client
+            .get(&format!("{base}/a"), &[])
+            .expect("first")
+            .text()
+            .ok(),
+        Some("first")
+    );
+    assert_eq!(client.idle_connections(), 1);
+    let resp = client
+        .get(&format!("{base}/b"), &[])
+        .expect("retried transparently");
+    assert_eq!(resp.text().ok(), Some("second"));
+    assert_eq!(server.join().expect("fake server"), 2);
+}
+
+#[test]
+fn truncated_response_body_is_an_error() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = thread::spawn(move || {
+        let (mut conn, _) = listener.accept().expect("connection");
+        read_request(&mut conn);
+        let _ = conn.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nonly a little");
+    });
+    let err = client()
+        .get(&format!("http://{addr}/"), &[])
+        .expect_err("truncated");
+    assert!(matches!(err, Error::ConnectionClosed), "{err}");
+    server.join().expect("fake server");
+}
+
+#[test]
+fn interim_responses_are_skipped() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = thread::spawn(move || {
+        let (mut conn, _) = listener.accept().expect("connection");
+        read_request(&mut conn);
+        let _ = conn.write_all(
+            b"HTTP/1.1 100 Continue\r\n\r\nHTTP/1.1 103 Early Hints\r\nLink: </a>\r\n\r\n\
+              HTTP/1.1 201 Created\r\nContent-Length: 2\r\n\r\nok",
+        );
+    });
+    let resp = client()
+        .post(&format!("http://{addr}/"), "x", &[])
+        .expect("final response");
+    assert_eq!(resp.status, StatusCode::CREATED);
+    assert_eq!(resp.text().ok(), Some("ok"));
+    server.join().expect("fake server");
+}
+
+#[test]
+fn close_delimited_response_is_read_to_eof_and_not_pooled() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let addr = listener.local_addr().expect("addr");
+    let server = thread::spawn(move || {
+        let (mut conn, _) = listener.accept().expect("connection");
+        read_request(&mut conn);
+        let _ = conn.write_all(b"HTTP/1.0 200 OK\r\n\r\nall of it");
+    });
+    let client = client();
+    let resp = client
+        .get(&format!("http://{addr}/"), &[])
+        .expect("response");
+    assert_eq!(resp.text().ok(), Some("all of it"));
+    assert_eq!(client.idle_connections(), 0);
+    server.join().expect("fake server");
+}
