@@ -394,3 +394,114 @@ fn protocol_violations_get_specific_statuses() {
     }
     assert_eq!(server.stats().protocol_errors, cases.len() as u64);
 }
+
+#[test]
+fn binary_garbage_is_rejected_immediately() {
+    let server = serve(app());
+    let mut conn = Conn::open(server.local_addr());
+    // The start of a TLS ClientHello, as sent by a client using https://.
+    let start = Instant::now();
+    conn.send(&[0x16, 0x03, 0x01, 0x02, 0x00, 0x01]);
+    assert_eq!(conn.response().status, 400);
+    assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+#[test]
+fn options_asterisk_is_answered() {
+    let server = serve(app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"OPTIONS * HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(conn.response().status, 204);
+}
+
+#[test]
+fn handler_panic_becomes_500_and_the_connection_survives() {
+    let (config, errors) = recorded_errors();
+    let server = serve_with(config, app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"GET /panic HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(conn.response().status, 500);
+    conn.send(b"GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(conn.response().status, 200);
+    let errors = errors.lock().expect("test lock");
+    assert_eq!(
+        errors.as_slice(),
+        ["handler for GET /panic panicked: handler exploded"]
+    );
+}
+
+#[test]
+fn streaming_response_uses_chunked_encoding() {
+    let server = serve(app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"GET /stream HTTP/1.1\r\nHost: t\r\n\r\n");
+    let resp = conn.response();
+    assert_eq!(resp.header("transfer-encoding"), Some("chunked"));
+    assert_eq!(resp.header("content-length"), None);
+    assert_eq!(resp.text(), "part0;part1;part2;");
+    // The connection stays usable after the terminating chunk.
+    conn.send(b"GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(conn.response().text(), "hello");
+}
+
+#[test]
+fn streaming_to_http10_is_close_delimited() {
+    let server = serve(app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"GET /stream HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
+    let resp = conn.response();
+    assert_eq!(resp.header("transfer-encoding"), None);
+    assert_eq!(resp.header("connection"), Some("close"));
+    assert_eq!(resp.text(), "part0;part1;part2;");
+}
+
+#[test]
+fn saturated_server_answers_503_from_the_accept_thread() {
+    let config = ServerConfig {
+        max_connections: 1,
+        ..fast_config()
+    };
+    let server = serve_with(config, app());
+    let mut holder = Conn::open(server.local_addr());
+    holder.send(b"GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(holder.response().status, 200);
+
+    // The holder's idle keep-alive connection occupies the only slot. The
+    // refused client reads without sending, so there is nothing unread on
+    // the server side to turn the close into a reset.
+    let mut refused = Conn::open(server.local_addr());
+    let resp = refused.response();
+    assert_eq!(resp.status, 503);
+    assert_eq!(resp.header("retry-after"), Some("1"));
+    assert_eq!(server.stats().rejected, 1);
+
+    drop(holder);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let mut conn = Conn::open(server.local_addr());
+        conn.send(b"GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+        if conn.response().status == 200 {
+            break;
+        }
+        assert!(Instant::now() < deadline, "slot was never released");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn custom_404_and_405_bodies_reach_the_wire() {
+    let mut router = app();
+    router.not_found(|_: &mut Request| {
+        Response::json_bytes(r#"{"code":"not_found"}"#).with_status(StatusCode::NOT_FOUND)
+    });
+    let server = serve(router);
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"GET /nowhere HTTP/1.1\r\nHost: t\r\n\r\n");
+    let resp = conn.response();
+    assert_eq!(resp.status, 404);
+    assert_eq!(resp.text(), r#"{"code":"not_found"}"#);
+    conn.send(b"DELETE /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    let resp = conn.response();
+    assert_eq!(resp.status, 405);
+    assert_eq!(resp.header("allow"), Some("GET, HEAD, OPTIONS"));
+}
