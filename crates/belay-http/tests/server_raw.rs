@@ -189,3 +189,208 @@ fn oversized_chunked_body_gets_413() {
     conn.send(&request);
     assert_eq!(conn.response().status, 413);
 }
+
+#[test]
+fn malformed_chunk_gets_400() {
+    let server = serve(app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n");
+    let resp = conn.response();
+    assert_eq!(resp.status, 400);
+    assert!(resp.text().contains("chunk"), "{}", resp.text());
+}
+
+#[test]
+fn chunked_body_with_extensions_and_trailers_is_decoded() {
+    let server = serve(app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(
+        b"POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: chunked\r\n\r\n\
+          3\r\nabc\r\n2;name=v\r\nde\r\n0\r\nX-Checksum: 1\r\n\r\n",
+    );
+    assert_eq!(conn.response().text(), "abcde");
+}
+
+#[test]
+fn slow_request_head_gets_408() {
+    let config = ServerConfig {
+        header_timeout: Duration::from_millis(200),
+        ..fast_config()
+    };
+    let server = serve_with(config, app());
+    let mut conn = Conn::open(server.local_addr());
+    let start = Instant::now();
+    conn.send(b"GET /hello HTTP/1.1\r\nHo");
+    let resp = conn.response();
+    assert_eq!(resp.status, 408);
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(150), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+}
+
+#[test]
+fn slow_request_body_gets_408() {
+    let config = ServerConfig {
+        body_timeout: Duration::from_millis(200),
+        ..fast_config()
+    };
+    let server = serve_with(config, app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\nabc");
+    assert_eq!(conn.response().status, 408);
+}
+
+#[test]
+fn silent_connection_is_closed_without_a_response() {
+    let config = ServerConfig {
+        header_timeout: Duration::from_millis(150),
+        ..fast_config()
+    };
+    let server = serve_with(config, app());
+    let mut conn = Conn::open(server.local_addr());
+    let start = Instant::now();
+    assert!(conn.closed_by_server());
+    assert!(start.elapsed() < Duration::from_secs(2));
+}
+
+#[test]
+fn idle_keep_alive_connection_times_out() {
+    let config = ServerConfig {
+        keep_alive_timeout: Duration::from_millis(150),
+        ..fast_config()
+    };
+    let server = serve_with(config, app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(conn.response().status, 200);
+    let start = Instant::now();
+    assert!(conn.closed_by_server());
+    let elapsed = start.elapsed();
+    assert!(elapsed >= Duration::from_millis(100), "{elapsed:?}");
+    assert!(elapsed < Duration::from_secs(2), "{elapsed:?}");
+}
+
+#[test]
+fn head_sends_length_but_no_body() {
+    let server = serve(app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"HEAD /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    let head = conn.head();
+    assert_eq!(head.status, 200);
+    assert_eq!(head.header("content-length"), Some("5"));
+    // Stray body bytes would be parsed as the start of this response.
+    conn.send(b"GET /path/2 HTTP/1.1\r\nHost: t\r\n\r\n");
+    let next = conn.response();
+    assert_eq!(next.status, 200);
+    assert_eq!(next.text(), "2");
+}
+
+#[test]
+fn head_of_a_stream_is_not_streamed() {
+    let server = serve(app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"HEAD /stream HTTP/1.1\r\nHost: t\r\n\r\n");
+    let head = conn.head();
+    assert_eq!(head.header("transfer-encoding"), Some("chunked"));
+    conn.send(b"GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(conn.response().text(), "hello");
+}
+
+#[test]
+fn expect_100_continue_gets_an_interim_response() {
+    let server = serve(app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(
+        b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n",
+    );
+    let interim = conn.head();
+    assert_eq!(interim.status, 100);
+    conn.send(b"hello");
+    let resp = conn.response();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.text(), "hello");
+}
+
+#[test]
+fn expect_100_continue_with_oversized_body_gets_413_directly() {
+    let server = serve_with(small_limits(), app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(
+        b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 5000\r\nExpect: 100-continue\r\n\r\n",
+    );
+    assert_eq!(conn.head().status, 413);
+}
+
+#[test]
+fn unknown_expectation_gets_417() {
+    let server = serve(app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 1\r\nExpect: telepathy\r\n\r\nx");
+    assert_eq!(conn.response().status, 417);
+}
+
+#[test]
+fn http10_closes_unless_keep_alive_is_requested() {
+    let server = serve(app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"GET /hello HTTP/1.0\r\n\r\n");
+    let resp = conn.response();
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.header("connection"), Some("close"));
+    assert!(conn.closed_by_server());
+
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"GET /hello HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
+    let resp = conn.response();
+    assert_eq!(resp.header("connection"), Some("keep-alive"));
+    conn.send(b"GET /path/5 HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
+    assert_eq!(conn.response().text(), "5");
+}
+
+#[test]
+fn connection_close_is_honoured() {
+    let server = serve(app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"GET /hello HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n");
+    let resp = conn.response();
+    assert_eq!(resp.header("connection"), Some("close"));
+    assert!(conn.closed_by_server());
+}
+
+#[test]
+fn max_requests_per_connection_closes_after_the_last_one() {
+    let config = ServerConfig {
+        max_requests_per_connection: 2,
+        ..fast_config()
+    };
+    let server = serve_with(config, app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(conn.response().header("connection"), None);
+    conn.send(b"GET /hello HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(conn.response().header("connection"), Some("close"));
+    assert!(conn.closed_by_server());
+}
+
+#[test]
+fn protocol_violations_get_specific_statuses() {
+    let server = serve(app());
+    let cases: [(&[u8], u16); 8] = [
+        (b"GET /hello HTTP/1.1\r\n\r\n", 400),
+        (b"GET /hello HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", 400),
+        (b"POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", 501),
+        (b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 1, 2\r\n\r\n", 400),
+        (b"GET /hello HTTP/2.0\r\nHost: t\r\n\r\n", 505),
+        (b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n", 501),
+        (b"GET * HTTP/1.1\r\nHost: t\r\n\r\n", 400),
+        (b"GET /hello HTTP/1.1\r\nHost: t\r\nBad Header: x\r\n\r\n", 400),
+    ];
+    for (request, status) in cases {
+        let mut conn = Conn::open(server.local_addr());
+        conn.send(request);
+        let resp = conn.response();
+        assert_eq!(resp.status, status, "{}", String::from_utf8_lossy(request));
+        assert_eq!(resp.header("connection"), Some("close"));
+    }
+    assert_eq!(server.stats().protocol_errors, cases.len() as u64);
+}
