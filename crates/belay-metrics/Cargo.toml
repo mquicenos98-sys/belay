@@ -1,0 +1,15 @@
+[package]
+name = "belay-metrics"
+description = "Metrics registry with counters, gauges, histograms and summaries, rendered in the Prometheus text format"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "belay_metrics"
+path = "src/lib.rs"
+
+[dependencies]
