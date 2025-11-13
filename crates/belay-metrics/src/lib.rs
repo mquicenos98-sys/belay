@@ -64,23 +64,48 @@
 #![warn(missing_docs)]
 
 mod atomic;
-
 mod counter;
-
 mod desc;
-
 mod error;
-
 mod gauge;
-
 mod histogram;
-
 mod names;
-
 mod process;
-
 mod registry;
-
 mod snapshot;
-
 mod summary;
+pub mod text;
+mod time;
+mod timer;
+mod vec;
+
+pub use counter::Counter;
+pub use desc::{Desc, MetricType};
+pub use error::{Error, Result};
+pub use gauge::{Gauge, InFlight};
+pub use histogram::{exponential_buckets, linear_buckets, Histogram, DEFAULT_BUCKETS};
+pub use names::{is_valid_label_name, is_valid_metric_name};
+pub use process::ProcessCollector;
+pub use registry::{Collector, Registry};
+pub use snapshot::{
+    Bucket, FamilySnapshot, HistogramValue, MetricSnapshot, MetricValue, Quantile, SummaryValue,
+};
+pub use summary::{Summary, SummaryOpts};
+pub use time::{ManualTime, MonotonicTime, SharedTimeSource, TimeSource};
+pub use timer::{HistogramTimer, Observe, SummaryTimer, Timer};
+pub use vec::{CounterVec, GaugeVec, HistogramVec, SummaryVec};
+
+/// Lock helpers. A panic while a registry lock is held cannot leave the
+/// protected maps half-updated (every critical section is a single insert,
+/// remove or read), so poisoning is ignored rather than propagated.
+mod sync {
+    use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+
+    pub(crate) fn read<T>(lock: &RwLock<T>) -> RwLockReadGuard<'_, T> {
+        lock.read().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn write<T>(lock: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
+        lock.write().unwrap_or_else(PoisonError::into_inner)
+    }
+}
