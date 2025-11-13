@@ -283,7 +283,7 @@ impl FieldParser<'_> {
             }
             Field::DayOfWeek if self.peek_name("L") => {
                 self.pos += 1;
-                return self.special(Special::LastOfWeekday(start));
+                return self.special(Special::LastOfWeekday(self.domain.canonical(start)));
             }
             Field::DayOfWeek if self.peek() == Some(&TokenKind::Hash) => {
                 self.pos += 1;
@@ -523,6 +523,13 @@ mod tests {
                 Special::NthWeekday(1, 5)
             ]
         );
+        let f = parse("7L,SUN#1", &Domain::DAY_OF_WEEK).unwrap();
+        assert_eq!(
+            f.specials,
+            vec![Special::LastOfWeekday(0), Special::NthWeekday(0, 1)]
+        );
+        let f = parse("6L", &Domain::DAY_OF_WEEK_QUARTZ).unwrap();
+        assert_eq!(f.specials, vec![Special::LastOfWeekday(5)]);
     }
 
     #[test]
