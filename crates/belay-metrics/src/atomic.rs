@@ -42,3 +42,46 @@ impl AtomicF64 {
         }
     }
 }
+
+impl Default for AtomicF64 {
+    fn default() -> Self {
+        AtomicF64::zero()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[test]
+    fn starts_at_zero_and_adds() {
+        let cell = AtomicF64::zero();
+        assert_eq!(cell.load(), 0.0);
+        assert_eq!(cell.add(1.5), 1.5);
+        assert_eq!(cell.add(-4.0), -2.5);
+        cell.store(f64::INFINITY);
+        assert_eq!(cell.load(), f64::INFINITY);
+    }
+
+    #[test]
+    fn concurrent_adds_are_not_lost() {
+        let cell = Arc::new(AtomicF64::zero());
+        let threads: Vec<_> = (0..4)
+            .map(|_| {
+                let cell = Arc::clone(&cell);
+                thread::spawn(move || {
+                    for _ in 0..10_000 {
+                        cell.add(1.0);
+                    }
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        // Integers below 2^53 are exact in f64, so any lost update shows.
+        assert_eq!(cell.load(), 40_000.0);
+    }
+}
