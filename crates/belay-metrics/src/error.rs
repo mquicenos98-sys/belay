@@ -57,3 +57,36 @@ pub enum Error {
 
 /// Shorthand for results carrying this crate's [`Error`].
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::InvalidMetricName(name) => write!(
+                f,
+                "invalid metric name {name:?}: must match [a-zA-Z_:][a-zA-Z0-9_:]*"
+            ),
+            Error::InvalidLabelName { name, reason } => {
+                write!(f, "invalid label name {name:?}: {reason}")
+            }
+            Error::DuplicateLabel(name) => write!(f, "label {name:?} given more than once"),
+            Error::LabelCount { expected, got } => write!(
+                f,
+                "expected {expected} label value{}, got {got}",
+                if *expected == 1 { "" } else { "s" }
+            ),
+            Error::UnknownLabel(name) => write!(f, "unknown label {name:?}"),
+            Error::MissingLabel(name) => write!(f, "missing value for label {name:?}"),
+            Error::InvalidBuckets(detail) => write!(f, "invalid histogram buckets: {detail}"),
+            Error::InvalidSummary(detail) => write!(f, "invalid summary options: {detail}"),
+            Error::Conflict { name, detail } => write!(f, "metric {name:?} {detail}"),
+            Error::Collision {
+                name,
+                series,
+                owner,
+            } => write!(
+                f,
+                "metric {name:?} would expose series {series:?}, which clashes with metric {owner:?}"
+            ),
+        }
+    }
+}
