@@ -87,3 +87,58 @@ impl Gauge {
         }
     }
 }
+
+impl fmt::Debug for Gauge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Gauge").field("value", &self.get()).finish()
+    }
+}
+
+/// Guard returned by [`Gauge::track_in_flight`]; decrements on drop.
+#[must_use = "the gauge is decremented as soon as the guard is dropped"]
+#[derive(Debug)]
+pub struct InFlight {
+    gauge: Gauge,
+}
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.gauge.dec();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arithmetic_is_applied_in_order() {
+        let g = Gauge::new();
+        g.set(2.0);
+        g.add(0.5);
+        g.dec();
+        g.sub(-4.0);
+        assert_eq!(g.get(), 5.5);
+    }
+
+    #[test]
+    fn accepts_non_finite_values() {
+        let g = Gauge::new();
+        g.set(f64::NEG_INFINITY);
+        assert_eq!(g.get(), f64::NEG_INFINITY);
+        g.set(f64::NAN);
+        assert!(g.get().is_nan());
+    }
+
+    #[test]
+    fn in_flight_guard_decrements_when_work_panics() {
+        let g = Gauge::new();
+        let inner = g.clone();
+        let result = std::panic::catch_unwind(move || {
+            let _guard = inner.track_in_flight();
+            panic!("handler failed");
+        });
+        assert!(result.is_err());
+        assert_eq!(g.get(), 0.0);
+    }
+}
