@@ -154,7 +154,7 @@ impl EventFilter {
     /// Whether `event` should be delivered.
     #[must_use]
     pub fn matches(&self, event: &Event) -> bool {
-        self.from.map_or(true, |from| event.seq > from) && self.matches_kind(&event.kind)
+        self.from.map_or(true, |from| event.seq >= from) && self.matches_kind(&event.kind)
     }
 
     /// The decoded query pairs for this filter; empty criteria are left
@@ -203,6 +203,7 @@ impl EventFilter {
 mod tests {
     use super::super::samples;
     use super::*;
+    use belay_common::Timestamp;
 
     fn pairs(items: &[(&str, &str)]) -> Vec<(String, String)> {
         items
@@ -255,6 +256,35 @@ mod tests {
                 .len()
                 == 2
         );
+    }
+
+    #[test]
+    fn filter_combines_sequence_types_and_queue() {
+        let kinds = samples::all();
+        let at = Timestamp::from_millis(0);
+        let event = |seq, i: usize| Event {
+            seq,
+            at,
+            kind: kinds[i].clone(),
+        };
+        let filter = EventFilter::new()
+            .from_seq(10)
+            .with_type(EventPattern::Category("queue"))
+            .with_type(EventPattern::Type("job.dead"))
+            .for_queue(QueueName::from_static("emails"));
+        assert!(filter.matches(&event(10, 22)), "queue.paused on emails");
+        assert!(filter.matches(&event(11, 5)), "job.dead");
+        assert!(!filter.matches(&event(9, 22)), "before from");
+        assert!(!filter.matches(&event(12, 3)), "job.succeeded not selected");
+        let other_queue = EventFilter::new().for_queue(QueueName::from_static("sms"));
+        assert!(!other_queue.matches(&event(1, 22)));
+        assert!(
+            !EventFilter::new()
+                .for_queue(QueueName::from_static("emails"))
+                .matches(&event(1, 16)),
+            "schedule events concern no queue"
+        );
+        assert!(EventFilter::new().matches(&event(0, 16)));
     }
 
     #[test]
