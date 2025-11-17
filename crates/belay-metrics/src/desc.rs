@@ -30,3 +30,21 @@ impl MetricType {
         }
     }
 }
+
+impl fmt::Display for MetricType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The validated definition of a metric family.
+///
+/// Registration compares descriptors to decide whether a second registration
+/// of a name is the same family (and returns it) or a conflict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Desc {
+    name: String,
+    help: String,
+    kind: MetricType,
+    label_names: Vec<String>,
+}
