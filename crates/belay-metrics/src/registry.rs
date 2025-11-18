@@ -77,3 +77,73 @@ struct Inner {
     state: RwLock<State>,
     time: SharedTimeSource,
 }
+
+#[derive(Default)]
+struct State {
+    families: BTreeMap<String, Family>,
+    collectors: Vec<Registered>,
+}
+
+struct Registered {
+    collector: Arc<dyn Collector>,
+    descs: Vec<Desc>,
+}
+
+#[derive(Clone)]
+enum Family {
+    Counter(CounterVec),
+    Gauge(GaugeVec),
+    Histogram(HistogramVec),
+    Summary(SummaryVec),
+}
+
+impl Family {
+    fn desc(&self) -> &Desc {
+        match self {
+            Family::Counter(v) => v.desc(),
+            Family::Gauge(v) => v.desc(),
+            Family::Histogram(v) => v.desc(),
+            Family::Summary(v) => v.desc(),
+        }
+    }
+
+    fn snapshot(&self) -> FamilySnapshot {
+        match self {
+            Family::Counter(v) => v.snapshot(),
+            Family::Gauge(v) => v.snapshot(),
+            Family::Histogram(v) => v.snapshot(),
+            Family::Summary(v) => v.snapshot(),
+        }
+    }
+}
+
+/// Checks `desc` against already-claimed descriptors; `bool` marks those
+/// owned by a collector.
+fn check_available<'a>(desc: &Desc, owners: impl Iterator<Item = (&'a Desc, bool)>) -> Result<()> {
+    let claimed = desc.claimed_names();
+    for (owner, by_collector) in owners {
+        if owner.name() == desc.name() {
+            let detail = if by_collector {
+                "is already provided by a registered collector"
+            } else {
+                "is already registered"
+            };
+            return Err(Error::Conflict {
+                name: desc.name().to_owned(),
+                detail: detail.to_owned(),
+            });
+        }
+        if let Some(series) = owner
+            .claimed_names()
+            .into_iter()
+            .find(|s| claimed.contains(s))
+        {
+            return Err(Error::Collision {
+                name: desc.name().to_owned(),
+                series,
+                owner: owner.name().to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
