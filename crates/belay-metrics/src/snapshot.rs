@@ -127,3 +127,77 @@ impl MetricValue {
         }
     }
 }
+
+/// A histogram's cumulative buckets. The last bucket's upper bound is always
+/// `+Inf` and its count equals [`count`](Self::count).
+#[derive(Debug, Clone, PartialEq)]
+pub struct HistogramValue {
+    /// Buckets in increasing bound order.
+    pub buckets: Vec<Bucket>,
+    /// Sum of all observations.
+    pub sum: f64,
+    /// Number of observations.
+    pub count: u64,
+}
+
+/// One cumulative histogram bucket: observations `<= upper_bound`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Bucket {
+    /// Inclusive upper bound (`le`).
+    pub upper_bound: f64,
+    /// Observations at or below the bound.
+    pub cumulative_count: u64,
+}
+
+impl HistogramValue {
+    /// Mean of the observations, or `None` before the first one.
+    pub fn mean(&self) -> Option<f64> {
+        (self.count > 0).then(|| self.sum / self.count as f64)
+    }
+
+    /// Estimates the `q`-quantile the way PromQL's `histogram_quantile` does:
+    /// find the bucket holding rank `q * count` and interpolate linearly
+    /// inside it, assuming observations are spread evenly across the bucket.
+    ///
+    /// The lowest bucket is taken to start at 0 when its bound is positive.
+    /// A rank that lands in the `+Inf` bucket returns the highest finite
+    /// bound. Returns `NaN` with no observations or `q` outside `[0, 1]`.
+    ///
+    /// ```
+    /// use belay_metrics::Histogram;
+    ///
+    /// let h = Histogram::new(&[1.0, 2.0, 4.0]).unwrap();
+    /// for v in [0.5, 1.5, 1.5, 3.0] {
+    ///     h.observe(v);
+    /// }
+    /// // rank 2 of 4 falls halfway through the (1, 2] bucket, which holds 2.
+    /// assert_eq!(h.snapshot().quantile(0.5), 1.5);
+    /// ```
+    pub fn quantile(&self, q: f64) -> f64 {
+        if self.count == 0 || !(0.0..=1.0).contains(&q) {
+            return f64::NAN;
+        }
+        let rank = q * self.count as f64;
+        let mut lower = 0.0;
+        let mut below = 0u64;
+        for (i, bucket) in self.buckets.iter().enumerate() {
+            if (bucket.cumulative_count as f64) >= rank {
+                if bucket.upper_bound.is_infinite() {
+                    return if i == 0 { f64::NAN } else { lower };
+                }
+                if i == 0 && bucket.upper_bound <= 0.0 {
+                    return bucket.upper_bound;
+                }
+                let in_bucket = (bucket.cumulative_count - below) as f64;
+                if in_bucket == 0.0 {
+                    return lower;
+                }
+                let fraction = (rank - below as f64) / in_bucket;
+                return lower + (bucket.upper_bound - lower) * fraction;
+            }
+            lower = bucket.upper_bound;
+            below = bucket.cumulative_count;
+        }
+        lower
+    }
+}
