@@ -253,3 +253,119 @@ impl Observe for Histogram {
         &*self.core.time
     }
 }
+
+impl fmt::Debug for Histogram {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Histogram")
+            .field("buckets", &self.buckets())
+            .field("count", &self.count())
+            .field("sum", &self.sum())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cumulative(h: &Histogram) -> Vec<u64> {
+        h.snapshot()
+            .buckets
+            .iter()
+            .map(|b| b.cumulative_count)
+            .collect()
+    }
+
+    #[test]
+    fn nan_goes_to_the_inf_bucket_and_poisons_the_sum() {
+        let h = Histogram::new(&[1.0]).unwrap();
+        h.observe(0.5);
+        h.observe(f64::NAN);
+        assert_eq!(cumulative(&h), [1, 2]);
+        assert!(h.sum().is_nan());
+    }
+
+    #[test]
+    fn infinities_land_in_the_outer_buckets() {
+        let h = Histogram::new(&[0.0]).unwrap();
+        h.observe(f64::NEG_INFINITY);
+        h.observe(f64::INFINITY);
+        assert_eq!(cumulative(&h), [1, 2]);
+    }
+
+    #[test]
+    fn empty_bounds_leave_only_the_inf_bucket() {
+        let h = Histogram::new(&[]).unwrap();
+        h.observe(42.0);
+        let snap = h.snapshot();
+        assert_eq!(snap.buckets.len(), 1);
+        assert_eq!(snap.buckets[0].upper_bound, f64::INFINITY);
+        assert_eq!(snap.buckets[0].cumulative_count, 1);
+    }
+
+    #[test]
+    fn trailing_inf_bound_is_dropped() {
+        let h = Histogram::new(&[1.0, f64::INFINITY]).unwrap();
+        assert_eq!(h.buckets(), [1.0]);
+        assert_eq!(h.snapshot().buckets.len(), 2);
+    }
+
+    #[test]
+    fn rejects_unsorted_duplicate_or_non_finite_bounds() {
+        for bad in [
+            &[1.0, 0.5][..],
+            &[1.0, 1.0],
+            &[f64::NAN],
+            &[f64::NEG_INFINITY, 0.0],
+            &[f64::INFINITY, f64::INFINITY],
+        ] {
+            assert!(
+                matches!(Histogram::new(bad), Err(Error::InvalidBuckets(_))),
+                "{bad:?} should be rejected"
+            );
+        }
+        let err = Histogram::new(&[1.0, 0.5]).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid histogram buckets: bounds must be strictly increasing, got 0.5 after 1"
+        );
+    }
+
+    #[test]
+    fn observe_duration_uses_seconds() {
+        let h = Histogram::new(&DEFAULT_BUCKETS).unwrap();
+        h.observe_duration(Duration::from_millis(30));
+        assert_eq!(h.sum(), 0.03);
+        assert_eq!(h.snapshot().buckets[3].cumulative_count, 1); // le=0.05
+        assert_eq!(h.snapshot().buckets[2].cumulative_count, 0); // le=0.025
+    }
+
+    #[test]
+    fn exponential_buckets_validate_their_arguments() {
+        assert!(exponential_buckets(1.0, 1.0, 3).is_err());
+        assert!(exponential_buckets(1.0, 2.0, 0).is_err());
+        assert!(exponential_buckets(-1.0, 2.0, 3).is_err());
+        assert!(exponential_buckets(1e300, 1e10, 3).is_err());
+        assert_eq!(
+            exponential_buckets(1.0, 10.0, 3).unwrap(),
+            [1.0, 10.0, 100.0]
+        );
+    }
+
+    #[test]
+    fn linear_buckets_validate_their_arguments() {
+        assert!(linear_buckets(0.0, 0.0, 3).is_err());
+        assert!(linear_buckets(f64::NAN, 1.0, 3).is_err());
+        assert!(linear_buckets(0.0, 1.0, 0).is_err());
+        assert!(linear_buckets(f64::MAX, f64::MAX, 3).is_err());
+        assert_eq!(linear_buckets(-1.0, 1.0, 3).unwrap(), [-1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn bucket_helper_output_is_accepted_by_histograms() {
+        let bounds = linear_buckets(0.1, 0.1, 50).unwrap();
+        assert!(Histogram::new(&bounds).is_ok());
+        let bounds = exponential_buckets(0.001, 1.5, 40).unwrap();
+        assert!(Histogram::new(&bounds).is_ok());
+    }
+}
