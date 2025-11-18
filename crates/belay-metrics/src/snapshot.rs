@@ -201,3 +201,103 @@ impl HistogramValue {
         lower
     }
 }
+
+/// A summary's quantile estimates over its sliding window.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SummaryValue {
+    /// Estimates in increasing quantile order; `NaN` when the window is empty.
+    pub quantiles: Vec<Quantile>,
+    /// Sum of all observations ever made (not just the window).
+    pub sum: f64,
+    /// Number of observations ever made.
+    pub count: u64,
+}
+
+/// One quantile estimate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Quantile {
+    /// The quantile, in `[0, 1]`.
+    pub quantile: f64,
+    /// The estimated value at that quantile.
+    pub value: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hist(bounds: &[f64], counts: &[u64]) -> HistogramValue {
+        let mut cumulative = 0;
+        let mut buckets: Vec<Bucket> = bounds
+            .iter()
+            .zip(counts)
+            .map(|(&upper_bound, &c)| {
+                cumulative += c;
+                Bucket {
+                    upper_bound,
+                    cumulative_count: cumulative,
+                }
+            })
+            .collect();
+        cumulative += counts[bounds.len()];
+        buckets.push(Bucket {
+            upper_bound: f64::INFINITY,
+            cumulative_count: cumulative,
+        });
+        HistogramValue {
+            buckets,
+            sum: 0.0,
+            count: cumulative,
+        }
+    }
+
+    #[test]
+    fn quantile_interpolates_within_the_bucket() {
+        let h = hist(&[1.0, 2.0, 4.0], &[10, 0, 10, 0]);
+        assert_eq!(h.quantile(0.5), 1.0);
+        assert_eq!(h.quantile(0.75), 3.0);
+        assert_eq!(h.quantile(1.0), 4.0);
+        assert_eq!(h.quantile(0.0), 0.0);
+    }
+
+    #[test]
+    fn quantile_in_the_inf_bucket_returns_the_highest_finite_bound() {
+        let h = hist(&[1.0, 2.0], &[1, 1, 8]);
+        assert_eq!(h.quantile(0.9), 2.0);
+    }
+
+    #[test]
+    fn quantile_is_nan_without_observations_or_for_bad_q() {
+        assert!(hist(&[1.0], &[0, 0]).quantile(0.5).is_nan());
+        assert!(hist(&[1.0], &[3, 0]).quantile(1.5).is_nan());
+        assert!(hist(&[1.0], &[3, 0]).quantile(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn negative_first_bound_is_returned_as_is() {
+        let h = hist(&[-1.0, 0.0], &[4, 0, 0]);
+        assert_eq!(h.quantile(0.5), -1.0);
+    }
+
+    #[test]
+    fn mean_needs_observations() {
+        let mut h = hist(&[1.0], &[2, 0]);
+        assert_eq!(h.mean(), Some(0.0));
+        h.sum = 3.0;
+        assert_eq!(h.mean(), Some(1.5));
+        assert_eq!(hist(&[1.0], &[0, 0]).mean(), None);
+    }
+
+    #[test]
+    fn metric_lookup_ignores_label_order() {
+        let desc = Desc::new("x", "", MetricType::Gauge, &["a", "b"]).unwrap();
+        let family = FamilySnapshot::new(&desc)
+            .with_metric(&[("a", "1"), ("b", "2")], MetricValue::Gauge(3.0))
+            .with_metric(&[("a", "1"), ("b", "3")], MetricValue::Gauge(4.0));
+        let m = family.metric(&[("b", "3"), ("a", "1")]).unwrap();
+        assert_eq!(m.value.as_gauge(), Some(4.0));
+        assert!(family.metric(&[("a", "1")]).is_none());
+        assert_eq!(m.value.kind(), MetricType::Gauge);
+        assert_eq!(m.value.as_counter(), None);
+    }
+}
