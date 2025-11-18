@@ -108,3 +108,148 @@ pub(crate) fn validate_buckets(bounds: &[f64]) -> Result<Arc<[f64]>> {
     }
     Ok(bounds.into())
 }
+
+/// Counts observations into buckets, e.g. request latencies in seconds.
+///
+/// Each observation increments exactly one per-bucket atomic counter and adds
+/// to an atomic sum; the cumulative `le` counts Prometheus expects are
+/// computed at scrape time. The total count is the sum of the buckets, so the
+/// exported `_count` always equals the `+Inf` bucket even while observations
+/// race with a scrape (the `_sum` may be one observation ahead or behind).
+///
+/// `NaN` lands in the `+Inf` bucket and turns the sum into `NaN`, matching
+/// the reference Go client.
+///
+/// ```
+/// use belay_metrics::Histogram;
+///
+/// let h = Histogram::new(&[0.1, 1.0]).unwrap();
+/// h.observe(0.05);
+/// h.observe(3.0);
+/// let snap = h.snapshot();
+/// let cumulative: Vec<u64> = snap.buckets.iter().map(|b| b.cumulative_count).collect();
+/// assert_eq!(cumulative, [1, 1, 2]);
+/// assert_eq!(snap.count, 2);
+/// ```
+#[derive(Clone)]
+pub struct Histogram {
+    core: Arc<Core>,
+}
+
+struct Core {
+    bounds: Arc<[f64]>,
+    /// Non-cumulative counts; index `bounds.len()` is the `+Inf` bucket.
+    counts: Box<[AtomicU64]>,
+    sum: AtomicF64,
+    time: SharedTimeSource,
+}
+
+impl Histogram {
+    /// A standalone histogram with the given bucket upper bounds, timed by
+    /// the process-wide monotonic clock.
+    pub fn new(buckets: &[f64]) -> Result<Histogram> {
+        Self::with_time_source(buckets, time::monotonic())
+    }
+
+    /// Like [`new`](Self::new) but timers read `time`.
+    pub fn with_time_source(buckets: &[f64], time: SharedTimeSource) -> Result<Histogram> {
+        Ok(Self::from_bounds(validate_buckets(buckets)?, time))
+    }
+
+    /// Builds from bounds that already passed [`validate_buckets`].
+    pub(crate) fn from_bounds(bounds: Arc<[f64]>, time: SharedTimeSource) -> Histogram {
+        let counts = (0..=bounds.len()).map(|_| AtomicU64::new(0)).collect();
+        Histogram {
+            core: Arc::new(Core {
+                bounds,
+                counts,
+                sum: AtomicF64::zero(),
+                time,
+            }),
+        }
+    }
+
+    /// Records one observation.
+    #[inline]
+    pub fn observe(&self, value: f64) {
+        let core = &*self.core;
+        // `!(value < b)` rather than `b <= value` so NaN, which compares
+        // false with everything, falls through to the +Inf bucket.
+        let index = core.bounds.partition_point(|&b| !(value < b));
+        core.counts[index].fetch_add(1, Ordering::Relaxed);
+        core.sum.add(value);
+    }
+
+    /// Records a duration in seconds.
+    #[inline]
+    pub fn observe_duration(&self, elapsed: Duration) {
+        self.observe(elapsed.as_secs_f64());
+    }
+
+    /// Starts a timer that records into this histogram when stopped or dropped.
+    pub fn start_timer(&self) -> HistogramTimer {
+        Timer::start(self.clone())
+    }
+
+    /// Runs `f` and records how long it took.
+    pub fn time<R>(&self, f: impl FnOnce() -> R) -> R {
+        let timer = self.start_timer();
+        let out = f();
+        timer.stop_and_record();
+        out
+    }
+
+    /// The finite bucket upper bounds (the `+Inf` bucket is implicit).
+    pub fn buckets(&self) -> &[f64] {
+        &self.core.bounds
+    }
+
+    /// Number of observations so far.
+    #[must_use]
+    pub fn count(&self) -> u64 {
+        self.core
+            .counts
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum()
+    }
+
+    /// Sum of observations so far.
+    #[must_use]
+    pub fn sum(&self) -> f64 {
+        self.core.sum.load()
+    }
+
+    /// Cumulative buckets, sum and count as of now.
+    pub fn snapshot(&self) -> HistogramValue {
+        let core = &*self.core;
+        let mut cumulative = 0u64;
+        let buckets = core
+            .counts
+            .iter()
+            .enumerate()
+            .map(|(i, c)| {
+                cumulative += c.load(Ordering::Relaxed);
+                Bucket {
+                    upper_bound: core.bounds.get(i).copied().unwrap_or(f64::INFINITY),
+                    cumulative_count: cumulative,
+                }
+            })
+            .collect();
+        HistogramValue {
+            buckets,
+            sum: core.sum.load(),
+            count: cumulative,
+        }
+    }
+}
+
+impl Observe for Histogram {
+    fn observe(&self, value: f64) {
+        Histogram::observe(self, value);
+    }
+
+    fn time_source(&self) -> &dyn TimeSource {
+        &*self.core.time
+    }
+}
