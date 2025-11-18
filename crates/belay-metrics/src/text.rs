@@ -168,3 +168,77 @@ pub fn escape_label_value(value: &str) -> Cow<'_, str> {
 pub fn escape_help(help: &str) -> Cow<'_, str> {
     escape(help, false)
 }
+
+fn escape(s: &str, quotes: bool) -> Cow<'_, str> {
+    let needs = |c: char| c == '\\' || c == '\n' || (quotes && c == '"');
+    if !s.contains(needs) {
+        return Cow::Borrowed(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '"' if quotes => out.push_str("\\\""),
+            c => out.push(c),
+        }
+    }
+    Cow::Owned(out)
+}
+
+impl FamilySnapshot {
+    /// Renders this family alone in the text format.
+    pub fn to_prometheus(&self) -> String {
+        let mut out = String::new();
+        encode_family(&mut out, self);
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_floats_like_prometheus() {
+        let cases = [
+            (0.0, "0"),
+            (-0.0, "0"),
+            (1.0, "1"),
+            (-1.0, "-1"),
+            (0.005, "0.005"),
+            (-2.5, "-2.5"),
+            (1e6, "1000000"),
+            (123456789.0, "123456789"),
+            (9007199254740993.0, "9007199254740992"),
+            (1e20, "100000000000000000000"),
+            (1e21, "1e21"),
+            (1.5e300, "1.5e300"),
+            (0.00001, "0.00001"),
+            (0.000001234, "1.234e-6"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (f64::MIN_POSITIVE, "2.2250738585072014e-308"),
+            (f64::NAN, "NaN"),
+            (f64::INFINITY, "+Inf"),
+            (f64::NEG_INFINITY, "-Inf"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(format_float(v), want, "formatting {v:e}");
+        }
+    }
+
+    #[test]
+    fn formatted_floats_parse_back_exactly() {
+        for v in [0.1, 1.0 / 3.0, 6.02214076e23, 1e-300, -7.25, 4096.0] {
+            let parsed: f64 = format_float(v).parse().unwrap();
+            assert_eq!(parsed, v);
+        }
+    }
+
+    #[test]
+    fn escapes_label_values_and_help_differently() {
+        assert_eq!(escape_label_value("a\\b\"c\nd"), "a\\\\b\\\"c\\nd");
+        assert_eq!(escape_help("a\\b\"c\nd"), "a\\\\b\"c\\nd");
+        assert!(matches!(escape_label_value("no escapes"), Cow::Borrowed(_)));
+    }
+}
