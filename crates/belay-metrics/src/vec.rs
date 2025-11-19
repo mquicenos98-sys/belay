@@ -124,3 +124,229 @@ fn hash_values<S: AsRef<str>>(values: &[S]) -> u64 {
     }
     hasher.finish()
 }
+
+fn same_values(stored: &[String], wanted: &[&str]) -> bool {
+    stored.len() == wanted.len() && stored.iter().zip(wanted).all(|(a, b)| a == b)
+}
+
+impl<M: Child> Core<M> {
+    pub(crate) fn new(desc: Desc, config: M::Config, time: SharedTimeSource) -> Self {
+        Core {
+            desc,
+            config,
+            time,
+            children: RwLock::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, values: &[&str]) -> Result<M> {
+        let expected = self.desc.label_names().len();
+        if values.len() != expected {
+            return Err(Error::LabelCount {
+                expected,
+                got: values.len(),
+            });
+        }
+        let hash = hash_values(values);
+        if let Some(bucket) = read(&self.children).get(&hash) {
+            if let Some((_, child)) = bucket.iter().find(|(v, _)| same_values(v, values)) {
+                return Ok(child.clone());
+            }
+        }
+        let mut children = write(&self.children);
+        let bucket = children.entry(hash).or_default();
+        // Another thread may have created it between the two locks.
+        if let Some((_, child)) = bucket.iter().find(|(v, _)| same_values(v, values)) {
+            return Ok(child.clone());
+        }
+        let child = M::create(&self.config, &self.time);
+        let owned = values.iter().map(|v| (*v).to_owned()).collect();
+        bucket.push((owned, child.clone()));
+        Ok(child)
+    }
+
+    fn get_by_pairs(&self, labels: &[(&str, &str)]) -> Result<M> {
+        let names = self.desc.label_names();
+        for (i, (name, _)) in labels.iter().enumerate() {
+            if !names.iter().any(|n| n == name) {
+                return Err(Error::UnknownLabel((*name).to_owned()));
+            }
+            if labels[..i].iter().any(|(earlier, _)| earlier == name) {
+                return Err(Error::DuplicateLabel((*name).to_owned()));
+            }
+        }
+        let mut values = Vec::with_capacity(names.len());
+        for name in names {
+            match labels.iter().find(|(n, _)| n == name) {
+                Some(&(_, value)) => values.push(value),
+                None => return Err(Error::MissingLabel(name.clone())),
+            }
+        }
+        self.get(&values)
+    }
+
+    fn remove(&self, values: &[&str]) -> bool {
+        let hash = hash_values(values);
+        let mut children = write(&self.children);
+        let Some(bucket) = children.get_mut(&hash) else {
+            return false;
+        };
+        let before = bucket.len();
+        bucket.retain(|(v, _)| !same_values(v, values));
+        let removed = bucket.len() != before;
+        if bucket.is_empty() {
+            children.remove(&hash);
+        }
+        removed
+    }
+
+    fn len(&self) -> usize {
+        read(&self.children).values().map(Vec::len).sum()
+    }
+
+    fn snapshot(&self) -> FamilySnapshot {
+        // Clone the handles out so values (a summary sorts its samples) are
+        // read without holding the lock that child creation needs.
+        let mut children: Vec<Entry<M>> = read(&self.children)
+            .values()
+            .flatten()
+            .map(|(values, child)| (values.clone(), child.clone()))
+            .collect();
+        children.sort_by(|a, b| a.0.cmp(&b.0));
+        let mut family = FamilySnapshot::new(&self.desc);
+        family.metrics = children
+            .into_iter()
+            .map(|(values, child)| MetricSnapshot {
+                labels: self
+                    .desc
+                    .label_names()
+                    .iter()
+                    .cloned()
+                    .zip(values.into_vec())
+                    .collect(),
+                value: child.value(),
+            })
+            .collect();
+        family
+    }
+}
+
+macro_rules! metric_vec {
+    ($(#[$attr:meta])* $vec:ident => $metric:ident) => {
+        $(#[$attr])*
+        #[derive(Clone)]
+        pub struct $vec {
+            core: Arc<Core<$metric>>,
+        }
+
+        impl $vec {
+            pub(crate) fn from_core(core: Core<$metric>) -> Self {
+                $vec { core: Arc::new(core) }
+            }
+
+            pub(crate) fn snapshot(&self) -> FamilySnapshot {
+                self.core.snapshot()
+            }
+
+            /// The family's name, help text, type and label names.
+            pub fn desc(&self) -> &Desc {
+                &self.core.desc
+            }
+
+            #[doc = concat!("The [`", stringify!($metric), "`] for `values`, given in label-name")]
+            /// order, created on first use. Every call with equal values
+            /// returns a handle to the same series.
+            ///
+            /// # Panics
+            ///
+            /// Panics if the number of values differs from the number of
+            /// label names: a programming error, like indexing out of
+            /// bounds. Use [`try_with_label_values`](Self::try_with_label_values)
+            /// when the values come from input.
+            pub fn with_label_values(&self, values: &[&str]) -> $metric {
+                self.core
+                    .get(values)
+                    .unwrap_or_else(|e| panic!("metric {:?}: {e}", self.core.desc.name()))
+            }
+
+            /// Like [`with_label_values`](Self::with_label_values), but a
+            /// wrong number of values is an [`Error::LabelCount`].
+            pub fn try_with_label_values(&self, values: &[&str]) -> Result<$metric> {
+                self.core.get(values)
+            }
+
+            /// The child for `(label, value)` pairs given in any order.
+            ///
+            /// # Panics
+            ///
+            /// Panics if a label is unknown, missing or repeated; see
+            /// [`try_with`](Self::try_with).
+            pub fn with(&self, labels: &[(&str, &str)]) -> $metric {
+                self.core
+                    .get_by_pairs(labels)
+                    .unwrap_or_else(|e| panic!("metric {:?}: {e}", self.core.desc.name()))
+            }
+
+            /// Like [`with`](Self::with), returning an error for unknown,
+            /// missing or repeated labels.
+            pub fn try_with(&self, labels: &[(&str, &str)]) -> Result<$metric> {
+                self.core.get_by_pairs(labels)
+            }
+
+            /// Removes the child for `values`, so it is no longer exported
+            /// (e.g. after a queue is deleted). Returns whether it existed.
+            /// Handles already held keep working but are detached: a later
+            /// lookup of the same values starts a fresh series.
+            pub fn remove_label_values(&self, values: &[&str]) -> bool {
+                self.core.remove(values)
+            }
+
+            /// Removes every child.
+            pub fn clear(&self) {
+                write(&self.core.children).clear();
+            }
+
+            /// Number of children.
+            pub fn len(&self) -> usize {
+                self.core.len()
+            }
+
+            /// Whether the family has no children yet.
+            pub fn is_empty(&self) -> bool {
+                self.len() == 0
+            }
+        }
+
+        impl fmt::Debug for $vec {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.debug_struct(stringify!($vec))
+                    .field("name", &self.core.desc.name())
+                    .field("label_names", &self.core.desc.label_names())
+                    .field("children", &self.len())
+                    .finish()
+            }
+        }
+    };
+}
+
+metric_vec! {
+    /// A family of [`Counter`]s partitioned by labels.
+    CounterVec => Counter
+}
+
+metric_vec! {
+    /// A family of [`Gauge`]s partitioned by labels.
+    GaugeVec => Gauge
+}
+
+metric_vec! {
+    /// A family of [`Histogram`]s partitioned by labels, all sharing one
+    /// bucket layout.
+    HistogramVec => Histogram
+}
+
+metric_vec! {
+    /// A family of [`Summary`]s partitioned by labels, all sharing one set of
+    /// options.
+    SummaryVec => Summary
+}
