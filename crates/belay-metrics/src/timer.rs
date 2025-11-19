@@ -93,3 +93,83 @@ impl<O: Observe> Timer<O> {
         elapsed
     }
 }
+
+impl<O: Observe> Drop for Timer<O> {
+    fn drop(&mut self) {
+        self.finish(true);
+    }
+}
+
+impl<O: Observe> fmt::Debug for Timer<O> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Timer")
+            .field("elapsed", &self.elapsed())
+            .field("armed", &self.target.is_some())
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Histogram, ManualTime};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn setup() -> (ManualTime, Histogram) {
+        let time = ManualTime::new();
+        let h = Histogram::with_time_source(&[0.5, 1.0], Arc::new(time.clone())).unwrap();
+        (time, h)
+    }
+
+    #[test]
+    fn drop_records_exactly_once() {
+        let (time, h) = setup();
+        {
+            let _timer = h.start_timer();
+            time.advance(Duration::from_millis(750));
+        }
+        assert_eq!(h.count(), 1);
+        assert_eq!(h.sum(), 0.75);
+    }
+
+    #[test]
+    fn stop_and_record_does_not_record_again_on_drop() {
+        let (time, h) = setup();
+        let timer = h.start_timer();
+        time.advance(Duration::from_secs(2));
+        assert_eq!(timer.stop_and_record(), Duration::from_secs(2));
+        assert_eq!(h.count(), 1);
+        assert_eq!(h.snapshot().buckets[1].cumulative_count, 0);
+    }
+
+    #[test]
+    fn stop_and_discard_records_nothing() {
+        let (time, h) = setup();
+        let timer = h.start_timer();
+        time.advance(Duration::from_millis(10));
+        assert_eq!(timer.elapsed(), Duration::from_millis(10));
+        assert_eq!(timer.stop_and_discard(), Duration::from_millis(10));
+        assert_eq!(h.count(), 0);
+    }
+
+    #[test]
+    fn clock_going_backwards_records_zero() {
+        let (time, h) = setup();
+        time.set(Duration::from_secs(10));
+        let timer = h.start_timer();
+        time.set(Duration::from_secs(3));
+        assert_eq!(timer.stop_and_record(), Duration::ZERO);
+        assert_eq!(h.sum(), 0.0);
+    }
+
+    #[test]
+    fn time_closure_returns_the_result_and_records() {
+        let (time, h) = setup();
+        let out = h.time(|| {
+            time.advance(Duration::from_millis(100));
+            "done"
+        });
+        assert_eq!(out, "done");
+        assert_eq!(h.sum(), 0.1);
+    }
+}
