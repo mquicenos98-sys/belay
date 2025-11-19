@@ -36,9 +36,7 @@ use crate::time::{self, SharedTimeSource, TimeSource};
 use crate::timer::{Observe, SummaryTimer, Timer};
 
 const MAX_AGE_BUCKETS: u32 = 256;
-
 const MAX_RESERVOIR_SIZE: usize = 1 << 16;
-
 const MIN_SUB_WINDOW: Duration = Duration::from_millis(1);
 
 /// Configuration for a [`Summary`].
@@ -325,4 +323,302 @@ fn mix(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     z ^ (z >> 31)
+}
+
+impl Window {
+    fn new(opts: &SummaryOpts) -> Window {
+        let width = opts.max_age.as_nanos() / u128::from(opts.age_buckets);
+        Window {
+            width: u64::try_from(width).unwrap_or(u64::MAX).max(1),
+            capacity: opts.reservoir_size,
+            slots: (0..opts.age_buckets)
+                .map(|_| Slot {
+                    state: AtomicU64::new(0),
+                    samples: OnceLock::new(),
+                })
+                .collect(),
+        }
+    }
+
+    fn epoch(&self, now: Duration) -> u64 {
+        u64::try_from(now.as_nanos() / u128::from(self.width)).unwrap_or(u64::MAX)
+    }
+
+    fn slot(&self, epoch: u64) -> &Slot {
+        &self.slots[(epoch % self.slots.len() as u64) as usize]
+    }
+
+    fn record(&self, value: f64, now: Duration) {
+        let epoch = self.epoch(now);
+        let tag = epoch as u32;
+        let slot = self.slot(epoch);
+
+        let mut current = slot.state.load(Ordering::Acquire);
+        let index = loop {
+            let (held, seen) = unpack(current);
+            let (next, index) = if held == tag && seen > 0 {
+                (pack(tag, seen.saturating_add(1)), seen)
+            } else if seen == 0 || is_later(tag, held) {
+                // Unused, or holding an expired sub-window: take it over.
+                (pack(tag, 1), 0)
+            } else {
+                // The slot already moved on to a later sub-window (the clock
+                // went backwards or this thread stalled); the observation's
+                // own sub-window is gone.
+                return;
+            };
+            match slot.state.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break u64::from(index),
+                Err(actual) => current = actual,
+            }
+        };
+
+        let position = if index < self.capacity as u64 {
+            index
+        } else {
+            // Algorithm R: the (index+1)-th observation replaces a random
+            // retained sample with probability capacity / (index + 1).
+            let draw = mix(epoch.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ index) % (index + 1);
+            if draw >= self.capacity as u64 {
+                return;
+            }
+            draw
+        };
+        let samples = slot
+            .samples
+            .get_or_init(|| (0..self.capacity).map(|_| AtomicU64::new(0)).collect());
+        samples[position as usize].store(value.to_bits(), Ordering::Release);
+    }
+
+    /// Appends `(value, weight)` for every retained sample in the live
+    /// sub-windows and returns the total weight.
+    fn collect(&self, now: Duration, out: &mut Vec<(f64, f64)>) -> f64 {
+        let current = self.epoch(now);
+        let live = (self.slots.len() as u64).min(current.saturating_add(1));
+        let mut total = 0.0;
+        for age in 0..live {
+            let epoch = current - age;
+            let slot = self.slot(epoch);
+            let (tag, seen) = unpack(slot.state.load(Ordering::Acquire));
+            if tag != epoch as u32 || seen == 0 {
+                continue;
+            }
+            let Some(samples) = slot.samples.get() else {
+                continue;
+            };
+            let kept = (seen as usize).min(self.capacity);
+            let weight = f64::from(seen) / kept as f64;
+            out.extend(
+                samples[..kept]
+                    .iter()
+                    .map(|s| (f64::from_bits(s.load(Ordering::Acquire)), weight)),
+            );
+            total += weight * kept as f64;
+        }
+        total
+    }
+}
+
+/// Nearest-rank quantiles over weighted samples: the estimate for `q` is the
+/// smallest sample whose cumulative weight reaches `q * total`. `quantiles`
+/// must be sorted ascending; the result follows the same order.
+fn weighted_quantiles(samples: &mut [(f64, f64)], total: f64, quantiles: &[f64]) -> Vec<Quantile> {
+    samples.sort_by(|a, b| a.0.total_cmp(&b.0));
+    let mut out = Vec::with_capacity(quantiles.len());
+    let mut i = 0;
+    let mut below = 0.0;
+    for &quantile in quantiles {
+        let value = if samples.is_empty() {
+            f64::NAN
+        } else {
+            // Shave a relative epsilon off the target: `q * total` can round
+            // up past an exact rank (0.07 * 100 == 7.000000000000001), which
+            // would skip to the next sample.
+            let target = quantile * total * (1.0 - 1e-12);
+            while i + 1 < samples.len() && below + samples[i].1 < target {
+                below += samples[i].1;
+                i += 1;
+            }
+            samples[i].0
+        };
+        out.push(Quantile { quantile, value });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ManualTime;
+
+    fn summary(opts: SummaryOpts) -> (ManualTime, Summary) {
+        let time = ManualTime::new();
+        let s = Summary::with_time_source(opts, Arc::new(time.clone())).unwrap();
+        (time, s)
+    }
+
+    fn values(s: &Summary) -> Vec<f64> {
+        s.quantiles().iter().map(|q| q.value).collect()
+    }
+
+    #[test]
+    fn quantiles_are_exact_within_reservoir_capacity() {
+        let qs = [0.0, 0.07, 0.5, 0.9, 0.99, 1.0];
+        let (_, s) = summary(SummaryOpts::new().quantiles(&qs));
+        // Observe out of order: the estimate must not depend on arrival order.
+        for v in (1..=100).rev() {
+            s.observe(f64::from(v));
+        }
+        // 0.07 * 100 rounds up to 7.000000000000001 and must still give rank 7.
+        assert_eq!(values(&s), [1.0, 7.0, 50.0, 90.0, 99.0, 100.0]);
+        assert_eq!(s.count(), 100);
+        assert_eq!(s.sum(), 5050.0);
+    }
+
+    #[test]
+    fn empty_window_reports_nan() {
+        let (_, s) = summary(SummaryOpts::new());
+        assert!(values(&s).iter().all(|v| v.is_nan()));
+        assert_eq!(s.snapshot().quantiles.len(), 3);
+    }
+
+    #[test]
+    fn observations_expire_one_sub_window_at_a_time() {
+        let opts = SummaryOpts::new()
+            .quantiles(&[0.0])
+            .max_age(Duration::from_secs(10))
+            .age_buckets(5);
+        let (time, s) = summary(opts);
+        s.observe(1.0); // t=0, sub-window [0s, 2s)
+        time.set(Duration::from_secs(3));
+        s.observe(2.0); // sub-window [2s, 4s)
+
+        time.set(Duration::from_millis(9_999));
+        assert_eq!(values(&s), [1.0]);
+        time.set(Duration::from_secs(10));
+        assert_eq!(values(&s), [2.0]);
+        time.set(Duration::from_secs(12));
+        assert!(values(&s)[0].is_nan());
+        // Lifetime totals are unaffected by expiry.
+        assert_eq!((s.count(), s.sum()), (2, 3.0));
+    }
+
+    #[test]
+    fn reused_slot_forgets_its_previous_sub_window() {
+        let opts = SummaryOpts::new()
+            .quantiles(&[0.0, 1.0])
+            .max_age(Duration::from_secs(10))
+            .age_buckets(5);
+        let (time, s) = summary(opts);
+        s.observe(5.0);
+        s.observe(6.0);
+        time.set(Duration::from_secs(10)); // epoch 5 maps onto epoch 0's slot
+        s.observe(7.0);
+        assert_eq!(values(&s), [7.0, 7.0]);
+    }
+
+    #[test]
+    fn sampling_beyond_capacity_stays_close_and_is_deterministic() {
+        let opts = SummaryOpts::new()
+            .quantiles(&[0.1, 0.5, 0.9])
+            .reservoir_size(128);
+        let (_, a) = summary(opts.clone());
+        let (_, b) = summary(opts);
+        for i in 0..20_000u32 {
+            // A scrambled but reproducible order of 0..20000.
+            let v = f64::from((i * 7919) % 20_000);
+            a.observe(v);
+            b.observe(v);
+        }
+        let got = values(&a);
+        assert_eq!(got, values(&b));
+        for (estimate, truth) in got.iter().zip([2_000.0, 10_000.0, 18_000.0]) {
+            assert!(
+                (estimate - truth).abs() < 2_000.0,
+                "estimate {estimate} too far from {truth}"
+            );
+        }
+    }
+
+    #[test]
+    fn nan_is_counted_but_not_ranked() {
+        let (_, s) = summary(SummaryOpts::new().quantiles(&[1.0]));
+        s.observe(1.0);
+        s.observe(f64::NAN);
+        assert_eq!(values(&s), [1.0]);
+        assert_eq!(s.count(), 2);
+        assert!(s.sum().is_nan());
+    }
+
+    #[test]
+    fn without_quantiles_only_totals_are_kept() {
+        let (_, s) = summary(SummaryOpts::new().quantiles(&[]));
+        s.observe(2.5);
+        let snap = s.snapshot();
+        assert!(snap.quantiles.is_empty());
+        assert_eq!((snap.count, snap.sum), (1, 2.5));
+    }
+
+    #[test]
+    fn options_are_validated_and_normalised() {
+        let opts = SummaryOpts::new()
+            .quantiles(&[0.99, 0.5, 0.5])
+            .validated()
+            .unwrap();
+        assert_eq!(opts.get_quantiles(), [0.5, 0.99]);
+
+        let bad = [
+            SummaryOpts::new().quantiles(&[1.5]),
+            SummaryOpts::new().quantiles(&[f64::NAN]),
+            SummaryOpts::new().age_buckets(0),
+            SummaryOpts::new().age_buckets(257),
+            SummaryOpts::new().reservoir_size(0),
+            SummaryOpts::new().max_age(Duration::from_micros(4_999)),
+        ];
+        for opts in bad {
+            assert!(
+                matches!(opts.clone().validated(), Err(Error::InvalidSummary(_))),
+                "{opts:?} should be rejected"
+            );
+        }
+        let err = SummaryOpts::new()
+            .quantiles(&[-0.5])
+            .validated()
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid summary options: quantiles must be within [0, 1], got -0.5"
+        );
+    }
+
+    #[test]
+    fn weighted_quantiles_respect_weights() {
+        // 1.0 stands for 3 observations, 2.0 for 1.
+        let mut samples = vec![(2.0, 1.0), (1.0, 3.0)];
+        let q = weighted_quantiles(&mut samples, 4.0, &[0.5, 0.75, 0.76, 1.0]);
+        let v: Vec<f64> = q.iter().map(|q| q.value).collect();
+        assert_eq!(v, [1.0, 1.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn epoch_tags_compare_across_wrap_around() {
+        assert!(is_later(1, 0));
+        assert!(is_later(0, u32::MAX));
+        assert!(!is_later(7, 7));
+        assert_eq!(unpack(pack(0xdead_beef, 42)), (0xdead_beef, 42));
+    }
+
+    #[test]
+    fn timer_records_into_the_summary() {
+        let (time, s) = summary(SummaryOpts::new().quantiles(&[0.5]));
+        let timer = s.start_timer();
+        time.advance(Duration::from_millis(1500));
+        drop(timer);
+        assert_eq!(values(&s), [1.5]);
+    }
 }
