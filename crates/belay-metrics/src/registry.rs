@@ -147,3 +147,297 @@ fn check_available<'a>(desc: &Desc, owners: impl Iterator<Item = (&'a Desc, bool
     }
     Ok(())
 }
+
+impl State {
+    fn owners(&self) -> impl Iterator<Item = (&Desc, bool)> {
+        self.families.values().map(|f| (f.desc(), false)).chain(
+            self.collectors
+                .iter()
+                .flat_map(|c| c.descs.iter().map(|d| (d, true))),
+        )
+    }
+}
+
+impl Registry {
+    /// An empty registry whose timers and summaries use the process-wide
+    /// monotonic clock.
+    pub fn new() -> Self {
+        Self::with_time_source(time::monotonic())
+    }
+
+    /// An empty registry whose timers and summary windows read `time`.
+    pub fn with_time_source(time: SharedTimeSource) -> Self {
+        Registry {
+            inner: Arc::new(Inner {
+                state: RwLock::new(State::default()),
+                time,
+            }),
+        }
+    }
+
+    /// The clock handed to every histogram and summary created here.
+    pub fn time_source(&self) -> &SharedTimeSource {
+        &self.inner.time
+    }
+
+    /// Registers (or returns) an unlabelled counter.
+    pub fn counter(&self, name: &str, help: &str) -> Result<Counter> {
+        self.counter_vec(name, help, &[])?
+            .try_with_label_values(&[])
+    }
+
+    /// Registers (or returns) a labelled counter family.
+    pub fn counter_vec(&self, name: &str, help: &str, label_names: &[&str]) -> Result<CounterVec> {
+        let desc = Desc::new(name, help, MetricType::Counter, label_names)?;
+        self.register(
+            desc,
+            |family| match family {
+                Family::Counter(v) => Some(v.clone()),
+                _ => None,
+            },
+            |desc, time| {
+                let v = CounterVec::from_core(Core::new(desc, (), time));
+                (Family::Counter(v.clone()), v)
+            },
+        )
+    }
+
+    /// Registers (or returns) an unlabelled gauge.
+    pub fn gauge(&self, name: &str, help: &str) -> Result<Gauge> {
+        self.gauge_vec(name, help, &[])?.try_with_label_values(&[])
+    }
+
+    /// Registers (or returns) a labelled gauge family.
+    pub fn gauge_vec(&self, name: &str, help: &str, label_names: &[&str]) -> Result<GaugeVec> {
+        let desc = Desc::new(name, help, MetricType::Gauge, label_names)?;
+        self.register(
+            desc,
+            |family| match family {
+                Family::Gauge(v) => Some(v.clone()),
+                _ => None,
+            },
+            |desc, time| {
+                let v = GaugeVec::from_core(Core::new(desc, (), time));
+                (Family::Gauge(v.clone()), v)
+            },
+        )
+    }
+
+    /// Registers (or returns) an unlabelled histogram with the given finite
+    /// bucket upper bounds (see [`DEFAULT_BUCKETS`](crate::DEFAULT_BUCKETS)).
+    pub fn histogram(&self, name: &str, help: &str, buckets: &[f64]) -> Result<Histogram> {
+        self.histogram_vec(name, help, &[], buckets)?
+            .try_with_label_values(&[])
+    }
+
+    /// Registers (or returns) a labelled histogram family.
+    pub fn histogram_vec(
+        &self,
+        name: &str,
+        help: &str,
+        label_names: &[&str],
+        buckets: &[f64],
+    ) -> Result<HistogramVec> {
+        let desc = Desc::new(name, help, MetricType::Histogram, label_names)?;
+        let bounds = validate_buckets(buckets)?;
+        self.register(
+            desc,
+            |family| match family {
+                Family::Histogram(v) => Some(v.clone()),
+                _ => None,
+            },
+            |desc, time| {
+                let v = HistogramVec::from_core(Core::new(desc, Arc::clone(&bounds), time));
+                (Family::Histogram(v.clone()), v)
+            },
+        )
+    }
+
+    /// Registers (or returns) an unlabelled summary.
+    pub fn summary(&self, name: &str, help: &str, opts: SummaryOpts) -> Result<Summary> {
+        self.summary_vec(name, help, &[], opts)?
+            .try_with_label_values(&[])
+    }
+
+    /// Registers (or returns) a labelled summary family.
+    pub fn summary_vec(
+        &self,
+        name: &str,
+        help: &str,
+        label_names: &[&str],
+        opts: SummaryOpts,
+    ) -> Result<SummaryVec> {
+        let desc = Desc::new(name, help, MetricType::Summary, label_names)?;
+        let opts = opts.validated()?;
+        self.register(
+            desc,
+            |family| match family {
+                Family::Summary(v) if v.opts() == &opts => Some(v.clone()),
+                _ => None,
+            },
+            |desc, time| {
+                let v = SummaryVec::from_core(Core::new(desc, opts.clone(), time));
+                (Family::Summary(v.clone()), v)
+            },
+        )
+    }
+
+    /// The shared registration path: return the existing family when the
+    /// definition matches, reject any other use of the name or of its
+    /// series names, and otherwise insert what `create` builds.
+    fn register<T>(
+        &self,
+        desc: Desc,
+        existing: impl FnOnce(&Family) -> Option<T>,
+        create: impl FnOnce(Desc, SharedTimeSource) -> (Family, T),
+    ) -> Result<T> {
+        let mut state = write(&self.inner.state);
+        if let Some(family) = state.families.get(desc.name()) {
+            if family.desc() == &desc {
+                if let Some(found) = existing(family) {
+                    return Ok(found);
+                }
+            }
+            return Err(Error::Conflict {
+                name: desc.name().to_owned(),
+                detail: family.desc().conflict_detail(&desc),
+            });
+        }
+        check_available(&desc, state.owners())?;
+        let (family, handle) = create(desc, Arc::clone(&self.inner.time));
+        state
+            .families
+            .insert(family.desc().name().to_owned(), family);
+        Ok(handle)
+    }
+
+    /// Registers a gauge whose value is computed by `read` at scrape time.
+    ///
+    /// ```
+    /// use belay_metrics::Registry;
+    /// use std::sync::atomic::{AtomicUsize, Ordering};
+    /// use std::sync::Arc;
+    ///
+    /// # fn main() -> belay_metrics::Result<()> {
+    /// let registry = Registry::new();
+    /// let pending = Arc::new(AtomicUsize::new(3));
+    /// let source = Arc::clone(&pending);
+    /// registry.register_gauge_fn("store_pending_writes", "Writes awaiting fsync.", move || {
+    ///     source.load(Ordering::Relaxed) as f64
+    /// })?;
+    /// assert!(registry.render_prometheus().contains("store_pending_writes 3\n"));
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn register_gauge_fn<F>(&self, name: &str, help: &str, read: F) -> Result<()>
+    where
+        F: Fn() -> f64 + Send + Sync + 'static,
+    {
+        let desc = Desc::new(name, help, MetricType::Gauge, &[])?;
+        self.register_collector(Arc::new(FnMetric {
+            desc,
+            read: Box::new(move || MetricValue::Gauge(read())),
+        }))
+    }
+
+    /// Registers a counter whose value is computed by `read` at scrape time,
+    /// for totals another component already keeps. `read` must never
+    /// decrease, or rate calculations downstream will see a reset.
+    pub fn register_counter_fn<F>(&self, name: &str, help: &str, read: F) -> Result<()>
+    where
+        F: Fn() -> u64 + Send + Sync + 'static,
+    {
+        let desc = Desc::new(name, help, MetricType::Counter, &[])?;
+        self.register_collector(Arc::new(FnMetric {
+            desc,
+            read: Box::new(move || MetricValue::Counter(read())),
+        }))
+    }
+
+    /// Adds a collector. Its described families must not clash with any
+    /// registered family, other collector, or each other.
+    pub fn register_collector(&self, collector: Arc<dyn Collector>) -> Result<()> {
+        // Describe outside the lock: collector code is arbitrary.
+        let descs = collector.describe();
+        let mut state = write(&self.inner.state);
+        for (i, desc) in descs.iter().enumerate() {
+            check_available(desc, state.owners())?;
+            check_available(desc, descs[..i].iter().map(|d| (d, true)))?;
+        }
+        state.collectors.push(Registered { collector, descs });
+        Ok(())
+    }
+
+    /// Removes a collector previously registered (compared by identity).
+    /// Returns whether it was found.
+    pub fn unregister_collector(&self, collector: &Arc<dyn Collector>) -> bool {
+        let target = Arc::as_ptr(collector) as *const ();
+        let mut state = write(&self.inner.state);
+        let before = state.collectors.len();
+        state
+            .collectors
+            .retain(|r| Arc::as_ptr(&r.collector) as *const () != target);
+        state.collectors.len() != before
+    }
+
+    /// Removes the family called `name`. Handles already held keep working
+    /// but are no longer exported, and registering the name again starts a
+    /// fresh family. Returns whether the family existed.
+    pub fn unregister(&self, name: &str) -> bool {
+        write(&self.inner.state).families.remove(name).is_some()
+    }
+
+    /// Whether a family called `name` is registered (collectors excluded).
+    pub fn contains(&self, name: &str) -> bool {
+        read(&self.inner.state).families.contains_key(name)
+    }
+
+    /// Every family, from registered metrics and collectors, sorted by name.
+    ///
+    /// Families without series (a vec with no children yet) are included
+    /// with an empty `metrics` list; the text format leaves them out.
+    pub fn snapshot(&self) -> Vec<FamilySnapshot> {
+        let (families, collectors) = {
+            let state = read(&self.inner.state);
+            let families: Vec<Family> = state.families.values().cloned().collect();
+            let collectors: Vec<(Arc<dyn Collector>, Vec<Desc>)> = state
+                .collectors
+                .iter()
+                .map(|r| (Arc::clone(&r.collector), r.descs.clone()))
+                .collect();
+            (families, collectors)
+        };
+        let mut out: Vec<FamilySnapshot> = families.iter().map(Family::snapshot).collect();
+        for (collector, descs) in collectors {
+            let first = out.len();
+            for family in collector.collect() {
+                let described = descs
+                    .iter()
+                    .any(|d| d.name() == family.name && d.kind() == family.kind);
+                if !described {
+                    continue;
+                }
+                // A collector may split one family across several snapshots;
+                // the format needs them merged under one header.
+                match out[first..].iter_mut().find(|f| f.name == family.name) {
+                    Some(merged) => merged.metrics.extend(family.metrics),
+                    None => out.push(family),
+                }
+            }
+        }
+        out.sort_by(|a, b| a.name.cmp(&b.name));
+        out
+    }
+
+    /// Renders every family in the Prometheus text format, version 0.0.4.
+    /// Serve it with [`text::CONTENT_TYPE`].
+    pub fn render_prometheus(&self) -> String {
+        text::encode(&self.snapshot())
+    }
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
