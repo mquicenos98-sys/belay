@@ -350,3 +350,153 @@ metric_vec! {
     /// options.
     SummaryVec => Summary
 }
+
+impl HistogramVec {
+    /// The finite bucket bounds shared by every child.
+    pub fn buckets(&self) -> &[f64] {
+        &self.core.config
+    }
+}
+
+impl SummaryVec {
+    /// The (normalised) options shared by every child.
+    pub fn opts(&self) -> &SummaryOpts {
+        &self.core.config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::desc::MetricType;
+    use crate::time::monotonic;
+
+    fn counters(labels: &[&str]) -> CounterVec {
+        let desc = Desc::new("jobs_total", "Jobs.", MetricType::Counter, labels).unwrap();
+        CounterVec::from_core(Core::new(desc, (), monotonic()))
+    }
+
+    #[test]
+    fn equal_values_share_one_series() {
+        let vec = counters(&["queue"]);
+        vec.with_label_values(&["emails"]).inc();
+        vec.with_label_values(&["emails"]).inc_by(2);
+        vec.with_label_values(&["reports"]).inc();
+        assert_eq!(vec.with_label_values(&["emails"]).get(), 3);
+        assert_eq!(vec.len(), 2);
+    }
+
+    #[test]
+    fn values_are_not_split_ambiguously() {
+        let vec = counters(&["a", "b"]);
+        vec.with_label_values(&["x", "yz"]).inc();
+        assert_eq!(vec.with_label_values(&["xy", "z"]).get(), 0);
+        assert_eq!(vec.len(), 2);
+    }
+
+    #[test]
+    fn wrong_arity_is_an_error() {
+        let vec = counters(&["queue", "state"]);
+        assert_eq!(
+            vec.try_with_label_values(&["emails"]).unwrap_err(),
+            Error::LabelCount {
+                expected: 2,
+                got: 1
+            }
+        );
+        assert!(vec.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "metric \"jobs_total\": expected 1 label value, got 2")]
+    fn with_label_values_panics_on_wrong_arity() {
+        counters(&["queue"]).with_label_values(&["a", "b"]);
+    }
+
+    #[test]
+    fn pairs_are_matched_by_name() {
+        let vec = counters(&["queue", "state"]);
+        vec.with(&[("state", "ready"), ("queue", "emails")]).inc();
+        assert_eq!(vec.with_label_values(&["emails", "ready"]).get(), 1);
+
+        assert_eq!(
+            vec.try_with(&[("queue", "a"), ("stat", "b")]).unwrap_err(),
+            Error::UnknownLabel("stat".into())
+        );
+        assert_eq!(
+            vec.try_with(&[("queue", "a")]).unwrap_err(),
+            Error::MissingLabel("state".into())
+        );
+        assert_eq!(
+            vec.try_with(&[("queue", "a"), ("queue", "b"), ("state", "c")])
+                .unwrap_err(),
+            Error::DuplicateLabel("queue".into())
+        );
+    }
+
+    #[test]
+    fn a_family_without_labels_has_one_child() {
+        let vec = counters(&[]);
+        vec.with_label_values(&[]).inc();
+        vec.with(&[]).inc();
+        assert_eq!(vec.len(), 1);
+        assert_eq!(vec.snapshot().metrics[0].value.as_counter(), Some(2));
+    }
+
+    #[test]
+    fn removed_children_detach_existing_handles() {
+        let vec = counters(&["queue"]);
+        let old = vec.with_label_values(&["emails"]);
+        old.inc();
+        assert!(vec.remove_label_values(&["emails"]));
+        assert!(!vec.remove_label_values(&["emails"]));
+        old.inc();
+        assert_eq!(old.get(), 2);
+        assert_eq!(vec.with_label_values(&["emails"]).get(), 0);
+
+        vec.with_label_values(&["other"]);
+        vec.clear();
+        assert!(vec.is_empty());
+    }
+
+    #[test]
+    fn snapshot_sorts_children_and_keeps_label_order() {
+        let vec = counters(&["queue", "state"]);
+        vec.with_label_values(&["b", "ready"]).inc();
+        vec.with_label_values(&["a", "running"]).inc_by(2);
+        vec.with_label_values(&["a", "dead"]).inc_by(3);
+        let snap = vec.snapshot();
+        let rows: Vec<(Vec<(String, String)>, u64)> = snap
+            .metrics
+            .iter()
+            .map(|m| (m.labels.clone(), m.value.as_counter().unwrap()))
+            .collect();
+        let pair = |q: &str, s: &str| vec![("queue".into(), q.into()), ("state".into(), s.into())];
+        assert_eq!(
+            rows,
+            [
+                (pair("a", "dead"), 3),
+                (pair("a", "running"), 2),
+                (pair("b", "ready"), 1)
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_and_unicode_label_values_are_allowed() {
+        let vec = counters(&["queue"]);
+        vec.with_label_values(&[""]).inc();
+        vec.with_label_values(&["colas-ñandú"]).inc();
+        assert_eq!(vec.len(), 2);
+    }
+
+    #[test]
+    fn debug_shows_shape_not_values() {
+        let vec = counters(&["queue"]);
+        vec.with_label_values(&["a"]);
+        assert_eq!(
+            format!("{vec:?}"),
+            r#"CounterVec { name: "jobs_total", label_names: ["queue"], children: 1 }"#
+        );
+    }
+}
