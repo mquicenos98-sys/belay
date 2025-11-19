@@ -98,3 +98,29 @@ impl Child for Summary {
         MetricValue::Summary(self.snapshot())
     }
 }
+
+type Entry<M> = (Box<[String]>, M);
+
+/// The shared state behind every vec type.
+pub(crate) struct Core<M: Child> {
+    desc: Desc,
+    config: M::Config,
+    time: SharedTimeSource,
+    /// Children bucketed by the hash of their label values. Buckets almost
+    /// always hold one entry; the `Vec` only matters on a hash collision.
+    children: RwLock<HashMap<u64, Vec<Entry<M>>>>,
+}
+
+fn hash_values<S: AsRef<str>>(values: &[S]) -> u64 {
+    // `str`'s Hash impl appends a terminator byte, so ["a", "bc"] and
+    // ["ab", "c"] hash differently. DefaultHasher::new() has fixed keys, but
+    // label values may come from API input, so why that is safe matters: the
+    // outer map re-hashes this u64 with a random key, and lengthening one
+    // bucket takes full 64-bit SipHash collisions, which are impractical to
+    // mass-produce. Colliding tuples are still told apart by value.
+    let mut hasher = DefaultHasher::new();
+    for v in values {
+        v.as_ref().hash(&mut hasher);
+    }
+    hasher.finish()
+}
