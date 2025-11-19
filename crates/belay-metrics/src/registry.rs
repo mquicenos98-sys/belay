@@ -441,3 +441,29 @@ impl Default for Registry {
         Self::new()
     }
 }
+
+impl fmt::Debug for Registry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = read(&self.inner.state);
+        f.debug_struct("Registry")
+            .field("families", &state.families.keys().collect::<Vec<_>>())
+            .field("collectors", &state.collectors.len())
+            .finish()
+    }
+}
+
+/// A single unlabelled series computed by a closure.
+struct FnMetric {
+    desc: Desc,
+    read: Box<dyn Fn() -> MetricValue + Send + Sync>,
+}
+
+impl Collector for FnMetric {
+    fn describe(&self) -> Vec<Desc> {
+        vec![self.desc.clone()]
+    }
+
+    fn collect(&self) -> Vec<FamilySnapshot> {
+        vec![FamilySnapshot::new(&self.desc).with_metric(&[], (self.read)())]
+    }
+}
