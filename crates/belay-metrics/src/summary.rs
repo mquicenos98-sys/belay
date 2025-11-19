@@ -269,3 +269,60 @@ impl Summary {
         }
     }
 }
+
+impl Observe for Summary {
+    fn observe(&self, value: f64) {
+        Summary::observe(self, value);
+    }
+
+    fn time_source(&self) -> &dyn TimeSource {
+        &*self.core.time
+    }
+}
+
+impl fmt::Debug for Summary {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Summary")
+            .field("quantiles", &self.core.quantiles)
+            .field("count", &self.count())
+            .field("sum", &self.sum())
+            .finish()
+    }
+}
+
+/// The ring of sub-windows.
+struct Window {
+    /// Sub-window length in nanoseconds (at least 1ms).
+    width: u64,
+    capacity: usize,
+    slots: Box<[Slot]>,
+}
+
+struct Slot {
+    /// High 32 bits: low bits of the epoch this sub-window holds. Low 32
+    /// bits: observations seen during it (saturating). Zero means unused.
+    state: AtomicU64,
+    /// Allocated on first use so idle children of a vec cost little.
+    samples: OnceLock<Box<[AtomicU64]>>,
+}
+
+fn pack(tag: u32, seen: u32) -> u64 {
+    (u64::from(tag) << 32) | u64::from(seen)
+}
+
+fn unpack(state: u64) -> (u32, u32) {
+    ((state >> 32) as u32, state as u32)
+}
+
+/// Whether epoch tag `a` is later than `b`, tolerating wrap-around. Tags are
+/// only ever compared across a few sub-windows, far below 2^31 apart.
+fn is_later(a: u32, b: u32) -> bool {
+    a.wrapping_sub(b) > 0
+}
+
+/// SplitMix64's output function: a cheap, well-mixed 64-bit hash.
+fn mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    z ^ (z >> 31)
+}
