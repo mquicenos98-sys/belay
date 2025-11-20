@@ -109,3 +109,33 @@ path_bytes{path="plain ünïcödé"} 3
     assert_eq!(registry.render_prometheus(), expected);
     Ok(())
 }
+
+#[test]
+fn renders_special_and_extreme_floats() -> Result<()> {
+    let registry = Registry::new();
+    let g = registry.gauge_vec("values", "", &["case"])?;
+    for (case, v) in [
+        ("a_nan", f64::NAN),
+        ("b_pos_inf", f64::INFINITY),
+        ("c_neg_inf", f64::NEG_INFINITY),
+        ("d_neg_zero", -0.0),
+        ("e_big", 1e21),
+        ("f_tiny", 1e-7),
+        ("g_int", 1_234_567_890.0),
+        ("h_negative", -0.125),
+    ] {
+        g.with_label_values(&[case]).set(v);
+    }
+    let expected = r#"# TYPE values gauge
+values{case="a_nan"} NaN
+values{case="b_pos_inf"} +Inf
+values{case="c_neg_inf"} -Inf
+values{case="d_neg_zero"} 0
+values{case="e_big"} 1e21
+values{case="f_tiny"} 1e-7
+values{case="g_int"} 1234567890
+values{case="h_negative"} -0.125
+"#;
+    assert_eq!(registry.render_prometheus(), expected);
+    Ok(())
+}
