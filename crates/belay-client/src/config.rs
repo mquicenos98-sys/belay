@@ -205,3 +205,119 @@ impl ClientConfig {
         Ok(format!("http://{}{path}", url.authority()))
     }
 }
+
+impl fmt::Debug for ClientConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClientConfig")
+            .field("base_url", &self.base_url)
+            .field("token", &self.token.as_ref().map(|_| "<redacted>"))
+            .field("timeout", &self.timeout)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("retries", &self.retries)
+            .field("backoff", &format_args!("{}", self.backoff))
+            .field("user_agent", &self.user_agent)
+            .field("max_redirects", &self.max_redirects)
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn lookup<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    }
+
+    #[test]
+    fn env_lookup_falls_back_to_the_default_url() {
+        let config = ClientConfig::from_lookup(lookup(&[]));
+        assert_eq!(config.base_url, DEFAULT_URL);
+        assert_eq!(config.token, None);
+        let config = ClientConfig::from_lookup(lookup(&[(ENV_URL, "  "), (ENV_TOKEN, "")]));
+        assert_eq!(
+            (config.base_url.as_str(), config.token),
+            (DEFAULT_URL, None)
+        );
+    }
+
+    #[test]
+    fn env_lookup_reads_url_and_trimmed_token() {
+        let config = ClientConfig::from_lookup(lookup(&[
+            (ENV_URL, "http://10.0.0.5:7700"),
+            (ENV_TOKEN, " tok-123\n"),
+        ]));
+        assert_eq!(config.base_url, "http://10.0.0.5:7700");
+        assert_eq!(config.token.as_deref(), Some("tok-123"));
+    }
+
+    #[test]
+    fn base_url_is_normalised() {
+        let base = |url: &str| ClientConfig::new(url).validated_base().unwrap();
+        assert_eq!(base("http://127.0.0.1:7700"), "http://127.0.0.1:7700");
+        assert_eq!(base("http://127.0.0.1:7700/"), "http://127.0.0.1:7700");
+        assert_eq!(base("HTTP://Belay.Local:80/"), "http://belay.local");
+        assert_eq!(base("http://proxy/belay/"), "http://proxy/belay");
+        assert_eq!(base("http://[::1]:7700"), "http://[::1]:7700");
+    }
+
+    #[test]
+    fn rejects_unusable_base_urls() {
+        let err = |url: &str| {
+            ClientConfig::new(url)
+                .validated_base()
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            err("https://belay.example.com"),
+            "invalid client configuration: base_url must use http://, got https:// (put a TLS-terminating proxy in front of belay)"
+        );
+        assert!(
+            err("belay:7700").contains("invalid base_url"),
+            "{}",
+            err("belay:7700")
+        );
+        assert!(err("http://h/?x=1").contains("must not have a query"));
+        assert!(err("http://user:pw@h/").contains("must not carry credentials"));
+    }
+
+    #[test]
+    fn rejects_tokens_that_cannot_be_sent_in_a_header() {
+        for bad in ["", "two words", "line\nbreak"] {
+            let err = ClientConfig::default()
+                .token(bad)
+                .validated_base()
+                .unwrap_err();
+            assert!(matches!(err, Error::Config(_)), "{bad:?}");
+        }
+        assert!(ClientConfig::default()
+            .token("abc.DEF-123_~+/=")
+            .validated_base()
+            .is_ok());
+    }
+
+    #[test]
+    fn zero_timeout_is_rejected() {
+        let err = ClientConfig::default()
+            .timeout(Duration::ZERO)
+            .validated_base()
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "invalid client configuration: timeout must be greater than zero"
+        );
+    }
+
+    #[test]
+    fn debug_output_redacts_the_token() {
+        let text = format!("{:?}", ClientConfig::default().token("hunter2"));
+        assert!(text.contains("<redacted>"), "{text}");
+        assert!(!text.contains("hunter2"), "{text}");
+        assert!(text.contains("exp:100ms*2..2s~equal"), "{text}");
+    }
+}
