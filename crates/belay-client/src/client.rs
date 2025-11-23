@@ -276,3 +276,145 @@ pub(crate) struct Call {
     extra_wait: Duration,
     accept: &'static str,
 }
+
+impl Call {
+    fn new(method: Method, path: String, safety: Safety) -> Call {
+        Call {
+            method,
+            path,
+            query: Vec::new(),
+            body: None,
+            safety,
+            extra_wait: Duration::ZERO,
+            accept: JSON,
+        }
+    }
+
+    /// A `GET`, which is always repeatable.
+    pub(crate) fn get(path: String) -> Call {
+        Call::new(Method::Get, path, Safety::Repeatable)
+    }
+
+    /// A `PUT`, which replaces state and so is repeatable.
+    pub(crate) fn put(path: String) -> Call {
+        Call::new(Method::Put, path, Safety::Repeatable)
+    }
+
+    /// A `DELETE`, repeatable (a repeat may answer `not_found`).
+    pub(crate) fn delete(path: String) -> Call {
+        Call::new(Method::Delete, path, Safety::Repeatable)
+    }
+
+    /// A `POST`, whose safety depends on the endpoint.
+    pub(crate) fn post(path: String, safety: Safety) -> Call {
+        Call::new(Method::Post, path, safety)
+    }
+
+    /// Sets a JSON body.
+    pub(crate) fn json<T: ToJson + ?Sized>(mut self, body: &T) -> Call {
+        self.body = Some(encode_body(body));
+        self
+    }
+
+    /// Sets the query parameters.
+    pub(crate) fn query(mut self, pairs: Vec<(String, String)>) -> Call {
+        self.query = pairs;
+        self
+    }
+
+    /// Overrides how safe the call is to repeat.
+    pub(crate) fn safety(mut self, safety: Safety) -> Call {
+        self.safety = safety;
+        self
+    }
+
+    /// Lets the server hold the request for up to `wait` before answering.
+    pub(crate) fn long_poll(mut self, wait: Duration) -> Call {
+        self.extra_wait = wait;
+        self
+    }
+
+    /// Sets the `Accept` header.
+    pub(crate) fn accept(mut self, media_type: &'static str) -> Call {
+        self.accept = media_type;
+        self
+    }
+
+    /// `METHOD /path` for error messages and logs.
+    pub(crate) fn endpoint(&self) -> String {
+        format!("{} {}", self.method, self.path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn client(base: &str) -> Client {
+        Client::new(ClientConfig::new(base)).expect("valid config")
+    }
+
+    #[test]
+    fn urls_keep_the_base_prefix_and_encode_the_query() {
+        let c = client("http://proxy:8080/belay/");
+        assert_eq!(c.url("/v1/info", &[]), "http://proxy:8080/belay/v1/info");
+        let query = vec![
+            ("state".to_owned(), "dead,retrying".to_owned()),
+            ("tag".to_owned(), "a&b=c d".to_owned()),
+        ];
+        assert_eq!(
+            c.url("/v1/jobs", &query),
+            "http://proxy:8080/belay/v1/jobs?state=dead,retrying&tag=a%26b%3Dc%20d"
+        );
+    }
+
+    #[test]
+    fn segments_cannot_escape_their_place_in_the_path() {
+        assert_eq!(segment("billing:invoices"), "billing:invoices");
+        assert_eq!(segment("../admin"), "..%2Fadmin");
+        assert_eq!(segment("a b?c#d"), "a%20b%3Fc%23d");
+        assert_eq!(segment("ü"), "%C3%BC");
+    }
+
+    #[test]
+    fn empty_and_malformed_bodies_are_decode_errors() {
+        let err = decode::<belay_json::Value>("GET /v1/info", b"  ").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "unexpected response to GET /v1/info: empty body where JSON was expected"
+        );
+        let err = decode::<u32>("GET /v1/info", b"\"x\"").unwrap_err();
+        assert!(matches!(err, Error::Decode(_)), "{err}");
+        assert_eq!(decode::<u32>("GET /x", b"42").unwrap(), 42);
+    }
+
+    #[test]
+    fn calls_describe_themselves() {
+        let call = Call::post("/v1/jobs/X/cancel".to_owned(), Safety::Repeatable)
+            .query(vec![("a".to_owned(), "b".to_owned())]);
+        assert_eq!(call.endpoint(), "POST /v1/jobs/X/cancel");
+        assert_eq!(Call::get("/v1/info".to_owned()).safety, Safety::Repeatable);
+    }
+
+    #[test]
+    fn clones_share_one_configuration() {
+        let a = client("http://127.0.0.1:7700");
+        let b = a.clone();
+        assert!(Arc::ptr_eq(&a.inner, &b.inner));
+        assert_eq!(b.base_url(), "http://127.0.0.1:7700");
+        let text = format!("{a:?}");
+        assert!(text.contains("base_url"), "{text}");
+    }
+
+    #[test]
+    fn invalid_configuration_fails_at_construction() {
+        let err = Client::new(ClientConfig::new("ftp://x")).unwrap_err();
+        assert!(matches!(err, Error::Config(_)), "{err}");
+    }
+
+    #[test]
+    fn client_is_send_and_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Client>();
+    }
+}
