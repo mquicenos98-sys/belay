@@ -75,9 +75,16 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
 mod client;
-
 mod config;
-
 mod error;
-
 mod events;
+mod pager;
+mod resources;
+pub mod retry;
+
+pub use client::Client;
+pub use config::{ClientConfig, DEFAULT_URL, ENV_TOKEN, ENV_URL};
+pub use error::{DecodeError, Error, Result};
+pub use events::{EventOptions, Subscription};
+pub use pager::{ListOptions, Paginator};
+pub use resources::{Admin, Calendars, Jobs, Queues, Schedules, Workflows};
