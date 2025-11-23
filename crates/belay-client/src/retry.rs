@@ -88,3 +88,70 @@ pub(crate) enum Safety {
     /// Never resent.
     Never,
 }
+
+/// Why an attempt failed, as far as retrying is concerned.
+#[derive(Debug)]
+pub(crate) enum Failure<'a> {
+    /// No answer.
+    Transport(&'a belay_http::Error),
+    /// An error status, with the server's `Retry-After` if it sent one.
+    Status {
+        status: u16,
+        retry_after: Option<Duration>,
+    },
+}
+
+/// Statuses that mean "try again later" without having acted.
+fn is_retry_status(status: u16) -> bool {
+    matches!(status, 429 | 502..=504)
+}
+
+/// The retry budget and pacing of one client.
+#[derive(Debug)]
+pub(crate) struct RetryPolicy {
+    retries: u32,
+    backoff: BackoffPolicy,
+    /// The longest `Retry-After` worth waiting for.
+    max_wait: Duration,
+    rng: Mutex<Rng>,
+}
+
+impl RetryPolicy {
+    pub(crate) fn new(retries: u32, backoff: BackoffPolicy, max_wait: Duration) -> RetryPolicy {
+        RetryPolicy {
+            retries,
+            backoff,
+            max_wait,
+            rng: Mutex::new(Rng::from_entropy()),
+        }
+    }
+
+    /// The wait before the next attempt after attempt number `attempt`
+    /// (1 = the first) failed with `failure`, or `None` to give up.
+    pub(crate) fn next_delay(
+        &self,
+        attempt: u32,
+        safety: Safety,
+        failure: &Failure<'_>,
+    ) -> Option<Duration> {
+        if attempt > self.retries || safety == Safety::Never {
+            return None;
+        }
+        let repeatable = safety == Safety::Repeatable;
+        let retry_after = match failure {
+            Failure::Transport(e) if never_sent(e) => None,
+            Failure::Transport(e) if repeatable && e.is_transient() && !e.is_timeout() => None,
+            Failure::Status {
+                status,
+                retry_after,
+            } if repeatable && is_retry_status(*status) => *retry_after,
+            _ => return None,
+        };
+        let backoff = self.backoff.delay_for(attempt, &mut lock(&self.rng));
+        match retry_after {
+            Some(wait) if wait > self.max_wait => None,
+            Some(wait) => Some(wait.min(backoff)),
+            None => Some(backoff),
+        }
+    }
+}
