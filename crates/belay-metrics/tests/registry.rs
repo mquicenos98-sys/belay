@@ -242,3 +242,81 @@ fn collector_names_are_checked_against_everything() -> Result<()> {
     assert_eq!(names, ["disk_bytes", "rpc"]);
     Ok(())
 }
+
+#[test]
+fn collector_output_of_the_wrong_type_is_dropped() -> Result<()> {
+    struct Liar;
+    impl Collector for Liar {
+        fn describe(&self) -> Vec<Desc> {
+            vec![Desc::new("liar", "", MetricType::Gauge, &[]).unwrap()]
+        }
+        fn collect(&self) -> Vec<FamilySnapshot> {
+            let as_counter = Desc::new("liar", "", MetricType::Counter, &[]).unwrap();
+            vec![FamilySnapshot::new(&as_counter).with_metric(&[], MetricValue::Counter(1))]
+        }
+    }
+    let registry = Registry::new();
+    registry.register_collector(Arc::new(Liar))?;
+    assert!(registry.snapshot().is_empty());
+    Ok(())
+}
+
+#[test]
+fn unregister_collector_uses_identity() -> Result<()> {
+    let registry = Registry::new();
+    let collector: Arc<dyn Collector> = Fixed::new(&["g"]);
+    registry.register_collector(Arc::clone(&collector))?;
+    let lookalike: Arc<dyn Collector> = Fixed::new(&["g"]);
+    assert!(!registry.unregister_collector(&lookalike));
+    assert!(registry.unregister_collector(&collector));
+    assert!(registry.snapshot().is_empty());
+    // The name is free again.
+    registry.gauge("g", "")?;
+    Ok(())
+}
+
+#[test]
+fn function_metrics_are_read_at_scrape_time() -> Result<()> {
+    let registry = Registry::new();
+    let writes = Arc::new(AtomicU64::new(0));
+    let source = Arc::clone(&writes);
+    registry.register_counter_fn("store_writes_total", "WAL writes.", move || {
+        source.load(Ordering::Relaxed)
+    })?;
+    registry.register_gauge_fn("store_ratio", "", || 0.5)?;
+
+    writes.store(17, Ordering::Relaxed);
+    assert_eq!(
+        registry.render_prometheus(),
+        "# TYPE store_ratio gauge\nstore_ratio 0.5\n\
+         # HELP store_writes_total WAL writes.\n# TYPE store_writes_total counter\nstore_writes_total 17\n"
+    );
+    assert!(matches!(
+        registry.register_gauge_fn("store_ratio", "", || 1.0),
+        Err(Error::Conflict { .. })
+    ));
+    assert!(matches!(
+        registry.register_gauge_fn("bad name", "", || 1.0),
+        Err(Error::InvalidMetricName(_))
+    ));
+    Ok(())
+}
+
+#[test]
+fn vec_lookup_errors_carry_detail() -> Result<()> {
+    let registry = Registry::new();
+    let vec = registry.histogram_vec("h", "", &["queue", "kind"], &[1.0])?;
+    assert_eq!(
+        vec.try_with_label_values(&["a"]).unwrap_err().to_string(),
+        "expected 2 label values, got 1"
+    );
+    assert_eq!(
+        vec.try_with(&[("queue", "a"), ("knd", "b")])
+            .unwrap_err()
+            .to_string(),
+        r#"unknown label "knd""#
+    );
+    assert_eq!(vec.buckets(), [1.0]);
+    assert_eq!(vec.desc().label_names(), ["queue", "kind"]);
+    Ok(())
+}
