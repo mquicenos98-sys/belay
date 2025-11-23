@@ -181,3 +181,116 @@ impl DecodeError {
         &self.message
     }
 }
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "unexpected response to {}: {}",
+            self.endpoint, self.message
+        )
+    }
+}
+
+impl std::error::Error for DecodeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.source
+            .as_ref()
+            .map(|e| e as &(dyn std::error::Error + 'static))
+    }
+}
+
+/// Whether a transport failure proves the request never reached the
+/// server, which makes repeating it harmless whatever it does: the TCP
+/// connection was refused or never completed, so not one byte was written.
+pub(crate) fn never_sent(e: &belay_http::Error) -> bool {
+    match e {
+        belay_http::Error::Timeout(phase) => *phase == "connect",
+        belay_http::Error::Io(e) => matches!(
+            e.kind(),
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::AddrNotAvailable
+        ),
+        _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    fn io(kind: io::ErrorKind) -> belay_http::Error {
+        belay_http::Error::Io(io::Error::from(kind))
+    }
+
+    #[test]
+    fn helpers_classify_api_errors() {
+        let err = Error::Api(ApiError::not_found("job", "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z"));
+        assert!(err.is_not_found());
+        assert!(!err.is_retryable());
+        assert_eq!(err.code(), Some(ErrorCode::NotFound));
+        assert_eq!(
+            err.to_string(),
+            "server error: not_found: job 01HQ3K9Z8N6V2T4R5S7W0X1Y2Z not found"
+        );
+        let err = Error::Api(ApiError::unavailable("draining"));
+        assert!(err.is_retryable() && !err.is_not_found());
+        let err = Error::Api(ApiError::new(ErrorCode::LeaseLost, "gone"));
+        assert!(err.is_lease_lost());
+    }
+
+    #[test]
+    fn transport_errors_are_retryable_only_when_transient() {
+        assert!(Error::Transport(io(io::ErrorKind::ConnectionReset)).is_retryable());
+        let timeout = Error::Transport(belay_http::Error::Timeout("read"));
+        assert!(timeout.is_retryable() && timeout.is_timeout());
+        let redirects = Error::Transport(belay_http::Error::TooManyRedirects { max: 5 });
+        assert!(!redirects.is_retryable());
+        assert!(redirects.api_error().is_none() && redirects.code().is_none());
+    }
+
+    #[test]
+    fn only_refused_or_unfinished_connects_count_as_never_sent() {
+        assert!(never_sent(&io(io::ErrorKind::ConnectionRefused)));
+        assert!(never_sent(&belay_http::Error::Timeout("connect")));
+        assert!(!never_sent(&belay_http::Error::Timeout("read")));
+        assert!(!never_sent(&belay_http::Error::Timeout("write")));
+        assert!(!never_sent(&io(io::ErrorKind::ConnectionReset)));
+        assert!(!never_sent(&belay_http::Error::ConnectionClosed));
+    }
+
+    #[test]
+    fn job_source_mapping_keeps_codes_and_marks_outages_retryable() {
+        let lost = ApiError::new(ErrorCode::LeaseLost, "gone");
+        assert_eq!(Error::Api(lost.clone()).into_api_error(), lost);
+        let down = Error::Transport(io(io::ErrorKind::ConnectionRefused)).into_api_error();
+        assert_eq!(down.code, ErrorCode::Unavailable);
+        assert!(
+            down.message.starts_with("belay server unreachable: "),
+            "{}",
+            down.message
+        );
+        let decode = Error::Decode(DecodeError::new("GET /v1/info", "empty body"));
+        let mapped = ApiError::from(decode);
+        assert_eq!(mapped.code, ErrorCode::Internal);
+        assert_eq!(
+            mapped.message,
+            "unexpected response to GET /v1/info: empty body"
+        );
+    }
+
+    #[test]
+    fn decode_errors_keep_their_json_source() {
+        let json_err = belay_json::from_str::<u8>("[").unwrap_err();
+        let err = Error::Decode(DecodeError::json("POST /v1/jobs", json_err));
+        assert!(err
+            .to_string()
+            .starts_with("unexpected response to POST /v1/jobs: invalid JSON"));
+        let decode = err.source().expect("decode error is the source");
+        assert!(decode.source().is_some(), "the JSON error is kept");
+        match &err {
+            Error::Decode(d) => assert_eq!(d.endpoint(), "POST /v1/jobs"),
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+}
