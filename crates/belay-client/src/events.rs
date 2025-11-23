@@ -352,3 +352,73 @@ impl fmt::Debug for Subscription {
 fn bad_event(message: String) -> Error {
     Error::Decode(DecodeError::new(format!("GET {EVENTS_PATH}"), message))
 }
+
+/// Error answers become [`Error::Api`] like everywhere else.
+fn stream_error(e: belay_http::Error) -> Error {
+    match e {
+        belay_http::Error::Status { status, body } => {
+            Error::Api(decode_error(status.as_u16(), body.as_bytes()))
+        }
+        other => Error::Transport(other),
+    }
+}
+
+/// Whether reconnecting may help: a dropped or refused connection, or a
+/// server (or proxy) that is temporarily unavailable.
+fn is_transient(e: &Error) -> bool {
+    match e {
+        Error::Transport(e) => e.is_transient(),
+        Error::Api(e) => e.is_retryable(),
+        Error::Decode(_) | Error::Config(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_http::StatusCode;
+    use belay_proto::api::ErrorCode;
+
+    #[test]
+    fn error_answers_decode_into_api_errors() {
+        let e = stream_error(belay_http::Error::Status {
+            status: StatusCode::UNAUTHORIZED,
+            body: r#"{"error":{"code":"unauthenticated","message":"missing token"}}"#.into(),
+        });
+        assert_eq!(e.code(), Some(ErrorCode::Unauthenticated));
+        assert!(!is_transient(&e));
+        let e = stream_error(belay_http::Error::Status {
+            status: StatusCode::BAD_GATEWAY,
+            body: String::new(),
+        });
+        assert_eq!(e.code(), Some(ErrorCode::Unavailable));
+        assert!(is_transient(&e));
+    }
+
+    #[test]
+    fn dropped_connections_are_transient_but_protocol_errors_are_not() {
+        assert!(is_transient(&Error::Transport(
+            belay_http::Error::ConnectionClosed
+        )));
+        assert!(!is_transient(&Error::Transport(
+            belay_http::Error::UnexpectedContentType {
+                expected: "text/event-stream",
+                found: "text/html".into(),
+            }
+        )));
+        assert!(!is_transient(&Error::Transport(
+            belay_http::Error::BodyTooLarge { limit: 1 }
+        )));
+    }
+
+    #[test]
+    fn options_builders() {
+        let options = EventOptions::default()
+            .idle_timeout(Duration::from_secs(5))
+            .reconnect_backoff(BackoffPolicy::constant(Duration::from_millis(1)))
+            .max_reconnects(2);
+        assert_eq!(options.idle_timeout, Duration::from_secs(5));
+        assert_eq!(options.max_reconnects, Some(2));
+        assert!(options.reconnect_backoff.is_some());
+    }
+}
