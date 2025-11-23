@@ -105,3 +105,79 @@ impl fmt::Display for Error {
         }
     }
 }
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Api(e) => Some(e),
+            Error::Transport(e) => Some(e),
+            Error::Decode(e) => Some(e),
+            Error::Config(_) => None,
+        }
+    }
+}
+
+impl From<ApiError> for Error {
+    fn from(e: ApiError) -> Error {
+        Error::Api(e)
+    }
+}
+
+impl From<belay_http::Error> for Error {
+    fn from(e: belay_http::Error) -> Error {
+        Error::Transport(e)
+    }
+}
+
+impl From<DecodeError> for Error {
+    fn from(e: DecodeError) -> Error {
+        Error::Decode(e)
+    }
+}
+
+impl From<Error> for ApiError {
+    fn from(e: Error) -> ApiError {
+        e.into_api_error()
+    }
+}
+
+/// A successful response whose body could not be read as the expected
+/// type.
+#[derive(Debug)]
+pub struct DecodeError {
+    endpoint: String,
+    message: String,
+    source: Option<belay_json::Error>,
+}
+
+impl DecodeError {
+    /// A decoding failure of the response to `endpoint` (`GET /v1/info`).
+    pub(crate) fn new(endpoint: impl Into<String>, message: impl Into<String>) -> DecodeError {
+        DecodeError {
+            endpoint: endpoint.into(),
+            message: message.into(),
+            source: None,
+        }
+    }
+
+    /// A JSON parse or shape error in the response to `endpoint`.
+    pub(crate) fn json(endpoint: impl Into<String>, source: belay_json::Error) -> DecodeError {
+        DecodeError {
+            endpoint: endpoint.into(),
+            message: source.to_string(),
+            source: Some(source),
+        }
+    }
+
+    /// The request whose response failed to decode, e.g. `GET /v1/info`.
+    #[must_use]
+    pub fn endpoint(&self) -> &str {
+        &self.endpoint
+    }
+
+    /// What was wrong with the body.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+}
