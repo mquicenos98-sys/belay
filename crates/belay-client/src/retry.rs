@@ -155,3 +155,171 @@ impl RetryPolicy {
         }
     }
 }
+
+/// Parses a `Retry-After` value (RFC 9110 §10.2.3): a number of seconds or
+/// an HTTP date, the latter measured from `now` (a date in the past means
+/// "now").
+pub(crate) fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if let Ok(seconds) = value.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let at = belay_http::parse_http_date(value)?;
+    Some(at.duration_since(now).unwrap_or(Duration::ZERO))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_proto::Unique;
+    use std::io;
+
+    fn policy(retries: u32) -> RetryPolicy {
+        RetryPolicy::new(
+            retries,
+            BackoffPolicy::constant(Duration::from_millis(10)),
+            Duration::from_secs(30),
+        )
+    }
+
+    fn status(status: u16) -> Failure<'static> {
+        Failure::Status {
+            status,
+            retry_after: None,
+        }
+    }
+
+    const MS10: Option<Duration> = Some(Duration::from_millis(10));
+
+    #[test]
+    fn repeatable_requests_retry_on_gateway_and_overload_statuses() {
+        let p = policy(3);
+        for code in [429, 502, 503, 504] {
+            assert_eq!(
+                p.next_delay(1, Safety::Repeatable, &status(code)),
+                MS10,
+                "{code}"
+            );
+        }
+        for code in [400, 401, 404, 409, 500, 501] {
+            assert_eq!(
+                p.next_delay(1, Safety::Repeatable, &status(code)),
+                None,
+                "{code}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_repeatable_requests_ignore_retry_statuses() {
+        let p = policy(3);
+        for code in [429, 502, 503, 504] {
+            assert_eq!(p.next_delay(1, Safety::NotRepeatable, &status(code)), None);
+        }
+    }
+
+    #[test]
+    fn refused_connections_are_retried_whatever_the_request() {
+        let p = policy(3);
+        let refused = belay_http::Error::Io(io::Error::from(io::ErrorKind::ConnectionRefused));
+        let failure = Failure::Transport(&refused);
+        assert_eq!(p.next_delay(1, Safety::Repeatable, &failure), MS10);
+        assert_eq!(p.next_delay(1, Safety::NotRepeatable, &failure), MS10);
+        assert_eq!(p.next_delay(1, Safety::Never, &failure), None);
+    }
+
+    #[test]
+    fn dropped_connections_are_retried_only_for_repeatable_requests() {
+        let p = policy(3);
+        let closed = belay_http::Error::ConnectionClosed;
+        let failure = Failure::Transport(&closed);
+        assert_eq!(p.next_delay(1, Safety::Repeatable, &failure), MS10);
+        assert_eq!(p.next_delay(1, Safety::NotRepeatable, &failure), None);
+    }
+
+    #[test]
+    fn timeouts_after_connecting_are_never_retried() {
+        let p = policy(3);
+        let timeout = belay_http::Error::Timeout("read");
+        assert_eq!(
+            p.next_delay(1, Safety::Repeatable, &Failure::Transport(&timeout)),
+            None
+        );
+        let protocol = belay_http::Error::TooManyRedirects { max: 5 };
+        assert_eq!(
+            p.next_delay(1, Safety::Repeatable, &Failure::Transport(&protocol)),
+            None
+        );
+    }
+
+    #[test]
+    fn the_budget_counts_retries_after_the_first_attempt() {
+        let p = policy(2);
+        assert!(p.next_delay(1, Safety::Repeatable, &status(503)).is_some());
+        assert!(p.next_delay(2, Safety::Repeatable, &status(503)).is_some());
+        assert_eq!(p.next_delay(3, Safety::Repeatable, &status(503)), None);
+        assert_eq!(
+            policy(0).next_delay(1, Safety::Repeatable, &status(503)),
+            None
+        );
+    }
+
+    #[test]
+    fn backoff_grows_with_the_attempt_number() {
+        let p = RetryPolicy::new(
+            5,
+            BackoffPolicy::exponential(Duration::from_millis(100), 2.0, Duration::from_secs(1)),
+            Duration::from_secs(30),
+        );
+        let delays: Vec<_> = (1..=5)
+            .map(|n| p.next_delay(n, Safety::Repeatable, &status(503)))
+            .map(|d| d.map(|d| d.as_millis()))
+            .collect();
+        assert_eq!(
+            delays,
+            [Some(100), Some(200), Some(400), Some(800), Some(1000)]
+        );
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(784_111_777);
+        assert_eq!(
+            parse_retry_after("120", now),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(parse_retry_after(" 0 ", now), Some(Duration::ZERO));
+        // RFC 9110's example date is 784111777 seconds after the epoch.
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:47 GMT", now),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            parse_retry_after("Sun, 06 Nov 1994 08:49:30 GMT", now),
+            Some(Duration::ZERO),
+            "dates in the past mean now"
+        );
+        assert_eq!(parse_retry_after("-5", now), None);
+        assert_eq!(parse_retry_after("soon", now), None);
+    }
+
+    #[test]
+    fn enqueue_is_repeatable_only_with_a_lasting_deduplicating_key() {
+        let base = || JobSpec::new("q", "k");
+        assert!(!is_repeatable_enqueue(&base()));
+        assert!(is_repeatable_enqueue(
+            &base().unique("a", UniqueScope::UntilFinished)
+        ));
+        assert!(is_repeatable_enqueue(
+            &base().unique("a", UniqueScope::For(Duration::from_secs(5)))
+        ));
+        assert!(!is_repeatable_enqueue(
+            &base().unique("a", UniqueScope::UntilStarted)
+        ));
+        for policy in [OnConflict::Reject, OnConflict::Replace] {
+            let spec = base()
+                .unique_with(Unique::new("a", UniqueScope::UntilFinished).on_conflict(policy));
+            assert!(!is_repeatable_enqueue(&spec), "{policy}");
+        }
+    }
+}
