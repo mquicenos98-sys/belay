@@ -9,7 +9,6 @@ use std::thread;
 use belay_metrics::{HistogramValue, MetricValue, Registry, SummaryOpts};
 
 const THREADS: usize = 8;
-
 const ITERATIONS: u64 = 20_000;
 
 /// Runs `work(thread_index)` on `THREADS` threads released together.
@@ -88,4 +87,132 @@ fn histogram_buckets_and_sum_are_exact() {
         [per_value, 2 * per_value, 3 * per_value, 4 * per_value]
     );
     assert_eq!(snap.sum, per_value as f64 * 555.0);
+}
+
+#[test]
+fn racing_lookups_create_each_child_once() {
+    let registry = Registry::new();
+    let vec = registry
+        .counter_vec("jobs_total", "", &["queue", "outcome"])
+        .unwrap();
+    let v = vec.clone();
+    in_parallel(move |i| {
+        for n in 0..ITERATIONS {
+            let queue = format!("q{}", n % 16);
+            let outcome = if (n + i as u64) % 2 == 0 { "ok" } else { "err" };
+            v.with_label_values(&[&queue, outcome]).inc();
+        }
+    });
+    assert_eq!(vec.len(), 32);
+    let family = vec.desc().name().to_owned();
+    let snapshot = registry.snapshot();
+    let total: u64 = snapshot
+        .iter()
+        .find(|f| f.name == family)
+        .unwrap()
+        .metrics
+        .iter()
+        .map(|m| m.value.as_counter().unwrap())
+        .sum();
+    assert_eq!(total, THREADS as u64 * ITERATIONS);
+}
+
+#[test]
+fn racing_registrations_share_one_family() {
+    let registry = Registry::new();
+    let r = registry.clone();
+    in_parallel(move |_| {
+        for _ in 0..1_000 {
+            r.counter_vec("shared_total", "Shared.", &["k"])
+                .unwrap()
+                .with_label_values(&["v"])
+                .inc();
+        }
+    });
+    let snapshot = registry.snapshot();
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(
+        snapshot[0].metrics[0].value.as_counter(),
+        Some(THREADS as u64 * 1_000)
+    );
+}
+
+#[test]
+fn summary_counts_every_observation() {
+    let registry = Registry::new();
+    let s = registry
+        .summary(
+            "latency",
+            "",
+            SummaryOpts::new().quantiles(&[0.5]).reservoir_size(64),
+        )
+        .unwrap();
+    let sc = s.clone();
+    in_parallel(move |i| {
+        for n in 0..ITERATIONS {
+            sc.observe(((n + i as u64) % 100) as f64);
+        }
+    });
+    assert_eq!(s.count(), THREADS as u64 * ITERATIONS);
+    let median = s.quantiles()[0].value;
+    assert!((0.0..100.0).contains(&median), "median {median}");
+}
+
+fn check_histogram(h: &HistogramValue) {
+    let mut last = 0;
+    for b in &h.buckets {
+        assert!(b.cumulative_count >= last, "buckets must be cumulative");
+        last = b.cumulative_count;
+    }
+    assert_eq!(last, h.count, "+Inf bucket must equal the count");
+}
+
+#[test]
+fn scrapes_during_updates_are_self_consistent() {
+    let registry = Registry::new();
+    let requests = registry.counter_vec("requests_total", "", &["w"]).unwrap();
+    let latency = registry
+        .histogram_vec("latency_seconds", "", &["w"], &[0.25, 0.5, 0.75])
+        .unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let writers: Vec<_> = (0..4)
+        .map(|w| {
+            let requests = requests.with_label_values(&[&w.to_string()]);
+            let latency = latency.with_label_values(&[&w.to_string()]);
+            let stop = Arc::clone(&stop);
+            thread::spawn(move || {
+                let mut n = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    requests.inc();
+                    latency.observe(f64::from(n % 100) / 100.0);
+                    n = n.wrapping_add(1);
+                }
+            })
+        })
+        .collect();
+
+    let mut previous_total = 0;
+    for _ in 0..200 {
+        let mut total = 0;
+        for family in registry.snapshot() {
+            for metric in &family.metrics {
+                match &metric.value {
+                    MetricValue::Counter(v) => total += v,
+                    MetricValue::Histogram(h) => check_histogram(h),
+                    other => panic!("unexpected value {other:?}"),
+                }
+            }
+        }
+        assert!(total >= previous_total, "counters went backwards");
+        previous_total = total;
+        // Rendering takes the same path; make sure it never trips either.
+        assert!(registry
+            .render_prometheus()
+            .contains("# TYPE requests_total counter\n"));
+    }
+    stop.store(true, Ordering::Relaxed);
+    for w in writers {
+        w.join().expect("writer panicked");
+    }
 }
