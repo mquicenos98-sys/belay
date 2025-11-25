@@ -219,3 +219,38 @@ impl JobSource for Client {
         self.jobs().fail(*id, req).map_err(ApiError::from)
     }
 }
+
+/// `{"jobs": [...]}` without copying the specs into an
+/// [`EnqueueRequest`](belay_proto::api::EnqueueRequest).
+fn batch_body(specs: &[JobSpec]) -> Value {
+    ObjectBuilder::new().field("jobs", specs).build()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::ToJson;
+    use belay_proto::api::EnqueueRequest;
+
+    #[test]
+    fn batch_body_matches_the_proto_wire_form() {
+        let specs = vec![
+            JobSpec::new("emails", "send").priority(5),
+            JobSpec::new("sms", "send").tag("urgent"),
+        ];
+        assert_eq!(
+            batch_body(&specs),
+            EnqueueRequest::Batch(specs.clone()).to_json()
+        );
+    }
+
+    #[test]
+    fn job_paths_name_the_action() {
+        let id: JobId = "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().unwrap();
+        assert_eq!(job_path(id, ""), "/v1/jobs/01HQ3K9Z8N6V2T4R5S7W0X1Y2Z");
+        assert_eq!(
+            job_path(id, "heartbeat"),
+            "/v1/jobs/01HQ3K9Z8N6V2T4R5S7W0X1Y2Z/heartbeat"
+        );
+    }
+}
