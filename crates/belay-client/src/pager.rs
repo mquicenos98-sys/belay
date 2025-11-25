@@ -184,3 +184,28 @@ impl<T> fmt::Debug for Paginator<T> {
             .finish()
     }
 }
+
+/// Every item of a listing, collected. For listings that are short by
+/// nature (workers, cluster members), where streaming buys nothing.
+pub(crate) fn collect_all<T: FromJson>(client: &Client, path: &str) -> Result<Vec<T>> {
+    Paginator::new(client.clone(), path.to_owned(), Vec::new(), None).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_options_encode_cursor_then_limit() {
+        let cursor = Cursor::from_name("nightly");
+        let options = ListOptions::new().limit(10).after(cursor.clone());
+        assert_eq!(
+            options.to_query(),
+            [
+                ("cursor".to_owned(), cursor.to_string()),
+                ("limit".to_owned(), "10".to_owned())
+            ]
+        );
+        assert!(ListOptions::new().to_query().is_empty());
+    }
+}
