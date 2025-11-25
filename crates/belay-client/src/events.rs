@@ -152,3 +152,273 @@ pub struct Subscription {
     finished: bool,
     rng: Rng,
 }
+
+enum Decoded {
+    Event(Event),
+    Skip,
+    Invalid(Error),
+}
+
+impl Subscription {
+    /// Sequence number of the last event delivered (or skipped as
+    /// unknown); the stream resumes after it.
+    #[must_use]
+    pub fn last_seq(&self) -> Option<u64> {
+        self.last_seq
+    }
+
+    /// Successful reconnections so far.
+    #[must_use]
+    pub fn reconnects(&self) -> u64 {
+        self.reconnects
+    }
+
+    /// Events skipped because their type is unknown to this client.
+    #[must_use]
+    pub fn skipped(&self) -> u64 {
+        self.skipped
+    }
+
+    /// Closes the connection; iteration then ends.
+    pub fn close(&mut self) {
+        self.finished = true;
+        self.stream = None;
+    }
+
+    /// Whether the subscription has ended.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.finished
+    }
+
+    fn resume_from(&self) -> Option<u64> {
+        match self.last_seq {
+            Some(seq) => Some(seq.saturating_add(1)),
+            None => self.filter.from,
+        }
+    }
+
+    /// Opens one connection that starts at `from`. belay-http's own
+    /// reconnection is switched off so that each connection carries an
+    /// up-to-date `from` as well as `Last-Event-ID`.
+    fn open(&self, from: Option<u64>) -> Result<EventStream> {
+        let filter = EventFilter {
+            from,
+            ..self.filter.clone()
+        };
+        let url = self.client.url(EVENTS_PATH, &filter.to_query());
+        let mut options = SseOptions::default()
+            .reconnect_delay(Duration::ZERO)
+            .max_reconnects(0)
+            .read_timeout(Some(self.options.idle_timeout));
+        if let Some(auth) = self.client.auth_header() {
+            options = options.header(AUTHORIZATION, auth);
+        }
+        if let Some(previous) = from.and_then(|seq| seq.checked_sub(1)) {
+            options = options.last_event_id(previous.to_string());
+        }
+        self.client
+            .http()
+            .sse_with(&url, options)
+            .map_err(stream_error)
+    }
+
+    /// Replaces a dropped connection, waiting between attempts.
+    fn reconnect(&mut self) -> Result<()> {
+        loop {
+            if let Some(max) = self.options.max_reconnects {
+                if self.failures >= max {
+                    return Err(self
+                        .last_error
+                        .take()
+                        .unwrap_or(Error::Transport(belay_http::Error::ConnectionClosed)));
+                }
+            }
+            self.failures += 1;
+            let delay = self
+                .server_retry
+                .unwrap_or_else(|| self.backoff.delay_for(self.failures, &mut self.rng));
+            std::thread::sleep(delay);
+            match self.open(self.resume_from()) {
+                Ok(stream) => {
+                    // A 204 opens an already finished stream: the server
+                    // wants no more, which is an ending, not a reconnection.
+                    if !stream.is_closed() {
+                        self.reconnects += 1;
+                    }
+                    self.stream = Some(stream);
+                    return Ok(());
+                }
+                Err(e) if is_transient(&e) => self.last_error = Some(e),
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
+    /// Decodes one frame, moving the resume point to its sequence number
+    /// (from the JSON, or else the SSE id).
+    fn decode(&mut self, sse: &SseEvent) -> Decoded {
+        let value = match belay_json::parse(&sse.data) {
+            Ok(value) => value,
+            Err(e) => {
+                return Decoded::Invalid(bad_event(format!("event data is not JSON: {e}")));
+            }
+        };
+        let seq = value
+            .get("seq")
+            .and_then(Value::as_u64)
+            .or_else(|| sse.id.as_deref().and_then(|id| id.parse().ok()));
+        if let Some(seq) = seq {
+            if self.last_seq.is_some_and(|last| seq <= last) {
+                // Replayed by the server after a reconnect.
+                return Decoded::Skip;
+            }
+            self.last_seq = Some(seq);
+        }
+        let known = value
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| EventKind::TYPES.contains(&t));
+        if !known {
+            self.skipped += 1;
+            return Decoded::Skip;
+        }
+        match Event::from_json(&value) {
+            Ok(event) => Decoded::Event(event),
+            Err(e) => Decoded::Invalid(bad_event(e.to_string())),
+        }
+    }
+}
+
+impl Iterator for Subscription {
+    type Item = Result<Event>;
+
+    fn next(&mut self) -> Option<Result<Event>> {
+        loop {
+            if self.finished {
+                return None;
+            }
+            let Some(stream) = self.stream.as_mut() else {
+                if let Err(e) = self.reconnect() {
+                    self.finished = true;
+                    return Some(Err(e));
+                }
+                continue;
+            };
+            let item = stream.next();
+            let hinted = stream.reconnect_delay();
+            if !hinted.is_zero() {
+                self.server_retry = Some(hinted);
+            }
+            match item {
+                Some(Ok(sse)) => match self.decode(&sse) {
+                    Decoded::Event(event) => {
+                        self.failures = 0;
+                        self.last_error = None;
+                        return Some(Ok(event));
+                    }
+                    Decoded::Skip => {}
+                    Decoded::Invalid(e) => return Some(Err(e)),
+                },
+                Some(Err(e)) => {
+                    let e = stream_error(e);
+                    if !is_transient(&e) {
+                        self.finished = true;
+                        return Some(Err(e));
+                    }
+                    self.stream = None;
+                    self.last_error = Some(e);
+                }
+                // The server answered 204: nothing more for this client.
+                None => self.finished = true,
+            }
+        }
+    }
+}
+
+impl fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Subscription")
+            .field("filter", &self.filter)
+            .field("last_seq", &self.last_seq)
+            .field("connected", &self.stream.is_some())
+            .field("reconnects", &self.reconnects)
+            .field("skipped", &self.skipped)
+            .field("finished", &self.finished)
+            .finish()
+    }
+}
+
+fn bad_event(message: String) -> Error {
+    Error::Decode(DecodeError::new(format!("GET {EVENTS_PATH}"), message))
+}
+
+/// Error answers become [`Error::Api`] like everywhere else.
+fn stream_error(e: belay_http::Error) -> Error {
+    match e {
+        belay_http::Error::Status { status, body } => {
+            Error::Api(decode_error(status.as_u16(), body.as_bytes()))
+        }
+        other => Error::Transport(other),
+    }
+}
+
+/// Whether reconnecting may help: a dropped or refused connection, or a
+/// server (or proxy) that is temporarily unavailable.
+fn is_transient(e: &Error) -> bool {
+    match e {
+        Error::Transport(e) => e.is_transient(),
+        Error::Api(e) => e.is_retryable(),
+        Error::Decode(_) | Error::Config(_) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_http::StatusCode;
+    use belay_proto::api::ErrorCode;
+
+    #[test]
+    fn error_answers_decode_into_api_errors() {
+        let e = stream_error(belay_http::Error::Status {
+            status: StatusCode::UNAUTHORIZED,
+            body: r#"{"error":{"code":"unauthenticated","message":"missing token"}}"#.into(),
+        });
+        assert_eq!(e.code(), Some(ErrorCode::Unauthenticated));
+        assert!(!is_transient(&e));
+        let e = stream_error(belay_http::Error::Status {
+            status: StatusCode::BAD_GATEWAY,
+            body: String::new(),
+        });
+        assert_eq!(e.code(), Some(ErrorCode::Unavailable));
+        assert!(is_transient(&e));
+    }
+
+    #[test]
+    fn dropped_connections_are_transient_but_protocol_errors_are_not() {
+        assert!(is_transient(&Error::Transport(
+            belay_http::Error::ConnectionClosed
+        )));
+        assert!(!is_transient(&Error::Transport(
+            belay_http::Error::UnexpectedContentType {
+                expected: "text/event-stream",
+                found: "text/html".into(),
+            }
+        )));
+        assert!(!is_transient(&Error::Transport(
+            belay_http::Error::BodyTooLarge { limit: 1 }
+        )));
+    }
+
+    #[test]
+    fn options_builders() {
+        let options = EventOptions::default()
+            .idle_timeout(Duration::from_secs(5))
+            .reconnect_backoff(BackoffPolicy::constant(Duration::from_millis(1)))
+            .max_reconnects(2);
+        assert_eq!(options.idle_timeout, Duration::from_secs(5));
+        assert_eq!(options.max_reconnects, Some(2));
+        assert!(options.reconnect_backoff.is_some());
+    }
+}
