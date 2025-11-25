@@ -89,3 +89,18 @@ impl<'a> Queues<'a> {
         self.client.execute(Call::delete(queue_path(name, "")))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn namespaced_queue_names_stay_readable_in_paths() {
+        let name = QueueName::from_static("billing:invoices");
+        assert_eq!(queue_path(&name, ""), "/v1/queues/billing:invoices");
+        assert_eq!(
+            queue_path(&name, "purge"),
+            "/v1/queues/billing:invoices/purge"
+        );
+    }
+}
