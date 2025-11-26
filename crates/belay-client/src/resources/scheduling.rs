@@ -165,3 +165,67 @@ pub struct Workflows<'a> {
 fn workflow_path(id: WorkflowId) -> String {
     format!("/v1/workflows/{}", segment(&id.to_string()))
 }
+
+impl<'a> Workflows<'a> {
+    pub(crate) fn new(client: &'a Client) -> Workflows<'a> {
+        Workflows { client }
+    }
+
+    /// Starts a run of `spec` (`POST /v1/workflows`). The server checks the
+    /// step graph (unique names, known dependencies, no cycles) and
+    /// enqueues the root steps. Not retried: each call starts a run.
+    pub fn submit(&self, spec: &WorkflowSpec) -> Result<Workflow> {
+        self.client
+            .fetch(Call::post("/v1/workflows".to_owned(), Safety::NotRepeatable).json(spec))
+    }
+
+    /// The run `id` with the state of every step (`GET /v1/workflows/:id`).
+    pub fn get(&self, id: WorkflowId) -> Result<Workflow> {
+        self.client.fetch(Call::get(workflow_path(id)))
+    }
+
+    /// One page of runs (`GET /v1/workflows`).
+    pub fn list(&self, options: &ListOptions) -> Result<Page<Workflow>> {
+        self.client
+            .fetch(Call::get("/v1/workflows".to_owned()).query(options.to_query()))
+    }
+
+    /// Every run, following cursors as the iterator is consumed.
+    #[must_use]
+    pub fn list_all(&self) -> Paginator<Workflow> {
+        Paginator::new(
+            self.client.clone(),
+            "/v1/workflows".to_owned(),
+            Vec::new(),
+            None,
+        )
+    }
+
+    /// Cancels run `id` and its unfinished steps
+    /// (`POST /v1/workflows/:id/cancel`).
+    pub fn cancel(&self, id: WorkflowId) -> Result<()> {
+        self.client.execute(Call::post(
+            format!("{}/cancel", workflow_path(id)),
+            Safety::Repeatable,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn paths_encode_ids_and_names() {
+        let id = ScheduleId::from_static("nightly.report");
+        assert_eq!(schedule_path(&id, ""), "/v1/schedules/nightly.report");
+        assert_eq!(
+            schedule_path(&id, "preview"),
+            "/v1/schedules/nightly.report/preview"
+        );
+        assert_eq!(
+            calendar_path("business hours/eu"),
+            "/v1/calendars/business%20hours%2Feu"
+        );
+    }
+}
