@@ -56,3 +56,33 @@ fn probe(path: &str) -> Call {
         .safety(Safety::Never)
         .accept("text/plain, application/json")
 }
+
+/// Administrative calls; see [`Client::admin`]. They need a token with
+/// the `admin` scope.
+#[derive(Clone, Copy, Debug)]
+pub struct Admin<'a> {
+    client: &'a Client,
+}
+
+impl<'a> Admin<'a> {
+    pub(crate) fn new(client: &'a Client) -> Admin<'a> {
+        Admin { client }
+    }
+
+    /// Writes a storage snapshot now and drops the write-ahead log it
+    /// covers (`POST /v1/admin/checkpoint`). Repeatable: a second
+    /// checkpoint only snapshots again.
+    pub fn checkpoint(&self) -> Result<CheckpointResponse> {
+        self.client.fetch(Call::post(
+            "/v1/admin/checkpoint".to_owned(),
+            Safety::Repeatable,
+        ))
+    }
+
+    /// Storage statistics (`GET /v1/admin/store`). The shape follows the
+    /// storage engine's own counters and is not part of the stable API, so
+    /// it is returned as raw JSON for display.
+    pub fn store(&self) -> Result<Value> {
+        self.client.fetch(Call::get("/v1/admin/store".to_owned()))
+    }
+}
