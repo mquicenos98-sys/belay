@@ -150,3 +150,142 @@ pub struct Fake {
     handle: Option<ServerHandle>,
     state: Arc<State>,
 }
+
+impl Fake {
+    pub fn start() -> Fake {
+        let state = Arc::new(State::default());
+        let mut router = Router::new();
+        for (method, pattern) in ROUTES {
+            let state = Arc::clone(&state);
+            router.route(method.clone(), pattern, move |req: &mut Request| {
+                answer(&state, req)
+            });
+        }
+        let handle = Server::bind("127.0.0.1:0", server_config())
+            .expect("bind an ephemeral port")
+            .spawn(router)
+            .expect("spawn the fake server");
+        Fake {
+            handle: Some(handle),
+            state,
+        }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.handle.as_ref().expect("running").local_addr()
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr())
+    }
+
+    /// A client with the test token, 1 ms retry backoff and 3 retries.
+    pub fn client(&self) -> Client {
+        Client::new(fast_config(&self.url())).expect("valid client config")
+    }
+
+    /// A client built from `config` adjusted by `adjust`.
+    pub fn client_with(&self, adjust: impl FnOnce(ClientConfig) -> ClientConfig) -> Client {
+        Client::new(adjust(fast_config(&self.url()))).expect("valid client config")
+    }
+
+    /// Queues an answer computed from the request.
+    pub fn reply_with(&self, reply: impl FnOnce(&Request) -> Response + Send + 'static) {
+        guard(&self.state.replies).push_back(Box::new(reply));
+    }
+
+    /// Queues a JSON answer.
+    pub fn reply_json<T: ToJson + ?Sized>(&self, status: u16, body: &T) {
+        let bytes = encode_body(body);
+        self.reply_with(move |_| {
+            Response::json_bytes(bytes).with_status(StatusCode::from_u16(status).expect("status"))
+        });
+    }
+
+    /// Queues an [`ApiError`] answer with its proper status.
+    pub fn reply_error(&self, error: ApiError) {
+        self.reply_json(error.http_status(), &error);
+    }
+
+    /// Queues an empty answer.
+    pub fn reply_status(&self, status: u16) {
+        self.reply_with(move |_| Response::status(StatusCode::from_u16(status).expect("status")));
+    }
+
+    pub fn requests(&self) -> Vec<Seen> {
+        guard(&self.state.seen).clone()
+    }
+
+    pub fn count(&self) -> usize {
+        guard(&self.state.seen).len()
+    }
+
+    /// The only request seen; fails if there were more or none.
+    pub fn only(&self) -> Seen {
+        let seen = self.requests();
+        assert_eq!(seen.len(), 1, "expected exactly one request, saw {seen:#?}");
+        seen.into_iter().next().expect("one request")
+    }
+
+    pub fn last(&self) -> Seen {
+        self.requests().pop().expect("at least one request")
+    }
+
+    /// Canned replies not consumed yet.
+    pub fn pending_replies(&self) -> usize {
+        guard(&self.state.replies).len()
+    }
+}
+
+impl Drop for Fake {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.shutdown_and_join();
+        }
+    }
+}
+
+fn answer(state: &State, req: &mut Request) -> Response {
+    let route = req
+        .extensions
+        .get::<MatchedRoute>()
+        .map(|r| r.as_str().to_owned())
+        .unwrap_or_default();
+    guard(&state.seen).push(Seen {
+        method: req.method.clone(),
+        route,
+        path: req.path.clone(),
+        params: req
+            .params
+            .iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        query: req
+            .query
+            .iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        headers: req.headers.clone(),
+        body: req.body.clone(),
+    });
+    let reply = guard(&state.replies).pop_front();
+    match reply {
+        Some(reply) => reply(req),
+        None => {
+            let error = ApiError::internal(format!(
+                "fake server has no reply queued for {} {}",
+                req.method, req.path
+            ));
+            Response::json_bytes(encode_body(&error)).with_status(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Test defaults: the fake's token, near-instant retries, generous timeout.
+pub fn fast_config(url: &str) -> ClientConfig {
+    ClientConfig::new(url)
+        .token(TOKEN)
+        .backoff(BackoffPolicy::constant(Duration::from_millis(1)))
+        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(2))
+}
