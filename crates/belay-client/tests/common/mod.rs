@@ -119,3 +119,34 @@ impl Seen {
         format!("{} {}", self.method, self.route)
     }
 }
+
+type Reply = Box<dyn FnOnce(&Request) -> Response + Send>;
+
+#[derive(Default)]
+struct State {
+    seen: Mutex<Vec<Seen>>,
+    replies: Mutex<VecDeque<Reply>>,
+}
+
+fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Short timeouts so shutdown and keep-alive expiry are quick.
+pub fn server_config() -> ServerConfig {
+    ServerConfig {
+        keep_alive_timeout: Duration::from_secs(2),
+        header_timeout: Duration::from_secs(2),
+        body_timeout: Duration::from_secs(2),
+        write_timeout: Duration::from_secs(2),
+        shutdown_grace: Duration::from_secs(2),
+        poll_interval: Duration::from_millis(10),
+        ..ServerConfig::default()
+    }
+}
+
+/// The fake server; shut down when dropped.
+pub struct Fake {
+    handle: Option<ServerHandle>,
+    state: Arc<State>,
+}
