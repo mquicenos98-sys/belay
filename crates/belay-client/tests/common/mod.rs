@@ -321,3 +321,83 @@ pub fn unreachable_config() -> ClientConfig {
     fast_config(&format!("http://127.0.0.1:{}", dead_port()))
         .connect_timeout(Duration::from_millis(200))
 }
+
+/// A listener that reads each request head and then hangs up without
+/// answering, counting the connections: what a crashing server looks like.
+pub struct Hangup {
+    addr: SocketAddr,
+    accepted: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Hangup {
+    pub fn start() -> Hangup {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("local addr");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let (accepted, stop) = (Arc::clone(&accepted), Arc::clone(&stop));
+            thread::spawn(move || {
+                for stream in listener.incoming() {
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    let Ok(mut stream) = stream else { continue };
+                    accepted.fetch_add(1, Ordering::SeqCst);
+                    read_head(&mut stream);
+                }
+            })
+        };
+        Hangup {
+            addr,
+            accepted,
+            stop,
+            thread: Some(thread),
+        }
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr)
+    }
+
+    pub fn accepted(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Hangup {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        // Wake the blocking accept so the thread sees the flag.
+        let _ = TcpStream::connect(self.addr);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn read_head(stream: &mut TcpStream) {
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+    let mut head = Vec::new();
+    let mut byte = [0u8; 1];
+    while !head.ends_with(b"\r\n\r\n") {
+        match stream.read(&mut byte) {
+            Ok(1) => head.push(byte[0]),
+            _ => return,
+        }
+    }
+    // Consume a small body too, so closing does not reset the connection
+    // before the client finished writing.
+    let text = String::from_utf8_lossy(&head).to_ascii_lowercase();
+    if let Some(len) = text
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse::<usize>().ok())
+    {
+        let mut body = vec![0u8; len];
+        let _ = stream.read_exact(&mut body);
+    }
+    let _ = stream.flush();
+}
