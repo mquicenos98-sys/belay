@@ -400,3 +400,129 @@ fn empty_lease_answer_means_nothing_was_ready() {
     );
     assert!(fake.client().jobs().lease(&request).expect("ok").is_empty());
 }
+
+#[test]
+fn worker_reports_send_the_token_and_decode_answers() {
+    let fake = Fake::start();
+    let client = fake.client();
+    let expires_at = Timestamp::from_millis(t0().as_millis() + 30_000);
+    fake.reply_json(
+        200,
+        &HeartbeatResponse {
+            expires_at,
+            cancel_requested: true,
+        },
+    );
+    fake.reply_status(204);
+    fake.reply_status(204);
+
+    let heartbeat = HeartbeatRequest {
+        token: token(),
+        extend_by: Some(Duration::from_secs(90)),
+        progress: Some(Progress::percent(40.0).with_message("halfway-ish")),
+    };
+    let answer = client
+        .jobs()
+        .heartbeat(job_id(2), &heartbeat)
+        .expect("heartbeat");
+    assert!(answer.cancel_requested);
+    assert_eq!(answer.expires_at, expires_at);
+
+    let complete = CompleteRequest {
+        token: token(),
+        result: Some(Value::Null),
+    };
+    client
+        .jobs()
+        .complete(job_id(2), &complete)
+        .expect("complete");
+    let fail = FailRequest {
+        kind: Some("timeout".into()),
+        retryable: false,
+        retry_in: Some(Duration::from_secs(5)),
+        ..FailRequest::new(token(), "upstream timed out")
+    };
+    client.jobs().fail(job_id(2), &fail).expect("fail");
+
+    let seen = fake.requests();
+    assert_eq!(seen[0].call(), "POST /v1/jobs/:id/heartbeat");
+    assert_eq!(
+        seen[0].json(),
+        json!({"token": "000000000000c0de", "extend_by": "1m30s",
+               "progress": {"percent": 40.0, "message": "halfway-ish"}})
+    );
+    assert_eq!(seen[1].call(), "POST /v1/jobs/:id/complete");
+    assert_eq!(
+        seen[1].json(),
+        json!({"token": "000000000000c0de", "result": null})
+    );
+    assert_eq!(seen[2].call(), "POST /v1/jobs/:id/fail");
+    assert_eq!(
+        seen[2].json(),
+        json!({"token": "000000000000c0de", "error": "upstream timed out",
+               "kind": "timeout", "retryable": false, "retry_in": "5s"})
+    );
+}
+
+#[test]
+fn complete_accepts_a_json_answer_as_well_as_no_content() {
+    let fake = Fake::start();
+    fake.reply_json(200, &json!({"ok": true}));
+    fake.client()
+        .jobs()
+        .complete(job_id(1), &CompleteRequest::new(token()))
+        .expect("a body on success is ignored");
+}
+
+#[test]
+fn job_source_maps_lease_lost_and_outages_to_api_errors() {
+    let fake = Fake::start();
+    fake.reply_error(ApiError::lease_lost(job_id(1)));
+    let client = fake.client();
+    let source: &dyn JobSource = &client;
+
+    let err = source
+        .complete(&job_id(1), &CompleteRequest::new(token()))
+        .unwrap_err();
+    assert_eq!(err, ApiError::lease_lost(job_id(1)));
+
+    let unreachable =
+        belay_client::Client::new(common::unreachable_config().retries(0)).expect("config");
+    let err = JobSource::lease(
+        &unreachable,
+        &LeaseRequest::new(
+            WorkerId::from_static("w1"),
+            vec![QueueName::from_static("q")],
+        ),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Unavailable);
+    assert!(err.is_retryable());
+}
+
+#[test]
+fn job_source_heartbeat_and_fail_go_through_the_same_endpoints() {
+    let fake = Fake::start();
+    fake.reply_json(
+        200,
+        &HeartbeatResponse {
+            expires_at: t0(),
+            cancel_requested: false,
+        },
+    );
+    fake.reply_status(204);
+    let client = fake.client();
+    let answer = JobSource::heartbeat(&client, &job_id(3), &HeartbeatRequest::new(token()))
+        .expect("heartbeat");
+    assert!(!answer.cancel_requested);
+    JobSource::fail(&client, &job_id(3), &FailRequest::new(token(), "boom")).expect("fail");
+    let calls: Vec<String> = fake.requests().iter().map(|s| s.call()).collect();
+    assert_eq!(
+        calls,
+        ["POST /v1/jobs/:id/heartbeat", "POST /v1/jobs/:id/fail"]
+    );
+    assert_eq!(
+        fake.last().header("authorization"),
+        Some(format!("Bearer {TOKEN}").as_str())
+    );
+}
