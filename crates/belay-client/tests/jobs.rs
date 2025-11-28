@@ -151,3 +151,252 @@ fn rejected_spec_surfaces_the_servers_violations() {
     assert_eq!(err.api_error(), Some(&error));
     assert_eq!(fake.count(), 1, "client errors are not retried");
 }
+
+#[test]
+fn get_decodes_the_job_and_reports_missing_ones() {
+    let fake = Fake::start();
+    let mut job = sample_job(3);
+    job.state = JobState::Dead;
+    job.attempt = 25;
+    fake.reply_json(200, &job);
+    let client = fake.client();
+
+    assert_eq!(client.jobs().get(job_id(3)).expect("job"), job);
+    let seen = fake.only();
+    assert_eq!(seen.call(), "GET /v1/jobs/:id");
+    assert_eq!(seen.param("id"), Some(job_id(3).to_string().as_str()));
+
+    fake.reply_error(ApiError::not_found("job", job_id(4)));
+    let err = client.jobs().get(job_id(4)).unwrap_err();
+    assert!(err.is_not_found(), "{err}");
+    assert_eq!(
+        err.to_string(),
+        format!("server error: not_found: job {} not found", job_id(4))
+    );
+}
+
+#[test]
+fn list_sends_the_filter_as_query_parameters() {
+    let fake = Fake::start();
+    let next = Cursor::after_job(job_id(2));
+    fake.reply_json(
+        200,
+        &Page::new(vec![sample_job(1), sample_job(2)], Some(next.clone())),
+    );
+    let filter = JobFilter::new()
+        .queue(QueueName::from_static("emails"))
+        .state(JobState::Dead)
+        .state(JobState::Retrying)
+        .kind("send")
+        .tag("signup")
+        .created_between(Some(t0()), None)
+        .order(SortOrder::Asc)
+        .limit(2);
+
+    let page = fake.client().jobs().list(&filter).expect("page");
+
+    assert_eq!(page.items.len(), 2);
+    assert_eq!(page.next_cursor, Some(next));
+    let seen = fake.only();
+    assert_eq!(seen.call(), "GET /v1/jobs");
+    assert_eq!(
+        seen.query_pairs(),
+        [
+            ("queue", "emails"),
+            ("state", "dead,retrying"),
+            ("kind", "send"),
+            ("tag", "signup"),
+            ("created_after", "2025-03-04T05:06:07.089Z"),
+            ("order", "asc"),
+            ("limit", "2"),
+        ]
+    );
+    // What the server would parse back is the filter we sent.
+    let pairs: Vec<(String, String)> = seen.query.clone();
+    assert_eq!(JobFilter::from_query(&pairs), Ok(filter));
+}
+
+#[test]
+fn list_all_follows_cursors_to_the_last_page() {
+    let fake = Fake::start();
+    let first = Cursor::after_job(job_id(2));
+    let second = Cursor::after_job(job_id(4));
+    fake.reply_json(
+        200,
+        &Page::new(vec![sample_job(1), sample_job(2)], Some(first.clone())),
+    );
+    fake.reply_json(
+        200,
+        &Page::new(vec![sample_job(3), sample_job(4)], Some(second.clone())),
+    );
+    fake.reply_json(200, &Page::last(vec![sample_job(5)]));
+
+    let client = fake.client();
+    let mut all = client
+        .jobs()
+        .list_all(JobFilter::new().state(JobState::Ready).limit(2));
+    let ids: Vec<_> = all.by_ref().map(|j| j.expect("job").id).collect();
+
+    assert_eq!(ids, (1..=5).map(job_id).collect::<Vec<_>>());
+    assert_eq!(all.pages_fetched(), 3);
+    assert!(all.cursor().is_none());
+    let queries: Vec<Vec<(String, String)>> =
+        fake.requests().into_iter().map(|s| s.query).collect();
+    let pair = |k: &str, v: String| (k.to_owned(), v);
+    assert_eq!(
+        queries,
+        [
+            vec![pair("state", "ready".into()), pair("limit", "2".into())],
+            vec![
+                pair("state", "ready".into()),
+                pair("limit", "2".into()),
+                pair("cursor", first.to_string())
+            ],
+            vec![
+                pair("state", "ready".into()),
+                pair("limit", "2".into()),
+                pair("cursor", second.to_string())
+            ],
+        ]
+    );
+}
+
+#[test]
+fn list_all_starts_at_the_filters_cursor_and_fetches_lazily() {
+    let fake = Fake::start();
+    let start = Cursor::after_job(job_id(9));
+    fake.reply_json(
+        200,
+        &Page::new(vec![sample_job(8)], Some(Cursor::after_job(job_id(8)))),
+    );
+
+    let client = fake.client();
+    let first: Vec<_> = client
+        .jobs()
+        .list_all(JobFilter::new().after(start.clone()))
+        .take(1)
+        .collect();
+
+    assert_eq!(first.len(), 1);
+    let seen = fake.only();
+    assert_eq!(seen.query_pairs(), [("cursor", start.to_string().as_str())]);
+}
+
+#[test]
+fn list_all_yields_a_failed_page_once_and_ends() {
+    let fake = Fake::start();
+    fake.reply_json(
+        200,
+        &Page::new(vec![sample_job(1)], Some(Cursor::after_job(job_id(1)))),
+    );
+    fake.reply_error(ApiError::permission_denied("token lacks the read scope"));
+
+    let items: Vec<_> = fake.client().jobs().list_all(JobFilter::new()).collect();
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[1].as_ref().unwrap_err().code(),
+        Some(ErrorCode::PermissionDenied)
+    );
+}
+
+#[test]
+fn management_actions_post_to_their_routes() {
+    let fake = Fake::start();
+    let client = fake.client();
+    let mut cancelled = sample_job(1);
+    cancelled.state = JobState::Cancelled;
+    for _ in 0..3 {
+        fake.reply_json(200, &cancelled);
+    }
+    fake.reply_status(204);
+
+    assert_eq!(client.jobs().cancel(job_id(1)).expect("cancel"), cancelled);
+    client.jobs().retry(job_id(1)).expect("retry");
+    client.jobs().promote(job_id(1)).expect("promote");
+    client.jobs().delete(job_id(1)).expect("delete");
+
+    let calls: Vec<String> = fake.requests().iter().map(|s| s.call()).collect();
+    assert_eq!(
+        calls,
+        [
+            "POST /v1/jobs/:id/cancel",
+            "POST /v1/jobs/:id/retry",
+            "POST /v1/jobs/:id/promote",
+            "DELETE /v1/jobs/:id",
+        ]
+    );
+    for seen in fake.requests() {
+        assert_eq!(seen.param("id"), Some(job_id(1).to_string().as_str()));
+        assert!(seen.body.is_empty(), "{} has no body", seen.call());
+    }
+}
+
+#[test]
+fn deleting_a_running_job_reports_the_precondition() {
+    let fake = Fake::start();
+    fake.reply_error(ApiError::failed_precondition("job is running"));
+    let err = fake.client().jobs().delete(job_id(1)).unwrap_err();
+    assert_eq!(err.code(), Some(ErrorCode::FailedPrecondition));
+    assert_eq!(fake.count(), 1);
+}
+
+#[test]
+fn lease_sends_the_request_and_returns_the_leased_jobs() {
+    let fake = Fake::start();
+    let mut job = sample_job(5);
+    job.state = JobState::Running;
+    job.attempt = 1;
+    fake.reply_json(
+        200,
+        &LeaseResponse {
+            jobs: vec![LeasedJob {
+                job: job.clone(),
+                token: token(),
+            }],
+        },
+    );
+    let request = LeaseRequest::new(
+        WorkerId::from_static("host-1:4242"),
+        vec![
+            QueueName::from_static("emails"),
+            QueueName::from_static("sms"),
+        ],
+    )
+    .max_jobs(4)
+    .lease_for(Duration::from_secs(60))
+    .wait(Duration::from_millis(100));
+
+    let leased = fake.client().jobs().lease(&request).expect("leased");
+
+    assert_eq!(
+        leased,
+        [LeasedJob {
+            job,
+            token: token()
+        }]
+    );
+    let seen = fake.only();
+    assert_eq!(seen.call(), "POST /v1/lease");
+    assert_eq!(
+        seen.json(),
+        json!({
+            "worker": "host-1:4242",
+            "queues": ["emails", "sms"],
+            "max_jobs": 4,
+            "lease_for": "1m",
+            "wait": "100ms"
+        })
+    );
+}
+
+#[test]
+fn empty_lease_answer_means_nothing_was_ready() {
+    let fake = Fake::start();
+    fake.reply_json(200, &json!({}));
+    let request = LeaseRequest::new(
+        WorkerId::from_static("w1"),
+        vec![QueueName::from_static("q")],
+    );
+    assert!(fake.client().jobs().lease(&request).expect("ok").is_empty());
+}
