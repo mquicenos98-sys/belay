@@ -289,3 +289,35 @@ pub fn fast_config(url: &str) -> ClientConfig {
         .timeout(Duration::from_secs(5))
         .connect_timeout(Duration::from_secs(2))
 }
+
+/// A fixed point in time for sample records.
+pub fn t0() -> Timestamp {
+    "2025-03-04T05:06:07.089Z".parse().expect("valid timestamp")
+}
+
+pub fn job_id(n: u8) -> JobId {
+    format!("01HQ3K9Z8N6V2T4R5S7W0X1Y{n:02}")
+        .parse()
+        .expect("valid job id")
+}
+
+/// A ready job on queue `emails`.
+pub fn sample_job(n: u8) -> Job {
+    Job::new(job_id(n), JobSpec::new("emails", "send"), t0())
+}
+
+/// A port with nothing listening on it.
+pub fn dead_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .and_then(|l| l.local_addr())
+        .expect("ephemeral port")
+        .port()
+}
+
+/// Test defaults for a server that is not there. Linux refuses such a
+/// connection at once; Windows retries the handshake for about two seconds
+/// first, so the connect timeout is kept short. Either way nothing is sent.
+pub fn unreachable_config() -> ClientConfig {
+    fast_config(&format!("http://127.0.0.1:{}", dead_port()))
+        .connect_timeout(Duration::from_millis(200))
+}
