@@ -56,3 +56,98 @@ fn enqueue_posts_the_bare_spec_with_auth_and_json_headers() {
     let agent = seen.header("user-agent").expect("user agent sent");
     assert!(agent.starts_with("belay-client/"), "{agent}");
 }
+
+#[test]
+fn requests_carry_no_authorization_without_a_token() {
+    let fake = Fake::start();
+    fake.reply_json(200, &sample_job(1));
+    let client = fake.client_with(|mut c| {
+        c.token = None;
+        c
+    });
+    client.jobs().get(job_id(1)).expect("job");
+    assert_eq!(fake.only().header("authorization"), None);
+}
+
+#[test]
+fn enqueue_batch_wraps_specs_and_keeps_result_order() {
+    let fake = Fake::start();
+    let duplicate = EnqueueResult {
+        status: EnqueueStatus::Duplicate,
+        state: JobState::Running,
+        ..created(7)
+    };
+    fake.reply_json(
+        200,
+        &EnqueueResponse {
+            results: vec![created(1), duplicate.clone()],
+        },
+    );
+    let specs = [
+        JobSpec::new("emails", "send"),
+        JobSpec::new("sms", "send").unique("user:7", UniqueScope::UntilFinished),
+    ];
+
+    let results = fake
+        .client()
+        .jobs()
+        .enqueue_batch(&specs)
+        .expect("enqueued");
+
+    assert_eq!(results, [created(1), duplicate]);
+    let body = fake.only().json();
+    assert_eq!(body["jobs"].as_array().map(Vec::len), Some(2));
+    assert_eq!(body["jobs"][1], specs[1].to_json());
+}
+
+#[test]
+fn empty_batch_sends_nothing() {
+    let fake = Fake::start();
+    assert!(fake
+        .client()
+        .jobs()
+        .enqueue_batch(&[])
+        .expect("ok")
+        .is_empty());
+    assert_eq!(fake.count(), 0);
+}
+
+#[test]
+fn result_count_mismatch_is_a_decode_error() {
+    let fake = Fake::start();
+    fake.reply_json(
+        200,
+        &EnqueueResponse {
+            results: vec![created(1)],
+        },
+    );
+    let specs = [JobSpec::new("q", "a"), JobSpec::new("q", "b")];
+    let err = fake.client().jobs().enqueue_batch(&specs).unwrap_err();
+    assert!(matches!(err, Error::Decode(_)), "{err}");
+    assert_eq!(
+        err.to_string(),
+        "unexpected response to POST /v1/jobs: expected 2 results for 2 jobs, got 1"
+    );
+
+    fake.reply_json(200, &EnqueueResponse { results: vec![] });
+    let err = fake.client().jobs().enqueue(&specs[0]).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unexpected response to POST /v1/jobs: expected 1 result for 1 job, got 0"
+    );
+}
+
+#[test]
+fn rejected_spec_surfaces_the_servers_violations() {
+    let fake = Fake::start();
+    let error = ApiError::invalid_argument("$.priority: must be between -1000 and 1000, got 5000")
+        .with_details(json!({"violations": [{"field": "$.priority", "message": "too high"}]}));
+    fake.reply_error(error.clone());
+    let err = fake
+        .client()
+        .jobs()
+        .enqueue(&JobSpec::new("q", "k").priority(5000))
+        .unwrap_err();
+    assert_eq!(err.api_error(), Some(&error));
+    assert_eq!(fake.count(), 1, "client errors are not retried");
+}
