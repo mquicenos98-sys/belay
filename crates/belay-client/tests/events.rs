@@ -221,3 +221,92 @@ fn gives_up_after_max_reconnects_with_the_last_error() {
     );
     assert_eq!(fake.count(), 3);
 }
+
+#[test]
+fn a_fatal_answer_while_reconnecting_ends_the_stream() {
+    let fake = Fake::start();
+    fake.reply_with(stream_of(vec![frame(&event(1))]));
+    fake.reply_error(ApiError::permission_denied("token revoked"));
+
+    let items: Vec<_> = fake
+        .client()
+        .events_with(&EventFilter::new(), fast())
+        .expect("subscribed")
+        .collect();
+
+    assert_eq!(items.len(), 2);
+    assert_eq!(
+        items[1].as_ref().unwrap_err().code(),
+        Some(ErrorCode::PermissionDenied)
+    );
+}
+
+#[test]
+fn the_servers_retry_hint_replaces_the_backoff() {
+    let fake = Fake::start();
+    fake.reply_with(|_| {
+        Response::sse(|sse| {
+            sse.retry(Duration::from_millis(1))?;
+            sse.send(&frame(&event(1)))
+        })
+    });
+    fake.reply_with(|_| Response::no_content());
+    let slow =
+        EventOptions::default().reconnect_backoff(BackoffPolicy::constant(Duration::from_secs(5)));
+    let started = Instant::now();
+
+    let received = seqs(
+        fake.client()
+            .events_with(&EventFilter::new(), slow)
+            .expect("subscribed")
+            .collect(),
+    );
+
+    assert_eq!(received, [1]);
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "reconnected after the server's 1 ms, not the 5 s backoff"
+    );
+}
+
+#[test]
+fn a_silent_connection_is_replaced_after_the_idle_timeout() {
+    let fake = Fake::start();
+    fake.reply_with(|_| {
+        Response::sse(|sse| {
+            sse.send(&frame(&event(1)))?;
+            // No heartbeat: the client should give up on this connection.
+            thread::sleep(Duration::from_millis(300));
+            Ok(())
+        })
+    });
+    fake.reply_with(stream_of(vec![frame(&event(2))]));
+    fake.reply_with(|_| Response::no_content());
+    let options = fast().idle_timeout(Duration::from_millis(100));
+
+    let mut events = fake
+        .client()
+        .events_with(&EventFilter::new(), options)
+        .expect("subscribed");
+    let received = seqs(events.by_ref().collect());
+
+    assert_eq!(received, [1, 2]);
+    assert_eq!(fake.requests()[1].query_pairs(), [("from", "2")]);
+}
+
+#[test]
+fn close_ends_iteration() {
+    let fake = Fake::start();
+    fake.reply_with(stream_of(vec![frame(&event(1)), frame(&event(2))]));
+    let mut events = fake
+        .client()
+        .events_with(&EventFilter::new(), fast())
+        .expect("subscribed");
+
+    assert_eq!(events.next().map(|e| e.expect("event").seq), Some(1));
+    events.close();
+
+    assert!(events.is_closed());
+    assert!(events.next().is_none());
+    assert_eq!(fake.count(), 1, "no reconnection after close");
+}
