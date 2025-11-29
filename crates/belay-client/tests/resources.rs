@@ -137,3 +137,236 @@ fn queue_pause_resume_purge_and_delete() {
     assert_eq!(seen[2].query_pairs(), [("state", "dead")]);
     assert!(seen[3].query.is_empty());
 }
+
+#[test]
+fn queue_list_all_walks_name_cursors() {
+    let fake = Fake::start();
+    let after_a = Cursor::from_name("a");
+    fake.reply_json(
+        200,
+        &Page::new(vec![QueueInfo::new(queue("a"))], Some(after_a.clone())),
+    );
+    fake.reply_json(200, &Page::last(vec![QueueInfo::new(queue("b"))]));
+
+    let names: Vec<String> = fake
+        .client()
+        .queues()
+        .list_all()
+        .map(|q| q.expect("queue").name.to_string())
+        .collect();
+
+    assert_eq!(names, ["a", "b"]);
+    assert_eq!(
+        fake.last().query_pairs(),
+        [("cursor", after_a.to_string().as_str())]
+    );
+}
+
+// ---- schedules ----------------------------------------------------------
+
+#[test]
+fn schedule_create_put_get_and_delete() {
+    let fake = Fake::start();
+    fake.reply_json(201, &schedule());
+    fake.reply_json(200, &schedule());
+    fake.reply_json(200, &schedule());
+    fake.reply_status(204);
+    let client = fake.client();
+    let spec = schedule_spec();
+
+    assert_eq!(
+        client.schedules().create(&spec).expect("created"),
+        schedule()
+    );
+    client.schedules().put(&spec).expect("replaced");
+    assert_eq!(
+        client.schedules().get(&spec.id).expect("got").id(),
+        &spec.id
+    );
+    client.schedules().delete(&spec.id).expect("deleted");
+
+    let seen = fake.requests();
+    let calls: Vec<String> = seen.iter().map(|s| s.call()).collect();
+    assert_eq!(
+        calls,
+        [
+            "POST /v1/schedules",
+            "PUT /v1/schedules/:id",
+            "GET /v1/schedules/:id",
+            "DELETE /v1/schedules/:id",
+        ]
+    );
+    assert_eq!(seen[0].json(), spec.to_json());
+    assert_eq!(seen[1].json(), spec.to_json());
+    assert_eq!(seen[1].param("id"), Some("nightly"));
+}
+
+#[test]
+fn creating_an_existing_schedule_is_already_exists_and_not_retried() {
+    let fake = Fake::start();
+    fake.reply_error(ApiError::already_exists("schedule", "nightly"));
+    let err = fake
+        .client()
+        .schedules()
+        .create(&schedule_spec())
+        .unwrap_err();
+    assert_eq!(err.code(), Some(ErrorCode::AlreadyExists));
+    assert_eq!(fake.count(), 1);
+}
+
+#[test]
+fn schedule_actions_trigger_and_preview() {
+    let fake = Fake::start();
+    let id = ScheduleId::from_static("nightly");
+    fake.reply_status(204);
+    fake.reply_status(204);
+    fake.reply_json(200, &TriggerResponse { job: job_id(9) });
+    let times = vec![t0(), t0() + Duration::from_secs(86_400)];
+    fake.reply_json(
+        200,
+        &PreviewResponse {
+            times: times.clone(),
+        },
+    );
+    let client = fake.client();
+
+    client.schedules().pause(&id).expect("paused");
+    client.schedules().resume(&id).expect("resumed");
+    assert_eq!(
+        client.schedules().trigger(&id).expect("triggered"),
+        job_id(9)
+    );
+    assert_eq!(client.schedules().preview(&id, 2).expect("preview"), times);
+
+    let seen = fake.requests();
+    let calls: Vec<String> = seen.iter().map(|s| s.call()).collect();
+    assert_eq!(
+        calls,
+        [
+            "POST /v1/schedules/:id/pause",
+            "POST /v1/schedules/:id/resume",
+            "POST /v1/schedules/:id/trigger",
+            "GET /v1/schedules/:id/preview",
+        ]
+    );
+    assert_eq!(seen[3].query_pairs(), [("n", "2")]);
+}
+
+#[test]
+fn schedule_listing_pages_and_walks() {
+    let fake = Fake::start();
+    let cursor = Cursor::from_name("nightly");
+    fake.reply_json(200, &Page::new(vec![schedule()], Some(cursor.clone())));
+    fake.reply_json(200, &Page::new(vec![schedule()], Some(cursor.clone())));
+    fake.reply_json(200, &Page::<Schedule>::last(vec![]));
+    let client = fake.client();
+
+    let page = client
+        .schedules()
+        .list(
+            &ListOptions::new()
+                .after(Cursor::from_name("hourly"))
+                .limit(1),
+        )
+        .expect("page");
+    assert!(page.has_more());
+    let all: Vec<_> = client.schedules().list_all().collect();
+    assert_eq!(all.len(), 1);
+
+    let seen = fake.requests();
+    assert_eq!(
+        seen[0].query_pairs(),
+        [
+            ("cursor", Cursor::from_name("hourly").to_string().as_str()),
+            ("limit", "1")
+        ]
+    );
+    assert!(seen[1].query.is_empty());
+    assert_eq!(
+        seen[2].query_pairs(),
+        [("cursor", cursor.to_string().as_str())]
+    );
+}
+
+// ---- calendars ----------------------------------------------------------
+
+#[test]
+fn calendar_crud_encodes_names_in_the_path() {
+    let fake = Fake::start();
+    let mut spec = CalendarSpec::new("business hours");
+    spec.timezone = "Europe/Berlin".into();
+    fake.reply_json(200, &spec);
+    fake.reply_json(200, &spec);
+    fake.reply_json(200, &Page::last(vec![spec.clone()]));
+    fake.reply_status(204);
+    let client = fake.client();
+
+    assert_eq!(client.calendars().put(&spec).expect("stored"), spec);
+    assert_eq!(client.calendars().get("business hours").expect("got"), spec);
+    assert_eq!(
+        client
+            .calendars()
+            .list(&ListOptions::new())
+            .expect("list")
+            .items,
+        [spec.clone()]
+    );
+    client
+        .calendars()
+        .delete("business hours")
+        .expect("deleted");
+
+    let seen = fake.requests();
+    let calls: Vec<String> = seen.iter().map(|s| s.call()).collect();
+    assert_eq!(
+        calls,
+        [
+            "PUT /v1/calendars/:name",
+            "GET /v1/calendars/:name",
+            "GET /v1/calendars",
+            "DELETE /v1/calendars/:name",
+        ]
+    );
+    assert_eq!(seen[0].path, "/v1/calendars/business%20hours");
+    assert_eq!(seen[0].param("name"), Some("business hours"));
+    assert_eq!(seen[0].json(), spec.to_json());
+}
+
+// ---- workflows ----------------------------------------------------------
+
+#[test]
+fn workflow_submit_get_list_and_cancel() {
+    let fake = Fake::start();
+    let spec = WorkflowSpec::new("etl")
+        .step(StepSpec::new("fetch", JobSpec::new("etl", "fetch")))
+        .step(StepSpec::new("store", JobSpec::new("etl", "store")).after("fetch"));
+    let run = Workflow::new(workflow_id(), spec.clone(), t0());
+    fake.reply_json(201, &run);
+    fake.reply_json(200, &run);
+    fake.reply_json(200, &Page::last(vec![run.clone()]));
+    fake.reply_status(204);
+    let client = fake.client();
+
+    assert_eq!(client.workflows().submit(&spec).expect("submitted"), run);
+    assert_eq!(client.workflows().get(workflow_id()).expect("got"), run);
+    let page = client
+        .workflows()
+        .list(&ListOptions::new().limit(5))
+        .expect("list");
+    assert_eq!(page.items.len(), 1);
+    client.workflows().cancel(workflow_id()).expect("cancelled");
+
+    let seen = fake.requests();
+    let calls: Vec<String> = seen.iter().map(|s| s.call()).collect();
+    assert_eq!(
+        calls,
+        [
+            "POST /v1/workflows",
+            "GET /v1/workflows/:id",
+            "GET /v1/workflows",
+            "POST /v1/workflows/:id/cancel",
+        ]
+    );
+    assert_eq!(seen[0].json(), spec.to_json());
+    assert_eq!(seen[3].param("id"), Some("01HQ3K9Z8N6V2T4R5S7W0X1Y2Z"));
+}
