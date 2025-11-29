@@ -370,3 +370,173 @@ fn workflow_submit_get_list_and_cancel() {
     assert_eq!(seen[0].json(), spec.to_json());
     assert_eq!(seen[3].param("id"), Some("01HQ3K9Z8N6V2T4R5S7W0X1Y2Z"));
 }
+
+#[test]
+fn workflow_list_all_is_lazy() {
+    let fake = Fake::start();
+    let run = Workflow::new(workflow_id(), WorkflowSpec::new("etl"), t0());
+    fake.reply_json(200, &Page::last(vec![run.clone(), run]));
+    let client = fake.client();
+    let mut all = client.workflows().list_all();
+    assert_eq!(fake.count(), 0, "nothing is fetched before iteration");
+    assert!(all.next().is_some());
+    assert_eq!(all.count(), 1);
+    assert_eq!(fake.count(), 1);
+}
+
+// ---- server-wide --------------------------------------------------------
+
+#[test]
+fn info_decodes_the_server_description() {
+    let fake = Fake::start();
+    let info = ServerInfo {
+        version: "0.6.0".into(),
+        node: "node-a".into(),
+        started_at: t0(),
+        uptime: Duration::from_secs(3600),
+        time: t0() + Duration::from_secs(3600),
+        storage: "memory".into(),
+        cluster_size: 3,
+    };
+    fake.reply_json(200, &info);
+    assert_eq!(fake.client().info().expect("info"), info);
+    assert_eq!(fake.only().call(), "GET /v1/info");
+}
+
+#[test]
+fn health_and_readiness_probes() {
+    let fake = Fake::start();
+    let client = fake.client();
+    fake.reply_with(|_| Response::text("ok"));
+    client.health().expect("healthy");
+
+    fake.reply_with(|_| Response::text("ready"));
+    assert!(client.ready().expect("answer"));
+    fake.reply_error(ApiError::unavailable("recovering storage"));
+    assert!(!client.ready().expect("not ready is an answer"));
+    fake.reply_error(ApiError::unauthenticated("missing token"));
+    let err = client.ready().unwrap_err();
+    assert_eq!(err.code(), Some(ErrorCode::Unauthenticated));
+
+    fake.reply_status(503);
+    let err = client.health().unwrap_err();
+    assert_eq!(err.code(), Some(ErrorCode::Unavailable));
+
+    let routes: Vec<String> = fake.requests().iter().map(|s| s.call()).collect();
+    assert_eq!(
+        routes,
+        [
+            "GET /healthz",
+            "GET /readyz",
+            "GET /readyz",
+            "GET /readyz",
+            "GET /healthz"
+        ],
+        "probes are never retried, even on 503"
+    );
+}
+
+#[test]
+fn metrics_are_returned_as_text() {
+    let fake = Fake::start();
+    let exposition = "# HELP belay_jobs_enqueued_total Jobs enqueued.\n\
+                      # TYPE belay_jobs_enqueued_total counter\n\
+                      belay_jobs_enqueued_total{queue=\"emails\"} 42\n";
+    fake.reply_with(move |_| {
+        Response::bytes("text/plain; version=0.0.4", exposition.as_bytes().to_vec())
+    });
+    assert_eq!(fake.client().metrics().expect("metrics"), exposition);
+    let seen = fake.only();
+    assert_eq!(seen.call(), "GET /metrics");
+    assert_eq!(seen.header("accept"), Some("text/plain"));
+}
+
+#[test]
+fn metrics_that_are_not_utf8_are_a_decode_error() {
+    let fake = Fake::start();
+    fake.reply_with(|_| Response::bytes("text/plain", vec![0xff, 0xfe]));
+    let err = fake.client().metrics().unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unexpected response to GET /metrics: body is not valid UTF-8"
+    );
+}
+
+#[test]
+fn workers_and_members_collect_every_page() {
+    let fake = Fake::start();
+    let worker = |id: &'static str| WorkerInfo::new(WorkerId::from_static(id), t0());
+    fake.reply_json(
+        200,
+        &Page::new(vec![worker("w1")], Some(Cursor::from_name("w1"))),
+    );
+    fake.reply_json(200, &Page::last(vec![worker("w2")]));
+    let member = MemberInfo {
+        id: "node-a".into(),
+        addr: "10.0.0.1:7700".into(),
+        state: MemberState::Alive,
+        leader: true,
+    };
+    fake.reply_json(200, &Page::last(vec![member.clone()]));
+    let client = fake.client();
+
+    let workers = client.workers().expect("workers");
+    assert_eq!(
+        workers.iter().map(|w| w.id.as_str()).collect::<Vec<_>>(),
+        ["w1", "w2"]
+    );
+    assert_eq!(client.members().expect("members"), [member]);
+
+    let calls: Vec<String> = fake.requests().iter().map(|s| s.call()).collect();
+    assert_eq!(
+        calls,
+        [
+            "GET /v1/workers",
+            "GET /v1/workers",
+            "GET /v1/cluster/members"
+        ]
+    );
+}
+
+#[test]
+fn admin_checkpoint_and_store_statistics() {
+    let fake = Fake::start();
+    let checkpoint = CheckpointResponse {
+        seq: 1234,
+        took: Duration::from_millis(250),
+    };
+    fake.reply_json(200, &checkpoint);
+    let stats = json!({"keys": 10, "wal_bytes": 4096, "segments": ["wal-1.log"]});
+    fake.reply_json(200, &stats);
+    let client = fake.client();
+
+    assert_eq!(client.admin().checkpoint().expect("checkpoint"), checkpoint);
+    assert_eq!(client.admin().store().expect("stats"), stats);
+    let calls: Vec<String> = fake.requests().iter().map(|s| s.call()).collect();
+    assert_eq!(calls, ["POST /v1/admin/checkpoint", "GET /v1/admin/store"]);
+}
+
+#[test]
+fn a_success_without_the_expected_body_is_a_decode_error() {
+    let fake = Fake::start();
+    fake.reply_status(204);
+    fake.reply_with(|_| {
+        Response::bytes("text/html", b"<html>maintenance</html>".to_vec())
+            .with_status(StatusCode::OK)
+    });
+    let client = fake.client();
+
+    let err = client.info().unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        "unexpected response to GET /v1/info: empty body where JSON was expected"
+    );
+    let err = client.queues().get(&queue("emails")).unwrap_err();
+    match &err {
+        belay_client::Error::Decode(d) => {
+            assert_eq!(d.endpoint(), "GET /v1/queues/emails");
+            assert!(d.message().starts_with("invalid JSON"), "{}", d.message());
+        }
+        other => panic!("expected a decode error, got {other:?}"),
+    }
+}
