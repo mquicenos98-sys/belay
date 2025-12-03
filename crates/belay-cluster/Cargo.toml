@@ -1,0 +1,16 @@
+[package]
+name = "belay-cluster"
+description = "Cluster membership (SWIM failure detection and gossip) and rendezvous-hash ownership for belay"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "belay_cluster"
+path = "src/lib.rs"
+
+[dependencies]
+belay-common = { path = "../belay-common" }
