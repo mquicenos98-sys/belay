@@ -190,17 +190,27 @@
 #![warn(missing_docs)]
 
 mod config;
-
 mod error;
-
 mod event;
-
 mod gossip;
-
 mod member;
-
 mod membership;
-
 mod node;
-
 mod ring;
+mod suspicion;
+mod transport;
+pub mod wire;
+
+pub use config::{Config, MAX_CLUSTER_NAME_LEN};
+pub use error::{Error, Result};
+pub use event::MembershipEvent;
+pub use member::{
+    validate_addr, validate_meta, Member, MemberState, Meta, NodeId, MAX_ADDR_LEN, MAX_META_BYTES,
+    MAX_META_ENTRIES, MAX_META_KEY_LEN, MAX_NODE_ID_LEN, MAX_WEIGHT, WEIGHT_KEY,
+};
+pub use membership::{LocalState, Membership, MembershipStats, Outbound};
+pub use node::Node;
+pub use ring::{Move, Ownership, Ring};
+pub use transport::{
+    Datagram, Faults, MemNetwork, MemTransport, NetStats, Transport, UdpTransport,
+};
