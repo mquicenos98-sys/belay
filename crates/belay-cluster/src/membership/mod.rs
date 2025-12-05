@@ -49,3 +49,38 @@ pub struct Outbound {
     /// [`max_packet_size`](Config::max_packet_size) bytes.
     pub bytes: Vec<u8>,
 }
+
+impl fmt::Debug for Outbound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Outbound")
+            .field("to", &self.to)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// The local node's own progress through the cluster lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LocalState {
+    /// Seeds are configured and none has answered yet.
+    Joining,
+    /// Part of the cluster (or the first node of one).
+    Active,
+    /// [`leave`](Membership::leave) was called; still spreading the news.
+    Leaving,
+    /// Gone: the state machine ignores all input.
+    Left,
+}
+
+impl LocalState {
+    /// Lowercase name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            LocalState::Joining => "joining",
+            LocalState::Active => "active",
+            LocalState::Leaving => "leaving",
+            LocalState::Left => "left",
+        }
+    }
+}
