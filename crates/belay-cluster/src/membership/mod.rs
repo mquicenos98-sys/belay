@@ -84,3 +84,34 @@ impl LocalState {
         }
     }
 }
+
+impl fmt::Display for LocalState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+/// Counters describing the protocol's activity since start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MembershipStats {
+    /// Datagrams accepted.
+    pub packets_received: u64,
+    /// Datagrams dropped as malformed, from another cluster or version.
+    pub packets_rejected: u64,
+    /// Datagrams produced.
+    pub packets_sent: u64,
+    /// Probes started (one per protocol period with someone to probe).
+    pub probes: u64,
+    /// Probes that fell back to indirect probing.
+    pub indirect_probes: u64,
+    /// Probes that got no ack at all within their period.
+    pub probe_failures: u64,
+    /// Members this node moved to suspect (on its own or through gossip).
+    pub suspicions: u64,
+    /// Times this node refuted a claim that it was suspect, dead or gone.
+    pub refutations: u64,
+    /// Full-state exchanges this node initiated.
+    pub syncs_sent: u64,
+    /// Full-state datagrams received.
+    pub syncs_received: u64,
+}
