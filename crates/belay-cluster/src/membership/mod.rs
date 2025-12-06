@@ -115,3 +115,20 @@ pub struct MembershipStats {
     /// Full-state datagrams received.
     pub syncs_received: u64,
 }
+
+/// Upcoming deadlines of the periodic duties.
+#[derive(Clone, Copy, Debug)]
+struct Timers {
+    probe: Timestamp,
+    gossip: Timestamp,
+    push_pull: Timestamp,
+    reconnect: Timestamp,
+    join: Timestamp,
+    reap: Timestamp,
+}
+
+/// How often tombstones are checked for expiry.
+const REAP_CHECK: Duration = Duration::from_secs(1);
+
+/// How often a node using this node's id is reported.
+const CONFLICT_LOG_INTERVAL: Duration = Duration::from_secs(60);
