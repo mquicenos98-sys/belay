@@ -49,3 +49,86 @@ pub struct Outbound {
     /// [`max_packet_size`](Config::max_packet_size) bytes.
     pub bytes: Vec<u8>,
 }
+
+impl fmt::Debug for Outbound {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Outbound")
+            .field("to", &self.to)
+            .field("len", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// The local node's own progress through the cluster lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LocalState {
+    /// Seeds are configured and none has answered yet.
+    Joining,
+    /// Part of the cluster (or the first node of one).
+    Active,
+    /// [`leave`](Membership::leave) was called; still spreading the news.
+    Leaving,
+    /// Gone: the state machine ignores all input.
+    Left,
+}
+
+impl LocalState {
+    /// Lowercase name.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            LocalState::Joining => "joining",
+            LocalState::Active => "active",
+            LocalState::Leaving => "leaving",
+            LocalState::Left => "left",
+        }
+    }
+}
+
+impl fmt::Display for LocalState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
+}
+
+/// Counters describing the protocol's activity since start.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MembershipStats {
+    /// Datagrams accepted.
+    pub packets_received: u64,
+    /// Datagrams dropped as malformed, from another cluster or version.
+    pub packets_rejected: u64,
+    /// Datagrams produced.
+    pub packets_sent: u64,
+    /// Probes started (one per protocol period with someone to probe).
+    pub probes: u64,
+    /// Probes that fell back to indirect probing.
+    pub indirect_probes: u64,
+    /// Probes that got no ack at all within their period.
+    pub probe_failures: u64,
+    /// Members this node moved to suspect (on its own or through gossip).
+    pub suspicions: u64,
+    /// Times this node refuted a claim that it was suspect, dead or gone.
+    pub refutations: u64,
+    /// Full-state exchanges this node initiated.
+    pub syncs_sent: u64,
+    /// Full-state datagrams received.
+    pub syncs_received: u64,
+}
+
+/// Upcoming deadlines of the periodic duties.
+#[derive(Clone, Copy, Debug)]
+struct Timers {
+    probe: Timestamp,
+    gossip: Timestamp,
+    push_pull: Timestamp,
+    reconnect: Timestamp,
+    join: Timestamp,
+    reap: Timestamp,
+}
+
+/// How often tombstones are checked for expiry.
+const REAP_CHECK: Duration = Duration::from_secs(1);
+
+/// How often a node using this node's id is reported.
+const CONFLICT_LOG_INTERVAL: Duration = Duration::from_secs(60);
