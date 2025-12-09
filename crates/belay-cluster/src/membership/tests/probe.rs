@@ -171,3 +171,43 @@ fn independent_confirmations_shorten_the_suspicion() {
     d.tick_until(since + min);
     assert_eq!(d.state_of("e"), Some(MemberState::Dead));
 }
+
+#[test]
+fn confirmations_are_gossiped_on() {
+    let mut d = Driver::named("a").with_peers(&["b", "c", "d", "e"]);
+    d.suspect_silent_member("e");
+    d.take_sent();
+    d.gossip("c", suspect("e", 0, "c"));
+    d.advance(d.m.config().gossip_interval);
+    assert!(updates_in(&d.take_sent()).contains(&suspect("e", 0, "c")));
+}
+
+#[test]
+fn next_wakeup_is_always_in_the_future_after_a_tick() {
+    let mut d = Driver::new(config("a").with_seeds([addr("b")])).with_peers(&["b", "c", "d"]);
+    d.answering.remove("d");
+    let mut now = d.now;
+    for _ in 0..500 {
+        let out = d.m.tick(now);
+        d.deliver(out);
+        let next = d.m.next_wakeup();
+        assert!(next > now, "next wakeup {next} is not after {now}");
+        now = next;
+        d.now = now;
+    }
+    assert!(now > at(10_000));
+}
+
+#[test]
+fn identical_seeds_and_inputs_give_identical_output() {
+    let run = || {
+        let mut d = Driver::named("a").with_peers(&["b", "c", "d", "e"]);
+        d.answering.remove("c");
+        d.advance(Duration::from_secs(40));
+        d.sent
+            .iter()
+            .map(|(to, p)| format!("{to} {p:?}"))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(run(), run());
+}
