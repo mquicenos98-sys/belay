@@ -52,3 +52,122 @@ fn probes_visit_every_member_once_per_round() {
         assert_eq!(distinct.len(), 5, "round {round:?}");
     }
 }
+
+#[test]
+fn a_silent_member_is_probed_indirectly_then_suspected() {
+    let mut d = Driver::named("a").with_peers(&["b", "c", "d", "e"]);
+    d.answering.remove("e");
+    let seq = d.run_until_ping_to("e", Duration::from_secs(10));
+    let ping_at = d.now;
+
+    d.tick_until(ping_at + Duration::from_millis(499));
+    assert!(!d
+        .take_sent()
+        .iter()
+        .any(|(_, p)| matches!(p.message, Message::PingReq { .. })));
+    d.tick_until(ping_at + Duration::from_millis(500));
+    let helpers: BTreeSet<SocketAddr> = d
+        .take_sent()
+        .into_iter()
+        .filter(|(_, p)| matches!(p.message, Message::PingReq { .. }))
+        .map(|(to, p)| {
+            assert_eq!(p.message, ping_req(seq, "e"));
+            to
+        })
+        .collect();
+    assert_eq!(helpers.len(), 3);
+    assert!(!helpers.contains(&addr("e")));
+    assert_eq!(d.m.stats().indirect_probes, 1);
+
+    d.tick_until(ping_at + Duration::from_millis(1_000));
+    assert_eq!(d.state_of("e"), Some(MemberState::Suspect));
+    assert_eq!(d.m.stats().probe_failures, 1);
+    let events = d.m.drain_events();
+    assert!(matches!(events.as_slice(), [MembershipEvent::Suspected(m)] if m.id == "e"));
+    // The suspect hears about it directly.
+    assert!(d
+        .take_sent()
+        .iter()
+        .any(|(to, p)| *to == addr("e") && p.updates.contains(&suspect("e", 0, "a"))));
+    // Suspects keep their keys.
+    assert!(d.m.ring().contains("e"));
+}
+
+#[test]
+fn an_indirect_ack_prevents_suspicion() {
+    let mut d = Driver::named("a").with_peers(&["b", "c", "d", "e"]);
+    // e cannot be reached directly, but a helper relays e's ack.
+    d.answering.remove("e");
+    let seq = d.run_until_ping_to("e", Duration::from_secs(10));
+    let ping_at = d.now;
+    d.tick_until(ping_at + Duration::from_millis(500));
+    d.recv("b", Message::Ack { seq }, vec![]);
+    d.tick_until(ping_at + Duration::from_millis(1_000));
+    assert_eq!(d.state_of("e"), Some(MemberState::Alive));
+    assert_eq!(d.m.stats().probe_failures, 0);
+}
+
+#[test]
+fn relays_ping_requests_and_forwards_the_ack() {
+    let mut d = Driver::named("a").with_peers(&["b", "c"]);
+    d.answering.clear();
+    d.recv("b", ping_req(77, "c"), vec![]);
+    let sent = d.take_sent();
+    let relay_seq = match sent.as_slice() {
+        [(to, p)] => match &p.message {
+            Message::Ping { seq, target } if *to == addr("c") && *target == "c" => *seq,
+            other => panic!("expected a ping to c, got {other:?}"),
+        },
+        other => panic!("expected one datagram, got {other:?}"),
+    };
+    d.recv("c", Message::Ack { seq: relay_seq }, vec![]);
+    let sent = d.take_sent();
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].0, addr("b"));
+    assert_eq!(sent[0].1.message, Message::Ack { seq: 77 });
+
+    // A second ack for the same relay is not forwarded again.
+    d.recv("c", Message::Ack { seq: relay_seq }, vec![]);
+    assert!(d.take_sent().is_empty());
+
+    // Asked to probe itself, the node answers the requester directly.
+    d.recv("b", ping_req(78, "a"), vec![]);
+    assert_eq!(d.take_sent()[0].1.message, Message::Ack { seq: 78 });
+}
+
+#[test]
+fn relayed_pings_expire_after_a_protocol_period() {
+    let mut d = Driver::named("a").with_peers(&["b", "c"]);
+    d.answering.clear();
+    d.recv("b", ping_req(5, "c"), vec![]);
+    let relay_seq = d
+        .take_sent()
+        .into_iter()
+        .find_map(|(_, p)| match p.message {
+            Message::Ping { seq, .. } => Some(seq),
+            _ => None,
+        })
+        .unwrap();
+    d.advance(Duration::from_millis(1_001));
+    d.take_sent();
+    d.recv("c", Message::Ack { seq: relay_seq }, vec![]);
+    assert!(!d
+        .take_sent()
+        .iter()
+        .any(|(_, p)| p.message == Message::Ack { seq: 5 }));
+}
+
+#[test]
+fn independent_confirmations_shorten_the_suspicion() {
+    let mut d = Driver::named("a").with_peers(&["b", "c", "d", "e"]);
+    let since = d.suspect_silent_member("e");
+    // The node's own repeated probe failures are not independent.
+    d.gossip("b", suspect("e", 0, "a"));
+    d.gossip("c", suspect("e", 0, "c"));
+    d.gossip("d", suspect("e", 0, "d"));
+    let min = d.m.config().suspicion_timeout(5);
+    d.tick_until(since + min - Duration::from_millis(1));
+    assert_eq!(d.state_of("e"), Some(MemberState::Suspect));
+    d.tick_until(since + min);
+    assert_eq!(d.state_of("e"), Some(MemberState::Dead));
+}
