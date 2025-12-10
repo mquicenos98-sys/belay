@@ -105,3 +105,60 @@ fn departed_members_are_not_probed_and_own_nothing() {
     d.gossip("c", dead("b", 0, "c"));
     assert_eq!(d.state_of("b"), Some(MemberState::Left));
 }
+
+#[test]
+fn a_sync_request_is_merged_and_answered_with_the_full_state() {
+    let mut d = Driver::named("a").with_peers(&["b"]);
+    let members = vec![
+        record("c", MemberState::Alive, 2),
+        // Remote death reports only raise suspicion here.
+        record("b", MemberState::Dead, 0),
+        // Unknown suspects are learned, unknown dead are not.
+        record("d", MemberState::Suspect, 4),
+        record("e", MemberState::Dead, 1),
+        record("f", MemberState::Left, 0),
+    ];
+    d.recv("c", sync(true, members), vec![]);
+    assert_eq!(d.state_of("c"), Some(MemberState::Alive));
+    assert_eq!(d.state_of("b"), Some(MemberState::Suspect));
+    assert_eq!(d.state_of("d"), Some(MemberState::Suspect));
+    assert_eq!(d.state_of("e"), None);
+    assert_eq!(d.state_of("f"), None);
+
+    let replies: Vec<MemberRecord> = d
+        .take_sent()
+        .into_iter()
+        .filter(|(to, p)| *to == addr("c") && is_sync(p, false))
+        .flat_map(|(_, p)| match p.message {
+            Message::Sync { members, .. } => members,
+            _ => Vec::new(),
+        })
+        .collect();
+    let names: Vec<&str> = replies.iter().map(|r| r.id.as_str()).collect();
+    assert_eq!(names, ["a", "b", "c", "d"]);
+    assert_eq!(d.m.stats().syncs_received, 1);
+}
+
+#[test]
+fn tells_a_member_it_believes_dead_so_that_it_refutes() {
+    let mut d = Driver::named("a").with_peers(&["b", "c"]);
+    d.gossip("c", dead("b", 0, "c"));
+    d.take_sent();
+    d.recv("b", ping(3, "a"), vec![]);
+    let sent = d.take_sent();
+    assert!(sent
+        .iter()
+        .any(|(to, p)| *to == addr("b") && p.updates.contains(&dead("b", 0, "a"))));
+    assert!(sent
+        .iter()
+        .any(|(_, p)| p.message == Message::Ack { seq: 3 }));
+    // Once per protocol period.
+    d.recv("b", ping(3, "a"), vec![]);
+    assert_eq!(d.take_sent().len(), 1);
+    // A member that refutes in the same packet is not told.
+    d.advance(Duration::from_secs(2));
+    d.take_sent();
+    d.recv("b", ping(3, "a"), vec![alive("b", 1)]);
+    assert_eq!(d.state_of("b"), Some(MemberState::Alive));
+    assert_eq!(d.take_sent().len(), 1);
+}
