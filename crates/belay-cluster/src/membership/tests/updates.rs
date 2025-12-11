@@ -162,3 +162,109 @@ fn tells_a_member_it_believes_dead_so_that_it_refutes() {
     assert_eq!(d.state_of("b"), Some(MemberState::Alive));
     assert_eq!(d.take_sent().len(), 1);
 }
+
+#[test]
+fn gossip_rounds_reach_fanout_members_including_the_recently_dead() {
+    let mut d = Driver::named("a").with_peers(&["b", "c", "d", "e", "f", "g"]);
+    d.gossip("b", dead("g", 0, "b"));
+    d.take_sent();
+    let interval = d.m.config().gossip_interval;
+    // Keeps the queue busy with a fresh update per round, and counts how
+    // often each address was picked as a gossip target.
+    let mut incarnation = 0;
+    let mut gossip_rounds = |d: &mut Driver, rounds: usize| {
+        let mut targets: BTreeMap<SocketAddr, usize> = BTreeMap::new();
+        for _ in 0..rounds {
+            incarnation += 1;
+            d.gossip("b", alive("b", incarnation));
+            d.take_sent();
+            d.advance(interval);
+            let round: Vec<SocketAddr> = d
+                .take_sent()
+                .into_iter()
+                .filter(|(_, p)| p.message == Message::Gossip)
+                .map(|(to, _)| to)
+                .collect();
+            assert!(round.len() <= 3, "fanout exceeded: {round:?}");
+            for to in round {
+                *targets.entry(to).or_insert(0) += 1;
+            }
+        }
+        targets
+    };
+    let early = gossip_rounds(&mut d, 30);
+    assert!(
+        early.contains_key(&addr("g")),
+        "dead member not gossiped to: {early:?}"
+    );
+    assert!(!early.contains_key(&addr("a")));
+    d.advance(d.m.config().gossip_to_dead);
+    let late = gossip_rounds(&mut d, 30);
+    assert!(
+        !late.contains_key(&addr("g")),
+        "still gossiping to the dead: {late:?}"
+    );
+    assert!(late.len() >= 4, "{late:?}");
+}
+
+#[test]
+fn every_datagram_fits_the_packet_limit() {
+    let mut config = config("a");
+    config.max_packet_size = 1_200;
+    let mut d = Driver::new(config);
+    let big_meta: Meta = (0..10)
+        .map(|i| (format!("key{i}"), "v".repeat(35)))
+        .collect();
+    for i in 0..40u8 {
+        let name = format!("b{i:02}");
+        let gossip_addr = SocketAddr::from(([10, 1, 0, i + 1], 7946));
+        let update = Update::Alive {
+            id: id(&name),
+            incarnation: 0,
+            addr: format!("{name}.example.internal:7070"),
+            gossip_addr,
+            meta: big_meta.clone(),
+        };
+        let out = d.m.handle(
+            gossip_addr,
+            packet(&name, Message::Gossip, vec![update]),
+            d.now,
+        );
+        assert!(out.is_empty());
+    }
+    assert_eq!(d.m.live_count(), 41);
+    assert!(d.m.pending_updates() >= 40);
+    // A full state reply and some gossip rounds; `deliver` asserts the
+    // size and decodability of every datagram.
+    let out =
+        d.m.handle(addr("c"), packet("c", sync(true, vec![]), vec![]), d.now);
+    assert!(out.len() > 1, "41 large records need several datagrams");
+    d.deliver(out);
+    d.advance(Duration::from_secs(5));
+    assert!(d.sent.len() > 20);
+}
+
+#[test]
+fn logs_joins_suspicions_and_failures() {
+    quiet();
+    let capture = CaptureLogger::new();
+    capture.scope(|| {
+        let mut d = Driver::named("a").with_peers(&["b", "c", "d"]);
+        let since = d.suspect_silent_member("d");
+        d.tick_until(since + Duration::from_secs(60));
+    });
+    let joined = capture
+        .find(|r| r.message == "member joined" && r.field("member") == Some("b"))
+        .expect("join logged");
+    assert_eq!(joined.level, Level::Info);
+    let suspected = capture
+        .find(|r| r.message == "member suspected")
+        .expect("suspicion logged");
+    assert_eq!(suspected.level, Level::Debug);
+    assert_eq!(suspected.field("member"), Some("d"));
+    let failed = capture
+        .find(|r| r.message == "member failed")
+        .expect("failure logged");
+    assert_eq!(failed.level, Level::Info);
+    assert_eq!(failed.field("declared_by"), Some("a"));
+}
