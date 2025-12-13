@@ -372,3 +372,157 @@ impl Config {
             .saturating_add(disseminate)
     }
 }
+
+fn fmt_ms(d: Duration) -> String {
+    belay_common::format_duration(d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config() -> Config {
+        Config::new(NodeId::new("n1").unwrap())
+    }
+
+    #[test]
+    fn defaults_match_the_documented_values_and_validate() {
+        let c = config();
+        assert_eq!(c.probe_interval, Duration::from_secs(1));
+        assert_eq!(c.probe_timeout, Duration::from_millis(500));
+        assert_eq!(c.indirect_checks, 3);
+        assert_eq!(c.suspicion_mult, 4);
+        assert_eq!(c.max_packet_size, 1400);
+        assert_eq!(c.cluster_name, "belay");
+        c.validate().unwrap();
+        Config::wan(c.node_id.clone()).validate().unwrap();
+        Config::local(c.node_id.clone()).validate().unwrap();
+    }
+
+    #[test]
+    fn probe_timeout_must_fit_in_the_protocol_period() {
+        let mut c = config();
+        c.probe_timeout = c.probe_interval;
+        assert_eq!(
+            c.validate().unwrap_err().to_string(),
+            "invalid cluster config: probe_timeout (1s) must be above zero and below probe_interval (1s)"
+        );
+        c.probe_timeout = Duration::ZERO;
+        assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_out_of_range_values() {
+        let cases: Vec<(fn(&mut Config), &str)> = vec![
+            (
+                |c| c.cluster_name.clear(),
+                "cluster_name must be 1-64 bytes, got 0",
+            ),
+            (
+                |c| c.suspicion_mult = 0,
+                "suspicion_mult must be at least 1",
+            ),
+            (
+                |c| c.retransmit_mult = 0,
+                "retransmit_mult must be at least 1",
+            ),
+            (
+                |c| c.max_packet_size = 500,
+                "max_packet_size must be 1200-65507 bytes, got 500",
+            ),
+            (|c| c.max_packet_size = 70_000, "got 70000"),
+            (
+                |c| c.gossip_interval = Duration::ZERO,
+                "gossip_interval must be at least 1ms",
+            ),
+            (
+                |c| c.join_retry_interval = Duration::ZERO,
+                "join_retry_interval",
+            ),
+            (
+                |c| c.probe_interval = Duration::ZERO,
+                "probe_interval must be at least 1ms",
+            ),
+            (
+                |c| c.advertise = Some("0.0.0.0:7946".parse().unwrap()),
+                "advertise address 0.0.0.0:7946 is not reachable",
+            ),
+            (|c| c.api_addr = "has space".into(), "invalid api address"),
+            (
+                |c| {
+                    c.meta.insert("weight".into(), "0".into());
+                },
+                "weight must be a number",
+            ),
+        ];
+        for (mutate, expected) in cases {
+            let mut c = config();
+            mutate(&mut c);
+            let err = c.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(expected),
+                "{err:?} should contain {expected:?}"
+            );
+        }
+        let mut c = config();
+        c.gossip_fanout = 0;
+        let err = c.validate().unwrap_err().to_string();
+        assert!(err.contains("gossip_fanout must be at least 1"), "{err}");
+    }
+
+    #[test]
+    fn suspicion_timeout_scales_with_log_of_cluster_size() {
+        let c = config();
+        assert_eq!(c.suspicion_timeout(0), Duration::from_secs(4));
+        assert_eq!(c.suspicion_timeout(1), Duration::from_secs(4));
+        assert_eq!(c.suspicion_timeout(10), Duration::from_secs(4));
+        assert_eq!(c.suspicion_timeout(100), Duration::from_secs(8));
+        let t20 = c.suspicion_timeout(20).as_millis();
+        assert!((5_200..=5_205).contains(&t20), "{t20}");
+        assert_eq!(c.suspicion_max_timeout(10), Duration::from_secs(24));
+        assert_eq!(c.suspicion_confirmations(), 2);
+        let mut c = config();
+        c.suspicion_mult = 1;
+        assert_eq!(c.suspicion_confirmations(), 1);
+    }
+
+    #[test]
+    fn push_pull_period_scales_above_32_members() {
+        let c = config();
+        assert_eq!(c.push_pull_period(1), Duration::from_secs(30));
+        assert_eq!(c.push_pull_period(32), Duration::from_secs(30));
+        assert_eq!(c.push_pull_period(33), Duration::from_secs(60));
+        assert_eq!(c.push_pull_period(64), Duration::from_secs(60));
+        assert_eq!(c.push_pull_period(65), Duration::from_secs(90));
+        assert_eq!(c.push_pull_period(1000), Duration::from_secs(180));
+    }
+
+    #[test]
+    fn failure_detection_bound_adds_detection_suspicion_and_dissemination() {
+        let c = config();
+        // 2 * 9 periods + 24 s suspicion + 16 * 200 ms + 1 s.
+        assert_eq!(
+            c.failure_detection_bound(10),
+            Duration::from_millis(18_000 + 24_000 + 3_200 + 1_000)
+        );
+        assert!(c.failure_detection_bound(20) > c.failure_detection_bound(10));
+        assert!(c.failure_detection_bound(1) > Duration::ZERO);
+    }
+
+    #[test]
+    fn builders_set_fields() {
+        let c = config()
+            .with_cluster_name("prod")
+            .with_api_addr("10.0.0.1:7070")
+            .with_advertise("10.0.0.1:7946".parse().unwrap())
+            .with_seeds(["10.0.0.2:7946".parse().unwrap()])
+            .with_meta("zone", "a")
+            .with_incarnation(7);
+        assert_eq!(c.cluster_name, "prod");
+        assert_eq!(c.seeds.len(), 1);
+        assert_eq!(c.meta["zone"], "a");
+        assert_eq!(c.incarnation, 7);
+        assert_ne!(c.cluster_tag(), config().cluster_tag());
+        c.validate().unwrap();
+    }
+}
