@@ -119,3 +119,256 @@ pub struct Config {
     /// the cluster.
     pub max_packet_size: usize,
 }
+
+impl Config {
+    /// LAN defaults for `node_id`.
+    #[must_use]
+    pub fn new(node_id: NodeId) -> Config {
+        Config {
+            node_id,
+            cluster_name: "belay".to_owned(),
+            api_addr: String::new(),
+            advertise: None,
+            seeds: Vec::new(),
+            meta: Meta::new(),
+            incarnation: 0,
+            probe_interval: Duration::from_secs(1),
+            probe_timeout: Duration::from_millis(500),
+            indirect_checks: 3,
+            suspicion_mult: 4,
+            suspicion_max_mult: 6,
+            retransmit_mult: 4,
+            gossip_interval: Duration::from_millis(200),
+            gossip_fanout: 3,
+            gossip_to_dead: Duration::from_secs(30),
+            push_pull_interval: Duration::from_secs(30),
+            reconnect_interval: Duration::from_secs(10),
+            join_retry_interval: Duration::from_secs(1),
+            leave_timeout: Duration::from_secs(5),
+            tombstone_ttl: Duration::from_secs(24 * 3600),
+            max_packet_size: 1400,
+        }
+    }
+
+    /// Defaults for members spread across regions: slower probes, longer
+    /// timeouts and suspicion, wider gossip.
+    #[must_use]
+    pub fn wan(node_id: NodeId) -> Config {
+        Config {
+            probe_interval: Duration::from_secs(5),
+            probe_timeout: Duration::from_secs(3),
+            suspicion_mult: 6,
+            retransmit_mult: 4,
+            gossip_interval: Duration::from_millis(500),
+            gossip_fanout: 4,
+            gossip_to_dead: Duration::from_secs(60),
+            push_pull_interval: Duration::from_secs(60),
+            reconnect_interval: Duration::from_secs(30),
+            join_retry_interval: Duration::from_secs(3),
+            leave_timeout: Duration::from_secs(10),
+            ..Config::new(node_id)
+        }
+    }
+
+    /// Defaults for processes on one machine (tests, development): failures
+    /// are detected within about a second.
+    #[must_use]
+    pub fn local(node_id: NodeId) -> Config {
+        Config {
+            probe_interval: Duration::from_millis(100),
+            probe_timeout: Duration::from_millis(50),
+            suspicion_mult: 3,
+            gossip_interval: Duration::from_millis(20),
+            gossip_to_dead: Duration::from_secs(5),
+            push_pull_interval: Duration::from_secs(2),
+            reconnect_interval: Duration::from_millis(500),
+            join_retry_interval: Duration::from_millis(100),
+            leave_timeout: Duration::from_secs(1),
+            ..Config::new(node_id)
+        }
+    }
+
+    /// Sets [`cluster_name`](Self::cluster_name).
+    #[must_use]
+    pub fn with_cluster_name(mut self, name: impl Into<String>) -> Config {
+        self.cluster_name = name.into();
+        self
+    }
+
+    /// Sets [`api_addr`](Self::api_addr).
+    #[must_use]
+    pub fn with_api_addr(mut self, addr: impl Into<String>) -> Config {
+        self.api_addr = addr.into();
+        self
+    }
+
+    /// Sets [`advertise`](Self::advertise).
+    #[must_use]
+    pub fn with_advertise(mut self, addr: SocketAddr) -> Config {
+        self.advertise = Some(addr);
+        self
+    }
+
+    /// Replaces [`seeds`](Self::seeds).
+    #[must_use]
+    pub fn with_seeds(mut self, seeds: impl IntoIterator<Item = SocketAddr>) -> Config {
+        self.seeds = seeds.into_iter().collect();
+        self
+    }
+
+    /// Adds one metadata entry.
+    #[must_use]
+    pub fn with_meta(mut self, key: impl Into<String>, value: impl Into<String>) -> Config {
+        self.meta.insert(key.into(), value.into());
+        self
+    }
+
+    /// Sets [`incarnation`](Self::incarnation).
+    #[must_use]
+    pub fn with_incarnation(mut self, incarnation: u64) -> Config {
+        self.incarnation = incarnation;
+        self
+    }
+
+    /// Checks every field and the relations between them.
+    pub fn validate(&self) -> Result<()> {
+        if self.cluster_name.is_empty() || self.cluster_name.len() > MAX_CLUSTER_NAME_LEN {
+            return Err(Error::config(format!(
+                "cluster_name must be 1-{MAX_CLUSTER_NAME_LEN} bytes, got {}",
+                self.cluster_name.len()
+            )));
+        }
+        validate_addr(&self.api_addr)?;
+        validate_meta(&self.meta)?;
+        if self.probe_interval < Duration::from_millis(1) {
+            return Err(Error::config("probe_interval must be at least 1ms"));
+        }
+        if self.probe_timeout.is_zero() || self.probe_timeout >= self.probe_interval {
+            return Err(Error::config(format!(
+                "probe_timeout ({}) must be above zero and below probe_interval ({})",
+                fmt_ms(self.probe_timeout),
+                fmt_ms(self.probe_interval)
+            )));
+        }
+        for (name, value) in [
+            ("suspicion_mult", self.suspicion_mult),
+            ("suspicion_max_mult", self.suspicion_max_mult),
+            ("retransmit_mult", self.retransmit_mult),
+        ] {
+            if value == 0 {
+                return Err(Error::config(format!("{name} must be at least 1")));
+            }
+        }
+        if self.gossip_fanout == 0 {
+            return Err(Error::config("gossip_fanout must be at least 1"));
+        }
+        if self.gossip_interval < Duration::from_millis(1) {
+            return Err(Error::config("gossip_interval must be at least 1ms"));
+        }
+        if self.join_retry_interval < Duration::from_millis(1) {
+            return Err(Error::config("join_retry_interval must be at least 1ms"));
+        }
+        if !(MIN_PACKET_SIZE..=MAX_DATAGRAM).contains(&self.max_packet_size) {
+            return Err(Error::config(format!(
+                "max_packet_size must be {MIN_PACKET_SIZE}-{MAX_DATAGRAM} bytes, got {}",
+                self.max_packet_size
+            )));
+        }
+        if let Some(addr) = self.advertise {
+            if addr.ip().is_unspecified() || addr.port() == 0 {
+                return Err(Error::config(format!(
+                    "advertise address {addr} is not reachable by other nodes"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// The tag carried by every packet: a hash of the cluster name.
+    #[must_use]
+    pub fn cluster_tag(&self) -> u32 {
+        cluster_tag(&self.cluster_name)
+    }
+
+    /// Minimum suspicion timeout in a cluster of `n` live members:
+    /// `suspicion_mult * max(1, log10(n)) * probe_interval`.
+    ///
+    /// The logarithm gives gossip about the suspicion, which needs O(log n)
+    /// rounds to reach the suspect, time to do so in larger clusters.
+    #[must_use]
+    pub fn suspicion_timeout(&self, n: usize) -> Duration {
+        let scale = (n.max(1) as f64).log10().max(1.0);
+        self.probe_interval
+            .mul_f64(f64::from(self.suspicion_mult) * scale)
+    }
+
+    /// Maximum suspicion timeout: `suspicion_max_mult` times the minimum.
+    #[must_use]
+    pub fn suspicion_max_timeout(&self, n: usize) -> Duration {
+        self.suspicion_timeout(n)
+            .saturating_mul(self.suspicion_max_mult)
+    }
+
+    /// Independent confirmations after which a suspicion runs for only the
+    /// minimum timeout: `suspicion_mult - 2`, at least 1. With the default
+    /// multiplier of 4 that is two members (besides the first suspecter)
+    /// failing to reach the suspect on their own.
+    #[must_use]
+    pub fn suspicion_confirmations(&self) -> u32 {
+        self.suspicion_mult.saturating_sub(2).max(1)
+    }
+
+    /// How many times each update is sent before it is dropped from the
+    /// gossip queue: `retransmit_mult * ceil(log10(n + 1))`.
+    ///
+    /// Epidemic dissemination reaches every member with high probability
+    /// after O(log n) rounds; the multiplier buys margin against loss.
+    #[must_use]
+    pub fn retransmit_limit(&self, n: usize) -> u32 {
+        let rounds = ((n as f64) + 1.0).log2().ceil().max(1.0) as u32;
+        self.retransmit_mult.saturating_mul(rounds)
+    }
+
+    /// The anti-entropy period for `n` members: `push_pull_interval` up to
+    /// 32 members, then one more multiple per doubling, so the total
+    /// full-state traffic grows like n log n rather than n squared.
+    #[must_use]
+    pub fn push_pull_period(&self, n: usize) -> Duration {
+        const SCALE_THRESHOLD: usize = 32;
+        if n <= SCALE_THRESHOLD {
+            return self.push_pull_interval;
+        }
+        let doublings = ((n as f64).log2() - (SCALE_THRESHOLD as f64).log2()).ceil() as u32;
+        self.push_pull_interval.saturating_mul(doublings + 1)
+    }
+
+    /// An upper bound on the time from a member crashing until every other
+    /// member of an `n`-member cluster has declared it dead, assuming no
+    /// message loss:
+    ///
+    /// 1. **Detection.** Randomized round-robin probing reaches every
+    ///    member at most `2(n - 1) - 1` periods apart (SWIM, section 4.3),
+    ///    and the failed probe completes one period later: `2(n - 1)`
+    ///    periods.
+    /// 2. **Suspicion.** At most the maximum suspicion timeout.
+    /// 3. **Dissemination.** The `Dead` update is gossiped in rounds of
+    ///    `gossip_fanout` members every `gossip_interval`, for up to
+    ///    `retransmit_limit(n)` rounds, plus one probe period for updates
+    ///    that travel only piggybacked.
+    ///
+    /// Typical detection is much faster: the first of `n - 1` probers to
+    /// reach the crashed member suspects it, and confirmations from the
+    /// others shrink the suspicion towards the minimum timeout.
+    #[must_use]
+    pub fn failure_detection_bound(&self, n: usize) -> Duration {
+        let periods = 2 * n.saturating_sub(1).max(1) as u32;
+        let detect = self.probe_interval.saturating_mul(periods);
+        let disseminate = self
+            .gossip_interval
+            .saturating_mul(self.retransmit_limit(n))
+            .saturating_add(self.probe_interval);
+        detect
+            .saturating_add(self.suspicion_max_timeout(n))
+            .saturating_add(disseminate)
+    }
+}
