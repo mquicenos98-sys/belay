@@ -76,3 +76,56 @@ impl std::error::Error for Error {
         }
     }
 }
+
+impl From<WireError> for Error {
+    fn from(e: WireError) -> Self {
+        Error::Wire(e)
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Self {
+        Error::Io(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn messages_are_lowercase_and_specific() {
+        let e = Error::InvalidNodeId {
+            id: "a b".into(),
+            reason: "contains invalid character ' '".into(),
+        };
+        assert_eq!(
+            e.to_string(),
+            "invalid node id \"a b\": contains invalid character ' '"
+        );
+        assert_eq!(
+            Error::InvalidWeight(-1.0).to_string(),
+            "rendezvous weight must be a finite number above 0, got -1"
+        );
+        assert_eq!(
+            Error::config("probe_timeout must be positive").to_string(),
+            "invalid cluster config: probe_timeout must be positive"
+        );
+        assert_eq!(Error::Stopped.to_string(), "cluster node has stopped");
+    }
+
+    #[test]
+    fn wrapped_errors_are_exposed_as_sources() {
+        let e: Error = io::Error::new(io::ErrorKind::AddrInUse, "port taken").into();
+        assert_eq!(e.to_string(), "cluster transport error: port taken");
+        assert_eq!(
+            e.source().map(ToString::to_string).as_deref(),
+            Some("port taken")
+        );
+
+        let e: Error = WireError::UnsupportedVersion(9).into();
+        assert!(e.source().is_some());
+        assert!(Error::Stopped.source().is_none());
+    }
+}
