@@ -46,3 +46,33 @@ impl Error {
         Error::InvalidConfig(message.into())
     }
 }
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::InvalidNodeId { id, reason } => write!(f, "invalid node id {id:?}: {reason}"),
+            Error::InvalidMeta(msg) => write!(f, "invalid member metadata: {msg}"),
+            Error::InvalidAddr(msg) => write!(f, "invalid api address: {msg}"),
+            Error::InvalidWeight(w) => {
+                write!(
+                    f,
+                    "rendezvous weight must be a finite number above 0, got {w}"
+                )
+            }
+            Error::InvalidConfig(msg) => write!(f, "invalid cluster config: {msg}"),
+            Error::Wire(e) => write!(f, "malformed cluster packet: {e}"),
+            Error::Io(e) => write!(f, "cluster transport error: {e}"),
+            Error::Stopped => f.write_str("cluster node has stopped"),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Wire(e) => Some(e),
+            Error::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
