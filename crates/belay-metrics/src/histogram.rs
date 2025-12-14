@@ -125,11 +125,12 @@ pub(crate) fn validate_buckets(bounds: &[f64]) -> Result<Arc<[f64]>> {
 ///
 /// let h = Histogram::new(&[0.1, 1.0]).unwrap();
 /// h.observe(0.05);
+/// h.observe(0.1); // bounds are inclusive
 /// h.observe(3.0);
 /// let snap = h.snapshot();
 /// let cumulative: Vec<u64> = snap.buckets.iter().map(|b| b.cumulative_count).collect();
-/// assert_eq!(cumulative, [1, 1, 2]);
-/// assert_eq!(snap.count, 2);
+/// assert_eq!(cumulative, [2, 2, 3]);
+/// assert_eq!(snap.count, 3);
 /// ```
 #[derive(Clone)]
 pub struct Histogram {
@@ -173,9 +174,9 @@ impl Histogram {
     #[inline]
     pub fn observe(&self, value: f64) {
         let core = &*self.core;
-        // `!(value < b)` rather than `b <= value` so NaN, which compares
+        // `!(value <= b)` rather than `b < value` so NaN, which compares
         // false with everything, falls through to the +Inf bucket.
-        let index = core.bounds.partition_point(|&b| !(value < b));
+        let index = core.bounds.partition_point(|&b| !(value <= b));
         core.counts[index].fetch_add(1, Ordering::Relaxed);
         core.sum.add(value);
     }
@@ -274,6 +275,16 @@ mod tests {
             .iter()
             .map(|b| b.cumulative_count)
             .collect()
+    }
+
+    #[test]
+    fn bounds_are_inclusive_upper_limits() {
+        let h = Histogram::new(&[1.0, 2.0, 5.0]).unwrap();
+        for v in [-3.0, 1.0, 1.0000001, 2.0, 5.0, 5.1, 1e300] {
+            h.observe(v);
+        }
+        assert_eq!(cumulative(&h), [2, 4, 5, 7]);
+        assert_eq!(h.count(), 7);
     }
 
     #[test]
