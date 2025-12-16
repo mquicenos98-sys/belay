@@ -470,7 +470,7 @@ impl CronExpr {
     /// [`next_after`](Self::next_after).
     #[must_use]
     pub fn is_periodic(&self) -> bool {
-        self.minutes.count_ones() > 1 || self.hours == ALL_HOURS
+        self.seconds.count_ones() > 1 || self.minutes.count_ones() > 1 || self.hours == ALL_HOURS
     }
 
     /// Whether any date in the year range can ever match. `0 0 30 2 *` and
@@ -628,6 +628,7 @@ mod tests {
             "*/15 * * * *",
             "0 * * * *",
             "0,30 1 * * *",
+            "*/10 0 1 * * *",
         ] {
             assert!(
                 CronExpr::parse(periodic).unwrap().is_periodic(),

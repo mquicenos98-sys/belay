@@ -134,6 +134,25 @@ fn hourly_schedule_loses_the_skipped_hour_when_clocks_go_forward() {
 }
 
 #[test]
+fn seconds_level_rules_follow_the_same_periodicity_test() {
+    // One fixed second: first pass only.
+    assert_eq!(
+        next_fires("0 0 1 * * *", NY, "2025-11-02T04:30:00", 2),
+        ["2025-11-02T01:00:00-04:00", "2025-11-03T01:00:00-05:00"]
+    );
+    // Several seconds per minute: periodic, both passes.
+    assert_eq!(
+        next_fires("*/30 0 1 * * *", NY, "2025-11-02T04:30:00", 4),
+        [
+            "2025-11-02T01:00:00-04:00",
+            "2025-11-02T01:00:30-04:00",
+            "2025-11-02T01:00:00-05:00",
+            "2025-11-02T01:00:30-05:00"
+        ]
+    );
+}
+
+#[test]
 fn london_transitions_at_one_utc() {
     assert_eq!(
         next_fires("30 1 * * *", "Europe/London", "2025-03-29T12:00:00", 2),
