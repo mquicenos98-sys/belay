@@ -90,3 +90,78 @@ impl fmt::Display for MembershipEvent {
         write!(f, "member {}: {}", self.name(), self.member())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::member::{MemberState, Meta, NodeId};
+    use belay_common::Timestamp;
+
+    fn member(state: MemberState) -> Member {
+        Member {
+            id: NodeId::new("n2").unwrap(),
+            addr: String::new(),
+            gossip_addr: "10.0.0.2:7946".parse().unwrap(),
+            state,
+            incarnation: 1,
+            meta: Meta::new(),
+            since: Timestamp::EPOCH,
+        }
+    }
+
+    #[test]
+    fn exposes_member_name_and_ownership_impact() {
+        let cases = [
+            (
+                MembershipEvent::Joined(member(MemberState::Alive)),
+                "joined",
+                true,
+            ),
+            (
+                MembershipEvent::Updated(member(MemberState::Alive)),
+                "updated",
+                true,
+            ),
+            (
+                MembershipEvent::Suspected(member(MemberState::Suspect)),
+                "suspected",
+                false,
+            ),
+            (
+                MembershipEvent::Recovered(member(MemberState::Alive)),
+                "recovered",
+                false,
+            ),
+            (
+                MembershipEvent::Failed(member(MemberState::Dead)),
+                "failed",
+                true,
+            ),
+            (
+                MembershipEvent::Left(member(MemberState::Left)),
+                "left",
+                true,
+            ),
+            (
+                MembershipEvent::Reaped(member(MemberState::Dead)),
+                "reaped",
+                false,
+            ),
+        ];
+        for (event, name, affects) in cases {
+            assert_eq!(event.name(), name);
+            assert_eq!(event.affects_ownership(), affects, "{name}");
+            assert_eq!(event.member().id, "n2");
+            assert_eq!(event.clone().into_member(), *event.member());
+        }
+    }
+
+    #[test]
+    fn display_names_the_event_and_member() {
+        let e = MembershipEvent::Failed(member(MemberState::Dead));
+        assert_eq!(
+            e.to_string(),
+            "member failed: n2 (10.0.0.2:7946, dead, incarnation 1)"
+        );
+    }
+}
