@@ -9,8 +9,8 @@ use super::{LevelFilter, LogConfigError, Metadata};
 /// A default level plus per-target overrides.
 ///
 /// A directive applies to its target and every module below it: the target
-/// `belay_store` matches `belay_store` and `belay_store::wal`. The most
-/// specific (longest) matching directive wins.
+/// `belay_store` matches `belay_store` and `belay_store::wal`, but not
+/// `belay_storex`. The most specific (longest) matching directive wins.
 ///
 /// ```
 /// use belay_common::log::{Filter, LevelFilter};
@@ -103,7 +103,9 @@ impl Filter {
 }
 
 fn covers(prefix: &str, target: &str) -> bool {
-    target.starts_with(prefix)
+    target
+        .strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
 }
 
 /// `info` with no overrides.
@@ -144,6 +146,15 @@ mod tests {
         assert!(f.enabled(&Metadata::new(Level::Info, "x")));
         assert!(!f.enabled(&Metadata::new(Level::Debug, "x")));
         assert_eq!(Filter::parse(""), Ok(Filter::default()));
+    }
+
+    #[test]
+    fn targets_match_on_module_boundaries() {
+        let f = Filter::parse("error,belay_store=debug").expect("valid");
+        assert_eq!(f.level_for("belay_store"), LevelFilter::Debug);
+        assert_eq!(f.level_for("belay_store::wal"), LevelFilter::Debug);
+        assert_eq!(f.level_for("belay_storex"), LevelFilter::Error);
+        assert_eq!(f.level_for("belay"), LevelFilter::Error);
     }
 
     #[test]
