@@ -276,7 +276,7 @@ impl<'a> Machine<'a> {
                         let downstream: Vec<String> = self
                             .wf()
                             .spec
-                            .dependents(name)
+                            .descendants(name)
                             .into_iter()
                             .map(str::to_owned)
                             .collect();

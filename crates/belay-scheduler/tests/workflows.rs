@@ -174,6 +174,29 @@ fn continue_lets_downstream_conditions_decide() {
 }
 
 #[test]
+fn skip_dependents_skips_the_whole_subtree_whatever_the_conditions() {
+    let f = Flow::new();
+    let run = f.submit(workflow(
+        "etl",
+        vec![
+            step("a", &[]).on_failure(StepFailurePolicy::SkipDependents),
+            step("b", &["a"]),
+            step("c", &["b"]).when(Condition::Always),
+            step("alert", &["a"]).when(Condition::AnyFailed),
+            step("d", &[]),
+        ],
+    ));
+    let after = f.fail(run.id, "a", "bad input");
+    for name in ["b", "c", "alert"] {
+        assert_eq!(after.steps[name].state, StepState::Skipped, "{name}");
+    }
+    assert_eq!(after.state, WorkflowState::Running, "d is still running");
+    let done = f.succeed(run.id, "d", Value::Null);
+    assert_eq!(done.state, WorkflowState::Succeeded);
+    assert_eq!(f.queue.job_count(), 2);
+}
+
+#[test]
 fn skips_propagate_through_default_conditions() {
     let f = Flow::new();
     let run = f.submit(workflow(
