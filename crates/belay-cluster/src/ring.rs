@@ -247,3 +247,97 @@ pub struct Ownership {
     moves: Vec<Move>,
     unchanged: usize,
 }
+
+impl Ownership {
+    /// Compares the owners of `keys` in `before` and `after`.
+    pub fn diff<I, K>(before: &Ring, after: &Ring, keys: I) -> Ownership
+    where
+        I: IntoIterator<Item = K>,
+        K: AsRef<str>,
+    {
+        let mut diff = Ownership::default();
+        for key in keys {
+            let key = key.as_ref();
+            let from = before.owner(key);
+            let to = after.owner(key);
+            if from == to {
+                diff.unchanged += 1;
+            } else {
+                diff.moves.push(Move {
+                    key: key.to_owned(),
+                    from: from.cloned(),
+                    to: to.cloned(),
+                });
+            }
+        }
+        diff
+    }
+
+    /// The keys that changed owner, in input order.
+    #[must_use]
+    pub fn moves(&self) -> &[Move] {
+        &self.moves
+    }
+
+    /// Number of keys that changed owner.
+    #[must_use]
+    pub fn moved(&self) -> usize {
+        self.moves.len()
+    }
+
+    /// Number of keys that kept their owner.
+    #[must_use]
+    pub fn unchanged(&self) -> usize {
+        self.unchanged
+    }
+
+    /// Number of keys compared.
+    #[must_use]
+    pub fn total(&self) -> usize {
+        self.moves.len() + self.unchanged
+    }
+
+    /// Fraction of keys that moved (0 when no keys were compared).
+    #[must_use]
+    pub fn moved_fraction(&self) -> f64 {
+        match self.total() {
+            0 => 0.0,
+            total => self.moved() as f64 / total as f64,
+        }
+    }
+
+    /// Whether no key moved.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.moves.is_empty()
+    }
+
+    /// Keys that `node` owns after the change but did not before.
+    pub fn gained_by<'a>(&'a self, node: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.moves
+            .iter()
+            .filter(move |m| m.to.as_ref().is_some_and(|to| to == node))
+            .map(|m| m.key.as_str())
+    }
+
+    /// Keys that `node` owned before the change but no longer does.
+    pub fn lost_by<'a>(&'a self, node: &'a str) -> impl Iterator<Item = &'a str> + 'a {
+        self.moves
+            .iter()
+            .filter(move |m| m.from.as_ref().is_some_and(|from| from == node))
+            .map(|m| m.key.as_str())
+    }
+
+    /// How many of the moved keys each new owner gained.
+    #[must_use]
+    pub fn gains(&self) -> BTreeMap<&NodeId, usize> {
+        let mut gains = BTreeMap::new();
+        for to in self.moves.iter().filter_map(|m| m.to.as_ref()) {
+            *gains.entry(to).or_insert(0) += 1;
+        }
+        gains
+    }
+}
+
+#[cfg(test)]
+mod tests;
