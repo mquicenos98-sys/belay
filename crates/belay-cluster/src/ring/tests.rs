@@ -147,3 +147,86 @@ fn weighted_rings_keep_minimal_movement() {
         diff.moved_fraction()
     );
 }
+
+#[test]
+fn uniform_weights_of_any_value_agree_with_unit_weights() {
+    let unit = ring(&["a", "b", "c", "d"]);
+    let mut doubled = Ring::new();
+    for name in ["a", "b", "c", "d"] {
+        doubled.insert(id(name), 2.0).unwrap();
+    }
+    assert!(Ownership::diff(&unit, &doubled, keys(1_000)).is_empty());
+}
+
+#[test]
+fn owners_lists_successors_in_score_order() {
+    let full = ring(&["a", "b", "c", "d", "e"]);
+    for key in keys(100) {
+        let top = full.owners(&key, 3);
+        assert_eq!(top.len(), 3);
+        assert_eq!(Some(top[0]), full.owner(&key));
+        let mut distinct = top.clone();
+        distinct.dedup();
+        assert_eq!(distinct.len(), 3);
+        // The runner-up is who takes over when the owner leaves.
+        let mut without = full.clone();
+        without.remove(top[0].as_str());
+        assert_eq!(without.owner(&key), Some(top[1]));
+    }
+    assert_eq!(full.owners("k", 10).len(), 5);
+}
+
+#[test]
+fn rejects_invalid_weights() {
+    let mut ring = Ring::new();
+    for bad in [0.0, -1.0, f64::NAN, f64::INFINITY, MAX_WEIGHT * 2.0] {
+        assert!(matches!(
+            ring.insert(id("a"), bad),
+            Err(Error::InvalidWeight(_))
+        ));
+    }
+    assert!(ring.is_empty());
+}
+
+#[test]
+fn from_members_takes_live_members_with_their_weights() {
+    let member = |name: &str, state: MemberState, weight: Option<&str>| Member {
+        id: id(name),
+        addr: String::new(),
+        gossip_addr: "10.0.0.1:7946".parse().unwrap(),
+        state,
+        incarnation: 0,
+        meta: weight
+            .map(|w| Meta::from([("weight".to_owned(), w.to_owned())]))
+            .unwrap_or_default(),
+        since: Timestamp::EPOCH,
+    };
+    let members = [
+        member("alive", MemberState::Alive, Some("3")),
+        member("suspect", MemberState::Suspect, None),
+        member("dead", MemberState::Dead, None),
+        member("left", MemberState::Left, None),
+    ];
+    let ring = Ring::from_members(&members);
+    let ids: Vec<&str> = ring.nodes().map(NodeId::as_str).collect();
+    assert_eq!(ids, ["alive", "suspect"]);
+    assert_eq!(ring.weight("alive"), Some(3.0));
+    assert_eq!(ring.weight("suspect"), Some(1.0));
+    assert!(ring.contains("suspect"));
+    assert!(!ring.contains("dead"));
+}
+
+#[test]
+fn ownership_diff_handles_empty_rings_and_no_keys() {
+    let empty = Ring::new();
+    let one = ring(&["a"]);
+    let diff = Ownership::diff(&empty, &one, ["k1", "k2"]);
+    assert_eq!(diff.moved(), 2);
+    assert!(diff.moves().iter().all(|m| m.from.is_none()));
+    let diff = Ownership::diff(&one, &empty, ["k1"]);
+    assert_eq!(diff.lost_by("a").collect::<Vec<_>>(), ["k1"]);
+    assert!(diff.moves()[0].to.is_none());
+    let none = Ownership::diff(&one, &one, Vec::<String>::new());
+    assert_eq!(none.total(), 0);
+    assert_eq!(none.moved_fraction(), 0.0);
+}
