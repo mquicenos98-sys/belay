@@ -33,3 +33,60 @@ pub(crate) struct Suspicion {
     /// Suspecters after the first, capped at `k`.
     confirmations: u32,
 }
+
+impl Suspicion {
+    pub(crate) fn new(
+        incarnation: u64,
+        from: NodeId,
+        started: Timestamp,
+        min: Duration,
+        max: Duration,
+        k: u32,
+    ) -> Suspicion {
+        Suspicion {
+            incarnation,
+            started,
+            min,
+            max: max.max(min),
+            k,
+            suspecters: BTreeSet::from([from]),
+            confirmations: 0,
+        }
+    }
+
+    /// Records that `from` suspects the same incarnation. Returns whether
+    /// this was a new confirmation that shortened the timeout, which is
+    /// when it is worth gossiping on so that others can count it too.
+    pub(crate) fn confirm(&mut self, from: &NodeId) -> bool {
+        if self.confirmations >= self.k {
+            return false;
+        }
+        self.suspecters.insert(from.clone());
+        self.confirmations += 1;
+        true
+    }
+
+    pub(crate) fn incarnation(&self) -> u64 {
+        self.incarnation
+    }
+
+    pub(crate) fn confirmations(&self) -> u32 {
+        self.confirmations
+    }
+
+    /// The current timeout, measured from when the suspicion started.
+    pub(crate) fn timeout(&self) -> Duration {
+        if self.k == 0 || self.confirmations >= self.k {
+            return self.min;
+        }
+        let fraction = f64::from(self.confirmations + 1).ln() / f64::from(self.k + 1).ln();
+        let span = (self.max - self.min).as_secs_f64();
+        let timeout = self.max.as_secs_f64() - span * fraction;
+        Duration::from_secs_f64(timeout.max(self.min.as_secs_f64()))
+    }
+
+    /// When the suspect is to be declared dead unless it refutes.
+    pub(crate) fn deadline(&self) -> Timestamp {
+        self.started.saturating_add(self.timeout())
+    }
+}
