@@ -90,3 +90,65 @@ impl Suspicion {
         self.started.saturating_add(self.timeout())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(s: &str) -> NodeId {
+        NodeId::new(s).unwrap()
+    }
+
+    fn suspicion(k: u32) -> Suspicion {
+        Suspicion::new(
+            3,
+            id("a"),
+            Timestamp::from_secs(100),
+            Duration::from_secs(4),
+            Duration::from_secs(24),
+            k,
+        )
+    }
+
+    fn secs(d: Duration) -> f64 {
+        (d.as_secs_f64() * 1000.0).round() / 1000.0
+    }
+
+    #[test]
+    fn starts_at_the_maximum_timeout() {
+        let s = suspicion(2);
+        assert_eq!(s.timeout(), Duration::from_secs(24));
+        assert_eq!(s.deadline(), Timestamp::from_secs(124));
+        assert_eq!(s.incarnation(), 3);
+        assert_eq!(s.confirmations(), 0);
+    }
+
+    #[test]
+    fn confirmations_shrink_the_timeout_logarithmically_to_the_minimum() {
+        let mut s = suspicion(2);
+        assert!(s.confirm(&id("b")));
+        // 24 - 20 * ln 2 / ln 3
+        assert_eq!(secs(s.timeout()), 11.381);
+        assert!(s.confirm(&id("c")));
+        assert_eq!(s.timeout(), Duration::from_secs(4));
+        assert_eq!(s.deadline(), Timestamp::from_secs(104));
+        // Beyond k, confirmations change nothing and are not re-gossiped.
+        assert!(!s.confirm(&id("d")));
+        assert_eq!(s.confirmations(), 2);
+    }
+
+    #[test]
+    fn zero_k_or_inverted_bounds_use_the_minimum() {
+        let s = suspicion(0);
+        assert_eq!(s.timeout(), Duration::from_secs(4));
+        let s = Suspicion::new(
+            0,
+            id("a"),
+            Timestamp::EPOCH,
+            Duration::from_secs(5),
+            Duration::from_secs(1),
+            2,
+        );
+        assert_eq!(s.timeout(), Duration::from_secs(5));
+    }
+}
