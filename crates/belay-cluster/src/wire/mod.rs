@@ -63,3 +63,23 @@ pub const MIN_PACKET_SIZE: usize = 1_200;
 
 /// Space kept free for the update count while packing updates.
 const COUNT_RESERVE: usize = 3;
+
+const MSG_PING: u8 = 1;
+
+const MSG_ACK: u8 = 2;
+
+const MSG_PING_REQ: u8 = 3;
+
+const MSG_SYNC: u8 = 4;
+
+const MSG_GOSSIP: u8 = 5;
+
+const SYNC_REPLY: u8 = 0b1;
+
+/// The tag identifying a cluster in packet headers: FNV-1a of the name,
+/// folded to 32 bits.
+#[must_use]
+pub fn cluster_tag(cluster_name: &str) -> u32 {
+    let h = fnv1a64(cluster_name.as_bytes());
+    (h ^ (h >> 32)) as u32
+}
