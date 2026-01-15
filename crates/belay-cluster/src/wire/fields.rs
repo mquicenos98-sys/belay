@@ -15,15 +15,11 @@ use super::{
 use crate::member::{validate_addr, validate_meta, MemberState, Meta, NodeId};
 
 const UPD_ALIVE: u8 = 1;
-
 const UPD_SUSPECT: u8 = 2;
-
 const UPD_DEAD: u8 = 3;
-
 const UPD_LEFT: u8 = 4;
 
 const FAMILY_V4: u8 = 4;
-
 const FAMILY_V6: u8 = 6;
 
 pub(super) fn put_message_body(enc: &mut Encoder, message: &Message) {
@@ -198,4 +194,44 @@ fn get_addr(dec: &mut Decoder<'_>) -> Result<String, DecodeError> {
     let s = dec.get_str()?;
     validate_addr(s).map_err(|e| at.invalid(e.to_string()))?;
     Ok(s.to_owned())
+}
+
+fn put_meta(enc: &mut Encoder, meta: &Meta) {
+    enc.put_count(meta.len());
+    for (key, value) in meta {
+        enc.put_str(key).put_str(value);
+    }
+}
+
+fn get_meta(dec: &mut Decoder<'_>) -> Result<Meta, DecodeError> {
+    let at = dec.clone();
+    let count = dec.get_count()?;
+    let mut meta = Meta::new();
+    for _ in 0..count {
+        let key = dec.get_str()?;
+        let value = dec.get_str()?;
+        if meta.insert(key.to_owned(), value.to_owned()).is_some() {
+            return Err(at.invalid(format!("duplicate metadata key {key:?}")));
+        }
+    }
+    validate_meta(&meta).map_err(|e| at.invalid(e.to_string()))?;
+    Ok(meta)
+}
+
+pub(super) fn put_socket_addr(enc: &mut Encoder, addr: SocketAddr) {
+    match addr.ip() {
+        IpAddr::V4(ip) => enc.put_u8(FAMILY_V4).put_raw(&ip.octets()),
+        IpAddr::V6(ip) => enc.put_u8(FAMILY_V6).put_raw(&ip.octets()),
+    };
+    enc.put_u16(addr.port());
+}
+
+fn get_socket_addr(dec: &mut Decoder<'_>) -> Result<SocketAddr, DecodeError> {
+    let at = dec.clone();
+    let ip = match dec.get_u8()? {
+        FAMILY_V4 => IpAddr::V4(Ipv4Addr::from(dec.get_array::<4>()?)),
+        FAMILY_V6 => IpAddr::V6(Ipv6Addr::from(dec.get_array::<16>()?)),
+        other => return Err(at.invalid(format!("unknown address family {other}"))),
+    };
+    Ok(SocketAddr::new(ip, dec.get_u16()?))
 }
