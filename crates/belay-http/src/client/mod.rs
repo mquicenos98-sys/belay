@@ -323,7 +323,8 @@ impl Client {
                 body.clear();
                 headers.remove(CONTENT_TYPE);
             }
-            let same_origin = next.host() == url.host();
+            let same_origin =
+                next.host() == url.host() && next.port_or_default() == url.port_or_default();
             if !same_origin && !policy.forward_credentials {
                 headers.remove(AUTHORIZATION);
                 headers.remove(COOKIE);

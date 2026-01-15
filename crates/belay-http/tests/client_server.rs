@@ -363,6 +363,31 @@ fn see_other_turns_post_into_get_but_308_keeps_it() {
     assert_eq!(resp.text().ok(), Some("POST /landing 7"));
 }
 
+#[test]
+fn credentials_do_not_follow_cross_origin_redirects_by_default() {
+    let target = redirecting_server(None);
+    let origin = redirecting_server(Some(target.local_addr()));
+    let auth = [("Authorization", "Bearer s3cret")];
+
+    let cautious = Client::new(ClientConfig {
+        redirects: RedirectPolicy::limited(1),
+        ..ClientConfig::default()
+    });
+    let resp = cautious
+        .get(&url(&origin, "/elsewhere"), &auth)
+        .expect("followed");
+    assert_eq!(resp.text().ok(), Some("none"));
+
+    let trusting = Client::new(ClientConfig {
+        redirects: RedirectPolicy::limited(1).with_forwarded_credentials(true),
+        ..ClientConfig::default()
+    });
+    let resp = trusting
+        .get(&url(&origin, "/elsewhere"), &auth)
+        .expect("followed");
+    assert_eq!(resp.text().ok(), Some("Bearer s3cret"));
+}
+
 /// Reads one request (head plus `Content-Length` body) from a raw socket.
 fn read_request(stream: &mut TcpStream) -> Option<String> {
     let mut data = Vec::new();
