@@ -49,13 +49,10 @@ use crate::member::{str_encoded_len, Member, MemberState, Meta, NodeId};
 
 /// The protocol version written in, and required of, every datagram.
 pub const PROTOCOL_VERSION: u8 = 1;
-
 /// Size of the fixed header (version, checksum, cluster tag).
 pub const HEADER_LEN: usize = 9;
-
 /// Largest UDP payload over IPv4; larger datagrams are rejected.
 pub const MAX_DATAGRAM: usize = 65_507;
-
 /// Smallest allowed [`Config::max_packet_size`](crate::Config::max_packet_size).
 /// The limits on ids, addresses and metadata guarantee that any single
 /// update or member record fits in a packet of this size.
@@ -65,13 +62,9 @@ pub const MIN_PACKET_SIZE: usize = 1_200;
 const COUNT_RESERVE: usize = 3;
 
 const MSG_PING: u8 = 1;
-
 const MSG_ACK: u8 = 2;
-
 const MSG_PING_REQ: u8 = 3;
-
 const MSG_SYNC: u8 = 4;
-
 const MSG_GOSSIP: u8 = 5;
 
 const SYNC_REPLY: u8 = 0b1;
@@ -279,3 +272,266 @@ pub struct MemberRecord {
     /// Its metadata.
     pub meta: Meta,
 }
+
+impl From<&Member> for MemberRecord {
+    fn from(m: &Member) -> Self {
+        MemberRecord {
+            id: m.id.clone(),
+            addr: m.addr.clone(),
+            gossip_addr: m.gossip_addr,
+            state: m.state,
+            incarnation: m.incarnation,
+            meta: m.meta.clone(),
+        }
+    }
+}
+
+impl Packet {
+    /// A packet without piggybacked updates.
+    #[must_use]
+    pub fn new(sender: NodeId, message: Message) -> Packet {
+        Packet {
+            sender,
+            message,
+            updates: Vec::new(),
+        }
+    }
+
+    /// Encodes the packet as one datagram for the cluster with tag
+    /// `cluster` (see [`cluster_tag`]).
+    ///
+    /// ```
+    /// use belay_cluster::wire::{cluster_tag, decode, Message, Packet};
+    /// use belay_cluster::NodeId;
+    ///
+    /// let tag = cluster_tag("belay");
+    /// let ping = Packet::new(
+    ///     NodeId::new("a").unwrap(),
+    ///     Message::Ping { seq: 7, target: NodeId::new("b").unwrap() },
+    /// );
+    /// let bytes = ping.encode(tag).unwrap();
+    /// assert_eq!(decode(&bytes, tag).unwrap(), ping);
+    /// assert!(decode(&bytes, cluster_tag("other")).is_err());
+    /// ```
+    pub fn encode(&self, cluster: u32) -> Result<Vec<u8>, WireError> {
+        let frame = FrameWriter::new(cluster, &self.sender, &self.message);
+        let updates: Vec<Vec<u8>> = self.updates.iter().map(Update::to_bytes).collect();
+        let bytes = frame.finish(updates.iter().map(Vec::as_slice));
+        if bytes.len() > MAX_DATAGRAM {
+            return Err(WireError::TooLarge(bytes.len()));
+        }
+        Ok(bytes)
+    }
+}
+
+/// Decodes and verifies one datagram addressed to the cluster with tag
+/// `cluster`.
+pub fn decode(bytes: &[u8], cluster: u32) -> Result<Packet, WireError> {
+    if bytes.len() < HEADER_LEN {
+        return Err(WireError::Truncated(bytes.len()));
+    }
+    if bytes.len() > MAX_DATAGRAM {
+        return Err(WireError::TooLarge(bytes.len()));
+    }
+    if bytes[0] != PROTOCOL_VERSION {
+        return Err(WireError::UnsupportedVersion(bytes[0]));
+    }
+    let expected = u32::from_le_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]);
+    let actual = crc32c(&bytes[5..]);
+    if expected != actual {
+        return Err(WireError::ChecksumMismatch { expected, actual });
+    }
+    let tag = u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]);
+    if tag != cluster {
+        return Err(WireError::ClusterMismatch {
+            expected: cluster,
+            actual: tag,
+        });
+    }
+    let mut dec = Decoder::new(bytes);
+    dec.get_raw(HEADER_LEN)?;
+    let sender = fields::get_node_id(&mut dec)?;
+    let message = fields::get_message(&mut dec)?;
+    let count = dec.get_uvarint()? as usize;
+    let mut updates = Vec::with_capacity(count);
+    for _ in 0..count {
+        updates.push(fields::get_update(&mut dec)?);
+    }
+    dec.expect_end()?;
+    Ok(Packet {
+        sender,
+        message,
+        updates,
+    })
+}
+
+/// Builds a datagram whose updates are chosen once the size of the rest is
+/// known, which is how gossip gets packed into the space a message leaves.
+pub(crate) struct FrameWriter {
+    enc: Encoder,
+}
+
+impl FrameWriter {
+    pub(crate) fn new(cluster: u32, sender: &NodeId, message: &Message) -> FrameWriter {
+        let mut enc = Encoder::with_capacity(256);
+        enc.put_u8(PROTOCOL_VERSION)
+            .put_u32(0)
+            .put_u32(cluster)
+            .put_str(sender.as_str())
+            .put_u8(message.kind());
+        fields::put_message_body(&mut enc, message);
+        FrameWriter { enc }
+    }
+
+    /// Bytes available for encoded updates in a datagram of at most
+    /// `limit` bytes.
+    pub(crate) fn update_budget(&self, limit: usize) -> usize {
+        limit.saturating_sub(self.enc.len() + COUNT_RESERVE)
+    }
+
+    /// Appends the pre-encoded `updates` and seals the checksum.
+    pub(crate) fn finish<'a, I>(mut self, updates: I) -> Vec<u8>
+    where
+        I: ExactSizeIterator<Item = &'a [u8]>,
+    {
+        self.enc.put_count(updates.len());
+        for update in updates {
+            self.enc.put_raw(update);
+        }
+        seal(self.enc.into_vec())
+    }
+}
+
+/// Writes the checksum of everything after it into the header.
+fn seal(mut bytes: Vec<u8>) -> Vec<u8> {
+    let crc = crc32c(&bytes[5..]);
+    bytes[1..5].copy_from_slice(&crc.to_le_bytes());
+    bytes
+}
+
+/// Encodes `records` as `Sync` datagrams of at most `limit` bytes each,
+/// packing as many records per datagram as fit.
+pub(crate) fn encode_sync(
+    cluster: u32,
+    sender: &NodeId,
+    reply: bool,
+    records: &[MemberRecord],
+    limit: usize,
+) -> Vec<Vec<u8>> {
+    let encoded: Vec<Vec<u8>> = records
+        .iter()
+        .map(|r| {
+            let mut enc = Encoder::new();
+            fields::put_record(&mut enc, r);
+            enc.into_vec()
+        })
+        .collect();
+    // Header, sender, kind, flags, record count, update count (always 0).
+    let base = HEADER_LEN + str_encoded_len(sender.as_str()) + 2 + COUNT_RESERVE + 1;
+    let mut datagrams = Vec::new();
+    let mut chunk: Vec<&[u8]> = Vec::new();
+    let mut size = base;
+    for record in &encoded {
+        if !chunk.is_empty() && size + record.len() > limit {
+            datagrams.push(sync_datagram(cluster, sender, reply, &chunk));
+            chunk.clear();
+            size = base;
+        }
+        chunk.push(record);
+        size += record.len();
+    }
+    if !chunk.is_empty() || datagrams.is_empty() {
+        datagrams.push(sync_datagram(cluster, sender, reply, &chunk));
+    }
+    datagrams
+}
+
+fn sync_datagram(cluster: u32, sender: &NodeId, reply: bool, records: &[&[u8]]) -> Vec<u8> {
+    let mut enc = Encoder::new();
+    enc.put_u8(PROTOCOL_VERSION)
+        .put_u32(0)
+        .put_u32(cluster)
+        .put_str(sender.as_str())
+        .put_u8(MSG_SYNC)
+        .put_u8(if reply { SYNC_REPLY } else { 0 })
+        .put_count(records.len());
+    for record in records {
+        enc.put_raw(record);
+    }
+    enc.put_count(0);
+    seal(enc.into_vec())
+}
+
+/// Why a datagram was rejected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum WireError {
+    /// Shorter than the fixed header; holds the length.
+    Truncated(usize),
+    /// Larger than [`MAX_DATAGRAM`]; holds the length.
+    TooLarge(usize),
+    /// Written by an incompatible protocol version.
+    UnsupportedVersion(u8),
+    /// The content does not match the header checksum.
+    ChecksumMismatch {
+        /// Checksum from the header.
+        expected: u32,
+        /// Checksum of the content.
+        actual: u32,
+    },
+    /// The packet belongs to a cluster with another name.
+    ClusterMismatch {
+        /// This node's cluster tag.
+        expected: u32,
+        /// The packet's cluster tag.
+        actual: u32,
+    },
+    /// The body is malformed.
+    Decode(DecodeError),
+}
+
+impl fmt::Display for WireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            WireError::Truncated(len) => write!(
+                f,
+                "datagram of {len} bytes is shorter than the {HEADER_LEN}-byte header"
+            ),
+            WireError::TooLarge(len) => write!(
+                f,
+                "datagram of {len} bytes exceeds the {MAX_DATAGRAM}-byte limit"
+            ),
+            WireError::UnsupportedVersion(v) => write!(
+                f,
+                "unsupported protocol version {v} (this node speaks version {PROTOCOL_VERSION})"
+            ),
+            WireError::ChecksumMismatch { expected, actual } => write!(
+                f,
+                "checksum mismatch (header {expected:#010x}, content {actual:#010x})"
+            ),
+            WireError::ClusterMismatch { expected, actual } => write!(
+                f,
+                "packet is from another cluster (tag {actual:#010x}, expected {expected:#010x})"
+            ),
+            WireError::Decode(e) => e.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for WireError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            WireError::Decode(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<DecodeError> for WireError {
+    fn from(e: DecodeError) -> Self {
+        WireError::Decode(e)
+    }
+}
+
+#[cfg(test)]
+mod tests;
