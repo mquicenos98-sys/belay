@@ -129,3 +129,76 @@ fn every_update_kind_round_trips_piggybacked() {
     let names: Vec<&str> = packet.updates.iter().map(Update::name).collect();
     assert_eq!(names, ["alive", "suspect", "dead", "left"]);
 }
+
+#[test]
+fn header_layout_matches_the_documentation() {
+    let bytes = Packet::new(id("a"), Message::Gossip).encode(TAG).unwrap();
+    assert_eq!(bytes[0], PROTOCOL_VERSION);
+    assert_eq!(
+        u32::from_le_bytes(bytes[1..5].try_into().unwrap()),
+        crc32c(&bytes[5..])
+    );
+    assert_eq!(u32::from_le_bytes(bytes[5..9].try_into().unwrap()), TAG);
+    // sender "a", kind 5, zero updates
+    assert_eq!(&bytes[9..], &[1, b'a', MSG_GOSSIP, 0]);
+}
+
+#[test]
+fn any_single_bit_flip_is_detected() {
+    let packet = Packet {
+        sender: id("node-a"),
+        message: Message::Ping {
+            seq: 77,
+            target: id("node-b"),
+        },
+        updates: vec![Update::Left {
+            id: id("node-c"),
+            incarnation: 2,
+        }],
+    };
+    let bytes = packet.encode(TAG).unwrap();
+    for i in 0..bytes.len() {
+        for bit in 0..8 {
+            let mut corrupt = bytes.clone();
+            corrupt[i] ^= 1 << bit;
+            assert!(decode(&corrupt, TAG).is_err(), "flip at byte {i} bit {bit}");
+        }
+    }
+}
+
+#[test]
+fn rejects_wrong_version_cluster_and_size() {
+    let bytes = Packet::new(id("a"), Message::Ack { seq: 1 })
+        .encode(TAG)
+        .unwrap();
+
+    let mut v2 = bytes.clone();
+    v2[0] = 2;
+    assert_eq!(decode(&v2, TAG), Err(WireError::UnsupportedVersion(2)));
+
+    match decode(&bytes, TAG ^ 1) {
+        Err(WireError::ClusterMismatch { expected, actual }) => {
+            assert_eq!((expected, actual), (TAG ^ 1, TAG));
+        }
+        other => panic!("expected cluster mismatch, got {other:?}"),
+    }
+
+    assert_eq!(decode(&bytes[..8], TAG), Err(WireError::Truncated(8)));
+    assert_eq!(
+        decode(&vec![1u8; MAX_DATAGRAM + 1], TAG),
+        Err(WireError::TooLarge(MAX_DATAGRAM + 1))
+    );
+    assert_eq!(
+        WireError::Truncated(3).to_string(),
+        "datagram of 3 bytes is shorter than the 9-byte header"
+    );
+}
+
+/// Re-seals `body` (everything after the header) so that only the body
+/// checks can reject it.
+fn forge(body: &[u8]) -> Vec<u8> {
+    let mut bytes = vec![PROTOCOL_VERSION, 0, 0, 0, 0];
+    bytes.extend_from_slice(&TAG.to_le_bytes());
+    bytes.extend_from_slice(body);
+    seal(bytes)
+}
