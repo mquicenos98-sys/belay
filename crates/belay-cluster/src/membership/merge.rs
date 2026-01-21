@@ -34,3 +34,9 @@ pub(super) struct AliveInfo {
     pub(super) gossip_addr: SocketAddr,
     pub(super) meta: Meta,
 }
+
+impl AliveInfo {
+    fn same_data(&self, m: &Member) -> bool {
+        m.addr == self.addr && m.gossip_addr == self.gossip_addr && m.meta == self.meta
+    }
+}
