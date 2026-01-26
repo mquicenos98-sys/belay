@@ -68,3 +68,40 @@ fn dead(name: &str, incarnation: u64, from: &str) -> Update {
         from: id(from),
     }
 }
+
+fn left(name: &str, incarnation: u64) -> Update {
+    Update::Left {
+        id: id(name),
+        incarnation,
+    }
+}
+
+fn record(name: &str, state: MemberState, incarnation: u64) -> MemberRecord {
+    MemberRecord {
+        id: id(name),
+        addr: format!("{name}:7070"),
+        gossip_addr: addr(name),
+        state,
+        incarnation,
+        meta: Meta::new(),
+    }
+}
+
+fn ping(seq: u64, target: &str) -> Message {
+    Message::Ping {
+        seq,
+        target: id(target),
+    }
+}
+
+fn ping_req(seq: u64, target: &str) -> Message {
+    Message::PingReq {
+        seq,
+        target: id(target),
+        target_addr: addr(target),
+    }
+}
+
+fn sync(reply: bool, members: Vec<MemberRecord>) -> Message {
+    Message::Sync { reply, members }
+}
