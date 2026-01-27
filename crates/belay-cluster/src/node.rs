@@ -81,3 +81,91 @@ struct Shared {
     subscribers: Mutex<Vec<Sender<MembershipEvent>>>,
     stopped: AtomicBool,
 }
+
+impl Shared {
+    /// Runs `f` on the state machine, then sends its output, publishes a
+    /// new snapshot if anything changed and delivers events.
+    fn drive<R>(&self, f: impl FnOnce(&mut Membership) -> (Vec<Outbound>, R)) -> R {
+        let (out, result, events, view) = {
+            let mut m = lock(&self.membership);
+            let (out, result) = f(&mut m);
+            let events = m.drain_events();
+            let current = read(&self.view).clone();
+            let view = (current.version != m.version() || current.state != m.state())
+                .then(|| Arc::new(View::of(&m)));
+            (out, result, events, view)
+        };
+        if let Some(view) = view {
+            *write(&self.view) = view;
+        }
+        self.send_all(out);
+        self.publish(events);
+        result
+    }
+
+    fn send_all(&self, out: Vec<Outbound>) {
+        for o in out {
+            if let Err(e) = self.transport.send_to(o.to, &o.bytes) {
+                debug!("gossip send failed"; to = %o.to, error = %e);
+            }
+        }
+    }
+
+    fn publish(&self, events: Vec<MembershipEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let mut subscribers = lock(&self.subscribers);
+        subscribers.retain(|tx| events.iter().all(|e| tx.send(e.clone()).is_ok()));
+    }
+
+    fn on_datagram(&self, d: Datagram) {
+        let now = self.clock.now();
+        self.drive(|m| (m.handle_datagram(d.from, &d.bytes, now), ()));
+    }
+
+    /// Ticks the machine and returns how long to sleep.
+    fn tick(&self) -> Duration {
+        let now = self.clock.now();
+        let next = self.drive(|m| {
+            let out = m.tick(now);
+            (out, m.next_wakeup())
+        });
+        next.saturating_duration_since(self.clock.now())
+            .clamp(Duration::from_millis(1), MAX_TICK_SLEEP)
+    }
+
+    fn view(&self) -> Arc<View> {
+        read(&self.view).clone()
+    }
+}
+
+/// A running cluster member: the SWIM protocol driven by background
+/// threads over a [`Transport`].
+///
+/// ```
+/// use belay_cluster::{Config, MemNetwork, Node, NodeId};
+/// use std::time::Duration;
+///
+/// let net = MemNetwork::new(1);
+/// let a = Node::start(Config::local(NodeId::new("a").unwrap()), net.bind_next())?;
+/// let b = Node::start(
+///     Config::local(NodeId::new("b").unwrap()).with_seeds([a.gossip_addr()]),
+///     net.bind_next(),
+/// )?;
+/// assert!(b.wait_until_joined(Duration::from_secs(5)));
+///
+/// // Both nodes agree on who owns what, and on the leader.
+/// let owner = b.owner_of("queue:emails").unwrap().id;
+/// assert!(a.is_owner("queue:emails") == (owner == "a"));
+/// assert_eq!(b.leader().unwrap().id, "a");
+///
+/// b.leave();
+/// a.shutdown();
+/// # Ok::<(), belay_cluster::Error>(())
+/// ```
+pub struct Node {
+    shared: Arc<Shared>,
+    shutdown: Shutdown,
+    threads: Mutex<Vec<JoinHandle<()>>>,
+}
