@@ -41,3 +41,43 @@ const MAX_TICK_SLEEP: Duration = Duration::from_millis(50);
 /// Pause after a transport receive error, to avoid spinning on a broken
 /// socket.
 const ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+/// An immutable snapshot of the membership, published after each change.
+#[derive(Debug)]
+struct View {
+    version: u64,
+    state: LocalState,
+    /// Every known member, in id order.
+    members: Vec<Member>,
+    ring: Ring,
+}
+
+impl View {
+    fn of(m: &Membership) -> View {
+        View {
+            version: m.version(),
+            state: m.state(),
+            members: m.members().cloned().collect(),
+            ring: m.ring(),
+        }
+    }
+
+    fn member(&self, id: &str) -> Option<&Member> {
+        self.members
+            .binary_search_by(|m| m.id.as_str().cmp(id))
+            .ok()
+            .map(|i| &self.members[i])
+    }
+}
+
+struct Shared {
+    id: NodeId,
+    gossip_addr: SocketAddr,
+    leave_timeout: Duration,
+    membership: Mutex<Membership>,
+    transport: Arc<dyn Transport>,
+    clock: SharedClock,
+    view: RwLock<Arc<View>>,
+    subscribers: Mutex<Vec<Sender<MembershipEvent>>>,
+    stopped: AtomicBool,
+}
