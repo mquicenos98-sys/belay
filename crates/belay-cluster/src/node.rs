@@ -169,3 +169,300 @@ pub struct Node {
     shutdown: Shutdown,
     threads: Mutex<Vec<JoinHandle<()>>>,
 }
+
+impl std::fmt::Debug for Node {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let view = self.shared.view();
+        f.debug_struct("Node")
+            .field("id", &self.shared.id)
+            .field("gossip_addr", &self.shared.gossip_addr)
+            .field("state", &view.state)
+            .field("members", &view.members.len())
+            .finish()
+    }
+}
+
+impl Node {
+    /// Starts a node on the system clock. If `config.advertise` is unset,
+    /// the transport's local address is advertised, which must then be
+    /// reachable by the other nodes (not `0.0.0.0`).
+    pub fn start<T: Transport + 'static>(config: Config, transport: T) -> Result<Node> {
+        Node::start_with(config, transport, system_clock(), Rng::from_entropy())
+    }
+
+    /// Starts a node with an explicit clock and random generator.
+    pub fn start_with<T: Transport + 'static>(
+        mut config: Config,
+        transport: T,
+        clock: SharedClock,
+        rng: Rng,
+    ) -> Result<Node> {
+        let transport: Arc<dyn Transport> = Arc::new(transport);
+        if config.advertise.is_none() {
+            let local = transport.local_addr();
+            if local.ip().is_unspecified() {
+                return Err(Error::config(format!(
+                    "the gossip transport is bound to {local}; set an advertise address other nodes can reach"
+                )));
+            }
+            config.advertise = Some(local);
+        }
+        let leave_timeout = config.leave_timeout;
+        let membership = Membership::new(config, rng, clock.now())?;
+        let id = membership.local_id().clone();
+        let gossip_addr = membership.local_member().gossip_addr;
+        info!(
+            "cluster node started";
+            node = %id,
+            gossip = %gossip_addr,
+            seeds = membership.seeds().len()
+        );
+        let shared = Arc::new(Shared {
+            id,
+            gossip_addr,
+            leave_timeout,
+            view: RwLock::new(Arc::new(View::of(&membership))),
+            membership: Mutex::new(membership),
+            transport,
+            clock,
+            subscribers: Mutex::new(Vec::new()),
+            stopped: AtomicBool::new(false),
+        });
+        let shutdown = Shutdown::new();
+        let node = Node {
+            shared,
+            shutdown,
+            threads: Mutex::new(Vec::new()),
+        };
+        let rx = node.spawn("belay-gossip-rx", receive_loop)?;
+        lock(&node.threads).push(rx);
+        let tick = node.spawn("belay-gossip-tick", tick_loop)?;
+        lock(&node.threads).push(tick);
+        Ok(node)
+    }
+
+    fn spawn(&self, name: &str, body: fn(&Shared, &Shutdown)) -> Result<JoinHandle<()>> {
+        let shared = Arc::clone(&self.shared);
+        let shutdown = self.shutdown.clone();
+        let handle = thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || body(&shared, &shutdown));
+        handle.map_err(|e| {
+            self.shutdown();
+            Error::Io(e)
+        })
+    }
+
+    /// This node's id.
+    #[must_use]
+    pub fn id(&self) -> &NodeId {
+        &self.shared.id
+    }
+
+    /// The gossip address this node advertises.
+    #[must_use]
+    pub fn gossip_addr(&self) -> SocketAddr {
+        self.shared.gossip_addr
+    }
+
+    /// Whether the node is still running (not shut down, not left).
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        !self.shared.stopped.load(Ordering::SeqCst)
+    }
+
+    /// The local node's lifecycle state.
+    #[must_use]
+    pub fn state(&self) -> LocalState {
+        self.shared.view().state
+    }
+
+    /// The local node's own record.
+    #[must_use]
+    pub fn local_member(&self) -> Member {
+        self.member(self.shared.id.as_str())
+            .expect("the local member is always in the view")
+    }
+
+    /// Every known member (the local node, live members and tombstones of
+    /// dead or departed ones), in id order.
+    #[must_use]
+    pub fn members(&self) -> Vec<Member> {
+        self.shared.view().members.clone()
+    }
+
+    /// The live members, in id order.
+    #[must_use]
+    pub fn live_members(&self) -> Vec<Member> {
+        self.shared
+            .view()
+            .members
+            .iter()
+            .filter(|m| m.is_live())
+            .cloned()
+            .collect()
+    }
+
+    /// The member with this id.
+    #[must_use]
+    pub fn member(&self, id: &str) -> Option<Member> {
+        self.shared.view().member(id).cloned()
+    }
+
+    /// The ring of live members.
+    #[must_use]
+    pub fn ring(&self) -> Ring {
+        self.shared.view().ring.clone()
+    }
+
+    /// The live member that owns `key` in this node's view.
+    #[must_use]
+    pub fn owner_of(&self, key: &str) -> Option<Member> {
+        let view = self.shared.view();
+        let id = view.ring.owner(key)?;
+        view.member(id.as_str()).cloned()
+    }
+
+    /// The `n` best candidates for `key`: the owner first, then whoever
+    /// would take over from it.
+    #[must_use]
+    pub fn owners(&self, key: &str, n: usize) -> Vec<Member> {
+        let view = self.shared.view();
+        view.ring
+            .owners(key, n)
+            .into_iter()
+            .filter_map(|id| view.member(id.as_str()).cloned())
+            .collect()
+    }
+
+    /// Whether this node owns `key`. Always false once stopped.
+    #[must_use]
+    pub fn is_owner(&self, key: &str) -> bool {
+        self.is_running() && self.shared.view().ring.owner(key) == Some(&self.shared.id)
+    }
+
+    /// The live member with the lowest id (see
+    /// [`Membership::leader`]).
+    #[must_use]
+    pub fn leader(&self) -> Option<Member> {
+        self.shared
+            .view()
+            .members
+            .iter()
+            .find(|m| m.is_live())
+            .cloned()
+    }
+
+    /// Whether this node is the [`leader`](Self::leader). Always false
+    /// once stopped.
+    #[must_use]
+    pub fn is_leader(&self) -> bool {
+        self.is_running() && self.leader().is_some_and(|m| m.id == self.shared.id)
+    }
+
+    /// Protocol counters.
+    #[must_use]
+    pub fn stats(&self) -> MembershipStats {
+        lock(&self.shared.membership).stats()
+    }
+
+    /// A channel receiving every membership change from now on. The
+    /// channel is unbounded; drop the receiver to unsubscribe.
+    #[must_use]
+    pub fn subscribe(&self) -> Receiver<MembershipEvent> {
+        let (tx, rx) = mpsc::channel();
+        lock(&self.shared.subscribers).push(tx);
+        rx
+    }
+
+    /// Blocks until the node has joined through a seed (or needed none),
+    /// up to `timeout`. Returns whether it has.
+    pub fn wait_until_joined(&self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.state() == LocalState::Active {
+                return true;
+            }
+            if !self.is_running() || Instant::now() >= deadline {
+                return false;
+            }
+            self.shutdown.wait_timeout(Duration::from_millis(5));
+        }
+    }
+
+    /// Contacts additional seeds, e.g. to merge with another cluster.
+    pub fn join(&self, seeds: &[SocketAddr]) -> Result<()> {
+        self.ensure_running()?;
+        let now = self.shared.clock.now();
+        self.shared.drive(|m| (m.join(seeds, now), ()));
+        Ok(())
+    }
+
+    /// Publishes new metadata for this node.
+    pub fn update_meta(&self, meta: Meta) -> Result<()> {
+        self.ensure_running()?;
+        self.shared.drive(|m| (Vec::new(), m.update_meta(meta)))
+    }
+
+    fn ensure_running(&self) -> Result<()> {
+        if self.is_running() {
+            Ok(())
+        } else {
+            Err(Error::Stopped)
+        }
+    }
+
+    /// Leaves the cluster gracefully: announces the departure, keeps
+    /// gossiping until the news has been sent enough times (or
+    /// [`leave_timeout`](Config::leave_timeout) passes), then stops.
+    /// Returns whether the announcement finished spreading; if not, the
+    /// other nodes will declare this one dead instead.
+    pub fn leave(&self) -> bool {
+        if !self.is_running() {
+            return false;
+        }
+        let now = self.shared.clock.now();
+        self.shared.drive(|m| (m.leave(now), ()));
+        let deadline = Instant::now() + self.shared.leave_timeout;
+        let propagated = loop {
+            if lock(&self.shared.membership).state() == LocalState::Left {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            self.shutdown.wait_timeout(Duration::from_millis(5));
+        };
+        if !propagated {
+            warn!(
+                "leave announcement did not finish spreading before the timeout";
+                node = %self.shared.id,
+                timeout = self.shared.leave_timeout
+            );
+        }
+        self.shutdown();
+        propagated
+    }
+
+    /// Stops the node's threads without announcing anything: to the other
+    /// nodes this looks like a crash, and they will declare it dead.
+    pub fn shutdown(&self) {
+        if self.shared.stopped.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        self.shutdown.trigger();
+        let threads = std::mem::take(&mut *lock(&self.threads));
+        for handle in threads {
+            if handle.join().is_err() {
+                warn!("cluster thread panicked"; node = %self.shared.id);
+            }
+        }
+        info!("cluster node stopped"; node = %self.shared.id);
+    }
+}
+
+impl Drop for Node {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
