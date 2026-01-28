@@ -33,11 +33,9 @@ use crate::transport::{Datagram, Transport};
 
 /// How long the receive thread blocks before re-checking for shutdown.
 const RECV_POLL: Duration = Duration::from_millis(50);
-
 /// Longest sleep of the tick thread, bounding how late it notices
 /// deadlines created by incoming datagrams.
 const MAX_TICK_SLEEP: Duration = Duration::from_millis(50);
-
 /// Pause after a transport receive error, to avoid spinning on a broken
 /// socket.
 const ERROR_BACKOFF: Duration = Duration::from_millis(100);
@@ -464,5 +462,107 @@ impl Node {
 impl Drop for Node {
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+fn receive_loop(shared: &Shared, shutdown: &Shutdown) {
+    while !shutdown.is_triggered() {
+        match shared.transport.recv_timeout(RECV_POLL) {
+            Ok(Some(datagram)) => shared.on_datagram(datagram),
+            Ok(None) => {}
+            Err(e) => {
+                warn!("gossip receive failed"; node = %shared.id, error = %e);
+                shutdown.wait_timeout(ERROR_BACKOFF);
+            }
+        }
+    }
+}
+
+fn tick_loop(shared: &Shared, shutdown: &Shutdown) {
+    loop {
+        let sleep = shared.tick();
+        if shutdown.wait_timeout(sleep) {
+            return;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::member::MemberState;
+    use crate::transport::MemNetwork;
+    use crate::UdpTransport;
+    use belay_common::log::{set_max_level, LevelFilter};
+    use std::sync::Once;
+
+    fn quiet() {
+        static ONCE: Once = Once::new();
+        ONCE.call_once(|| set_max_level(LevelFilter::Warn));
+    }
+
+    fn id(s: &str) -> NodeId {
+        NodeId::new(s).unwrap()
+    }
+
+    fn eventually(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            if cond() {
+                return true;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        cond()
+    }
+
+    #[test]
+    fn refuses_to_advertise_an_unspecified_address() {
+        quiet();
+        let transport = UdpTransport::bind("0.0.0.0:0").unwrap();
+        let err = Node::start(Config::local(id("a")), transport).unwrap_err();
+        assert!(
+            err.to_string().contains("set an advertise address"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_single_node_owns_everything_and_leads() {
+        quiet();
+        let net = MemNetwork::new(1);
+        let node = Node::start(Config::local(id("solo")), net.bind_next()).unwrap();
+        assert!(node.wait_until_joined(Duration::from_secs(1)));
+        assert!(node.is_owner("anything"));
+        assert!(node.is_leader());
+        assert_eq!(node.local_member().state, MemberState::Alive);
+        assert_eq!(node.live_members().len(), 1);
+        node.shutdown();
+        assert!(!node.is_running());
+        assert!(!node.is_owner("anything"));
+        assert!(!node.is_leader());
+        assert!(matches!(node.update_meta(Meta::new()), Err(Error::Stopped)));
+        assert!(!node.leave());
+    }
+
+    #[test]
+    fn metadata_updates_reach_other_nodes() {
+        quiet();
+        let net = MemNetwork::new(2);
+        let a = Node::start(Config::local(id("a")), net.bind_next()).unwrap();
+        let b = Node::start(
+            Config::local(id("b")).with_seeds([a.gossip_addr()]),
+            net.bind_next(),
+        )
+        .unwrap();
+        assert!(b.wait_until_joined(Duration::from_secs(5)));
+        let events = a.subscribe();
+        let meta = Meta::from([("weight".to_owned(), "3".to_owned())]);
+        b.update_meta(meta).unwrap();
+        let updated = std::iter::from_fn(|| events.recv_timeout(Duration::from_secs(5)).ok())
+            .find(|e| matches!(e, MembershipEvent::Updated(m) if m.id == "b"))
+            .expect("update event");
+        assert_eq!(updated.member().weight(), 3.0);
+        assert!(eventually(Duration::from_secs(5), || a.ring().weight("b") == Some(3.0)));
     }
 }
