@@ -91,3 +91,120 @@ struct InFlight {
     from: SocketAddr,
     bytes: Vec<u8>,
 }
+
+type Mailbox = BinaryHeap<Reverse<InFlight>>;
+
+struct NetState {
+    rng: Rng,
+    faults: Faults,
+    mailboxes: HashMap<SocketAddr, Mailbox>,
+    blocked: HashSet<(SocketAddr, SocketAddr)>,
+    isolated: HashSet<SocketAddr>,
+    stats: NetStats,
+    seq: u64,
+    next_host: u32,
+}
+
+impl NetState {
+    fn delay(&mut self) -> Duration {
+        let mut delay = self.faults.latency;
+        let jitter = u64::try_from(self.faults.jitter.as_millis()).unwrap_or(u64::MAX);
+        if jitter > 0 {
+            delay += Duration::from_millis(self.rng.gen_range(0..=jitter));
+        }
+        if self.rng.gen_bool(self.faults.reorder_rate) {
+            self.stats.reordered += 1;
+            delay += self.faults.reorder_delay;
+        }
+        delay
+    }
+
+    fn send(&mut self, from: SocketAddr, to: SocketAddr, bytes: &[u8], now: Timestamp) {
+        self.stats.sent += 1;
+        if self.isolated.contains(&from)
+            || self.isolated.contains(&to)
+            || self.blocked.contains(&(from, to))
+        {
+            self.stats.blocked += 1;
+            return;
+        }
+        if !self.mailboxes.contains_key(&to) {
+            self.stats.undeliverable += 1;
+            return;
+        }
+        if self.rng.gen_bool(self.faults.drop_rate) {
+            self.stats.dropped += 1;
+            return;
+        }
+        let copies = if self.rng.gen_bool(self.faults.duplicate_rate) {
+            self.stats.duplicated += 1;
+            2
+        } else {
+            1
+        };
+        for _ in 0..copies {
+            let deliver_at = now + self.delay();
+            self.seq += 1;
+            let item = InFlight {
+                deliver_at,
+                seq: self.seq,
+                from,
+                bytes: bytes.to_vec(),
+            };
+            if let Some(mailbox) = self.mailboxes.get_mut(&to) {
+                mailbox.push(Reverse(item));
+            }
+        }
+    }
+
+    fn pop_due(&mut self, at: SocketAddr, now: Timestamp) -> Option<Datagram> {
+        let mailbox = self.mailboxes.get_mut(&at)?;
+        if mailbox.peek()?.0.deliver_at > now {
+            return None;
+        }
+        let Reverse(item) = mailbox.pop()?;
+        self.stats.delivered += 1;
+        Some(Datagram {
+            from: item.from,
+            bytes: item.bytes,
+        })
+    }
+
+    fn next_for(&self, at: SocketAddr) -> Option<Timestamp> {
+        self.mailboxes.get(&at)?.peek().map(|r| r.0.deliver_at)
+    }
+}
+
+struct Net {
+    state: Mutex<NetState>,
+    arrived: Condvar,
+    clock: SharedClock,
+}
+
+/// A simulated network connecting [`MemTransport`]s. Clones share it.
+///
+/// ```
+/// use belay_cluster::{MemNetwork, Transport};
+/// use belay_common::{ManualClock, Timestamp};
+/// use std::time::Duration;
+///
+/// let clock = ManualClock::new(Timestamp::from_secs(0));
+/// let net = MemNetwork::with_clock(7, clock.shared());
+/// net.set_latency(Duration::from_millis(5), Duration::ZERO);
+/// let a = net.bind_next();
+/// let b = net.bind_next();
+///
+/// a.send_to(b.local_addr(), b"ping").unwrap();
+/// assert!(b.try_recv().is_none(), "still in flight");
+/// clock.advance(Duration::from_millis(5));
+/// assert_eq!(b.try_recv().unwrap().bytes, b"ping");
+///
+/// net.partition(&[a.local_addr()], &[b.local_addr()]);
+/// a.send_to(b.local_addr(), b"lost").unwrap();
+/// clock.advance(Duration::from_secs(1));
+/// assert!(b.try_recv().is_none());
+/// ```
+#[derive(Clone)]
+pub struct MemNetwork {
+    net: Arc<Net>,
+}
