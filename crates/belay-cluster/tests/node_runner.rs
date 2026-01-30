@@ -77,3 +77,129 @@ fn start_cluster<T: Transport + 'static>(
     );
     nodes
 }
+
+#[test]
+fn nodes_form_a_cluster_and_agree_on_owners_and_leader() {
+    quiet();
+    let net = MemNetwork::new(1);
+    let a = Node::start(config("a"), net.bind_next()).unwrap();
+    let events = a.subscribe();
+    let seed = a.gossip_addr();
+    let others: Vec<Node> = ["b", "c", "d"]
+        .iter()
+        .map(|name| Node::start(config(name).with_seeds([seed]), net.bind_next()).unwrap())
+        .collect();
+    let mut joined = BTreeSet::new();
+    while joined.len() < 3 {
+        let e = expect_event(&events, Duration::from_secs(10), |e| {
+            matches!(e, MembershipEvent::Joined(_))
+        });
+        joined.insert(e.member().id.to_string());
+    }
+    assert_eq!(joined, BTreeSet::from(["b".into(), "c".into(), "d".into()]));
+
+    let mut nodes = vec![a];
+    nodes.extend(others);
+    assert!(eventually(Duration::from_secs(10), || nodes
+        .iter()
+        .all(|n| n.live_members().len() == 4)));
+    for i in 0..200 {
+        let key = format!("queue:{i}");
+        let owners: BTreeSet<String> = nodes
+            .iter()
+            .map(|n| n.owner_of(&key).unwrap().id.to_string())
+            .collect();
+        assert_eq!(owners.len(), 1, "nodes disagree about {key}");
+        let claimants = nodes.iter().filter(|n| n.is_owner(&key)).count();
+        assert_eq!(claimants, 1, "{key} has {claimants} owners");
+        let successors = nodes[0].owners(&key, 2);
+        assert_eq!(successors.len(), 2);
+        assert_ne!(successors[0].id, successors[1].id);
+    }
+    for n in &nodes {
+        assert_eq!(n.leader().unwrap().id, "a");
+        assert_eq!(n.is_leader(), n.id() == "a");
+    }
+}
+
+#[test]
+fn a_crashed_node_is_declared_failed_and_its_keys_move() {
+    quiet();
+    let net = MemNetwork::new(2);
+    let nodes = start_cluster(&["a", "b", "c"], || net.bind_next());
+    let events = nodes[0].subscribe();
+    let keys: Vec<String> = (0..300).map(|i| format!("k{i}")).collect();
+    let owned_by_c: Vec<&String> = keys
+        .iter()
+        .filter(|k| nodes[0].owner_of(k).unwrap().id == "c")
+        .collect();
+    assert!(!owned_by_c.is_empty());
+
+    let bound = config("a").failure_detection_bound(3);
+    nodes[2].shutdown();
+    expect_event(
+        &events,
+        bound + Duration::from_secs(3),
+        |e| matches!(e, MembershipEvent::Failed(m) if m.id == "c"),
+    );
+    assert_eq!(nodes[0].member("c").unwrap().state, MemberState::Dead);
+    assert!(eventually(Duration::from_secs(5), || nodes[1]
+        .member("c")
+        .is_some_and(|m| m.state == MemberState::Dead)));
+    for key in owned_by_c {
+        let owner = nodes[0].owner_of(key).unwrap().id;
+        assert!(owner == "a" || owner == "b");
+        assert_eq!(nodes[1].owner_of(key).unwrap().id, owner);
+    }
+    assert!(!nodes[2].is_running());
+    assert!(!nodes[2].is_owner("k1"));
+}
+
+#[test]
+fn a_graceful_leave_propagates_as_left() {
+    quiet();
+    let net = MemNetwork::new(3);
+    let nodes = start_cluster(&["a", "b", "c"], || net.bind_next());
+    let events = nodes[0].subscribe();
+    assert!(nodes[2].leave(), "leave did not finish spreading");
+    assert!(!nodes[2].is_running());
+    expect_event(
+        &events,
+        Duration::from_secs(5),
+        |e| matches!(e, MembershipEvent::Left(m) if m.id == "c"),
+    );
+    assert!(eventually(Duration::from_secs(5), || nodes[1]
+        .member("c")
+        .is_some_and(|m| m.state == MemberState::Left)));
+    // Well past the failure detection bound: still left, never failed.
+    thread::sleep(Duration::from_millis(500));
+    assert_eq!(nodes[0].member("c").unwrap().state, MemberState::Left);
+    assert!(events
+        .try_iter()
+        .all(|e| !matches!(e, MembershipEvent::Failed(m) if m.id == "c")));
+}
+
+#[test]
+fn a_node_restarted_after_being_declared_dead_rejoins() {
+    quiet();
+    let net = MemNetwork::new(4);
+    let mut nodes = start_cluster(&["a", "b"], || net.bind_next());
+    let b = nodes.pop().unwrap();
+    let addr = b.gossip_addr();
+    let before = b.local_member().incarnation;
+    // Dropping the node stops it and frees its address, like a crash.
+    drop(b);
+    let bound = config("a").failure_detection_bound(2);
+    assert!(eventually(bound + Duration::from_secs(3), || nodes[0]
+        .member("b")
+        .is_some_and(|m| m.state == MemberState::Dead)));
+    let seed = nodes[0].gossip_addr();
+    let b = Node::start(config("b").with_seeds([seed]), net.bind(addr).unwrap()).unwrap();
+    assert!(b.wait_until_joined(Duration::from_secs(5)));
+    assert!(eventually(Duration::from_secs(10), || {
+        nodes[0]
+            .member("b")
+            .is_some_and(|m| m.state == MemberState::Alive && m.incarnation > before)
+    }));
+    assert_eq!(live_ids(&b).len(), 2);
+}
