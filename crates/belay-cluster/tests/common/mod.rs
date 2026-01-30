@@ -46,3 +46,16 @@ impl SimNode {
         self.transport.is_some()
     }
 }
+
+pub struct Sim {
+    pub clock: ManualClock,
+    pub net: MemNetwork,
+    pub nodes: Vec<SimNode>,
+    seed: u64,
+    restarts: u64,
+}
+
+/// Every node is configured with the defaults, as in production.
+pub fn config(id: &NodeId, addr: SocketAddr) -> Config {
+    Config::new(id.clone()).with_advertise(addr)
+}
