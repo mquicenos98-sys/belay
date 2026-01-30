@@ -203,3 +203,56 @@ fn a_node_restarted_after_being_declared_dead_rejoins() {
     }));
     assert_eq!(live_ids(&b).len(), 2);
 }
+
+#[test]
+fn join_contacts_seeds_after_start() {
+    quiet();
+    let net = MemNetwork::new(5);
+    let a = Node::start(config("a"), net.bind_next()).unwrap();
+    let b = Node::start(config("b"), net.bind_next()).unwrap();
+    assert_eq!(b.live_members().len(), 1);
+    b.join(&[a.gossip_addr()]).unwrap();
+    assert!(eventually(Duration::from_secs(5), || a
+        .live_members()
+        .len()
+        == 2
+        && b.live_members().len() == 2));
+    b.shutdown();
+    assert!(b.join(&[a.gossip_addr()]).is_err());
+}
+
+#[test]
+fn nodes_over_udp_on_loopback_form_a_cluster_and_leave() {
+    quiet();
+    let nodes = start_cluster(&["u1", "u2", "u3"], || {
+        UdpTransport::bind("127.0.0.1:0").unwrap()
+    });
+    for n in &nodes {
+        assert_eq!(n.gossip_addr().ip().to_string(), "127.0.0.1");
+        assert!(n.stats().packets_received > 0);
+        assert_eq!(n.stats().packets_rejected, 0);
+    }
+    assert!(nodes[1].leave());
+    assert!(eventually(Duration::from_secs(5), || {
+        [&nodes[0], &nodes[2]]
+            .iter()
+            .all(|n| n.member("u2").is_some_and(|m| m.state == MemberState::Left))
+    }));
+}
+
+#[test]
+fn clusters_with_different_names_ignore_each_other() {
+    quiet();
+    let net = MemNetwork::new(6);
+    let a = Node::start(config("a").with_cluster_name("blue"), net.bind_next()).unwrap();
+    let b = Node::start(
+        config("b")
+            .with_cluster_name("green")
+            .with_seeds([a.gossip_addr()]),
+        net.bind_next(),
+    )
+    .unwrap();
+    assert!(!b.wait_until_joined(Duration::from_millis(500)));
+    assert_eq!(a.live_members().len(), 1);
+    assert!(a.stats().packets_rejected > 0);
+}
