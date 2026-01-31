@@ -246,3 +246,121 @@ fn a_graceful_leave_is_reported_as_left_not_dead() {
         7
     );
 }
+
+#[test]
+fn a_restarted_node_with_a_higher_incarnation_rejoins() {
+    let mut sim = converged_cluster(71, 8);
+    let node = 4;
+    let old = sim.nodes[node].membership.incarnation();
+    sim.kill(node);
+    sim.run_until(secs(120), |s| s.all_see(node, MemberState::Dead))
+        .expect("the crash was not detected");
+    let restarted_at = sim.now();
+    sim.restart(node, old + 10, 1);
+    sim.run_until(secs(30), Sim::converged)
+        .expect("the restarted node did not rejoin");
+    for i in sim.running().filter(|&i| i != node) {
+        assert_eq!(sim.state(i, node), Some(MemberState::Alive));
+        assert_eq!(sim.incarnation(i, node), Some(old + 10));
+        assert!(sim.nodes[i].events.iter().any(|(at, e)| *at >= restarted_at
+            && matches!(e, MembershipEvent::Joined(m) if m.id == sim.nodes[node].id)));
+    }
+    assert_eq!(sim.nodes[node].membership.stats().refutations, 0);
+}
+
+#[test]
+fn a_restarted_node_with_a_stale_incarnation_refutes_what_the_cluster_remembers() {
+    let mut sim = converged_cluster(81, 6);
+    let node = 2;
+    // Make the cluster remember a high incarnation for the node.
+    sim.nodes[node]
+        .membership
+        .update_meta([("zone".to_owned(), "b".to_owned())].into())
+        .unwrap();
+    sim.run_for(secs(5));
+    let remembered = sim.incarnation(0, node).unwrap();
+    assert!(remembered >= 1);
+    sim.kill(node);
+    sim.run_until(secs(120), |s| s.all_see(node, MemberState::Dead))
+        .expect("the crash was not detected");
+    sim.restart(node, 0, 0);
+    sim.run_until(secs(30), Sim::converged)
+        .expect("the restarted node did not rejoin");
+    assert!(sim.nodes[node].membership.incarnation() > remembered);
+    assert!(sim.nodes[node].membership.stats().refutations >= 1);
+    // The restarted node's new (empty) metadata replaced the old record.
+    assert!(sim.nodes[0]
+        .membership
+        .member(sim.nodes[node].id.as_str())
+        .unwrap()
+        .meta
+        .is_empty());
+}
+
+#[test]
+fn a_restart_faster_than_failure_detection_goes_unnoticed() {
+    let mut sim = converged_cluster(91, 6);
+    let node = 3;
+    sim.kill(node);
+    sim.run_for(Duration::from_millis(300));
+    sim.restart(node, 0, 0);
+    sim.run_for(secs(60));
+    assert!(sim.converged());
+    assert!(sim
+        .events_about(node)
+        .iter()
+        .all(|(_, e)| !matches!(e, MembershipEvent::Failed(_))));
+}
+
+#[test]
+fn ownership_is_identical_everywhere_and_moves_minimally_on_join_and_crash() {
+    let mut sim = converged_cluster(101, 10);
+    let keys = keys(4_000);
+    let before = sim.ring(0);
+
+    let newcomer = sim.add_node();
+    sim.run_until(secs(30), Sim::converged)
+        .expect("the newcomer did not join");
+    let after_join = sim.ring(0);
+    let joined = Ownership::diff(&before, &after_join, &keys);
+    let newcomer_id = sim.nodes[newcomer].id.as_str();
+    assert_eq!(joined.gained_by(newcomer_id).count(), joined.moved());
+    let fraction = joined.moved_fraction();
+    assert!(
+        (0.06..=0.12).contains(&fraction),
+        "{fraction} of keys moved to the newcomer"
+    );
+    let reference = sim.owners(0, &keys);
+    for i in sim.running() {
+        assert_eq!(
+            sim.owners(i, &keys),
+            reference,
+            "node {i} disagrees after the join"
+        );
+    }
+
+    let victim = 6;
+    sim.kill(victim);
+    sim.run_until(secs(120), |s| s.all_see(victim, MemberState::Dead))
+        .expect("the crash was not detected");
+    let after_crash = sim.ring(0);
+    let crashed = Ownership::diff(&after_join, &after_crash, &keys);
+    assert_eq!(
+        crashed.lost_by(sim.nodes[victim].id.as_str()).count(),
+        crashed.moved()
+    );
+    let owners: BTreeSet<_> = crashed.gains().into_keys().cloned().collect();
+    assert!(
+        owners.len() >= 8,
+        "orphaned keys went to only {} nodes",
+        owners.len()
+    );
+    let reference = sim.owners(0, &keys);
+    for i in sim.running() {
+        assert_eq!(
+            sim.owners(i, &keys),
+            reference,
+            "node {i} disagrees after the crash"
+        );
+    }
+}
