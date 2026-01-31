@@ -138,3 +138,111 @@ fn duplication_jitter_and_reordering_do_not_disturb_a_healthy_cluster() {
     let stats = sim.net.stats();
     assert!(stats.duplicated > 0 && stats.reordered > 0);
 }
+
+#[test]
+fn a_healed_partition_reunites_the_cluster() {
+    let n = 10;
+    let mut sim = converged_cluster(41, n);
+    let left: Vec<usize> = (0..5).collect();
+    let right: Vec<usize> = (5..n).collect();
+    let addrs = |ids: &[usize]| ids.iter().map(|&i| sim.nodes[i].addr).collect::<Vec<_>>();
+    let (a, b) = (addrs(&left), addrs(&right));
+    sim.net.partition(&a, &b);
+
+    // Each side declares the other side dead...
+    let split = sim.run_until(secs(180), |s| {
+        left.iter().all(|&i| {
+            right
+                .iter()
+                .all(|&j| s.state(i, j) == Some(MemberState::Dead))
+        }) && right.iter().all(|&j| {
+            left.iter()
+                .all(|&i| s.state(j, i) == Some(MemberState::Dead))
+        })
+    });
+    assert!(split.is_some(), "the sides never gave up on each other");
+    // ...but keeps working on its own, with its own owners.
+    for &i in &left {
+        assert_eq!(sim.live_set(i).len(), 5);
+    }
+    let incarnations: Vec<u64> = (0..n).map(|j| sim.incarnation(j, j).unwrap()).collect();
+
+    sim.net.heal();
+    let healed = sim.run_until(secs(180), Sim::converged);
+    assert!(
+        healed.is_some(),
+        "the cluster did not reunite after the partition healed"
+    );
+    // Members came back by refuting their deaths with higher incarnations.
+    let refuted = (0..n)
+        .filter(|&j| sim.incarnation(0, j).unwrap() > incarnations[j])
+        .count();
+    assert!(refuted >= 5, "only {refuted} members refuted");
+    let keys = keys(500);
+    let reference = sim.owners(0, &keys);
+    for i in 1..n {
+        assert_eq!(sim.owners(i, &keys), reference);
+    }
+    // And they stay together.
+    sim.run_for(secs(60));
+    assert!(sim.converged());
+}
+
+#[test]
+fn a_briefly_unreachable_node_refutes_suspicion_and_stays_alive() {
+    let mut sim = converged_cluster(51, 10);
+    let target = 7;
+    let addr = sim.nodes[target].addr;
+    sim.net.isolate(addr);
+    let suspected = sim.run_until(secs(30), |s| {
+        s.running()
+            .any(|i| i != target && s.state(i, target) == Some(MemberState::Suspect))
+    });
+    assert!(
+        suspected.is_some(),
+        "nobody noticed the node was unreachable"
+    );
+    sim.net.heal();
+    sim.run_for(secs(60));
+    assert!(sim
+        .events_about(target)
+        .iter()
+        .all(|(_, e)| !matches!(e, MembershipEvent::Failed(_))));
+    assert!(sim.all_see(target, MemberState::Alive));
+    assert!(sim.nodes[target].membership.incarnation() >= 1);
+    assert!(sim
+        .events_about(target)
+        .iter()
+        .any(|(_, e)| matches!(e, MembershipEvent::Recovered(_))));
+}
+
+#[test]
+fn a_graceful_leave_is_reported_as_left_not_dead() {
+    let mut sim = converged_cluster(61, 8);
+    let leaver = 5;
+    sim.leave(leaver);
+    let took = sim
+        .run_until(secs(10), |s| s.all_see(leaver, MemberState::Left))
+        .expect("the departure did not reach everyone");
+    assert!(took < secs(3), "leaving took {took:?}");
+    // The leaver keeps gossiping until its retransmissions are used up,
+    // which takes a few more gossip rounds than reaching everyone.
+    let stopped = sim.run_until(secs(5), |s| !s.nodes[leaver].is_running());
+    assert!(stopped.is_some(), "the leaver never finished leaving");
+    assert_eq!(sim.nodes[leaver].membership.state(), LocalState::Left);
+    sim.run_for(secs(120));
+    assert!(sim.all_see(leaver, MemberState::Left));
+    assert!(sim.converged());
+    let about = sim.events_about(leaver);
+    assert!(about.iter().all(|(_, e)| !matches!(
+        e,
+        MembershipEvent::Failed(_) | MembershipEvent::Suspected(_)
+    )));
+    assert_eq!(
+        about
+            .iter()
+            .filter(|(_, e)| matches!(e, MembershipEvent::Left(_)))
+            .count(),
+        7
+    );
+}
