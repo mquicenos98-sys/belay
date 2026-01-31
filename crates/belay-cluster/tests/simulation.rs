@@ -364,3 +364,67 @@ fn ownership_is_identical_everywhere_and_moves_minimally_on_join_and_crash() {
         );
     }
 }
+
+#[test]
+fn two_clusters_merge_when_one_joins_the_other() {
+    // Nodes 0-3 form one cluster around node 0, nodes 4-7 another around
+    // node 4.
+    let mut sim = Sim::with_topology(111, 8, |i| match i {
+        0 | 4 => None,
+        1..=3 => Some(0),
+        _ => Some(4),
+    });
+    sim.run_for(secs(20));
+    assert_eq!(sim.live_set(0).len(), 4);
+    assert_eq!(sim.live_set(4).len(), 4);
+    assert!(!sim.converged());
+
+    sim.join(4, 0);
+    sim.run_until(secs(60), Sim::converged)
+        .expect("the clusters did not merge");
+    assert_eq!(sim.live_set(7).len(), 8);
+    assert_eq!(sim.live_set(1).len(), 8);
+}
+
+#[test]
+fn membership_changes_are_logged() {
+    let capture = CaptureLogger::new();
+    capture.scope(|| {
+        let mut sim = converged_cluster(121, 4);
+        sim.kill(2);
+        sim.run_until(secs(120), |s| s.all_see(2, MemberState::Dead))
+            .expect("the crash was not detected");
+        sim.leave(3);
+        sim.run_for(secs(5));
+    });
+    for message in [
+        "joined cluster",
+        "member joined",
+        "member suspected",
+        "member failed",
+        "leaving cluster",
+        "member left",
+        "left cluster",
+    ] {
+        assert!(capture.contains(message), "no {message:?} log");
+    }
+    let failed = capture.find(|r| r.message == "member failed").unwrap();
+    assert_eq!(failed.field("member"), Some("node-02"));
+}
+
+#[test]
+fn simulations_replay_exactly_from_their_seed() {
+    let run = || {
+        let mut sim = converged_cluster(131, 6);
+        sim.net.set_drop_rate(0.05);
+        sim.kill(1);
+        sim.run_for(secs(60));
+        sim.nodes
+            .iter()
+            .flat_map(|n| n.events.iter().map(|(at, e)| format!("{at} {e}")))
+            .collect::<Vec<_>>()
+    };
+    let first = run();
+    assert!(first.len() > 30);
+    assert_eq!(first, run());
+}
