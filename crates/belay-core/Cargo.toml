@@ -1,0 +1,26 @@
+[package]
+name = "belay-core"
+description = "The belay engine: configuration, storage, queue, scheduler, workflows, events, metrics and clustering composed into one embeddable Engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "belay_core"
+path = "src/lib.rs"
+
+[dependencies]
+belay-common = { path = "../belay-common" }
+belay-json = { path = "../belay-json" }
+belay-conf = { path = "../belay-conf" }
+belay-cron = { path = "../belay-cron" }
+belay-metrics = { path = "../belay-metrics" }
+belay-proto = { path = "../belay-proto" }
+belay-store = { path = "../belay-store" }
+belay-queue = { path = "../belay-queue" }
+belay-scheduler = { path = "../belay-scheduler" }
+belay-cluster = { path = "../belay-cluster" }
+belay-worker = { path = "../belay-worker" }
