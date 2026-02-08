@@ -94,3 +94,185 @@ use read::located;
 
 /// The environment variable prefix: `BELAY_SERVER__LISTEN`.
 pub const ENV_PREFIX: &str = "BELAY";
+
+/// A complete belay configuration. See the [module docs](self).
+///
+/// `Config::default()` is what an empty file gives: a server on
+/// `127.0.0.1:7700` without authentication, storing data under
+/// `./belay-data`. [`Config::dev`] keeps everything in memory instead.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Config {
+    /// `[server]`.
+    pub server: ServerConfig,
+    /// `[storage]`.
+    pub storage: StorageConfig,
+    /// `[auth]`.
+    pub auth: AuthConfig,
+    /// `[log]`.
+    pub log: LogConfig,
+    /// `[engine]`.
+    pub engine: EngineConfig,
+    /// `[queues.<name>]`: configurations applied at startup.
+    pub queues: BTreeMap<QueueName, QueueConfig>,
+    /// `[scheduler]`.
+    pub scheduler: SchedulerConfig,
+    /// `[[schedules]]`: created or updated at startup.
+    pub schedules: Vec<ScheduleSpec>,
+    /// `[[calendars]]`: created or updated at startup.
+    pub calendars: Vec<CalendarSpec>,
+    /// `[workflows]`.
+    pub workflows: WorkflowsConfig,
+    /// `[events]`.
+    pub events: EventsConfig,
+    /// `[cluster]`.
+    pub cluster: ClusterConfig,
+    /// `[metrics]`.
+    pub metrics: MetricsConfig,
+    warnings: Vec<UnusedKey>,
+}
+
+impl Default for Config {
+    fn default() -> Config {
+        Config {
+            server: ServerConfig::default(),
+            storage: StorageConfig::default(),
+            auth: AuthConfig::default(),
+            log: LogConfig::default(),
+            engine: EngineConfig::default(),
+            queues: BTreeMap::new(),
+            scheduler: SchedulerConfig::default(),
+            schedules: Vec::new(),
+            calendars: Vec::new(),
+            workflows: WorkflowsConfig::default(),
+            events: EventsConfig::default(),
+            cluster: ClusterConfig::default(),
+            metrics: MetricsConfig::default(),
+            warnings: Vec::new(),
+        }
+    }
+}
+
+impl Config {
+    /// The defaults with in-memory storage: what `belay dev` runs with.
+    #[must_use]
+    pub fn dev() -> Config {
+        let mut config = Config::default();
+        config.storage.in_memory = true;
+        config
+    }
+
+    /// Parses configuration text, without applying the environment.
+    #[allow(clippy::should_implement_trait)]
+    pub fn from_str(src: &str) -> Result<Config, ConfigError> {
+        Config::from_document(&Document::parse(src)?)
+    }
+
+    /// Parses configuration text named `name` (a file name) in
+    /// diagnostics, without applying the environment.
+    pub fn from_source(name: &str, src: &str) -> Result<Config, ConfigError> {
+        Config::from_document(&Document::parse_named(name, src)?)
+    }
+
+    /// Reads a configuration file, without applying the environment.
+    pub fn from_file(path: impl AsRef<Path>) -> Result<Config, ConfigError> {
+        Config::from_document(&Document::from_file(path)?)
+    }
+
+    /// What the server loads: the file at `path` (defaults if `None`) with
+    /// `BELAY_...` variables from the process environment applied.
+    pub fn load(path: Option<&Path>) -> Result<Config, ConfigError> {
+        let mut doc = match path {
+            Some(path) => Document::from_file(path)?,
+            None => Document::new(),
+        };
+        Overlay::new(ENV_PREFIX).apply_env(&mut doc)?;
+        Config::from_document(&doc)
+    }
+
+    /// Like [`load`](Self::load) with explicit variables instead of the
+    /// process environment.
+    pub fn from_source_with_env<I, K, V>(
+        name: &str,
+        src: &str,
+        vars: I,
+    ) -> Result<Config, ConfigError>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<str>,
+        V: AsRef<str>,
+    {
+        let mut doc = Document::parse_named(name, src)?;
+        Overlay::new(ENV_PREFIX).apply(&mut doc, vars)?;
+        Config::from_document(&doc)
+    }
+
+    /// Reads a parsed (and possibly overlaid) document.
+    pub fn from_document(doc: &Document) -> Result<Config, ConfigError> {
+        let r = Reader::new(doc);
+        let server = ServerConfig::read(&r)?;
+        let auth = AuthConfig::read(&r)?;
+        if !auth.disabled && auth.tokens.is_empty() && !server.is_loopback() {
+            return Err(r.invalid(
+                "server.listen",
+                format!(
+                    "{} accepts connections from other hosts, but no [[auth.tokens]] are \
+                     configured; add a token, or set auth.disabled = true to serve without \
+                     authentication",
+                    server.listen
+                ),
+            ));
+        }
+        let cluster = ClusterConfig::read(&r, &server)?;
+        let config = Config {
+            storage: StorageConfig::read(&r)?,
+            log: LogConfig::read(&r)?,
+            engine: EngineConfig::read(&r)?,
+            queues: read_queues(&r)?,
+            scheduler: SchedulerConfig::read(&r)?,
+            calendars: read_calendars(&r)?,
+            schedules: read_schedules(&r)?,
+            workflows: WorkflowsConfig::read(&r)?,
+            events: EventsConfig::read(&r)?,
+            metrics: MetricsConfig::read(&r)?,
+            server,
+            auth,
+            cluster,
+            warnings: Vec::new(),
+        };
+        Ok(Config {
+            warnings: r.unused_keys(),
+            ..config
+        })
+    }
+
+    /// Keys in the source that nothing reads, most likely typos. `Display`
+    /// renders each as a warning with its location and a suggestion.
+    #[must_use]
+    pub fn warnings(&self) -> &[UnusedKey] {
+        &self.warnings
+    }
+
+    /// A commented example configuration covering every section, as
+    /// printed by `belay config default`. It parses into a valid
+    /// configuration, as do the optional settings it shows commented out.
+    #[must_use]
+    pub fn example_toml() -> &'static str {
+        example::EXAMPLE
+    }
+
+    /// The configuration as TOML, defaults included, for
+    /// `belay config print`. Token secrets are printed as `token_sha256`.
+    /// Parsing the text gives back an equal configuration.
+    #[must_use]
+    pub fn to_toml(&self) -> String {
+        belay_conf::to_string(&print::to_table(self))
+    }
+}
+
+impl FromStr for Config {
+    type Err = ConfigError;
+
+    fn from_str(src: &str) -> Result<Config, ConfigError> {
+        Config::from_document(&Document::parse(src)?)
+    }
+}
