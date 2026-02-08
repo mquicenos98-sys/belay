@@ -66,13 +66,9 @@
 //! by [`ConfigError`]'s `Display`.
 
 mod auth;
-
 mod example;
-
 mod print;
-
 pub(crate) mod read;
-
 mod sections;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -275,4 +271,66 @@ impl FromStr for Config {
     fn from_str(src: &str) -> Result<Config, ConfigError> {
         Config::from_document(&Document::parse(src)?)
     }
+}
+
+fn read_queues(r: &Reader<'_>) -> Result<BTreeMap<QueueName, QueueConfig>, ConfigError> {
+    let mut queues = BTreeMap::new();
+    for (name, _) in r.tables("queues")? {
+        let path = KeyPath::root().key("queues").key(&name);
+        let queue = QueueName::new(name.as_str()).map_err(|e| located(r, &path, e.to_string()))?;
+        let config = read::domain::<QueueConfig>(r, &path.to_string())?
+            .expect("tables() only lists present entries");
+        queues.insert(queue, config);
+    }
+    Ok(queues)
+}
+
+fn read_calendars(r: &Reader<'_>) -> Result<Vec<CalendarSpec>, ConfigError> {
+    let mut calendars: Vec<CalendarSpec> = Vec::new();
+    let mut names = BTreeSet::new();
+    for (i, _) in r.array_of_tables("calendars")?.iter().enumerate() {
+        let path = KeyPath::root().key("calendars").index(i);
+        let spec = read::domain::<CalendarSpec>(r, &path.to_string())?
+            .expect("array_of_tables() only lists present elements");
+        if let Err(e) = Tz::parse(&spec.timezone) {
+            return Err(located(r, &path.key("timezone"), e.to_string()));
+        }
+        if !names.insert(spec.name.clone()) {
+            return Err(located(
+                r,
+                &path.key("name"),
+                format!("calendar {:?} is defined twice", spec.name),
+            ));
+        }
+        calendars.push(spec);
+    }
+    Ok(calendars)
+}
+
+fn read_schedules(r: &Reader<'_>) -> Result<Vec<ScheduleSpec>, ConfigError> {
+    let mut schedules: Vec<ScheduleSpec> = Vec::new();
+    let mut ids = BTreeSet::new();
+    for (i, _) in r.array_of_tables("schedules")?.iter().enumerate() {
+        let path = KeyPath::root().key("schedules").index(i);
+        let spec = read::domain::<ScheduleSpec>(r, &path.to_string())?
+            .expect("array_of_tables() only lists present elements");
+        // The spec's own validation checks the shape of the expression;
+        // parsing it here reports field-level problems at load time
+        // instead of when the engine starts.
+        if let Err(e) = CronExpr::parse(&spec.cron) {
+            return Err(located(r, &path.key("cron"), e.to_string()));
+        }
+        if let Err(e) = Tz::parse(&spec.timezone) {
+            return Err(located(r, &path.key("timezone"), e.to_string()));
+        }
+        if !ids.insert(spec.id.clone()) {
+            return Err(located(
+                r,
+                &path.key("id"),
+                format!("schedule {} is defined twice", spec.id),
+            ));
+        }
+        schedules.push(spec);
+    }
+    Ok(schedules)
 }
