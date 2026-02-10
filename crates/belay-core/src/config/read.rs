@@ -43,3 +43,61 @@ pub(crate) fn bytes(r: &Reader<'_>, path: &str, default: u64) -> Result<u64> {
     })?;
     Ok(value.unwrap_or(default))
 }
+
+/// Reads the whole table (or array) at `path` as a domain object, decoded
+/// by its JSON form and validated. `None` if absent.
+pub(crate) fn domain<T>(r: &Reader<'_>, path: &str) -> Result<Option<T>>
+where
+    T: FromJson + Validate,
+{
+    let Some(value) = r.value(path)? else {
+        return Ok(None);
+    };
+    let base = KeyPath::parse(path)?;
+    let json = to_json(value).map_err(|(at, message)| located(r, &base.join(&at), message))?;
+    let decoded = T::from_json(&json).map_err(|e| from_json_error(r, &base, &e))?;
+    if let Err(violations) = decoded.validate() {
+        let first = violations.first();
+        let at = pointer_path(&first.pointer());
+        let mut message = first.message().to_owned();
+        if violations.len() > 1 {
+            let more = violations.len() - 1;
+            message.push_str(&format!(
+                " (and {more} more problem{})",
+                if more == 1 { "" } else { "s" }
+            ));
+        }
+        return Err(located(r, &base.join(&at), message));
+    }
+    Ok(Some(decoded))
+}
+
+/// An error located at `path` (relative to `r`).
+pub(crate) fn located(
+    r: &Reader<'_>,
+    path: &KeyPath,
+    message: impl Into<String>,
+) -> belay_conf::Error {
+    r.invalid(&path.to_string(), message)
+}
+
+fn from_json_error(r: &Reader<'_>, base: &KeyPath, e: &FromJsonError) -> belay_conf::Error {
+    let mut at = base.clone();
+    for segment in e.path() {
+        at = match segment {
+            PathSegment::Key(k) => at.key(k),
+            PathSegment::Index(i) => at.index(*i),
+        };
+    }
+    // An unknown field is reported against its object; point at the key
+    // itself, which is the line the user has to fix.
+    let unknown = e
+        .message()
+        .strip_prefix("unknown field \"")
+        .and_then(|rest| rest.split_once('"'))
+        .map(|(field, _)| field);
+    if let Some(field) = unknown {
+        at = at.key(field);
+    }
+    located(r, &at, e.message())
+}
