@@ -101,3 +101,49 @@ fn from_json_error(r: &Reader<'_>, base: &KeyPath, e: &FromJsonError) -> belay_c
     }
     located(r, &at, e.message())
 }
+
+/// Converts an RFC 6901 pointer (`/steps/1/depends_on/0`) into a key path.
+/// All-digit tokens are taken as array indices, which is what they are in
+/// every structure read here.
+fn pointer_path(pointer: &str) -> KeyPath {
+    let mut path = KeyPath::root();
+    for token in pointer.split('/').skip(1) {
+        let token = token.replace("~1", "/").replace("~0", "~");
+        path = match token.parse::<usize>() {
+            Ok(i) if token.bytes().all(|b| b.is_ascii_digit()) => path.index(i),
+            _ => path.key(&token),
+        };
+    }
+    path
+}
+
+/// Converts TOML to JSON. Date-times become strings, which is how the
+/// JSON forms spell timestamps. Fails, with the path of the value, only for
+/// floats JSON cannot represent (`inf`, `nan`).
+pub(crate) fn to_json(value: &Value) -> std::result::Result<belay_json::Value, (KeyPath, String)> {
+    Ok(match value {
+        Value::String(s) | Value::Datetime(s) => belay_json::Value::String(s.clone()),
+        Value::Integer(i) => belay_json::Value::Number(Number::from(*i)),
+        Value::Float(f) => match Number::from_f64(*f) {
+            Some(n) => belay_json::Value::Number(n),
+            None => return Err((KeyPath::root(), format!("{f} cannot be represented here"))),
+        },
+        Value::Boolean(b) => belay_json::Value::Bool(*b),
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for (i, item) in items.iter().enumerate() {
+                out.push(to_json(item).map_err(|(at, m)| (prefixed(Segment::Index(i), &at), m))?);
+            }
+            belay_json::Value::Array(out)
+        }
+        Value::Table(table) => {
+            let mut map = Map::with_capacity(table.len());
+            for (key, item) in table {
+                let converted = to_json(item)
+                    .map_err(|(at, m)| (prefixed(Segment::Key(key.to_owned()), &at), m))?;
+                map.insert(key, converted);
+            }
+            belay_json::Value::Object(map)
+        }
+    })
+}
