@@ -106,3 +106,166 @@ impl Driving {
         })
     }
 }
+
+impl Drop for Driving {
+    fn drop(&mut self) {
+        DRIVING.with(|d| d.borrow_mut().retain(|x| *x != self.id));
+    }
+}
+
+/// Feeds finished jobs to the workflow engine without re-entering it; see
+/// the module docs.
+pub(crate) struct WorkflowDriver {
+    id: usize,
+    workflows: Arc<WorkflowEngine>,
+    pending: Mutex<VecDeque<Job>>,
+}
+
+impl fmt::Debug for WorkflowDriver {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WorkflowDriver")
+            .field("pending", &self.pending())
+            .finish_non_exhaustive()
+    }
+}
+
+impl WorkflowDriver {
+    pub(crate) fn new(workflows: Arc<WorkflowEngine>) -> WorkflowDriver {
+        WorkflowDriver {
+            id: NEXT_DRIVER_ID.fetch_add(1, Ordering::Relaxed),
+            workflows,
+            pending: Mutex::new(VecDeque::new()),
+        }
+    }
+
+    pub(crate) fn engine(&self) -> &WorkflowEngine {
+        &self.workflows
+    }
+
+    /// Runs `f` on the workflow engine, then hands it any jobs that
+    /// finished meanwhile.
+    pub(crate) fn call<R>(&self, f: impl FnOnce(&WorkflowEngine) -> R) -> R {
+        let out = {
+            let _busy = Driving::enter(self.id);
+            f(&self.workflows)
+        };
+        self.drain();
+        out
+    }
+
+    /// The queue's `on_finished` hook.
+    pub(crate) fn job_finished(&self, job: &Job) {
+        if job.spec.workflow.is_none() {
+            return;
+        }
+        lock(&self.pending).push_back(job.clone());
+        self.drain();
+    }
+
+    /// Reports queued jobs to the workflow engine, unless a call into it
+    /// is in progress on this thread (that call drains when it returns).
+    fn drain(&self) {
+        let Some(_busy) = Driving::enter(self.id) else {
+            return;
+        };
+        loop {
+            let Some(job) = lock(&self.pending).pop_front() else {
+                return;
+            };
+            if let Err(e) = self.workflows.on_job_finished(&job) {
+                warn!("advancing a workflow failed; the periodic sweep will retry";
+                    job = %job.id, error = %e);
+            }
+        }
+    }
+
+    /// Jobs waiting to be reported.
+    pub(crate) fn pending(&self) -> usize {
+        lock(&self.pending).len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_common::{ManualClock, Timestamp};
+    use belay_proto::source::NoopSink;
+    use belay_proto::workflow::{StepSpec, WorkflowState};
+    use belay_proto::{UniqueScope, WorkflowSpec};
+    use belay_queue::EngineOptions;
+    use belay_store::MemKv;
+
+    fn queue() -> Arc<QueueEngine> {
+        let clock = ManualClock::new(Timestamp::from_secs(1_700_000_000));
+        Arc::new(
+            QueueEngine::open(
+                Arc::new(MemKv::new()),
+                clock.shared(),
+                NoopSink::shared(),
+                EngineOptions::new().seed(1),
+            )
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn repeated_unique_dispatches_come_back_as_duplicates() {
+        let d = QueueDispatcher::new(queue());
+        let spec = JobSpec::new("q", "k").unique("sched:x:1", UniqueScope::UntilFinished);
+        let first = d.dispatch(&spec).unwrap();
+        let again = d.dispatch(&spec).unwrap();
+        assert!(!first.duplicate);
+        assert_eq!((again.id, again.duplicate), (first.id, true));
+        assert_eq!(d.job_state(&first.id), Some(JobState::Ready));
+        assert_eq!(d.job(&first.id).map(|j| j.id), Some(first.id));
+    }
+
+    #[test]
+    fn cancelling_finished_or_missing_jobs_is_not_an_error() {
+        let d = QueueDispatcher::new(queue());
+        let id = d.dispatch(&JobSpec::new("q", "k")).unwrap().id;
+        d.cancel(&id).unwrap();
+        assert_eq!(d.job_state(&id), Some(JobState::Cancelled));
+        d.cancel(&id).unwrap();
+        d.cancel(&JobId::generate()).unwrap();
+    }
+
+    #[test]
+    fn invalid_specs_are_rejected_not_retried() {
+        let d = QueueDispatcher::new(queue());
+        let err = d
+            .dispatch(&JobSpec::new("q", "k").priority(5000))
+            .unwrap_err();
+        assert!(!err.is_transient(), "{err}");
+    }
+
+    // Regression: cancelling a workflow cancelled its ready step jobs,
+    // whose finished hook re-entered the workflow engine and deadlocked.
+    #[test]
+    fn jobs_finished_during_a_workflow_call_are_reported_after_it() {
+        let q = queue();
+        let clock = ManualClock::new(Timestamp::from_secs(1_700_000_000));
+        let workflows = Arc::new(
+            WorkflowEngine::open(
+                Arc::new(MemKv::new()),
+                clock.shared(),
+                Arc::new(QueueDispatcher::new(Arc::clone(&q))),
+                NoopSink::shared(),
+            )
+            .unwrap(),
+        );
+        let driver = Arc::new(WorkflowDriver::new(workflows));
+        let hook = Arc::downgrade(&driver);
+        q.on_finished(move |job| {
+            if let Some(driver) = hook.upgrade() {
+                driver.job_finished(job);
+            }
+        });
+        let spec =
+            WorkflowSpec::new("one-step").step(StepSpec::new("only", JobSpec::new("q", "k")));
+        let run = driver.call(|w| w.submit(spec)).unwrap();
+        let cancelled = driver.call(|w| w.cancel(run.id)).unwrap();
+        assert_eq!(cancelled.state, WorkflowState::Cancelled);
+        assert_eq!(driver.pending(), 0);
+    }
+}
