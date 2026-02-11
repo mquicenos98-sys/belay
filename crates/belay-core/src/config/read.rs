@@ -147,3 +147,129 @@ pub(crate) fn to_json(value: &Value) -> std::result::Result<belay_json::Value, (
         }
     })
 }
+
+fn prefixed(first: Segment, rest: &KeyPath) -> KeyPath {
+    let head = match first {
+        Segment::Key(k) => KeyPath::root().key(&k),
+        Segment::Index(i) => KeyPath::root().index(i),
+    };
+    head.join(rest)
+}
+
+/// Converts JSON back to TOML, for printing an effective configuration.
+/// `null` members are dropped (TOML has no null), which matches how the
+/// JSON forms treat absent optional fields.
+pub(crate) fn from_json(value: &belay_json::Value) -> Option<Value> {
+    Some(match value {
+        belay_json::Value::Null => return None,
+        belay_json::Value::Bool(b) => Value::Boolean(*b),
+        belay_json::Value::Number(n) => match n.as_i64() {
+            Some(i) => Value::Integer(i),
+            None => Value::Float(n.as_f64()),
+        },
+        belay_json::Value::String(s) => Value::String(s.clone()),
+        belay_json::Value::Array(items) => {
+            Value::Array(items.iter().filter_map(from_json).collect())
+        }
+        belay_json::Value::Object(map) => {
+            let mut table = belay_conf::Table::new();
+            for (key, item) in map.iter() {
+                if let Some(v) = from_json(item) {
+                    table.insert(key, v);
+                }
+            }
+            Value::Table(table)
+        }
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_conf::Document;
+    use belay_proto::QueueConfig;
+
+    #[test]
+    fn durations_accept_text_and_whole_seconds() {
+        let doc = Document::parse("a = '1m30s'\nb = 45\nc = -1\nd = true\ne = 'soon'").unwrap();
+        let r = Reader::new(&doc);
+        let d = Duration::from_secs(7);
+        assert_eq!(duration(&r, "a", d).unwrap(), Duration::from_secs(90));
+        assert_eq!(duration(&r, "b", d).unwrap(), Duration::from_secs(45));
+        assert_eq!(duration(&r, "missing", d).unwrap(), d);
+        assert_eq!(
+            duration(&r, "c", d).unwrap_err().message(),
+            "invalid value for c: must not be negative, got -1"
+        );
+        assert_eq!(
+            duration(&r, "d", d).unwrap_err().message(),
+            "expected duration at d, found boolean"
+        );
+        assert!(duration(&r, "e", d)
+            .unwrap_err()
+            .message()
+            .starts_with("invalid value for e"));
+    }
+
+    #[test]
+    fn byte_sizes_accept_units() {
+        let doc = Document::parse("a = '64MiB'\nb = 4096\nc = 'lots'").unwrap();
+        let r = Reader::new(&doc);
+        assert_eq!(bytes(&r, "a", 0).unwrap(), 64 << 20);
+        assert_eq!(bytes(&r, "b", 0).unwrap(), 4096);
+        assert_eq!(bytes(&r, "z", 9).unwrap(), 9);
+        assert_eq!(bytes(&r, "c", 0).unwrap_err().line_col(), Some((3, 5)));
+    }
+
+    #[test]
+    fn domain_errors_point_at_the_nested_value() {
+        let src = "[q]\nmax_concurrency = 4\n[q.retention]\ndead = 'forever'\n";
+        let doc = Document::parse(src).unwrap();
+        let err = domain::<QueueConfig>(&Reader::new(&doc), "q").unwrap_err();
+        assert!(
+            err.message()
+                .starts_with("invalid value for q.retention.dead:"),
+            "{}",
+            err.message()
+        );
+        assert_eq!(err.line_col(), Some((4, 8)));
+
+        let doc = Document::parse("[q]\nmax_concurrency = 0\n").unwrap();
+        let err = domain::<QueueConfig>(&Reader::new(&doc), "q").unwrap_err();
+        assert_eq!(
+            err.message(),
+            "invalid value for q.max_concurrency: must be at least 1; omit it for no limit"
+        );
+        assert_eq!(err.line_col(), Some((2, 19)));
+    }
+
+    #[test]
+    fn pointers_become_key_paths() {
+        assert_eq!(
+            pointer_path("/steps/1/depends_on/0").to_string(),
+            "steps[1].depends_on[0]"
+        );
+        assert_eq!(pointer_path("/meta/a~1b").to_string(), "meta.\"a/b\"");
+        assert!(pointer_path("").is_root());
+    }
+
+    #[test]
+    fn json_and_toml_convert_both_ways() {
+        let doc =
+            Document::parse("[t]\na = [1, 2.5, 'x']\nb = { c = true }\nd = 2025-01-02T03:04:05Z\n")
+                .unwrap();
+        let t = doc.get("t").unwrap();
+        let json = to_json(t).unwrap();
+        assert_eq!(
+            json.to_string(),
+            r#"{"a":[1,2.5,"x"],"b":{"c":true},"d":"2025-01-02T03:04:05Z"}"#
+        );
+        let back = from_json(&json).unwrap();
+        assert_eq!(
+            back.as_table().unwrap().get("b"),
+            t.as_table().unwrap().get("b")
+        );
+        let err = to_json(&belay_conf::parse_value("[1, inf]").unwrap()).unwrap_err();
+        assert_eq!(err.0.to_string(), "[1]");
+    }
+}
