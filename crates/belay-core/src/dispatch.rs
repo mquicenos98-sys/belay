@@ -106,3 +106,17 @@ impl Driving {
         })
     }
 }
+
+impl Drop for Driving {
+    fn drop(&mut self) {
+        DRIVING.with(|d| d.borrow_mut().retain(|x| *x != self.id));
+    }
+}
+
+/// Feeds finished jobs to the workflow engine without re-entering it; see
+/// the module docs.
+pub(crate) struct WorkflowDriver {
+    id: usize,
+    workflows: Arc<WorkflowEngine>,
+    pending: Mutex<VecDeque<Job>>,
+}
