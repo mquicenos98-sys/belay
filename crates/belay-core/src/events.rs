@@ -71,3 +71,39 @@ pub enum Delivery {
         missed: u64,
     },
 }
+
+/// Why [`Subscription::recv_timeout`] returned without a delivery.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecvError {
+    /// Nothing arrived in time.
+    Timeout,
+    /// The bus was closed (the engine is shutting down) and everything
+    /// queued has been delivered.
+    Closed,
+}
+
+impl fmt::Display for RecvError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            RecvError::Timeout => "no event arrived in time",
+            RecvError::Closed => "the event bus is closed",
+        })
+    }
+}
+
+impl std::error::Error for RecvError {}
+
+/// Counters describing a bus.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BusStats {
+    /// Events published since the bus was created.
+    pub published: u64,
+    /// Sequence number the next event will get.
+    pub next_seq: u64,
+    /// Events in the replay buffer.
+    pub buffered: usize,
+    /// Subscriptions alive.
+    pub subscribers: usize,
+    /// `Lagged` markers delivered.
+    pub lagged: u64,
+}
