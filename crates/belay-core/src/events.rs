@@ -107,3 +107,242 @@ pub struct BusStats {
     /// `Lagged` markers delivered.
     pub lagged: u64,
 }
+
+type Observer = Arc<dyn Fn(&Event) + Send + Sync>;
+
+/// A sequence-numbered event stream with replay. Clones share the bus.
+///
+/// ```
+/// use std::time::Duration;
+/// use belay_common::{ManualClock, Timestamp};
+/// use belay_core::events::{Delivery, EventBus};
+/// use belay_proto::event::{EventFilter, EventKind};
+/// use belay_proto::{EventSink, QueueName};
+///
+/// let bus = EventBus::new(ManualClock::new(Timestamp::from_secs(1)).shared());
+/// bus.emit(EventKind::QueuePaused { queue: QueueName::from_static("a") });
+/// let sub = bus.subscribe(EventFilter::new()); // replays from the oldest event
+/// bus.emit(EventKind::QueueResumed { queue: QueueName::from_static("a") });
+///
+/// let first = sub.recv_timeout(Duration::from_millis(10)).unwrap();
+/// let Delivery::Event(first) = first else { panic!("expected an event") };
+/// assert_eq!((first.seq, first.type_name()), (1, "queue.paused"));
+/// let Ok(Delivery::Event(second)) = sub.recv_timeout(Duration::from_millis(10)) else { panic!() };
+/// assert_eq!(second.seq, 2);
+/// ```
+#[derive(Clone)]
+pub struct EventBus {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    clock: SharedClock,
+    capacity: usize,
+    subscriber_queue: usize,
+    state: Mutex<State>,
+    observers: RwLock<Vec<Observer>>,
+    lagged: AtomicU64,
+}
+
+struct State {
+    next_seq: u64,
+    published: u64,
+    buffer: VecDeque<Event>,
+    subscribers: Vec<Weak<Slot>>,
+    closed: bool,
+}
+
+impl State {
+    fn oldest_seq(&self) -> u64 {
+        self.buffer.front().map_or(self.next_seq, |e| e.seq)
+    }
+}
+
+/// One subscriber's side of the bus.
+struct Slot {
+    filter: EventFilter,
+    queue: Mutex<SlotState>,
+    ready: Condvar,
+}
+
+struct SlotState {
+    items: VecDeque<Event>,
+    mode: Mode,
+    closed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Mode {
+    /// Receiving pushes from `emit`.
+    Live,
+    /// Not receiving pushes; the next event to read from the buffer is the
+    /// first matching one at or after `cursor`.
+    Behind { cursor: u64 },
+}
+
+impl fmt::Debug for EventBus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EventBus")
+            .field("stats", &self.stats())
+            .finish_non_exhaustive()
+    }
+}
+
+impl EventBus {
+    /// A bus with default sizing, numbering events from 1.
+    #[must_use]
+    pub fn new(clock: SharedClock) -> EventBus {
+        EventBus::with_options(clock, BusOptions::default())
+    }
+
+    /// A bus with explicit sizing.
+    #[must_use]
+    pub fn with_options(clock: SharedClock, options: BusOptions) -> EventBus {
+        let capacity = options.capacity.max(1);
+        EventBus {
+            inner: Arc::new(Inner {
+                clock,
+                capacity,
+                subscriber_queue: options.subscriber_queue.max(1),
+                state: Mutex::new(State {
+                    next_seq: options.first_seq,
+                    published: 0,
+                    buffer: VecDeque::with_capacity(capacity.min(4096)),
+                    subscribers: Vec::new(),
+                    closed: false,
+                }),
+                observers: RwLock::new(Vec::new()),
+                lagged: AtomicU64::new(0),
+            }),
+        }
+    }
+
+    /// Calls `f` with every event from now on, as it is published and
+    /// under the bus lock, so `f` must be quick and must not publish.
+    pub fn on_event<F>(&self, f: F)
+    where
+        F: Fn(&Event) + Send + Sync + 'static,
+    {
+        write(&self.inner.observers).push(Arc::new(f));
+    }
+
+    /// Stamps `kind` with the next sequence number and the current time,
+    /// buffers it and hands it to subscribers. Returns the sequence number.
+    pub fn publish(&self, kind: EventKind) -> u64 {
+        let inner = &*self.inner;
+        let mut st = lock(&inner.state);
+        let event = Event {
+            seq: st.next_seq,
+            at: inner.clock.now(),
+            kind,
+        };
+        st.next_seq += 1;
+        st.published += 1;
+        for observer in read(&inner.observers).iter() {
+            observer(&event);
+        }
+        if st.buffer.len() == inner.capacity {
+            st.buffer.pop_front();
+        }
+        st.subscribers.retain(|w| w.strong_count() > 0);
+        for slot in st.subscribers.iter().filter_map(Weak::upgrade) {
+            slot.offer(&event, inner.subscriber_queue);
+        }
+        let seq = event.seq;
+        st.buffer.push_back(event);
+        seq
+    }
+
+    /// Subscribes to events matching `filter`, starting at `filter.from`:
+    /// buffered events from there are replayed first. Without `from`,
+    /// replay starts at the oldest buffered event; use
+    /// [`subscribe_live`](Self::subscribe_live) for new events only. A
+    /// `from` beyond the next sequence number starts with the next event.
+    #[must_use]
+    pub fn subscribe(&self, filter: EventFilter) -> Subscription {
+        let mut st = lock(&self.inner.state);
+        let next = st.next_seq;
+        let cursor = filter.from.unwrap_or(0).max(st.oldest_seq());
+        let mode = if cursor >= next {
+            Mode::Live
+        } else {
+            Mode::Behind { cursor }
+        };
+        let slot = Arc::new(Slot {
+            filter: EventFilter {
+                from: None,
+                ..filter
+            },
+            queue: Mutex::new(SlotState {
+                items: VecDeque::new(),
+                mode,
+                closed: st.closed,
+            }),
+            ready: Condvar::new(),
+        });
+        st.subscribers.push(Arc::downgrade(&slot));
+        Subscription {
+            bus: Arc::clone(&self.inner),
+            slot,
+        }
+    }
+
+    /// Subscribes to events published from now on.
+    #[must_use]
+    pub fn subscribe_live(&self, filter: EventFilter) -> Subscription {
+        let next = self.next_seq();
+        self.subscribe(EventFilter {
+            from: Some(next),
+            ..filter
+        })
+    }
+
+    /// The sequence number the next event will get.
+    #[must_use]
+    pub fn next_seq(&self) -> u64 {
+        lock(&self.inner.state).next_seq
+    }
+
+    /// A copy of the buffered events at or after `from`, oldest first.
+    #[must_use]
+    pub fn replay(&self, from: u64) -> Vec<Event> {
+        let st = lock(&self.inner.state);
+        let skip = from.saturating_sub(st.oldest_seq()) as usize;
+        st.buffer.iter().skip(skip).cloned().collect()
+    }
+
+    /// Wakes every subscriber: once they have read what is queued for
+    /// them, they get [`RecvError::Closed`]. Events published afterwards
+    /// are still numbered and buffered, but no subscription sees them.
+    pub fn close(&self) {
+        let mut st = lock(&self.inner.state);
+        st.closed = true;
+        for slot in st.subscribers.drain(..).filter_map(|w| w.upgrade()) {
+            lock(&slot.queue).closed = true;
+            slot.ready.notify_all();
+        }
+    }
+
+    /// Whether [`close`](Self::close) was called.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        lock(&self.inner.state).closed
+    }
+
+    /// Current counters.
+    #[must_use]
+    pub fn stats(&self) -> BusStats {
+        let st = lock(&self.inner.state);
+        BusStats {
+            published: st.published,
+            next_seq: st.next_seq,
+            buffered: st.buffer.len(),
+            subscribers: st
+                .subscribers
+                .iter()
+                .filter(|w| w.strong_count() > 0)
+                .count(),
+            lagged: self.inner.lagged.load(Ordering::Relaxed),
+        }
+    }
+}
