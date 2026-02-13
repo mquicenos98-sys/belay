@@ -346,3 +346,49 @@ impl EventBus {
         }
     }
 }
+
+impl EventSink for EventBus {
+    fn emit(&self, kind: EventKind) {
+        self.publish(kind);
+    }
+}
+
+impl Slot {
+    /// Queues `event` if the subscriber is live, wants it and has room;
+    /// otherwise a full queue switches the subscriber to catching up from
+    /// the buffer, starting with this event.
+    fn offer(&self, event: &Event, room: usize) {
+        if !self.filter.matches_kind(&event.kind) {
+            return;
+        }
+        let mut s = lock(&self.queue);
+        if s.mode != Mode::Live {
+            return;
+        }
+        if s.items.len() < room {
+            s.items.push_back(event.clone());
+            drop(s);
+            self.ready.notify_one();
+        } else {
+            s.mode = Mode::Behind { cursor: event.seq };
+        }
+    }
+}
+
+/// A subscriber's handle, returned by [`EventBus::subscribe`]. Dropping it
+/// unsubscribes.
+pub struct Subscription {
+    bus: Arc<Inner>,
+    slot: Arc<Slot>,
+}
+
+impl fmt::Debug for Subscription {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = lock(&self.slot.queue);
+        f.debug_struct("Subscription")
+            .field("filter", &self.slot.filter)
+            .field("queued", &s.items.len())
+            .field("mode", &s.mode)
+            .finish()
+    }
+}
