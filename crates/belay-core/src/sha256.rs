@@ -120,3 +120,91 @@ pub struct Sha256 {
     /// Total message length in bytes.
     length: u64,
 }
+
+impl fmt::Debug for Sha256 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Sha256")
+            .field("length", &self.length)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Default for Sha256 {
+    fn default() -> Sha256 {
+        Sha256::new()
+    }
+}
+
+impl Sha256 {
+    /// A hasher with nothing absorbed yet.
+    #[must_use]
+    pub fn new() -> Sha256 {
+        Sha256 {
+            state: H0,
+            block: [0; BLOCK_LEN],
+            filled: 0,
+            length: 0,
+        }
+    }
+
+    /// Absorbs `data`.
+    pub fn update(&mut self, mut data: &[u8]) {
+        self.length = self.length.wrapping_add(data.len() as u64);
+        if self.filled > 0 {
+            let take = (BLOCK_LEN - self.filled).min(data.len());
+            self.block[self.filled..self.filled + take].copy_from_slice(&data[..take]);
+            self.filled += take;
+            data = &data[take..];
+            if self.filled < BLOCK_LEN {
+                return;
+            }
+            let block = self.block;
+            compress(&mut self.state, &block);
+            self.filled = 0;
+        }
+        let mut blocks = data.chunks_exact(BLOCK_LEN);
+        for block in &mut blocks {
+            let block: &[u8; BLOCK_LEN] =
+                block.try_into().expect("chunks_exact yields full blocks");
+            compress(&mut self.state, block);
+        }
+        let rest = blocks.remainder();
+        self.block[..rest.len()].copy_from_slice(rest);
+        self.filled = rest.len();
+    }
+
+    /// Pads the message (section 5.1.1) and returns the digest.
+    #[must_use]
+    pub fn finalize(mut self) -> Digest {
+        let bit_length = self.length.wrapping_mul(8);
+        let mut tail = [0u8; 2 * BLOCK_LEN];
+        tail[..self.filled].copy_from_slice(&self.block[..self.filled]);
+        tail[self.filled] = 0x80;
+        // The 64-bit length must fit after the 0x80 byte; if it does not,
+        // the padding spills into a second block.
+        let total = if self.filled + 8 <= BLOCK_LEN {
+            BLOCK_LEN
+        } else {
+            2 * BLOCK_LEN
+        };
+        tail[total - 8..total].copy_from_slice(&bit_length.to_be_bytes());
+        for block in tail[..total].chunks_exact(BLOCK_LEN) {
+            let block: &[u8; BLOCK_LEN] =
+                block.try_into().expect("chunks_exact yields full blocks");
+            compress(&mut self.state, block);
+        }
+        let mut out = [0u8; DIGEST_LEN];
+        for (chunk, word) in out.chunks_exact_mut(4).zip(self.state) {
+            chunk.copy_from_slice(&word.to_be_bytes());
+        }
+        out
+    }
+}
+
+/// The SHA-256 digest of `data`.
+#[must_use]
+pub fn sha256(data: &[u8]) -> Digest {
+    let mut h = Sha256::new();
+    h.update(data);
+    h.finalize()
+}
