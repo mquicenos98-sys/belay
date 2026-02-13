@@ -392,3 +392,312 @@ impl fmt::Debug for Subscription {
             .finish()
     }
 }
+
+impl Subscription {
+    /// The next delivery, waiting up to `timeout` for one.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Delivery, RecvError> {
+        let deadline = Instant::now().checked_add(timeout);
+        loop {
+            {
+                let mut s = lock(&self.slot.queue);
+                loop {
+                    if let Some(event) = s.items.pop_front() {
+                        return Ok(Delivery::Event(event));
+                    }
+                    if s.closed {
+                        return Err(RecvError::Closed);
+                    }
+                    if s.mode != Mode::Live {
+                        break;
+                    }
+                    let remaining = match deadline {
+                        Some(d) => d.saturating_duration_since(Instant::now()),
+                        None => Duration::from_secs(3600),
+                    };
+                    if remaining.is_zero() {
+                        return Err(RecvError::Timeout);
+                    }
+                    s = wait_timeout(&self.slot.ready, s, remaining).0;
+                }
+            }
+            if let Some(delivery) = self.catch_up() {
+                return Ok(delivery);
+            }
+        }
+    }
+
+    /// The next delivery if one is available now.
+    pub fn try_recv(&self) -> Result<Delivery, RecvError> {
+        self.recv_timeout(Duration::ZERO)
+    }
+
+    /// The next delivery, waiting as long as it takes; `None` once the bus
+    /// is closed.
+    pub fn recv(&self) -> Option<Delivery> {
+        loop {
+            match self.recv_timeout(Duration::from_secs(3600)) {
+                Ok(delivery) => return Some(delivery),
+                Err(RecvError::Closed) => return None,
+                Err(RecvError::Timeout) => {}
+            }
+        }
+    }
+
+    /// Takes one step of catching up from the buffer: a lag marker, the
+    /// next matching buffered event, or (having reached the end) a switch
+    /// back to live pushes, in which case `None`.
+    fn catch_up(&self) -> Option<Delivery> {
+        let st = lock(&self.bus.state);
+        let mut s = lock(&self.slot.queue);
+        let Mode::Behind { cursor } = s.mode else {
+            return None;
+        };
+        if !s.items.is_empty() || s.closed {
+            // Queued events precede the cursor; the caller delivers them
+            // (or reports the close) first.
+            return None;
+        }
+        let oldest = st.oldest_seq();
+        if cursor < oldest {
+            s.mode = Mode::Behind { cursor: oldest };
+            self.bus.lagged.fetch_add(1, Ordering::Relaxed);
+            return Some(Delivery::Lagged {
+                missed: oldest - cursor,
+            });
+        }
+        let start = (cursor - oldest) as usize;
+        let found = st
+            .buffer
+            .range(start.min(st.buffer.len())..)
+            .find(|e| self.slot.filter.matches_kind(&e.kind));
+        match found {
+            Some(event) => {
+                s.mode = Mode::Behind {
+                    cursor: event.seq + 1,
+                };
+                Some(Delivery::Event(event.clone()))
+            }
+            None => {
+                // Everything published so far has been seen; the bus lock
+                // is held, so no event can slip in before pushes resume.
+                s.mode = Mode::Live;
+                None
+            }
+        }
+    }
+}
+
+impl Iterator for Subscription {
+    type Item = Delivery;
+
+    /// Blocks for the next delivery; ends when the bus closes.
+    fn next(&mut self) -> Option<Delivery> {
+        self.recv()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_common::{ManualClock, Timestamp};
+    use belay_proto::event::EventPattern;
+    use belay_proto::QueueName;
+    use std::thread;
+
+    fn bus(capacity: usize, subscriber_queue: usize) -> EventBus {
+        EventBus::with_options(
+            ManualClock::new(Timestamp::from_secs(1_000)).shared(),
+            BusOptions {
+                capacity,
+                subscriber_queue,
+                first_seq: 1,
+            },
+        )
+    }
+
+    fn paused(queue: &'static str) -> EventKind {
+        EventKind::QueuePaused {
+            queue: QueueName::from_static(queue),
+        }
+    }
+
+    fn resumed(queue: &'static str) -> EventKind {
+        EventKind::QueueResumed {
+            queue: QueueName::from_static(queue),
+        }
+    }
+
+    fn next_seq(sub: &Subscription) -> Result<u64, Delivery> {
+        match sub.try_recv() {
+            Ok(Delivery::Event(e)) => Ok(e.seq),
+            Ok(other) => Err(other),
+            Err(e) => panic!("expected a delivery, got {e}"),
+        }
+    }
+
+    #[test]
+    fn events_are_numbered_stamped_and_buffered() {
+        let bus = bus(3, 8);
+        for q in ["a", "b", "c", "d"] {
+            bus.emit(paused(q));
+        }
+        let buffered = bus.replay(0);
+        let seqs: Vec<u64> = buffered.iter().map(|e| e.seq).collect();
+        assert_eq!(seqs, [2, 3, 4]);
+        assert_eq!(buffered[0].at, Timestamp::from_secs(1_000));
+        assert_eq!(bus.replay(4).len(), 1);
+        let stats = bus.stats();
+        assert_eq!((stats.published, stats.next_seq, stats.buffered), (4, 5, 3));
+    }
+
+    #[test]
+    fn subscribe_replays_from_a_sequence_number_then_goes_live() {
+        let bus = bus(100, 8);
+        for q in ["a", "b", "c"] {
+            bus.emit(paused(q));
+        }
+        let sub = bus.subscribe(EventFilter::new().from_seq(2));
+        assert_eq!(next_seq(&sub), Ok(2));
+        bus.emit(paused("d"));
+        assert_eq!(next_seq(&sub), Ok(3));
+        assert_eq!(next_seq(&sub), Ok(4));
+        assert_eq!(sub.try_recv(), Err(RecvError::Timeout));
+        bus.emit(paused("e"));
+        assert_eq!(next_seq(&sub), Ok(5));
+    }
+
+    #[test]
+    fn live_subscriptions_skip_the_past_and_filters_apply() {
+        let bus = bus(100, 8);
+        bus.emit(paused("a"));
+        let live =
+            bus.subscribe_live(EventFilter::new().with_type(EventPattern::Type("queue.resumed")));
+        let queue_b = bus.subscribe(EventFilter::new().for_queue(QueueName::from_static("b")));
+        bus.emit(paused("b"));
+        bus.emit(resumed("a"));
+        assert_eq!(next_seq(&live), Ok(3));
+        assert_eq!(live.try_recv(), Err(RecvError::Timeout));
+        assert_eq!(next_seq(&queue_b), Ok(2));
+        assert_eq!(queue_b.try_recv(), Err(RecvError::Timeout));
+    }
+
+    #[test]
+    fn a_full_queue_catches_up_from_the_buffer_without_loss() {
+        let bus = bus(100, 2);
+        let sub = bus.subscribe_live(EventFilter::new());
+        for q in ["a", "b", "c", "d", "e"] {
+            bus.emit(paused(q));
+        }
+        let seqs: Vec<u64> = (0..5).map(|_| next_seq(&sub).unwrap()).collect();
+        assert_eq!(seqs, [1, 2, 3, 4, 5]);
+        assert_eq!(sub.try_recv(), Err(RecvError::Timeout));
+        assert_eq!(bus.stats().lagged, 0);
+        bus.emit(paused("f"));
+        assert_eq!(next_seq(&sub), Ok(6));
+    }
+
+    #[test]
+    fn a_subscriber_behind_the_buffer_gets_a_lag_marker_and_resyncs() {
+        let bus = bus(3, 1);
+        let sub = bus.subscribe_live(EventFilter::new());
+        for i in 0..10 {
+            bus.emit(if i % 2 == 0 {
+                paused("a")
+            } else {
+                resumed("a")
+            });
+        }
+        // Event 1 was queued; 2 overflowed the queue and was evicted from
+        // the buffer (which holds 8, 9, 10) along with 3..7.
+        assert_eq!(next_seq(&sub), Ok(1));
+        assert_eq!(next_seq(&sub), Err(Delivery::Lagged { missed: 6 }));
+        let rest: Vec<u64> = (0..3).map(|_| next_seq(&sub).unwrap()).collect();
+        assert_eq!(rest, [8, 9, 10]);
+        assert_eq!(bus.stats().lagged, 1);
+    }
+
+    #[test]
+    fn close_wakes_waiters_after_queued_events_are_delivered() {
+        let bus = bus(10, 10);
+        let sub = bus.subscribe_live(EventFilter::new());
+        bus.emit(paused("a"));
+        let waiter = {
+            let bus = bus.clone();
+            thread::spawn(move || {
+                let sub = bus.subscribe_live(EventFilter::new());
+                sub.recv_timeout(Duration::from_secs(10))
+            })
+        };
+        // Give the waiter a moment to block, then close.
+        while bus.stats().subscribers < 2 {
+            thread::yield_now();
+        }
+        bus.close();
+        assert_eq!(waiter.join().unwrap(), Err(RecvError::Closed));
+        assert_eq!(next_seq(&sub), Ok(1));
+        assert_eq!(sub.try_recv(), Err(RecvError::Closed));
+        assert!(bus.subscribe(EventFilter::new()).try_recv().is_err());
+    }
+
+    #[test]
+    fn dropped_subscriptions_are_forgotten() {
+        let bus = bus(10, 10);
+        let sub = bus.subscribe(EventFilter::new());
+        assert_eq!(bus.stats().subscribers, 1);
+        drop(sub);
+        assert_eq!(bus.stats().subscribers, 0);
+        bus.emit(paused("a"));
+        assert_eq!(bus.stats().published, 1);
+    }
+
+    #[test]
+    fn observers_see_every_event_in_order() {
+        let bus = bus(10, 10);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        bus.on_event(move |e| lock(&sink).push(e.seq));
+        bus.emit(paused("a"));
+        bus.emit(paused("b"));
+        assert_eq!(*lock(&seen), [1, 2]);
+    }
+
+    #[test]
+    fn concurrent_publishers_and_subscribers_see_every_event_in_order() {
+        const PUBLISHERS: usize = 4;
+        const EACH: usize = 500;
+        let bus = bus(PUBLISHERS * EACH, 16);
+        let subscribers: Vec<_> = (0..3)
+            .map(|_| {
+                let sub = bus.subscribe_live(EventFilter::new());
+                thread::spawn(move || {
+                    let mut seqs = Vec::new();
+                    while seqs.len() < PUBLISHERS * EACH {
+                        match sub.recv_timeout(Duration::from_secs(10)) {
+                            Ok(Delivery::Event(e)) => seqs.push(e.seq),
+                            Ok(Delivery::Lagged { missed }) => panic!("lagged by {missed}"),
+                            Err(e) => panic!("{e}"),
+                        }
+                    }
+                    seqs
+                })
+            })
+            .collect();
+        let publishers: Vec<_> = (0..PUBLISHERS)
+            .map(|_| {
+                let bus = bus.clone();
+                thread::spawn(move || {
+                    for _ in 0..EACH {
+                        bus.emit(paused("q"));
+                    }
+                })
+            })
+            .collect();
+        for p in publishers {
+            p.join().unwrap();
+        }
+        let expected: Vec<u64> = (1..=(PUBLISHERS * EACH) as u64).collect();
+        for s in subscribers {
+            assert_eq!(s.join().unwrap(), expected);
+        }
+    }
+}
