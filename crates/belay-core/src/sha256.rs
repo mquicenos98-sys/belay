@@ -208,3 +208,196 @@ pub fn sha256(data: &[u8]) -> Digest {
     h.update(data);
     h.finalize()
 }
+
+/// The hash computation of section 6.2.2 for one 512-bit block.
+fn compress(state: &mut [u32; 8], block: &[u8; BLOCK_LEN]) {
+    let mut w = [0u32; 64];
+    for (t, word) in block.chunks_exact(4).enumerate() {
+        w[t] = u32::from_be_bytes([word[0], word[1], word[2], word[3]]);
+    }
+    for t in 16..64 {
+        let s0 = w[t - 15].rotate_right(7) ^ w[t - 15].rotate_right(18) ^ (w[t - 15] >> 3);
+        let s1 = w[t - 2].rotate_right(17) ^ w[t - 2].rotate_right(19) ^ (w[t - 2] >> 10);
+        w[t] = w[t - 16]
+            .wrapping_add(s0)
+            .wrapping_add(w[t - 7])
+            .wrapping_add(s1);
+    }
+    let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = *state;
+    for t in 0..64 {
+        let big_s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+        let ch = (e & f) ^ (!e & g);
+        let t1 = h
+            .wrapping_add(big_s1)
+            .wrapping_add(ch)
+            .wrapping_add(K[t])
+            .wrapping_add(w[t]);
+        let big_s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+        let maj = (a & b) ^ (a & c) ^ (b & c);
+        let t2 = big_s0.wrapping_add(maj);
+        h = g;
+        g = f;
+        f = e;
+        e = d.wrapping_add(t1);
+        d = c;
+        c = b;
+        b = a;
+        a = t1.wrapping_add(t2);
+    }
+    for (slot, v) in state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+        *slot = slot.wrapping_add(v);
+    }
+}
+
+/// Lowercase hexadecimal.
+#[must_use]
+pub fn to_hex(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push(char::from(DIGITS[usize::from(b >> 4)]));
+        out.push(char::from(DIGITS[usize::from(b & 0x0f)]));
+    }
+    out
+}
+
+/// Parses a digest written as 64 hexadecimal digits (either case).
+///
+/// ```
+/// use belay_core::sha256::{parse_hex_digest, sha256};
+///
+/// let hex = "BA7816BF8F01CFEA414140DE5DAE2223B00361A396177A9CB410FF61F20015AD";
+/// assert_eq!(parse_hex_digest(hex).unwrap(), sha256(b"abc"));
+/// assert!(parse_hex_digest("ba78").is_err());
+/// ```
+pub fn parse_hex_digest(text: &str) -> Result<Digest, String> {
+    let text = text.trim();
+    if text.len() != DIGEST_LEN * 2 {
+        return Err(format!(
+            "expected {} hexadecimal digits, got {}",
+            DIGEST_LEN * 2,
+            text.chars().count()
+        ));
+    }
+    let mut out = [0u8; DIGEST_LEN];
+    for (i, pair) in text.as_bytes().chunks_exact(2).enumerate() {
+        let high = hex_value(pair[0]);
+        let low = hex_value(pair[1]);
+        match (high, low) {
+            (Some(h), Some(l)) => out[i] = h << 4 | l,
+            _ => {
+                return Err(format!(
+                    "invalid hexadecimal digit at position {}",
+                    i * 2 + usize::from(high.is_some()) + 1
+                ))
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn hex_value(c: u8) -> Option<u8> {
+    match c {
+        b'0'..=b'9' => Some(c - b'0'),
+        b'a'..=b'f' => Some(c - b'a' + 10),
+        b'A'..=b'F' => Some(c - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Compares two byte strings in time that depends only on their lengths,
+/// so that a mismatch position cannot be learnt by timing the comparison.
+#[must_use]
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let diff = a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    // black_box keeps the optimiser from turning the fold into an early
+    // exit on the first difference.
+    std::hint::black_box(diff) == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hex(data: &[u8]) -> String {
+        to_hex(&sha256(data))
+    }
+
+    // Test vectors from the NIST "SHA-256 examples" document for FIPS 180-4
+    // and the long-message vector of FIPS 180-2 appendix B.3.
+    #[test]
+    fn matches_the_fips_180_4_example_vectors() {
+        assert_eq!(
+            hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex(b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"),
+            "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1"
+        );
+    }
+
+    #[test]
+    fn hashes_one_million_a_characters() {
+        let mut h = Sha256::new();
+        let chunk = [b'a'; 1000];
+        for _ in 0..1000 {
+            h.update(&chunk);
+        }
+        assert_eq!(
+            to_hex(&h.finalize()),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn incremental_updates_match_one_shot_at_every_split() {
+        // 55, 56 and 64 bytes are the padding boundaries: 55 is the longest
+        // message whose length fits in its last block.
+        for len in [0usize, 1, 55, 56, 63, 64, 65, 119, 120, 200] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            let expected = sha256(&data);
+            for split in 0..=len {
+                let mut h = Sha256::new();
+                h.update(&data[..split]);
+                h.update(&data[split..]);
+                assert_eq!(h.finalize(), expected, "len {len}, split {split}");
+            }
+        }
+    }
+
+    #[test]
+    fn hex_round_trips_and_rejects_bad_digits() {
+        let digest = sha256(b"belay");
+        assert_eq!(parse_hex_digest(&to_hex(&digest)).unwrap(), digest);
+        assert_eq!(
+            parse_hex_digest(&"z".repeat(64)).unwrap_err(),
+            "invalid hexadecimal digit at position 1"
+        );
+        let mut bad = to_hex(&digest);
+        bad.replace_range(9..10, "g");
+        assert_eq!(
+            parse_hex_digest(&bad).unwrap_err(),
+            "invalid hexadecimal digit at position 10"
+        );
+        assert_eq!(
+            parse_hex_digest("abc").unwrap_err(),
+            "expected 64 hexadecimal digits, got 3"
+        );
+    }
+
+    #[test]
+    fn constant_time_eq_compares_contents_and_lengths() {
+        assert!(constant_time_eq(b"secret", b"secret"));
+        assert!(!constant_time_eq(b"secret", b"secreT"));
+        assert!(!constant_time_eq(b"secret", b"secrets"));
+        assert!(constant_time_eq(b"", b""));
+    }
+}
