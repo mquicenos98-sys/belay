@@ -66,3 +66,63 @@ impl Scope {
         1 << self as u8
     }
 }
+
+impl fmt::Display for Scope {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for Scope {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Scope, String> {
+        Scope::ALL
+            .into_iter()
+            .find(|scope| scope.as_str() == s)
+            .ok_or_else(|| format!("unknown scope {s:?}, expected admin, enqueue, work or read"))
+    }
+}
+
+/// A set of scopes.
+#[derive(Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub struct Scopes(u8);
+
+impl Scopes {
+    /// No scope at all.
+    pub const NONE: Scopes = Scopes(0);
+
+    /// Every scope.
+    #[must_use]
+    pub fn all() -> Scopes {
+        Scope::ALL.into_iter().collect()
+    }
+
+    /// Whether `scope` is in the set itself.
+    #[must_use]
+    pub fn contains(self, scope: Scope) -> bool {
+        self.0 & scope.bit() != 0
+    }
+
+    /// Whether the set permits `scope`: it contains it, or `admin`.
+    #[must_use]
+    pub fn permits(self, scope: Scope) -> bool {
+        self.contains(scope) || self.contains(Scope::Admin)
+    }
+
+    /// Adds `scope`.
+    pub fn insert(&mut self, scope: Scope) {
+        self.0 |= scope.bit();
+    }
+
+    /// Whether the set is empty.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    /// The scopes in the set, in declaration order.
+    pub fn iter(self) -> impl Iterator<Item = Scope> {
+        Scope::ALL.into_iter().filter(move |s| self.contains(*s))
+    }
+}
