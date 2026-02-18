@@ -125,3 +125,44 @@ impl From<belay_scheduler::Error> for Error {
         Error::Scheduler(e)
     }
 }
+
+impl From<belay_cluster::Error> for Error {
+    fn from(e: belay_cluster::Error) -> Error {
+        Error::Cluster(e)
+    }
+}
+
+impl From<belay_metrics::Error> for Error {
+    fn from(e: belay_metrics::Error) -> Error {
+        Error::Metrics(e)
+    }
+}
+
+impl From<belay_worker::Error> for Error {
+    fn from(e: belay_worker::Error) -> Error {
+        Error::Worker(e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn messages_say_what_failed() {
+        let e = Error::apply("schedule nightly", ApiError::invalid_argument("bad cron"));
+        assert_eq!(
+            e.to_string(),
+            "applying schedule nightly from the configuration failed: invalid_argument: bad cron"
+        );
+        let e = Error::io(
+            "binding the gossip socket 0.0.0.0:7946",
+            io::Error::new(io::ErrorKind::AddrInUse, "address in use"),
+        );
+        assert_eq!(
+            e.to_string(),
+            "binding the gossip socket 0.0.0.0:7946 failed: address in use"
+        );
+        assert!(std::error::Error::source(&e).is_some());
+    }
+}
