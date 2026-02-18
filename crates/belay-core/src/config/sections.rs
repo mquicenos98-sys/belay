@@ -130,3 +130,121 @@ pub(crate) fn check_host_port(text: &str) -> std::result::Result<(), String> {
         Err(format!("invalid host {host:?} in {text:?}"))
     }
 }
+
+/// `[storage]`: where and how jobs are kept.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StorageConfig {
+    /// Data directory. Default `belay-data` (relative to the working
+    /// directory).
+    pub dir: PathBuf,
+    /// Keep everything in memory and lose it on exit. Default false.
+    pub in_memory: bool,
+    /// When the write-ahead log is synced. Default `always`.
+    pub sync: SyncPolicy,
+    /// Log size that triggers a checkpoint; 0 disables size-triggered
+    /// checkpoints. Default 128 MiB.
+    pub checkpoint_bytes: u64,
+    /// Longest time between checkpoints while anything is written; 0
+    /// disables time-triggered checkpoints. Default 1h. Bounds recovery
+    /// time on stores that grow too slowly to reach `checkpoint_bytes`.
+    pub checkpoint_interval: Duration,
+    /// Size at which a log segment is sealed. Default 32 MiB.
+    pub segment_size: u64,
+    /// How recovery treats damage a crash cannot explain. Default `strict`.
+    pub recovery: RecoveryMode,
+}
+
+impl Default for StorageConfig {
+    fn default() -> StorageConfig {
+        StorageConfig {
+            dir: PathBuf::from("belay-data"),
+            in_memory: false,
+            sync: SyncPolicy::Always,
+            checkpoint_bytes: Options::DEFAULT_CHECKPOINT_BYTES,
+            checkpoint_interval: Duration::from_secs(3600),
+            segment_size: Options::DEFAULT_SEGMENT_SIZE,
+            recovery: RecoveryMode::Strict,
+        }
+    }
+}
+
+impl StorageConfig {
+    pub(crate) fn read(r: &Reader<'_>) -> Result<StorageConfig> {
+        let d = StorageConfig::default();
+        let dir: Option<String> = r.opt("storage.dir")?;
+        let config = StorageConfig {
+            dir: dir.map_or(d.dir, PathBuf::from),
+            in_memory: r.or("storage.in_memory", d.in_memory)?,
+            sync: r.opt_parsed("storage.sync")?.unwrap_or(d.sync),
+            checkpoint_bytes: bytes(r, "storage.checkpoint_bytes", d.checkpoint_bytes)?,
+            checkpoint_interval: duration(r, "storage.checkpoint_interval", d.checkpoint_interval)?,
+            segment_size: bytes(r, "storage.segment_size", d.segment_size)?,
+            recovery: r.opt_parsed("storage.recovery")?.unwrap_or(d.recovery),
+        };
+        if config.dir.as_os_str().is_empty() {
+            return Err(r.invalid("storage.dir", "must not be empty"));
+        }
+        let range = Options::MIN_SEGMENT_SIZE..=Options::MAX_SEGMENT_SIZE;
+        if !range.contains(&config.segment_size) {
+            return Err(r.invalid(
+                "storage.segment_size",
+                format!(
+                    "must be between {} and {} bytes, got {}",
+                    range.start(),
+                    range.end(),
+                    config.segment_size
+                ),
+            ));
+        }
+        Ok(config)
+    }
+
+    /// Options for opening the log-structured store.
+    #[must_use]
+    pub fn store_options(&self) -> Options {
+        let options = Options::new()
+            .sync(self.sync)
+            .segment_size(self.segment_size)
+            .recovery(self.recovery);
+        if self.checkpoint_bytes == 0 {
+            options.manual_checkpoints()
+        } else {
+            options.checkpoint_every(self.checkpoint_bytes)
+        }
+    }
+}
+
+/// `[log]`: what is logged and how.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogConfig {
+    /// Level directives, key `level`: `info`, `debug,belay_store=trace`.
+    /// Default `info`.
+    pub filter: Filter,
+    /// Line format: `logfmt` (default) or `json`.
+    pub format: LogFormat,
+}
+
+impl Default for LogConfig {
+    fn default() -> LogConfig {
+        LogConfig {
+            filter: Filter::new(belay_common::log::Level::Info),
+            format: LogFormat::Logfmt,
+        }
+    }
+}
+
+impl LogConfig {
+    pub(crate) fn read(r: &Reader<'_>) -> Result<LogConfig> {
+        let d = LogConfig::default();
+        Ok(LogConfig {
+            filter: r.opt_parsed("log.level")?.unwrap_or(d.filter),
+            format: r.opt_parsed("log.format")?.unwrap_or(d.format),
+        })
+    }
+
+    /// Installs a stderr logger with this filter and format as the
+    /// process-wide logger.
+    pub fn install(&self) {
+        belay_common::log::init_stderr(self.filter.clone(), self.format);
+    }
+}
