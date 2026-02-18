@@ -126,3 +126,37 @@ impl Scopes {
         Scope::ALL.into_iter().filter(move |s| self.contains(*s))
     }
 }
+
+impl FromIterator<Scope> for Scopes {
+    fn from_iter<I: IntoIterator<Item = Scope>>(iter: I) -> Scopes {
+        let mut scopes = Scopes::NONE;
+        for scope in iter {
+            scopes.insert(scope);
+        }
+        scopes
+    }
+}
+
+impl fmt::Display for Scopes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let names: Vec<&str> = self.iter().map(Scope::as_str).collect();
+        f.write_str(&names.join(","))
+    }
+}
+
+impl fmt::Debug for Scopes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Scopes({self})")
+    }
+}
+
+/// A configured token: its name, the SHA-256 of its secret, its scopes.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiToken {
+    /// Name, for logs and errors; never the secret.
+    pub name: String,
+    /// SHA-256 of the secret.
+    pub digest: Digest,
+    /// What it may do.
+    pub scopes: Scopes,
+}
