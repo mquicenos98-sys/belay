@@ -274,11 +274,11 @@ impl Router {
     }
 
     fn reject_method(&self, route: &Route, req: &mut Request) -> Response {
-        match &self.method_not_allowed {
+        let response = match &self.method_not_allowed {
             Some(handler) => handler.call(req),
-            None => Response::error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
-                .header(ALLOW, route.allow_header()),
-        }
+            None => Response::error(StatusCode::METHOD_NOT_ALLOWED, "method not allowed"),
+        };
+        response.header(ALLOW, route.allow_header())
     }
 
     fn missing(&self, req: &mut Request) -> Response {
@@ -551,6 +551,28 @@ mod tests {
 
         router.trailing_slash(TrailingSlash::Strict);
         assert_eq!(call(&router, Method::Get, "/v1/jobs/").status, 404);
+    }
+
+    #[test]
+    fn custom_fallbacks() {
+        let mut router = Router::new();
+        router
+            .get("/only-get", echo_route)
+            .not_found(|_: &mut Request| {
+                Response::json_bytes(r#"{"code":"not_found"}"#).with_status(StatusCode::NOT_FOUND)
+            })
+            .method_not_allowed(|_: &mut Request| {
+                Response::error(StatusCode::METHOD_NOT_ALLOWED, "nope")
+            });
+        let missing = call(&router, Method::Get, "/elsewhere");
+        assert_eq!(missing.status, 404);
+        assert_eq!(
+            missing.headers.get("content-type"),
+            Some("application/json")
+        );
+        let wrong = call(&router, Method::Post, "/only-get");
+        assert_eq!(body(&wrong), "nope\n");
+        assert_eq!(wrong.headers.get("allow"), Some("GET, HEAD, OPTIONS"));
     }
 
     #[test]
