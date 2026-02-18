@@ -48,3 +48,31 @@ pub struct RemoteOwner {
     /// Base URL of its HTTP API, e.g. `http://10.0.0.6:7700`.
     pub addr: String,
 }
+
+impl RemoteOwner {
+    /// The absolute URL of `path_and_query` on the owner, for a redirect's
+    /// `Location`.
+    ///
+    /// ```
+    /// use belay_core::RemoteOwner;
+    ///
+    /// let owner = RemoteOwner { node: "b".into(), addr: "http://10.0.0.6:7700".into() };
+    /// assert_eq!(owner.url("/v1/lease"), "http://10.0.0.6:7700/v1/lease");
+    /// ```
+    #[must_use]
+    pub fn url(&self, path_and_query: &str) -> String {
+        format!("{}{}", self.addr.trim_end_matches('/'), path_and_query)
+    }
+}
+
+impl fmt::Display for RemoteOwner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{} ({})", self.node, self.addr)
+    }
+}
+
+/// The ownership key of a queue.
+#[must_use]
+pub fn queue_key(queue: &QueueName) -> String {
+    format!("queue:{queue}")
+}
