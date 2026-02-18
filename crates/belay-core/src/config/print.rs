@@ -159,3 +159,9 @@ pub(super) fn to_table(c: &Config) -> Table {
 fn dur(d: Duration) -> Value {
     Value::String(format_duration(d))
 }
+
+/// Sizes and counts beyond `i64` cannot be written in TOML; nothing belay
+/// accepts comes close.
+fn int(n: u64) -> Value {
+    Value::Integer(i64::try_from(n).unwrap_or(i64::MAX))
+}
