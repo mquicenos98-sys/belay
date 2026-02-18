@@ -524,3 +524,303 @@ impl FromStr for ClusterProfile {
         }
     }
 }
+
+/// `[cluster]`: membership and ownership across several nodes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClusterConfig {
+    /// Join a cluster. Default false: a single node owns everything.
+    pub enabled: bool,
+    /// This node's id, unique in the cluster. Default: the host name.
+    pub node_id: String,
+    /// Shared by every node of one cluster. Default `belay`.
+    pub name: String,
+    /// UDP address for membership gossip. Default `0.0.0.0:7946`.
+    pub gossip_listen: String,
+    /// Gossip address other nodes should use, when `gossip_listen` is a
+    /// wildcard or behind NAT.
+    pub advertise: Option<SocketAddr>,
+    /// Base URL of this node's HTTP API as other nodes should redirect
+    /// clients to it, e.g. `http://10.0.0.5:7700`. Default: derived from
+    /// `server.listen`, which then must not be a wildcard address.
+    pub api_addr: Option<String>,
+    /// Gossip addresses (`host:port`) of nodes to join through.
+    pub seeds: Vec<String>,
+    /// Timing preset: `lan` (default), `wan` or `local`.
+    pub profile: ClusterProfile,
+    /// Until the node has joined through a seed, it fires no schedules;
+    /// after this long it fires the ones it owns regardless, so that a
+    /// node whose seeds are all down still runs. Default 10s.
+    pub join_grace: Duration,
+    /// Free-form metadata gossiped with this node, `[cluster.meta]`.
+    pub meta: BTreeMap<String, String>,
+}
+
+impl Default for ClusterConfig {
+    fn default() -> ClusterConfig {
+        ClusterConfig {
+            enabled: false,
+            node_id: default_node_id(),
+            name: "belay".to_owned(),
+            gossip_listen: "0.0.0.0:7946".to_owned(),
+            advertise: None,
+            api_addr: None,
+            seeds: Vec::new(),
+            profile: ClusterProfile::Lan,
+            join_grace: Duration::from_secs(10),
+            meta: BTreeMap::new(),
+        }
+    }
+}
+
+/// A node id from the host name (`HOSTNAME` or `COMPUTERNAME`), reduced to
+/// the characters node ids allow; `belay` if neither is set.
+#[must_use]
+pub fn default_node_id() -> String {
+    let host = ["HOSTNAME", "COMPUTERNAME"]
+        .iter()
+        .find_map(|var| std::env::var(var).ok().filter(|v| !v.trim().is_empty()));
+    let Some(host) = host else {
+        return "belay".to_owned();
+    };
+    let id: String = host
+        .trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(belay_cluster::MAX_NODE_ID_LEN)
+        .collect();
+    if id.starts_with(|c: char| c.is_ascii_alphanumeric()) {
+        id
+    } else {
+        format!(
+            "n{}",
+            &id[..id.len().min(belay_cluster::MAX_NODE_ID_LEN - 1)]
+        )
+    }
+}
+
+impl ClusterConfig {
+    pub(crate) fn read(r: &Reader<'_>, server: &ServerConfig) -> Result<ClusterConfig> {
+        let d = ClusterConfig::default();
+        let config = ClusterConfig {
+            enabled: r.or("cluster.enabled", d.enabled)?,
+            node_id: r.string_or("cluster.node_id", &d.node_id)?,
+            name: r.string_or("cluster.name", &d.name)?,
+            gossip_listen: r.string_or("cluster.gossip_listen", &d.gossip_listen)?,
+            advertise: r.opt_parsed("cluster.advertise")?,
+            api_addr: r
+                .opt::<String>("cluster.api_addr")?
+                .map(|a| normalize_api_addr(&a)),
+            seeds: r.or("cluster.seeds", d.seeds)?,
+            profile: r.opt_parsed("cluster.profile")?.unwrap_or(d.profile),
+            join_grace: duration(r, "cluster.join_grace", d.join_grace)?,
+            meta: r.or("cluster.meta", d.meta)?,
+        };
+        if let Err(e) = belay_cluster::NodeId::new(config.node_id.as_str()) {
+            return Err(r.invalid("cluster.node_id", strip_prefix(&e.to_string())));
+        }
+        if let Err(problem) = check_host_port(&config.gossip_listen) {
+            return Err(r.invalid("cluster.gossip_listen", problem));
+        }
+        for (i, seed) in config.seeds.iter().enumerate() {
+            if let Err(problem) = check_host_port(seed) {
+                return Err(r.invalid(&format!("cluster.seeds[{i}]"), problem));
+            }
+        }
+        if let Some(addr) = &config.api_addr {
+            if let Err(e) = belay_cluster::validate_addr(addr) {
+                return Err(r.invalid("cluster.api_addr", strip_prefix(&e.to_string())));
+            }
+        } else if config.enabled && server.is_wildcard() {
+            return Err(r.invalid(
+                "cluster.enabled",
+                format!(
+                    "server.listen {} is a wildcard address other nodes cannot redirect \
+                     clients to; set cluster.api_addr to this node's reachable address",
+                    server.listen
+                ),
+            ));
+        }
+        if let Err(e) = belay_cluster::validate_meta(&config.meta) {
+            return Err(r.invalid("cluster.meta", strip_prefix(&e.to_string())));
+        }
+        Ok(config)
+    }
+
+    /// The API base URL other nodes redirect to: `api_addr`, or one derived
+    /// from the listen address.
+    #[must_use]
+    pub fn api_url(&self, server: &ServerConfig) -> String {
+        self.api_addr
+            .clone()
+            .unwrap_or_else(|| normalize_api_addr(&server.listen))
+    }
+
+    /// The membership protocol configuration for this node, with seeds
+    /// resolved to addresses (host names are looked up once, here).
+    pub fn membership(&self, api_url: &str) -> std::io::Result<belay_cluster::Config> {
+        let id = belay_cluster::NodeId::new(self.node_id.as_str())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        let mut config = match self.profile {
+            ClusterProfile::Lan => belay_cluster::Config::new(id),
+            ClusterProfile::Wan => belay_cluster::Config::wan(id),
+            ClusterProfile::Local => belay_cluster::Config::local(id),
+        };
+        let mut seeds = Vec::with_capacity(self.seeds.len());
+        for seed in &self.seeds {
+            // Starting without a seed would make this node a cluster of
+            // one that owns everything, so a seed that does not resolve
+            // fails the start instead of being skipped.
+            let addr = seed
+                .to_socket_addrs()
+                .map_err(|e| std::io::Error::new(e.kind(), format!("{seed}: {e}")))?
+                .next()
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        format!("{seed} resolves to no address"),
+                    )
+                })?;
+            seeds.push(addr);
+        }
+        config = config
+            .with_cluster_name(self.name.as_str())
+            .with_api_addr(api_url)
+            .with_seeds(seeds);
+        if let Some(advertise) = self.advertise {
+            config = config.with_advertise(advertise);
+        }
+        for (key, value) in &self.meta {
+            config = config.with_meta(key.as_str(), value.as_str());
+        }
+        Ok(config)
+    }
+}
+
+/// `10.0.0.5:7700` becomes `http://10.0.0.5:7700`; URLs are kept, minus a
+/// trailing slash, so that paths can be appended.
+pub(crate) fn normalize_api_addr(addr: &str) -> String {
+    let addr = addr.trim().trim_end_matches('/');
+    if addr.contains("://") {
+        addr.to_owned()
+    } else {
+        format!("http://{addr}")
+    }
+}
+
+/// Error texts of other crates repeat what the key path already says.
+fn strip_prefix(message: &str) -> &str {
+    message.split_once(": ").map_or(message, |(_, rest)| rest)
+}
+
+/// `[metrics]`: the Prometheus registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetricsConfig {
+    /// Register belay's metric families. Default true.
+    pub enabled: bool,
+    /// Also export `process_*` metrics. Default true.
+    pub process: bool,
+    /// How often lease latencies are folded into the histogram. Default
+    /// 5s.
+    pub refresh: Duration,
+}
+
+impl Default for MetricsConfig {
+    fn default() -> MetricsConfig {
+        MetricsConfig {
+            enabled: true,
+            process: true,
+            refresh: Duration::from_secs(5),
+        }
+    }
+}
+
+impl MetricsConfig {
+    pub(crate) fn read(r: &Reader<'_>) -> Result<MetricsConfig> {
+        let d = MetricsConfig::default();
+        let config = MetricsConfig {
+            enabled: r.or("metrics.enabled", d.enabled)?,
+            process: r.or("metrics.process", d.process)?,
+            refresh: duration(r, "metrics.refresh", d.refresh)?,
+        };
+        positive(r, "metrics.refresh", config.refresh)?;
+        Ok(config)
+    }
+}
+
+fn positive(r: &Reader<'_>, key: &str, d: Duration) -> Result<()> {
+    if d.is_zero() {
+        Err(r.invalid(key, "must be positive"))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn host_port_syntax_is_checked_without_resolving() {
+        assert!(check_host_port("127.0.0.1:7700").is_ok());
+        assert!(check_host_port("[::1]:7700").is_ok());
+        assert!(check_host_port("belay-1.internal:7700").is_ok());
+        assert_eq!(
+            check_host_port("localhost").unwrap_err(),
+            "expected host:port, got \"localhost\""
+        );
+        assert_eq!(
+            check_host_port("localhost:77000").unwrap_err(),
+            "invalid port \"77000\" in \"localhost:77000\""
+        );
+        assert_eq!(
+            check_host_port("bad host:1").unwrap_err(),
+            "invalid host \"bad host\" in \"bad host:1\""
+        );
+    }
+
+    #[test]
+    fn listen_addresses_are_classified() {
+        let server = |listen: &str| ServerConfig {
+            listen: listen.to_owned(),
+            ..ServerConfig::default()
+        };
+        assert!(server("127.0.0.1:1").is_loopback());
+        assert!(server("[::1]:1").is_loopback());
+        assert!(!server("0.0.0.0:1").is_loopback());
+        assert!(server("0.0.0.0:1").is_wildcard());
+        assert!(server("[::]:1").is_wildcard());
+        assert!(!server("10.0.0.1:1").is_wildcard());
+    }
+
+    #[test]
+    fn api_addresses_become_base_urls() {
+        assert_eq!(normalize_api_addr("10.0.0.5:7700"), "http://10.0.0.5:7700");
+        assert_eq!(
+            normalize_api_addr("https://belay.example/"),
+            "https://belay.example"
+        );
+    }
+
+    #[test]
+    fn default_node_ids_are_valid() {
+        assert!(belay_cluster::NodeId::new(default_node_id()).is_ok());
+    }
+
+    #[test]
+    fn storage_options_follow_the_checkpoint_setting() {
+        let mut storage = StorageConfig::default();
+        assert_eq!(
+            storage.store_options().checkpoint_bytes(),
+            Some(Options::DEFAULT_CHECKPOINT_BYTES)
+        );
+        storage.checkpoint_bytes = 0;
+        assert_eq!(storage.store_options().checkpoint_bytes(), None);
+    }
+}
