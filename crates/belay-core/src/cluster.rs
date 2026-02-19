@@ -76,3 +76,16 @@ impl fmt::Display for RemoteOwner {
 pub fn queue_key(queue: &QueueName) -> String {
     format!("queue:{queue}")
 }
+
+/// The ownership key of a schedule.
+#[must_use]
+pub fn schedule_key(id: &ScheduleId) -> String {
+    format!("schedule:{id}")
+}
+
+/// A running cluster node plus what the engine needs to decide ownership.
+pub(crate) struct Cluster {
+    node: Node,
+    started: Instant,
+    join_grace: Duration,
+}
