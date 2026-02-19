@@ -100,12 +100,13 @@ impl ParseOptions {
     }
 }
 
-/// Nicknames and their five-field expansions.
+/// Nicknames and their five-field expansions. Weekdays are spelled as names
+/// so the expansions mean the same thing in both dialects.
 const NICKNAMES: [(&str, &str); 7] = [
     ("@yearly", "0 0 1 1 *"),
     ("@annually", "0 0 1 1 *"),
     ("@monthly", "0 0 1 * *"),
-    ("@weekly", "0 0 * * 0"),
+    ("@weekly", "0 0 * * SUN"),
     ("@daily", "0 0 * * *"),
     ("@midnight", "0 0 * * *"),
     ("@hourly", "0 * * * *"),
@@ -311,6 +312,31 @@ mod tests {
             parse("   ", ParseOptions::new()).unwrap_err(),
             CronError::Empty
         );
+    }
+
+    #[test]
+    fn nicknames_expand_in_both_dialects() {
+        let daily = parse("@daily", ParseOptions::new()).unwrap();
+        assert_eq!(daily, parse("0 0 * * *", ParseOptions::new()).unwrap());
+        assert_eq!(
+            parse("@WEEKLY", ParseOptions::new()).unwrap(),
+            parse("0 0 * * 0", ParseOptions::new()).unwrap()
+        );
+        let quartz = parse("@weekly", ParseOptions::quartz()).unwrap();
+        assert_eq!(
+            quartz,
+            parse("0 0 0 ? * 1", ParseOptions::quartz()).unwrap()
+        );
+        assert_eq!(
+            parse("@reboot", ParseOptions::new()).unwrap_err(),
+            CronError::UnknownNickname {
+                name: "@reboot".into()
+            }
+        );
+        assert!(matches!(
+            parse("@daily 5", ParseOptions::new()),
+            Err(CronError::UnknownNickname { .. })
+        ));
     }
 
     #[test]
