@@ -141,3 +141,94 @@ pub struct StoreReport {
     /// The store's own statistics.
     pub stats: KvStats,
 }
+
+impl ToJson for StoreReport {
+    fn to_json(&self) -> Value {
+        let s = &self.stats;
+        let r = &s.recovery;
+        let recovery = json!({
+            "snapshot_seq": r.snapshot_seq,
+            "snapshot_keys": r.snapshot_keys,
+            "bad_snapshots": r.bad_snapshots,
+            "segments_replayed": r.segments_replayed,
+            "batches_replayed": r.batches_replayed,
+            "torn_tails": r.torn_tails,
+            "torn_bytes": r.torn_bytes,
+            "skipped_regions": r.skipped_regions,
+            "skipped_bytes": r.skipped_bytes,
+            "removed_files": r.removed_files,
+            "duration": belay_common::format_duration(r.duration),
+            "lost_data": r.lost_data(),
+        });
+        ObjectBuilder::new()
+            .field("storage", &self.storage)
+            .opt_field_with("dir", &self.dir, |d| {
+                Value::String(d.to_string_lossy().into_owned())
+            })
+            .field("keys", s.keys)
+            .field("live_bytes", s.live_bytes)
+            .field("last_seq", s.last_seq)
+            .field("durable_seq", s.durable_seq)
+            .field("batches", s.batches)
+            .field("ops", s.ops)
+            .field("commit_groups", s.commit_groups)
+            .field("wal_syncs", s.wal_syncs)
+            .field("wal_bytes_written", s.wal_bytes_written)
+            .field("wal_segments", s.wal_segments)
+            .field("wal_bytes", s.wal_bytes)
+            .field("checkpoints", s.checkpoints)
+            .field("checkpoint_seq", s.checkpoint_seq)
+            .field("snapshot_bytes", s.snapshot_bytes)
+            .raw("recovery", recovery)
+            .build()
+    }
+}
+
+/// The result of [`Engine::verify`]: whether the queue's in-memory indexes
+/// agree with the store.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VerifyOutcome {
+    /// Jobs found in the store.
+    pub jobs: u64,
+    /// Queues found.
+    pub queues: u64,
+    /// Uniqueness claims found.
+    pub claims: u64,
+    /// One line per inconsistency (at most 100).
+    pub problems: Vec<String>,
+    /// Inconsistencies beyond those listed.
+    pub more_problems: u64,
+}
+
+impl VerifyOutcome {
+    /// Whether everything agrees.
+    #[must_use]
+    pub fn is_consistent(&self) -> bool {
+        self.problems.is_empty()
+    }
+}
+
+impl From<VerifyReport> for VerifyOutcome {
+    fn from(r: VerifyReport) -> VerifyOutcome {
+        VerifyOutcome {
+            jobs: r.jobs,
+            queues: r.queues,
+            claims: r.claims,
+            problems: r.problems,
+            more_problems: r.more_problems,
+        }
+    }
+}
+
+impl ToJson for VerifyOutcome {
+    fn to_json(&self) -> Value {
+        ObjectBuilder::new()
+            .field("consistent", self.is_consistent())
+            .field("jobs", self.jobs)
+            .field("queues", self.queues)
+            .field("claims", self.claims)
+            .field("problems", &self.problems)
+            .field("more_problems", self.more_problems)
+            .build()
+    }
+}
