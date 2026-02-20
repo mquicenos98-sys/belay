@@ -114,3 +114,30 @@ impl Paging {
         }
     }
 }
+
+/// One page of `items` ordered by `name`, after `paging`'s cursor.
+fn page_by_name<T>(
+    mut items: Vec<T>,
+    name: impl Fn(&T) -> &str,
+    paging: &Paging,
+) -> Result<Page<T>, ApiError> {
+    let limit = paging.effective_limit()?;
+    let after = paging.after_name()?;
+    items.retain(|item| after.map_or(true, |a| name(item) > a));
+    items.sort_by(|a, b| name(a).cmp(name(b)));
+    items.truncate(limit as usize + 1);
+    Ok(Page::paginate(items, limit, |item| {
+        Cursor::from_name(name(item))
+    }))
+}
+
+/// `GET /v1/admin/store`: what the store is and its figures.
+#[derive(Clone, Debug, PartialEq)]
+pub struct StoreReport {
+    /// `memory`, `disk` or `custom`.
+    pub storage: String,
+    /// The data directory, for `disk`.
+    pub dir: Option<PathBuf>,
+    /// The store's own statistics.
+    pub stats: KvStats,
+}
