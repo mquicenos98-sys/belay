@@ -39,3 +39,91 @@ pub struct TickReport {
     /// Duties that failed, one line each. They are retried next round.
     pub errors: Vec<String>,
 }
+
+impl Engine {
+    /// Runs one round of every periodic duty at `now`: the queue tick, the
+    /// scheduler tick (when schedules may fire on this node), the workflow
+    /// chores, the metrics refresh, and a checkpoint if
+    /// `storage.checkpoint_interval` has passed since the last one.
+    ///
+    /// Engines built with background threads run these on their own; this
+    /// is for engines built with
+    /// [`background(false)`](super::EngineBuilder::background).
+    pub fn tick(&self, now: Timestamp) -> TickReport {
+        let shared = &self.shared;
+        let mut report = TickReport::default();
+        match shared.queue.tick(now) {
+            Ok(r) => report.queue = r,
+            Err(e) => report.errors.push(format!("queue tick: {e}")),
+        }
+        if let Some(r) = shared.run_schedules(now) {
+            report.schedules = r;
+        }
+        let (recovered, deleted, errors) = shared.workflow_chores(now);
+        report.workflows_recovered = recovered;
+        report.workflows_deleted = deleted;
+        report.errors.extend(errors);
+        shared.refresh_metrics();
+        match shared.checkpoint_if_due(now) {
+            Ok(info) => report.checkpoint = info,
+            Err(e) => report.errors.push(format!("checkpoint: {e}")),
+        }
+        report
+    }
+
+    /// Starts the background threads.
+    pub(super) fn spawn_duties(&self) -> Result<()> {
+        let config = &self.shared.config;
+        let mut threads = lock(&self.threads);
+
+        let shared = Arc::clone(&self.shared);
+        threads.push(spawn(
+            "belay-queue-tick",
+            config.engine.tick,
+            &self.shutdown,
+            move || {
+                let now = shared.clock.now();
+                if let Err(e) = shared.queue.tick(now) {
+                    warn!("queue tick failed"; error = %e);
+                }
+            },
+        )?);
+
+        if config.scheduler.enabled {
+            let shared = Arc::clone(&self.shared);
+            let shutdown = self.shutdown.clone();
+            let handle = thread::Builder::new()
+                .name("belay-scheduler".to_owned())
+                .spawn(move || scheduler_loop(&shared, &shutdown))
+                .map_err(|e| Error::io("starting the scheduler thread", e))?;
+            threads.push(handle);
+        }
+
+        let shared = Arc::clone(&self.shared);
+        threads.push(spawn(
+            "belay-workflows",
+            config.workflows.sweep_every,
+            &self.shutdown,
+            move || {
+                let now = shared.clock.now();
+                for problem in shared.workflow_chores(now).2 {
+                    warn!("workflow chore failed"; error = %problem);
+                }
+            },
+        )?);
+
+        let shared = Arc::clone(&self.shared);
+        threads.push(spawn(
+            "belay-housekeeping",
+            config.metrics.refresh,
+            &self.shutdown,
+            move || {
+                shared.refresh_metrics();
+                if let Err(e) = shared.checkpoint_if_due(shared.clock.now()) {
+                    warn!("periodic checkpoint failed"; error = %e);
+                }
+            },
+        )?);
+        Ok(())
+    }
+}
