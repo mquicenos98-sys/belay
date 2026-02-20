@@ -127,3 +127,39 @@ impl Engine {
         Ok(())
     }
 }
+
+fn spawn(
+    name: &str,
+    period: Duration,
+    shutdown: &Shutdown,
+    mut f: impl FnMut() + Send + 'static,
+) -> Result<thread::JoinHandle<()>> {
+    spawn_periodic(name, period, shutdown.clone(), move |_| f())
+        .map_err(|e| Error::io(format!("starting the {name} thread"), e))
+}
+
+/// Sleeps until the next fire time (at most `scheduler.tick`, which bounds
+/// how late it notices schedules added or changed meanwhile), ticks, and
+/// repeats until shutdown.
+fn scheduler_loop(shared: &Shared, shutdown: &Shutdown) {
+    let max_sleep = shared.config.scheduler.tick;
+    while !shutdown.is_triggered() {
+        let now = shared.clock.now();
+        if shared.scheduler.next_wakeup().is_some_and(|t| t <= now) {
+            let ran = panic::catch_unwind(AssertUnwindSafe(|| shared.run_schedules(now)));
+            if ran.is_err() {
+                error!("scheduler tick panicked");
+            }
+        }
+        let now = shared.clock.now();
+        // A wakeup still due after the tick is waiting for something else
+        // (a retry delay, the cluster join); do not spin on it.
+        let sleep = match shared.scheduler.next_wakeup() {
+            Some(t) if t > now => t.saturating_duration_since(now).min(max_sleep),
+            _ => max_sleep,
+        };
+        if shutdown.wait_timeout(sleep.max(Duration::from_millis(1))) {
+            break;
+        }
+    }
+}
