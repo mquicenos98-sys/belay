@@ -163,3 +163,79 @@ fn scheduler_loop(shared: &Shared, shutdown: &Shutdown) {
         }
     }
 }
+
+impl Shared {
+    /// Ticks the scheduler if schedules may fire on this node: always when
+    /// not clustered; when clustered, once the node has joined (or its
+    /// grace period has passed), firing only the schedules it owns.
+    pub(crate) fn run_schedules(&self, now: Timestamp) -> Option<belay_scheduler::TickReport> {
+        if !self.config.scheduler.enabled {
+            return None;
+        }
+        let report = match &self.cluster {
+            None => self.scheduler.tick(now),
+            Some(cluster) if cluster.may_fire() => {
+                self.scheduler.tick_owned(now, &|id| cluster.fires(id))
+            }
+            Some(_) => return None,
+        };
+        for problem in &report.errors {
+            warn!("schedule fire failed"; error = %problem.message, schedule = ?problem.schedule);
+        }
+        if !report.is_empty() {
+            debug!("scheduler tick"; fired = report.fired.len(), skipped = report.skipped.len());
+        }
+        Some(report)
+    }
+
+    /// Reconciles running workflow steps with their jobs and deletes runs
+    /// past `workflows.keep_for`. Returns (runs changed, runs deleted,
+    /// problems).
+    pub(crate) fn workflow_chores(&self, now: Timestamp) -> (usize, usize, Vec<String>) {
+        let mut problems = Vec::new();
+        let recovered = self.workflows.call(|w| w.recover()).unwrap_or_else(|e| {
+            problems.push(format!("workflow recovery: {e}"));
+            0
+        });
+        let keep_for = self.config.workflows.keep_for;
+        let deleted = self
+            .workflows
+            .call(|w| w.sweep(now, keep_for))
+            .unwrap_or_else(|e| {
+                problems.push(format!("workflow retention: {e}"));
+                0
+            });
+        (recovered, deleted, problems)
+    }
+
+    /// Folds lease latency samples into the metrics.
+    pub(crate) fn refresh_metrics(&self) {
+        let samples = self.queue.drain_lease_latencies();
+        self.metrics.observe_lease_waits(&samples);
+    }
+
+    /// Writes a checkpoint when `storage.checkpoint_interval` has passed
+    /// since the last one. The store skips it if nothing was written.
+    pub(crate) fn checkpoint_if_due(
+        &self,
+        now: Timestamp,
+    ) -> belay_store::Result<Option<CheckpointInfo>> {
+        let interval = self.config.storage.checkpoint_interval;
+        if self.log_kv.is_none() || interval.is_zero() {
+            return Ok(None);
+        }
+        {
+            let mut last = lock(&self.last_checkpoint);
+            let elapsed = now.saturating_duration_since(*last);
+            *last = now;
+            if elapsed < interval {
+                return Ok(None);
+            }
+        }
+        let info = self.kv.checkpoint()?;
+        if info.written {
+            debug!("periodic checkpoint written"; seq = info.seq, keys = info.keys);
+        }
+        Ok(Some(info))
+    }
+}
