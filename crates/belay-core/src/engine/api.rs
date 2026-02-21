@@ -473,3 +473,147 @@ impl Engine {
         Ok(self.shared.workflows.call(|w| w.cancel(id))?)
     }
 }
+
+/// Workers, cluster and administration.
+impl Engine {
+    /// One page of workers seen recently, by id.
+    pub fn workers(&self, paging: &Paging) -> Result<Page<WorkerInfo>, ApiError> {
+        let workers = self.shared.queue.workers();
+        page_by_name(workers, |w| w.id.as_str(), paging)
+    }
+
+    /// Whether this engine is part of a cluster.
+    #[must_use]
+    pub fn is_clustered(&self) -> bool {
+        self.shared.cluster.is_some()
+    }
+
+    /// Which node should serve requests about `queue`.
+    #[must_use]
+    pub fn owner_of(&self, queue: &QueueName) -> Ownership {
+        self.owner_of_key(&queue_key(queue))
+    }
+
+    /// Which node fires schedule `id` and should serve requests about it.
+    #[must_use]
+    pub fn owner_of_schedule(&self, id: &ScheduleId) -> Ownership {
+        self.owner_of_key(&schedule_key(id))
+    }
+
+    /// The owner of an arbitrary ownership key.
+    #[must_use]
+    pub fn owner_of_key(&self, key: &str) -> Ownership {
+        match &self.shared.cluster {
+            Some(cluster) => cluster.ownership(key),
+            None => Ownership::Local,
+        }
+    }
+
+    /// The cluster members as this node sees them, by id; just this node
+    /// when not clustered.
+    #[must_use]
+    pub fn members(&self) -> Vec<MemberInfo> {
+        match &self.shared.cluster {
+            Some(cluster) => cluster.members(),
+            None => vec![MemberInfo {
+                id: self.shared.node_id.clone(),
+                addr: self
+                    .shared
+                    .config
+                    .cluster
+                    .api_url(&self.shared.config.server),
+                state: MemberState::Alive,
+                leader: true,
+            }],
+        }
+    }
+
+    /// Whether the cluster node has joined through a seed (always true
+    /// when not clustered).
+    #[must_use]
+    pub fn is_joined(&self) -> bool {
+        self.shared.cluster.as_ref().map_or(true, |c| c.is_joined())
+    }
+
+    /// Writes a checkpoint of the store now.
+    pub fn checkpoint(&self) -> Result<CheckpointResponse, ApiError> {
+        let started = Instant::now();
+        let info = self
+            .shared
+            .kv
+            .checkpoint()
+            .map_err(|e| ApiError::from(belay_queue::Error::Store(e)))?;
+        *belay_common::sync::lock(&self.shared.last_checkpoint) = self.shared.clock.now();
+        Ok(CheckpointResponse {
+            seq: info.seq,
+            took: started.elapsed(),
+        })
+    }
+
+    /// What the store is and its statistics.
+    #[must_use]
+    pub fn store_report(&self) -> StoreReport {
+        let shared = &self.shared;
+        StoreReport {
+            storage: shared.storage.as_str().to_owned(),
+            dir: shared.log_kv.as_ref().map(|kv| kv.dir().to_path_buf()),
+            stats: shared.kv.stats(),
+        }
+    }
+
+    /// Rebuilds the queue's indexes from the store and compares them with
+    /// the live ones. Holds the queue lock for a full scan: a diagnostic,
+    /// not something to run periodically.
+    pub fn verify(&self) -> Result<VerifyOutcome, ApiError> {
+        Ok(self.shared.queue.verify()?.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug)]
+    struct Named(&'static str);
+
+    fn names(page: &Page<Named>) -> Vec<&'static str> {
+        page.items.iter().map(|n| n.0).collect()
+    }
+
+    #[test]
+    fn name_pages_are_sorted_and_continue_after_the_cursor() {
+        let items = || vec![Named("c"), Named("a"), Named("d"), Named("b")];
+        let first = page_by_name(items(), |n| n.0, &Paging::new().limit(3)).unwrap();
+        assert_eq!(names(&first), ["a", "b", "c"]);
+        let cursor = first.next_cursor.clone().expect("more to come");
+        let rest = page_by_name(items(), |n| n.0, &Paging::new().after(cursor).limit(3)).unwrap();
+        assert_eq!(names(&rest), ["d"]);
+        assert!(rest.next_cursor.is_none());
+    }
+
+    #[test]
+    fn foreign_cursors_and_bad_limits_are_invalid_arguments() {
+        let job_cursor = Cursor::after_job(JobId::generate());
+        let err =
+            page_by_name(vec![Named("a")], |n| n.0, &Paging::new().after(job_cursor)).unwrap_err();
+        assert_eq!(err.message, "$.cursor: was not issued by this listing");
+        let err = page_by_name(vec![Named("a")], |n| n.0, &Paging::new().limit(5000)).unwrap_err();
+        assert_eq!(err.message, "$.limit: must be between 1 and 1000, got 5000");
+        assert!(Paging::from_pairs([("limit", "ten")]).is_err());
+        assert_eq!(Paging::from_pairs([("cursor", "")]).unwrap(), Paging::new());
+    }
+
+    #[test]
+    fn verify_outcomes_render_as_json() {
+        let outcome = VerifyOutcome {
+            jobs: 3,
+            queues: 1,
+            claims: 0,
+            problems: vec!["job x: state differs".into()],
+            more_problems: 0,
+        };
+        let json = outcome.to_json();
+        assert_eq!(json["consistent"], false);
+        assert_eq!(json["problems"][0], "job x: state differs");
+    }
+}
