@@ -340,3 +340,136 @@ impl Engine {
         Ok(PurgeResponse { purged })
     }
 }
+
+/// Schedules and calendars.
+impl Engine {
+    /// One page of schedules, by id.
+    pub fn list_schedules(&self, paging: &Paging) -> Result<Page<Schedule>, ApiError> {
+        let limit = paging.effective_limit()?;
+        // The scheduler would treat a job cursor as "from the start";
+        // refuse it instead, like the other name-ordered listings.
+        paging.after_name()?;
+        Ok(self
+            .shared
+            .scheduler
+            .list_page(paging.cursor.as_ref(), limit))
+    }
+
+    /// The schedule `id`.
+    pub fn get_schedule(&self, id: &ScheduleId) -> Result<Schedule, ApiError> {
+        self.shared
+            .scheduler
+            .get(id)
+            .ok_or_else(|| ApiError::not_found("schedule", id))
+    }
+
+    /// Creates a schedule; `already_exists` if the id is taken.
+    pub fn create_schedule(&self, spec: ScheduleSpec) -> Result<Schedule, ApiError> {
+        Ok(self.shared.scheduler.create(spec)?)
+    }
+
+    /// Replaces an existing schedule's definition.
+    pub fn update_schedule(&self, spec: ScheduleSpec) -> Result<Schedule, ApiError> {
+        Ok(self.shared.scheduler.update(spec)?)
+    }
+
+    /// Creates or replaces a schedule (`PUT /v1/schedules/:id`).
+    pub fn put_schedule(&self, spec: ScheduleSpec) -> Result<(Schedule, Upserted), ApiError> {
+        Ok(self.shared.scheduler.upsert(spec)?)
+    }
+
+    /// Deletes a schedule, returning its last state. Jobs it created stay.
+    pub fn delete_schedule(&self, id: &ScheduleId) -> Result<Schedule, ApiError> {
+        Ok(self.shared.scheduler.delete(id)?)
+    }
+
+    /// Pauses a schedule.
+    pub fn pause_schedule(&self, id: &ScheduleId) -> Result<Schedule, ApiError> {
+        Ok(self.shared.scheduler.pause(id)?)
+    }
+
+    /// Resumes a schedule; fires missed while paused are not caught up.
+    pub fn resume_schedule(&self, id: &ScheduleId) -> Result<Schedule, ApiError> {
+        Ok(self.shared.scheduler.resume(id)?)
+    }
+
+    /// Fires a schedule now, whatever its cron expression and state say.
+    pub fn trigger_schedule(&self, id: &ScheduleId) -> Result<TriggerResponse, ApiError> {
+        let fired = self.shared.scheduler.trigger_now(id)?;
+        Ok(TriggerResponse { job: fired.job })
+    }
+
+    /// The next `n` fire times of a schedule.
+    pub fn preview_schedule(&self, id: &ScheduleId, n: usize) -> Result<PreviewResponse, ApiError> {
+        let times = self.shared.scheduler.preview(id, n)?;
+        Ok(PreviewResponse { times })
+    }
+
+    /// The first `n` fire times of a schedule that is not stored, from now.
+    pub fn preview_spec(&self, spec: &ScheduleSpec, n: usize) -> Result<PreviewResponse, ApiError> {
+        let now = self.shared.clock.now();
+        let times = self.shared.scheduler.preview_spec(spec, now, n)?;
+        Ok(PreviewResponse { times })
+    }
+
+    /// One page of calendars, by name.
+    pub fn list_calendars(&self, paging: &Paging) -> Result<Page<CalendarSpec>, ApiError> {
+        let calendars = self.shared.scheduler.list_calendars();
+        page_by_name(calendars, |c| c.name.as_str(), paging)
+    }
+
+    /// The calendar `name`.
+    pub fn get_calendar(&self, name: &str) -> Result<CalendarSpec, ApiError> {
+        self.shared
+            .scheduler
+            .get_calendar(name)
+            .ok_or_else(|| ApiError::not_found("calendar", name))
+    }
+
+    /// Creates or replaces a calendar; schedules using it are rescheduled.
+    pub fn put_calendar(&self, spec: CalendarSpec) -> Result<(CalendarSpec, Upserted), ApiError> {
+        let upserted = self.shared.scheduler.put_calendar(spec.clone())?;
+        Ok((spec, upserted))
+    }
+
+    /// Deletes a calendar no schedule uses.
+    pub fn delete_calendar(&self, name: &str) -> Result<CalendarSpec, ApiError> {
+        Ok(self.shared.scheduler.delete_calendar(name)?)
+    }
+}
+
+/// Workflows.
+impl Engine {
+    /// Starts a workflow run.
+    pub fn submit_workflow(&self, spec: WorkflowSpec) -> Result<Workflow, ApiError> {
+        Ok(self.shared.workflows.call(|w| w.submit(spec))?)
+    }
+
+    /// The run `id`.
+    pub fn get_workflow(&self, id: WorkflowId) -> Result<Workflow, ApiError> {
+        self.shared
+            .workflows
+            .engine()
+            .get(id)?
+            .ok_or_else(|| ApiError::not_found("workflow", id))
+    }
+
+    /// The run `id` with the failure message of each failed step.
+    pub fn workflow_details(&self, id: WorkflowId) -> Result<WorkflowDetails, ApiError> {
+        self.shared
+            .workflows
+            .engine()
+            .details(id)?
+            .ok_or_else(|| ApiError::not_found("workflow", id))
+    }
+
+    /// One page of runs matching `filter`.
+    pub fn list_workflows(&self, filter: &WorkflowFilter) -> Result<Page<Workflow>, ApiError> {
+        Ok(self.shared.workflows.engine().list(filter)?)
+    }
+
+    /// Cancels a run and its running step jobs.
+    pub fn cancel_workflow(&self, id: WorkflowId) -> Result<Workflow, ApiError> {
+        Ok(self.shared.workflows.call(|w| w.cancel(id))?)
+    }
+}
