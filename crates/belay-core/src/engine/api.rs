@@ -232,3 +232,111 @@ impl ToJson for VerifyOutcome {
             .build()
     }
 }
+
+/// Jobs.
+impl Engine {
+    /// Enqueues one job.
+    pub fn enqueue(&self, spec: JobSpec) -> Result<EnqueueResult, ApiError> {
+        Ok(self.shared.queue.enqueue(spec)?)
+    }
+
+    /// Enqueues several jobs atomically: all are accepted or none.
+    pub fn enqueue_batch(&self, specs: Vec<JobSpec>) -> Result<EnqueueResponse, ApiError> {
+        let results = self.shared.queue.enqueue_batch(specs)?;
+        Ok(EnqueueResponse { results })
+    }
+
+    /// `POST /v1/jobs` with either body form.
+    pub fn enqueue_request(&self, request: EnqueueRequest) -> Result<EnqueueResponse, ApiError> {
+        match request {
+            EnqueueRequest::One(spec) => Ok(EnqueueResponse {
+                results: vec![self.enqueue(spec)?],
+            }),
+            EnqueueRequest::Batch(specs) => self.enqueue_batch(specs),
+        }
+    }
+
+    /// The job `id`.
+    pub fn get_job(&self, id: &JobId) -> Result<Job, ApiError> {
+        Ok(self.shared.queue.get(id)?)
+    }
+
+    /// One page of jobs matching `filter`.
+    pub fn list_jobs(&self, filter: &JobFilter) -> Result<Page<Job>, ApiError> {
+        Ok(self.shared.queue.list(filter)?)
+    }
+
+    /// Cancels a job: waiting and ready jobs at once, running ones through
+    /// their worker's next heartbeat.
+    pub fn cancel_job(&self, id: &JobId) -> Result<Job, ApiError> {
+        Ok(self.shared.queue.cancel(id)?)
+    }
+
+    /// Sends a dead or cancelled job back to `ready`.
+    pub fn retry_job(&self, id: &JobId) -> Result<Job, ApiError> {
+        Ok(self.shared.queue.retry(id)?)
+    }
+
+    /// Makes a scheduled or retrying job ready now.
+    pub fn promote_job(&self, id: &JobId) -> Result<Job, ApiError> {
+        Ok(self.shared.queue.promote(id)?)
+    }
+
+    /// Deletes a finished job.
+    pub fn delete_job(&self, id: &JobId) -> Result<(), ApiError> {
+        Ok(self.shared.queue.delete(id)?)
+    }
+}
+
+/// Queues.
+impl Engine {
+    /// One page of queues, by name.
+    pub fn list_queues(&self, paging: &Paging) -> Result<Page<QueueInfo>, ApiError> {
+        let queues = self.shared.queue.list_queues();
+        page_by_name(queues, |q| q.name.as_str(), paging)
+    }
+
+    /// Status of queue `name`.
+    pub fn queue_info(&self, name: &QueueName) -> Result<QueueInfo, ApiError> {
+        Ok(self.shared.queue.queue_info(name)?)
+    }
+
+    /// Replaces a queue's configuration, creating the queue if needed.
+    pub fn set_queue_config(
+        &self,
+        name: &QueueName,
+        config: QueueConfig,
+    ) -> Result<QueueInfo, ApiError> {
+        Ok(self.shared.queue.set_config(name, config)?)
+    }
+
+    /// Stops leasing from a queue (creating it if needed).
+    pub fn pause_queue(&self, name: &QueueName) -> Result<QueueInfo, ApiError> {
+        self.shared.queue.pause(name)?;
+        self.queue_info(name)
+    }
+
+    /// Resumes leasing from a queue.
+    pub fn resume_queue(&self, name: &QueueName) -> Result<QueueInfo, ApiError> {
+        self.shared.queue.resume(name)?;
+        self.queue_info(name)
+    }
+
+    /// Deletes a queue's jobs, only those in `state` if given (never
+    /// running ones).
+    pub fn purge_queue(
+        &self,
+        name: &QueueName,
+        state: Option<JobState>,
+    ) -> Result<PurgeResponse, ApiError> {
+        let purged = self.shared.queue.purge(name, state)?;
+        Ok(PurgeResponse { purged })
+    }
+
+    /// Deletes a queue with its jobs. Without `force`, a queue with
+    /// unfinished jobs is refused.
+    pub fn delete_queue(&self, name: &QueueName, force: bool) -> Result<PurgeResponse, ApiError> {
+        let purged = self.shared.queue.delete_queue(name, force)?;
+        Ok(PurgeResponse { purged })
+    }
+}
