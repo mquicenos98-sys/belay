@@ -256,3 +256,52 @@ impl EngineBuilder {
 }
 
 type OpenedStore = (Arc<dyn Kv>, Option<Arc<LogKv>>, StorageKind);
+
+fn open_store(config: &Config, custom: Option<Arc<dyn Kv>>) -> Result<OpenedStore> {
+    if let Some(kv) = custom {
+        return Ok((kv, None, StorageKind::Custom));
+    }
+    let storage = &config.storage;
+    if storage.in_memory {
+        return Ok((Arc::new(MemKv::new()), None, StorageKind::Memory));
+    }
+    let log_kv = Arc::new(LogKv::open(&storage.dir, storage.store_options())?);
+    let kv: Arc<dyn Kv> = log_kv.clone();
+    Ok((kv, Some(log_kv), StorageKind::Disk))
+}
+
+/// Applies `[queues.*]`, `[[calendars]]` and `[[schedules]]`, creating or
+/// updating each.
+fn apply_config(config: &Config, queue: &QueueEngine, scheduler: &Scheduler) -> Result<()> {
+    let mut queues = 0;
+    for (name, wanted) in &config.queues {
+        queue
+            .set_config(name, wanted.clone())
+            .map_err(|e| Error::apply(format!("queue {name}"), e))?;
+        queues += 1;
+    }
+    let mut calendars = 0;
+    for spec in &config.calendars {
+        let name = spec.name.clone();
+        let outcome = scheduler
+            .put_calendar(spec.clone())
+            .map_err(|e| Error::apply(format!("calendar {name}"), e))?;
+        if outcome != Upserted::Unchanged {
+            calendars += 1;
+        }
+    }
+    let mut schedules = 0;
+    for spec in &config.schedules {
+        let id = spec.id.clone();
+        let (_, outcome) = scheduler
+            .upsert(spec.clone())
+            .map_err(|e| Error::apply(format!("schedule {id}"), e))?;
+        if outcome != Upserted::Unchanged {
+            schedules += 1;
+        }
+    }
+    if queues + calendars + schedules > 0 {
+        info!("applied configuration changes"; queues, calendars, schedules);
+    }
+    Ok(())
+}
