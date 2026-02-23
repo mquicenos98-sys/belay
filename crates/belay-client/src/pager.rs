@@ -136,7 +136,7 @@ impl<T: FromJson> Paginator<T> {
         let page: Page<T> = self.client.fetch(call)?;
         self.pages += 1;
         match page.next_cursor {
-            Some(next) if page.items.is_empty() && self.cursor.as_ref() == Some(&next) => {
+            Some(next) if self.cursor.as_ref() == Some(&next) => {
                 return Err(Error::Decode(DecodeError::new(
                     endpoint,
                     format!("server returned cursor {next} again; stopping instead of looping"),

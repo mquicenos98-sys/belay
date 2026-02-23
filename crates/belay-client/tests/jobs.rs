@@ -283,6 +283,25 @@ fn list_all_starts_at_the_filters_cursor_and_fetches_lazily() {
 }
 
 #[test]
+fn list_all_stops_when_the_server_repeats_a_cursor() {
+    // Regression guard: a server bug that echoes the cursor would
+    // otherwise make list_all loop forever.
+    let fake = Fake::start();
+    let cursor = Cursor::after_job(job_id(1));
+    fake.reply_json(200, &Page::new(vec![sample_job(1)], Some(cursor.clone())));
+    fake.reply_json(200, &Page::new(vec![sample_job(1)], Some(cursor.clone())));
+
+    let items: Vec<_> = fake.client().jobs().list_all(JobFilter::new()).collect();
+
+    assert_eq!(items.len(), 2);
+    assert!(items[0].is_ok());
+    let err = items[1].as_ref().unwrap_err();
+    assert!(matches!(err, Error::Decode(_)), "{err}");
+    assert!(err.to_string().contains("again; stopping"), "{err}");
+    assert_eq!(fake.count(), 2);
+}
+
+#[test]
 fn list_all_yields_a_failed_page_once_and_ends() {
     let fake = Fake::start();
     fake.reply_json(
