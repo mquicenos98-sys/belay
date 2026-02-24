@@ -162,3 +162,72 @@ impl EventCounters {
         family.with_label_values(&[label]).inc();
     }
 }
+
+/// The engine's handle on its registry.
+pub(crate) struct Metrics {
+    registry: Registry,
+    lease_wait: Option<HistogramVec>,
+}
+
+impl Metrics {
+    /// Registers the event counters, the lease latency histogram and, if
+    /// asked, the process collector. With `enabled` false nothing is
+    /// registered and the registry stays empty.
+    pub(crate) fn register(
+        registry: Registry,
+        enabled: bool,
+        process: bool,
+        bus: &EventBus,
+    ) -> belay_metrics::Result<Metrics> {
+        if !enabled {
+            return Ok(Metrics {
+                registry,
+                lease_wait: None,
+            });
+        }
+        let counters = EventCounters::register(&registry)?;
+        bus.on_event(move |event| counters.observe(event));
+        // 5ms to about 5.5h: a lease wait is anything from an idle
+        // worker's immediate pickup to a backlog drained overnight.
+        let buckets = exponential_buckets(0.005, 4.0, 12)?;
+        let lease_wait = registry.histogram_vec(
+            "belay_lease_wait_seconds",
+            "Time jobs waited between becoming eligible and being leased.",
+            &["queue"],
+            &buckets,
+        )?;
+        if process {
+            registry.register_collector(Arc::new(ProcessCollector::new()))?;
+        }
+        Ok(Metrics {
+            registry,
+            lease_wait: Some(lease_wait),
+        })
+    }
+
+    /// Adds the scrape-time collector. It holds `shared` weakly: a registry
+    /// that outlives the engine simply stops reporting its state.
+    pub(crate) fn attach(&self, shared: &Arc<Shared>) -> belay_metrics::Result<()> {
+        if self.lease_wait.is_none() {
+            return Ok(());
+        }
+        self.registry
+            .register_collector(Arc::new(EngineCollector::new(Arc::downgrade(shared))?))
+    }
+
+    pub(crate) fn registry(&self) -> &Registry {
+        &self.registry
+    }
+
+    /// Feeds lease latency samples into the histogram.
+    pub(crate) fn observe_lease_waits(&self, samples: &[LeaseLatency]) {
+        let Some(histogram) = &self.lease_wait else {
+            return;
+        };
+        for sample in samples {
+            histogram
+                .with_label_values(&[sample.queue.as_str()])
+                .observe_duration(sample.waited);
+        }
+    }
+}
