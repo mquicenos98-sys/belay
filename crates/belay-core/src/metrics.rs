@@ -231,3 +231,291 @@ impl Metrics {
         }
     }
 }
+
+struct Descs {
+    queue_jobs: Desc,
+    queue_paused: Desc,
+    oldest_ready: Desc,
+    workers: Desc,
+    lease_waiting: Desc,
+    schedules: Desc,
+    workflows_running: Desc,
+    store_keys: Desc,
+    store_live_bytes: Desc,
+    store_wal_bytes: Desc,
+    store_wal_segments: Desc,
+    store_snapshot_bytes: Desc,
+    store_last_seq: Desc,
+    store_checkpoints: Desc,
+    store_wal_syncs: Desc,
+    events_published: Desc,
+    event_lags: Desc,
+    event_subscribers: Desc,
+    events_buffered: Desc,
+    cluster_members: Desc,
+    uptime: Desc,
+    info: Desc,
+}
+
+impl Descs {
+    fn new() -> belay_metrics::Result<Descs> {
+        let gauge = |name: &str, help: &str, labels: &[&str]| {
+            Desc::new(name, help, MetricType::Gauge, labels)
+        };
+        let counter = |name: &str, help: &str| Desc::new(name, help, MetricType::Counter, &[]);
+        Ok(Descs {
+            queue_jobs: gauge(
+                "belay_queue_jobs",
+                "Jobs by queue and state.",
+                &["queue", "state"],
+            )?,
+            queue_paused: gauge(
+                "belay_queue_paused",
+                "1 if the queue is paused.",
+                &["queue"],
+            )?,
+            oldest_ready: gauge(
+                "belay_queue_oldest_ready_seconds",
+                "How long the oldest ready job has been waiting.",
+                &["queue"],
+            )?,
+            workers: gauge("belay_workers", "Workers seen recently.", &[])?,
+            lease_waiting: gauge(
+                "belay_lease_waiting",
+                "Lease requests currently long-polling.",
+                &[],
+            )?,
+            schedules: gauge("belay_schedules", "Schedules defined.", &[])?,
+            workflows_running: gauge("belay_workflows_running", "Workflow runs in progress.", &[])?,
+            store_keys: gauge("belay_store_keys", "Keys in the store.", &[])?,
+            store_live_bytes: gauge(
+                "belay_store_live_bytes",
+                "Bytes of keys and values in the store.",
+                &[],
+            )?,
+            store_wal_bytes: gauge(
+                "belay_store_wal_bytes",
+                "Bytes of write-ahead log on disk.",
+                &[],
+            )?,
+            store_wal_segments: gauge(
+                "belay_store_wal_segments",
+                "Write-ahead log segment files.",
+                &[],
+            )?,
+            store_snapshot_bytes: gauge(
+                "belay_store_snapshot_bytes",
+                "Size of the newest snapshot.",
+                &[],
+            )?,
+            store_last_seq: gauge(
+                "belay_store_last_seq",
+                "Sequence number of the last write.",
+                &[],
+            )?,
+            store_checkpoints: counter("belay_store_checkpoints_total", "Checkpoints written.")?,
+            store_wal_syncs: counter("belay_store_wal_syncs_total", "Log syncs to disk.")?,
+            events_published: counter(
+                "belay_events_published_total",
+                "Events published on the bus.",
+            )?,
+            event_lags: counter(
+                "belay_event_lags_total",
+                "Times a subscriber fell behind the replay buffer.",
+            )?,
+            event_subscribers: gauge("belay_event_subscribers", "Event stream subscribers.", &[])?,
+            events_buffered: gauge("belay_events_buffered", "Events held for replay.", &[])?,
+            cluster_members: gauge(
+                "belay_cluster_members",
+                "Cluster members by state, as this node sees them.",
+                &["state"],
+            )?,
+            uptime: gauge(
+                "belay_uptime_seconds",
+                "Time since the engine started.",
+                &[],
+            )?,
+            info: gauge(
+                "belay_info",
+                "Version and node id of this engine; always 1.",
+                &["version", "node"],
+            )?,
+        })
+    }
+
+    fn all(&self) -> Vec<Desc> {
+        vec![
+            self.queue_jobs.clone(),
+            self.queue_paused.clone(),
+            self.oldest_ready.clone(),
+            self.workers.clone(),
+            self.lease_waiting.clone(),
+            self.schedules.clone(),
+            self.workflows_running.clone(),
+            self.store_keys.clone(),
+            self.store_live_bytes.clone(),
+            self.store_wal_bytes.clone(),
+            self.store_wal_segments.clone(),
+            self.store_snapshot_bytes.clone(),
+            self.store_last_seq.clone(),
+            self.store_checkpoints.clone(),
+            self.store_wal_syncs.clone(),
+            self.events_published.clone(),
+            self.event_lags.clone(),
+            self.event_subscribers.clone(),
+            self.events_buffered.clone(),
+            self.cluster_members.clone(),
+            self.uptime.clone(),
+            self.info.clone(),
+        ]
+    }
+}
+
+/// Reads engine state at scrape time.
+struct EngineCollector {
+    shared: Weak<Shared>,
+    descs: Descs,
+}
+
+impl EngineCollector {
+    fn new(shared: Weak<Shared>) -> belay_metrics::Result<EngineCollector> {
+        Ok(EngineCollector {
+            shared,
+            descs: Descs::new()?,
+        })
+    }
+}
+
+fn gauge(desc: &Desc, value: f64) -> FamilySnapshot {
+    FamilySnapshot::new(desc).with_metric(&[], MetricValue::Gauge(value))
+}
+
+fn counter(desc: &Desc, value: u64) -> FamilySnapshot {
+    FamilySnapshot::new(desc).with_metric(&[], MetricValue::Counter(value))
+}
+
+impl Collector for EngineCollector {
+    fn describe(&self) -> Vec<Desc> {
+        self.descs.all()
+    }
+
+    fn collect(&self) -> Vec<FamilySnapshot> {
+        let Some(shared) = self.shared.upgrade() else {
+            return Vec::new();
+        };
+        let d = &self.descs;
+        let stats = shared.queue.stats();
+        let mut jobs = FamilySnapshot::new(&d.queue_jobs);
+        let mut paused = FamilySnapshot::new(&d.queue_paused);
+        let mut oldest = FamilySnapshot::new(&d.oldest_ready);
+        for q in &stats.queues {
+            let name = q.name.as_str();
+            for state in JobState::ALL {
+                let count = q.counts.get(state) as f64;
+                jobs = jobs.with_metric(
+                    &[("queue", name), ("state", state.as_str())],
+                    MetricValue::Gauge(count),
+                );
+            }
+            paused = paused.with_metric(
+                &[("queue", name)],
+                MetricValue::Gauge(if q.paused { 1.0 } else { 0.0 }),
+            );
+            let age = q.oldest_ready_age.map_or(0.0, |a| a.as_secs_f64());
+            oldest = oldest.with_metric(&[("queue", name)], MetricValue::Gauge(age));
+        }
+
+        let store = shared.kv.stats();
+        let bus = shared.events.stats();
+        let mut members = FamilySnapshot::new(&d.cluster_members);
+        for (state, count) in shared.member_counts() {
+            members = members.with_metric(&[("state", state)], MetricValue::Gauge(count as f64));
+        }
+        let info = FamilySnapshot::new(&d.info).with_metric(
+            &[
+                ("version", crate::VERSION),
+                ("node", shared.node_id.as_str()),
+            ],
+            MetricValue::Gauge(1.0),
+        );
+        vec![
+            jobs,
+            paused,
+            oldest,
+            gauge(&d.workers, stats.workers as f64),
+            gauge(&d.lease_waiting, stats.waiting_leases as f64),
+            gauge(&d.schedules, shared.scheduler.len() as f64),
+            gauge(
+                &d.workflows_running,
+                shared.workflows.engine().running() as f64,
+            ),
+            gauge(&d.store_keys, store.keys as f64),
+            gauge(&d.store_live_bytes, store.live_bytes as f64),
+            gauge(&d.store_wal_bytes, store.wal_bytes as f64),
+            gauge(&d.store_wal_segments, store.wal_segments as f64),
+            gauge(&d.store_snapshot_bytes, store.snapshot_bytes as f64),
+            gauge(&d.store_last_seq, store.last_seq as f64),
+            counter(&d.store_checkpoints, store.checkpoints),
+            counter(&d.store_wal_syncs, store.wal_syncs),
+            counter(&d.events_published, bus.published),
+            counter(&d.event_lags, bus.lagged),
+            gauge(&d.event_subscribers, bus.subscribers as f64),
+            gauge(&d.events_buffered, bus.buffered as f64),
+            members,
+            gauge(&d.uptime, shared.uptime().as_secs_f64()),
+            info,
+        ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Config, Engine};
+
+    fn engine(config: Config) -> Engine {
+        Engine::builder()
+            .config(config)
+            .background(false)
+            .start()
+            .expect("engine starts")
+    }
+
+    #[test]
+    fn every_listed_family_is_registered() {
+        let engine = engine(Config::dev());
+        let names: Vec<String> = engine
+            .metrics()
+            .snapshot()
+            .into_iter()
+            .map(|f| f.name)
+            .collect();
+        for family in FAMILIES {
+            assert!(names.iter().any(|n| n == family), "{family} is missing");
+        }
+        assert!(names.iter().any(|n| n == "process_uptime_seconds"));
+        let unlisted: Vec<&String> = names
+            .iter()
+            .filter(|n| !n.starts_with("process_") && !FAMILIES.contains(&n.as_str()))
+            .collect();
+        assert!(unlisted.is_empty(), "not in FAMILIES: {unlisted:?}");
+    }
+
+    #[test]
+    fn disabled_metrics_leave_the_registry_empty() {
+        let mut config = Config::dev();
+        config.metrics.enabled = false;
+        let engine = engine(config);
+        assert!(engine.metrics().snapshot().is_empty());
+        assert_eq!(engine.render_metrics(), "");
+    }
+
+    #[test]
+    fn the_collector_outlives_its_engine_quietly() {
+        let engine = engine(Config::dev());
+        let registry = engine.metrics().clone();
+        drop(engine);
+        let text = registry.render_prometheus();
+        assert!(!text.contains("belay_store_keys"), "{text}");
+    }
+}
