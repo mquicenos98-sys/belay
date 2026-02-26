@@ -217,6 +217,11 @@ impl HeadScanner {
                 }
                 let start = self.head_start;
                 let end = self.pos;
+                if end > self.limits.head {
+                    return Err(ParseError::HeadTooLarge {
+                        limit: self.limits.head,
+                    });
+                }
                 self.reset();
                 return Ok(Some((start, end)));
             }
@@ -575,6 +580,19 @@ mod tests {
         let err = parse(&input).unwrap_err();
         assert_eq!(err, ParseError::HeadTooLarge { limit: 256 });
         assert_eq!(err.status(), StatusCode::REQUEST_HEADER_FIELDS_TOO_LARGE);
+    }
+
+    #[test]
+    fn oversized_head_arriving_in_one_read_is_rejected() {
+        // Regression: the size check only ran while the head was incomplete,
+        // so an oversized head delivered by a single read was accepted.
+        let mut input = b"GET / HTTP/1.1\r\nX-Big: ".to_vec();
+        input.extend(std::iter::repeat(b'v').take(300));
+        input.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(
+            parse(&input).unwrap_err(),
+            ParseError::HeadTooLarge { limit: 256 }
+        );
     }
 
     #[test]

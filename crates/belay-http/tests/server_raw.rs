@@ -145,6 +145,21 @@ fn absolute_form_and_encoded_paths_route_normally() {
 }
 
 #[test]
+fn oversized_headers_get_431_and_the_connection_closes() {
+    let server = serve_with(small_limits(), app());
+    let mut conn = Conn::open(server.local_addr());
+    let mut request = b"GET /hello HTTP/1.1\r\nHost: t\r\nX-Big: ".to_vec();
+    request.extend(std::iter::repeat(b'a').take(2000));
+    request.extend_from_slice(b"\r\n\r\n");
+    conn.send(&request);
+    let resp = conn.response();
+    assert_eq!(resp.status, 431);
+    assert_eq!(resp.header("connection"), Some("close"));
+    assert!(conn.closed_by_server());
+    assert_eq!(server.stats().protocol_errors, 1);
+}
+
+#[test]
 fn long_request_line_gets_414() {
     let server = serve_with(small_limits(), app());
     let mut conn = Conn::open(server.local_addr());
