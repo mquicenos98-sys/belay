@@ -100,3 +100,23 @@ impl Harness {
 pub fn quiet_logs() {
     belay_common::log::set_max_level(belay_common::log::Level::Warn);
 }
+
+/// A subscription filter replaying everything buffered.
+pub fn everything() -> EventFilter {
+    EventFilter::new()
+}
+
+/// Polls `condition` every few milliseconds until it holds or `timeout`
+/// passes; returns whether it held.
+pub fn eventually(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
