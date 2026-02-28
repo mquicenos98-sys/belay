@@ -122,6 +122,20 @@ fn a_rare_match_is_found_behind_many_non_matching_jobs() {
 }
 
 #[test]
+fn listed_jobs_hide_lease_tokens() {
+    let h = Harness::new();
+    h.enqueue(JobSpec::new("q", "k"));
+    let leased = h.lease_one("q");
+    let page = h.engine.list(&JobFilter::new()).expect("list");
+    let lease = page.items[0]
+        .lease
+        .as_ref()
+        .expect("running job has a lease");
+    assert!(lease.token.is_redacted());
+    assert!(!leased.token.is_redacted());
+}
+
+#[test]
 fn a_cursor_from_another_listing_is_rejected() {
     let h = Harness::new();
     let filter = JobFilter::new().after(Cursor::from_name("emails"));

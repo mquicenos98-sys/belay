@@ -110,7 +110,7 @@ impl QueueEngine {
                     continue;
                 };
                 if filter.matches(&job) {
-                    found.push(job);
+                    found.push(job.redacted());
                     if found.len() == want {
                         break;
                     }
