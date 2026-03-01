@@ -112,3 +112,21 @@ fn every_section_is_read() {
     assert!(!config.metrics.process);
     assert!(config.warnings().is_empty(), "{:?}", config.warnings());
 }
+
+#[test]
+fn environment_variables_override_the_file() {
+    let src = "[server]\nlisten = \"127.0.0.1:7700\"\n\n[queues.emails]\nmax_concurrency = 2\n";
+    let vars = [
+        ("BELAY_SERVER__THREADS", "3"),
+        ("BELAY_STORAGE__IN_MEMORY", "true"),
+        ("BELAY_QUEUES__EMAILS__MAX_CONCURRENCY", "9"),
+        ("BELAY_LOG__LEVEL", "warn"),
+        ("BELAY_URL", "http://ignored:7700"),
+        ("OTHER_SERVER__THREADS", "99"),
+    ];
+    let config = Config::from_source_with_env("belay.toml", src, vars).unwrap();
+    assert_eq!(config.server.threads, 3);
+    assert!(config.storage.in_memory);
+    assert_eq!(config.queues["emails"].max_concurrency, Some(9));
+    assert_eq!(config.log.filter.to_string(), "warn");
+}
