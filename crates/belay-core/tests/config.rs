@@ -198,3 +198,183 @@ fn errors_point_at_the_offending_line() {
         .collect();
     assert_eq!(actual, expected);
 }
+
+#[test]
+fn diagnostics_render_the_source_line() {
+    let err = error("[scheduler]\ntick = \"0s\"\n");
+    assert_eq!(
+        err.to_string(),
+        "error: invalid value for scheduler.tick: must be positive\n \
+         --> belay.toml:2:8\n  |\n2 | tick = \"0s\"\n  |        ^^^^"
+    );
+}
+
+#[test]
+fn schedules_are_checked_when_loaded() {
+    let base = |cron: &str, tz: &str| {
+        format!(
+            "[[schedules]]\nid = \"s\"\ncron = \"{cron}\"\ntimezone = \"{tz}\"\n\
+             template = {{ queue = \"q\", kind = \"k\" }}\n"
+        )
+    };
+    let err = error(&base("61 * * * *", "UTC"));
+    assert!(
+        err.message()
+            .starts_with("invalid value for schedules[0].cron:"),
+        "{}",
+        err.message()
+    );
+    assert!(err.message().contains("61"), "{}", err.message());
+    assert_eq!(err.line_col(), Some((3, 8)));
+
+    let err = error(&base("0 * * * *", "Mars/Olympus_Mons"));
+    assert!(
+        err.message()
+            .starts_with("invalid value for schedules[0].timezone:"),
+        "{}",
+        err.message()
+    );
+
+    let twice = format!("{}{}", base("0 * * * *", "UTC"), base("5 * * * *", "UTC"));
+    assert_eq!(
+        error(&twice).message(),
+        "invalid value for schedules[1].id: schedule s is defined twice"
+    );
+
+    let err = error(
+        "[[schedules]]\nid = \"s\"\ncron = \"0 * * * *\"\n[schedules.template]\nqueue = \"q\"\nkind = \"k\"\npriority = 5000\n",
+    );
+    assert_eq!(
+        err.message(),
+        "invalid value for schedules[0].template.priority: must be between -1000 and 1000, got 5000"
+    );
+    assert_eq!(err.line_col(), Some((7, 12)));
+}
+
+#[test]
+fn calendars_must_be_unique_and_well_formed() {
+    let cal = "[[calendars]]\nname = \"office\"\nwindows = [{ days = [\"mon-fri\"], start = \"09:00\", end = \"17:00\" }]\n";
+    let config = load(cal);
+    assert_eq!(config.calendars[0].windows.len(), 1);
+    let err = error(&format!("{cal}{cal}"));
+    assert_eq!(
+        err.message(),
+        "invalid value for calendars[1].name: calendar \"office\" is defined twice"
+    );
+    let err = error("[[calendars]]\nname = \"x\"\nexclude_dates = [\"2025-02-30\"]\n");
+    assert!(
+        err.message()
+            .starts_with("invalid value for calendars[0].exclude_dates[0]"),
+        "{}",
+        err.message()
+    );
+}
+
+#[test]
+fn open_listeners_need_tokens_or_an_explicit_opt_out() {
+    let err = error("[server]\nlisten = \"0.0.0.0:7700\"\n");
+    assert!(
+        err.message().contains("no [[auth.tokens]] are configured"),
+        "{}",
+        err.message()
+    );
+    assert_eq!(err.line_col(), Some((2, 10)));
+    let config = load("[server]\nlisten = \"0.0.0.0:7700\"\n[auth]\ndisabled = true\n");
+    assert!(!config.auth.is_enforced());
+}
+
+#[test]
+fn a_cluster_behind_a_wildcard_listener_needs_an_api_address() {
+    let src =
+        "[server]\nlisten = \"0.0.0.0:7700\"\n[auth]\ndisabled = true\n[cluster]\nenabled = true\n";
+    let err = error(src);
+    assert!(
+        err.message().contains("set cluster.api_addr"),
+        "{}",
+        err.message()
+    );
+    let fixed = format!("{src}api_addr = \"http://10.1.2.3:7700\"\n");
+    assert_eq!(
+        load(&fixed).cluster.api_addr.as_deref(),
+        Some("http://10.1.2.3:7700")
+    );
+    let err = error("[cluster]\nnode_id = \"node one\"\n");
+    assert!(
+        err.message()
+            .starts_with("invalid value for cluster.node_id: contains invalid character"),
+        "{}",
+        err.message()
+    );
+}
+
+#[test]
+fn unknown_keys_are_warnings_with_suggestions() {
+    let config = load(
+        "[sever]\nlisten = \"x\"\n\n[server]\nthreds = 8\n\n[storage]\nsync = \"never\"\nfsync = true\n",
+    );
+    let warnings: Vec<(String, Option<String>)> = config
+        .warnings()
+        .iter()
+        .map(|w| (w.path.clone(), w.suggestion.clone()))
+        .collect();
+    assert_eq!(
+        warnings,
+        [
+            ("sever".to_owned(), Some("server".to_owned())),
+            (
+                "server.threds".to_owned(),
+                Some("server.threads".to_owned())
+            ),
+            ("storage.fsync".to_owned(), Some("storage.sync".to_owned())),
+        ]
+    );
+    let rendered = config.warnings()[1].to_string();
+    assert!(
+        rendered.starts_with("warning: unknown key `server.threds`"),
+        "{rendered}"
+    );
+    assert!(
+        rendered.contains("did you mean `server.threads`?"),
+        "{rendered}"
+    );
+}
+
+#[test]
+fn printed_configuration_loads_back_equal() {
+    let original = load(
+        "[auth]\n[[auth.tokens]]\nname = \"ci\"\ntoken = \"0123456789abcdef-ci\"\nscopes = [\"enqueue\", \"read\"]\n",
+    );
+    let example = Config::from_str(Config::example_toml()).unwrap();
+    for config in [Config::default(), original, example] {
+        let text = config.to_toml();
+        let back =
+            Config::from_source("printed.toml", &text).unwrap_or_else(|e| panic!("{e}\n{text}"));
+        assert_eq!(back, config, "{text}");
+        assert!(back.warnings().is_empty(), "{:?}", back.warnings());
+        assert!(
+            !text.contains("0123456789abcdef"),
+            "secrets must not be printed"
+        );
+    }
+}
+
+#[test]
+fn files_are_read_and_named_in_diagnostics() {
+    let dir = belay_common::fs::TempDir::new().unwrap();
+    let path = dir.join("belay.toml");
+    std::fs::write(&path, "[server]\nthreads = -1\n").unwrap();
+    let err = Config::from_file(&path).unwrap_err();
+    assert!(err.to_string().contains("belay.toml:2:11"), "{err}");
+    let missing = Config::from_file(dir.join("nope.toml")).unwrap_err();
+    assert!(
+        missing.message().starts_with("cannot read"),
+        "{}",
+        missing.message()
+    );
+    assert_eq!(
+        Config::load(None).map(|c| c.server.listen).ok(),
+        Some(Config::default().server.listen)
+            .filter(|_| std::env::var_os("BELAY_SERVER__LISTEN").is_none())
+            .or_else(|| Config::load(None).ok().map(|c| c.server.listen))
+    );
+}
