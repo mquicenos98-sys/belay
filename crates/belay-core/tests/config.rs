@@ -130,3 +130,71 @@ fn environment_variables_override_the_file() {
     assert_eq!(config.queues["emails"].max_concurrency, Some(9));
     assert_eq!(config.log.filter.to_string(), "warn");
 }
+
+#[test]
+fn a_bad_environment_value_names_the_variable() {
+    let err = Config::from_source_with_env("belay.toml", "", [("BELAY_SERVER__THREADS", "many")])
+        .unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("expected integer at server.threads, found string"),
+        "{text}"
+    );
+    assert!(
+        text.contains("environment variable BELAY_SERVER__THREADS"),
+        "{text}"
+    );
+}
+
+#[test]
+fn errors_point_at_the_offending_line() {
+    let cases = [
+        (
+            "[server]\nlisten = \"localhost\"\n",
+            "invalid value for server.listen: expected host:port, got \"localhost\"",
+            (2, 10),
+        ),
+        (
+            "[server]\nthreads = 0\n",
+            "invalid value for server.threads: must be at least 1",
+            (2, 11),
+        ),
+        (
+            "[storage]\nsync = \"sometimes\"\n",
+            "invalid value for storage.sync: invalid sync policy \"sometimes\" (expected always, never or interval:<duration> such as interval:10ms)",
+            (2, 8),
+        ),
+        (
+            "[engine]\ntick = \"soon\"\n",
+            "invalid value for engine.tick: invalid duration \"soon\": expected a number at byte 0",
+            (2, 8),
+        ),
+        (
+            "[cluster]\nprofile = \"moon\"\n",
+            "invalid value for cluster.profile: unknown cluster profile \"moon\", expected lan, wan or local",
+            (2, 11),
+        ),
+        (
+            "[queues.emails]\nmax_concurency = 3\n",
+            "invalid value for queues.emails.max_concurency: unknown field \"max_concurency\" in QueueConfig, did you mean \"max_concurrency\"?",
+            (2, 18),
+        ),
+        (
+            "[queues.Emails]\nmax_concurrency = 3\n",
+            "invalid value for queues.Emails: invalid queue name \"Emails\": must start with a lowercase letter or digit, got 'E'",
+            (1, 1),
+        ),
+    ];
+    let expected: Vec<(String, Option<(usize, usize)>)> = cases
+        .iter()
+        .map(|(_, message, at)| (message.to_string(), Some(*at)))
+        .collect();
+    let actual: Vec<(String, Option<(usize, usize)>)> = cases
+        .iter()
+        .map(|(src, _, _)| {
+            let err = error(src);
+            (err.message(), err.line_col())
+        })
+        .collect();
+    assert_eq!(actual, expected);
+}
