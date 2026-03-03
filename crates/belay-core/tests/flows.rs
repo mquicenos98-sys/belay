@@ -17,7 +17,6 @@ use belay_proto::{
 use common::{everything, Harness};
 
 const MINUTE: Duration = Duration::from_secs(60);
-
 const HOUR: Duration = Duration::from_secs(3600);
 
 #[test]
@@ -432,4 +431,111 @@ fn a_slow_subscriber_is_told_how_much_it_missed() {
     assert_eq!(deliveries.len(), 7, "{deliveries:?}");
     assert_eq!(deliveries[2], "lagged:4");
     assert_eq!(h.engine.events().stats().lagged, 1);
+}
+
+#[test]
+fn metrics_report_jobs_schedules_store_and_process() {
+    let h = Harness::new();
+    let id = h.engine.enqueue(JobSpec::new("emails", "send")).unwrap().id;
+    h.clock.advance(Duration::from_millis(1500));
+    let leased = h.lease_one("emails");
+    h.complete(&leased, None);
+    h.engine.enqueue(JobSpec::new("emails", "later")).unwrap();
+    h.engine
+        .create_schedule(ScheduleSpec::new(
+            "tick".parse().unwrap(),
+            "* * * * *",
+            JobSpec::new("cron", "k"),
+        ))
+        .unwrap();
+    h.advance(MINUTE);
+    assert_eq!(h.engine.get_job(&id).unwrap().state, JobState::Succeeded);
+
+    let text = h.engine.render_metrics();
+    for expected in [
+        "belay_jobs_enqueued_total{queue=\"emails\"} 2\n",
+        "belay_jobs_succeeded_total{queue=\"emails\"} 1\n",
+        "belay_jobs_started_total{queue=\"emails\"} 1\n",
+        "belay_queue_jobs{queue=\"emails\",state=\"ready\"} 1\n",
+        "belay_queue_jobs{queue=\"emails\",state=\"succeeded\"} 1\n",
+        "belay_queue_paused{queue=\"emails\"} 0\n",
+        "belay_lease_wait_seconds_count{queue=\"emails\"} 1\n",
+        "belay_lease_wait_seconds_bucket{queue=\"emails\",le=\"+Inf\"} 1\n",
+        "belay_schedule_fires_total{schedule=\"tick\"} 1\n",
+        "belay_schedules 1\n",
+        "belay_workers 1\n",
+        "belay_uptime_seconds 61.5\n",
+        "belay_cluster_members{state=\"alive\"} 1\n",
+        "# TYPE belay_store_keys gauge\n",
+        "# TYPE belay_events_published_total counter\n",
+        "belay_info{version=\"",
+        "# TYPE process_uptime_seconds gauge\n",
+    ] {
+        assert!(text.contains(expected), "missing {expected:?} in\n{text}");
+    }
+}
+
+#[test]
+fn listings_page_through_jobs_and_workers() {
+    let h = Harness::new();
+    for i in 0..5 {
+        h.engine
+            .enqueue(JobSpec::new("list", format!("k{i}")))
+            .unwrap();
+    }
+    let filter = JobFilter::new()
+        .queue(QueueName::from_static("list"))
+        .limit(3);
+    let first = h.engine.list_jobs(&filter).unwrap();
+    assert_eq!(first.items.len(), 3);
+    let rest = h
+        .engine
+        .list_jobs(&filter.clone().after(first.next_cursor.clone().unwrap()))
+        .unwrap();
+    assert_eq!(rest.items.len(), 2);
+    h.lease_one("list");
+    let workers = h.engine.workers(&Paging::new()).unwrap();
+    assert_eq!(workers.items[0].id.as_str(), "w1");
+    assert_eq!(workers.items[0].active_jobs, 1);
+}
+
+#[test]
+fn batches_are_atomic_and_errors_map_to_api_codes() {
+    let h = Harness::new();
+    let response = h
+        .engine
+        .enqueue_request(belay_proto::api::EnqueueRequest::Batch(vec![
+            JobSpec::new("b", "one"),
+            JobSpec::new("b", "two"),
+        ]))
+        .unwrap();
+    assert_eq!(response.results.len(), 2);
+    let err = h
+        .engine
+        .enqueue_batch(vec![
+            JobSpec::new("b", "ok"),
+            JobSpec::new("b", "bad").priority(9999),
+        ])
+        .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidArgument);
+    assert_eq!(
+        err.message,
+        "$.jobs[1].priority: must be between -1000 and 1000, got 9999"
+    );
+    assert_eq!(
+        h.engine
+            .queue_info(&QueueName::from_static("b"))
+            .unwrap()
+            .counts
+            .ready,
+        2
+    );
+}
+
+#[test]
+fn job_events_carry_the_right_kinds() {
+    let h = Harness::new();
+    h.engine.enqueue(JobSpec::new("q", "k")).unwrap();
+    let kinds: Vec<EventKind> = h.all_events().into_iter().map(|e| e.kind).collect();
+    assert!(matches!(&kinds[0], EventKind::JobEnqueued { kind, .. } if kind == "k"));
 }
