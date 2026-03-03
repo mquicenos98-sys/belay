@@ -155,3 +155,223 @@ fn an_injected_memory_store_survives_the_engine() {
     assert!(engine.get_schedule(&"memory".parse().unwrap()).is_ok());
     assert!(engine.store_report().dir.is_none());
 }
+
+#[test]
+fn steps_finished_while_the_engine_was_down_are_picked_up_at_start() {
+    let dir = TempDir::new().unwrap();
+    let clock = clock();
+    let run = {
+        let engine = start(disk_config(dir.path()), &clock);
+        engine.submit_workflow(two_steps()).unwrap().id
+    };
+    // A bare queue engine finishes the first step: no workflow engine is
+    // listening, as after a crash between the two.
+    {
+        let kv = Arc::new(LogKv::open(dir.path(), Options::new()).unwrap());
+        let queue = QueueEngine::open(
+            kv.clone(),
+            clock.shared(),
+            belay_proto::source::NoopSink::shared(),
+            EngineOptions::new(),
+        )
+        .unwrap();
+        let req = LeaseRequest::new(
+            WorkerId::from_static("w1"),
+            vec![QueueName::from_static("wf")],
+        );
+        let leased = queue.lease(&req).unwrap().remove(0);
+        let mut done = CompleteRequest::new(leased.token);
+        done.result = Some(json!({"rows": 7}));
+        queue.complete(&leased.job.id, &done).unwrap();
+        kv.close().unwrap();
+    }
+    let engine = start(disk_config(dir.path()), &clock);
+    let workflow = engine.get_workflow(run).unwrap();
+    assert_eq!(workflow.steps["extract"].state, StepState::Succeeded);
+    assert_eq!(workflow.steps["load"].state, StepState::Running);
+    assert_eq!(lease_one(&engine, "wf").job.spec.kind, "load");
+}
+
+#[test]
+fn shutdown_is_orderly_idempotent_and_releases_the_store() {
+    let dir = TempDir::new().unwrap();
+    let clock = clock();
+    let first = Arc::new(start(disk_config(dir.path()), &clock));
+    let sub = first.subscribe(EventFilter::new());
+    first.enqueue(JobSpec::new("q", "k")).unwrap();
+    assert!(first.is_ready());
+
+    let held = Arc::clone(&first);
+    first.shutdown();
+    first.shutdown();
+    assert!(held.is_shutting_down());
+    assert!(!held.is_ready());
+
+    // Everything queued is still delivered, then the stream ends.
+    while sub.try_recv().is_ok() {}
+    assert_eq!(sub.try_recv(), Err(belay_core::RecvError::Closed));
+
+    let req = LeaseRequest::new(
+        WorkerId::from_static("w1"),
+        vec![QueueName::from_static("q")],
+    );
+    assert_eq!(held.lease(&req).unwrap_err().code, ErrorCode::Unavailable);
+
+    // The directory lock is gone once the last handle is dropped.
+    drop(held);
+    drop(first);
+    let second = start(disk_config(dir.path()), &clock);
+    assert_eq!(
+        second
+            .queue_info(&QueueName::from_static("q"))
+            .unwrap()
+            .counts
+            .ready,
+        1
+    );
+}
+
+#[test]
+fn a_locked_store_or_a_bad_configured_schedule_fails_the_start() {
+    let dir = TempDir::new().unwrap();
+    let clock = clock();
+    let _running = start(disk_config(dir.path()), &clock);
+    let err = Engine::builder()
+        .config(disk_config(dir.path()))
+        .clock(clock.shared())
+        .background(false)
+        .start()
+        .unwrap_err();
+    assert!(matches!(err, Error::Store(_)), "{err}");
+
+    let mut config = Config::dev();
+    config.schedules = Config::from_str(
+        "[[schedules]]\nid = \"s\"\ncron = \"0 * * * *\"\ncalendar = \"missing\"\ntemplate = { queue = \"q\", kind = \"k\" }\n",
+    )
+    .unwrap()
+    .schedules;
+    let err = Engine::builder()
+        .config(config)
+        .background(false)
+        .start()
+        .unwrap_err();
+    assert!(matches!(err, Error::Apply { .. }), "{err}");
+    assert!(
+        err.to_string()
+            .starts_with("applying schedule s from the configuration failed"),
+        "{err}"
+    );
+}
+
+#[test]
+fn checkpoints_happen_on_demand_and_on_the_interval() {
+    let dir = TempDir::new().unwrap();
+    let clock = clock();
+    let engine = start(disk_config(dir.path()), &clock);
+    engine.enqueue(JobSpec::new("q", "k")).unwrap();
+    let response = engine.checkpoint().unwrap();
+    assert!(response.seq > 0);
+    let report = engine.store_report();
+    assert_eq!(report.storage, "disk");
+    assert_eq!(report.dir.as_deref(), Some(dir.path()));
+    assert_eq!(report.stats.checkpoints, 1);
+
+    engine.enqueue(JobSpec::new("q", "k2")).unwrap();
+    let due = engine.tick(clock.advance(Duration::from_secs(3600)));
+    assert!(due.checkpoint.is_some_and(|c| c.written));
+    assert_eq!(engine.store_report().stats.checkpoints, 2);
+    let json = belay_json::ToJson::to_json(&engine.store_report());
+    assert_eq!(json["storage"], "disk");
+    assert_eq!(json["recovery"]["lost_data"], false);
+}
+
+#[test]
+fn a_single_node_reports_itself() {
+    let clock = clock();
+    let engine = start(Config::dev(), &clock);
+    clock.advance(Duration::from_secs(90));
+    let info = engine.info();
+    assert_eq!(info.version, belay_core::VERSION);
+    assert_eq!(info.storage, "memory");
+    assert_eq!(info.cluster_size, 1);
+    assert_eq!(info.uptime, Duration::from_secs(90));
+    assert_eq!(info.node, engine.node_id());
+    let members = engine.members();
+    assert_eq!(members.len(), 1);
+    assert!(members[0].leader);
+    assert_eq!(members[0].addr, "http://127.0.0.1:7700");
+    assert_eq!(
+        engine.owner_of(&QueueName::from_static("any")),
+        Ownership::Local
+    );
+    assert!(!engine.is_clustered());
+    assert!(engine.is_joined());
+    engine.enqueue(JobSpec::new("q", "k")).unwrap();
+    assert!(engine.verify().unwrap().is_consistent());
+}
+
+#[test]
+fn background_threads_and_an_embedded_worker_run_jobs_in_real_time() {
+    quiet_logs();
+    let mut config = Config::dev();
+    config.engine.tick = Duration::from_millis(10);
+    config.scheduler.tick = Duration::from_millis(20);
+    config.workflows.sweep_every = Duration::from_millis(20);
+    config.metrics.refresh = Duration::from_millis(20);
+    let engine = Engine::start(config).unwrap();
+
+    let delayed = engine
+        .enqueue(JobSpec::new("default", "echo").delay(Duration::from_millis(30)))
+        .unwrap()
+        .id;
+    let run = engine
+        .submit_workflow(
+            WorkflowSpec::new("echoes")
+                .step(StepSpec::new(
+                    "one",
+                    JobSpec::new("default", "echo").payload(json!({"n": 1})),
+                ))
+                .step(StepSpec::new("two", JobSpec::new("default", "echo")).after("one")),
+        )
+        .unwrap()
+        .id;
+    engine
+        .create_schedule(ScheduleSpec::new(
+            "every-second".parse().unwrap(),
+            "* * * * * *",
+            JobSpec::new("default", "echo"),
+        ))
+        .unwrap();
+
+    let worker = engine
+        .embedded_worker(
+            builtin::defaults(),
+            WorkerConfig::default()
+                .queues(vec![QueueName::from_static("default")])
+                .poll_wait(Duration::from_millis(50)),
+        )
+        .unwrap();
+    let finished = eventually(Duration::from_secs(10), || {
+        engine
+            .get_job(&delayed)
+            .is_ok_and(|j| j.state == JobState::Succeeded)
+            && engine
+                .get_workflow(run)
+                .is_ok_and(|w| w.state == WorkflowState::Succeeded)
+            && engine
+                .get_schedule(&"every-second".parse().unwrap())
+                .is_ok_and(|s| s.fire_count >= 1)
+    });
+    assert!(finished, "jobs, workflow and schedule did not all complete");
+    let report = worker.stop();
+    assert!(report.stats.succeeded >= 3);
+
+    let began = Instant::now();
+    engine.shutdown();
+    assert!(
+        began.elapsed() < Duration::from_secs(5),
+        "shutdown took {:?}",
+        began.elapsed()
+    );
+    assert!(engine.clock().now() >= engine.info().started_at);
+}
