@@ -186,12 +186,7 @@ impl Scheduler {
                 MisfirePolicy::FireAll { max } => max as usize,
             };
             let n = allowed.min(due.missed_head.len());
-            let caught_up: Vec<Timestamp> = match spec.misfire {
-                // One job stands for the whole lot, as of the latest miss.
-                MisfirePolicy::FireOnce => vec![missed.last],
-                _ => due.missed_head[..n].to_vec(),
-            };
-            fires.extend(caught_up.into_iter().map(|t| (t, true)));
+            fires.extend(due.missed_head[..n].iter().map(|t| (*t, true)));
             if missed.count as usize > n {
                 let first_dropped = due.missed_head.get(n).copied().unwrap_or(missed.last);
                 let dropped = Span {

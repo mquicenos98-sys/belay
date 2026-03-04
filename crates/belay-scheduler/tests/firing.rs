@@ -95,6 +95,50 @@ fn misfire_skip_drops_everything_missed() {
 }
 
 #[test]
+fn misfire_fire_once_fires_the_first_missed_time_after_a_restart() {
+    let h = Harness::new(MONDAY);
+    h.scheduler.create(spec("hourly", "0 * * * *")).unwrap();
+    assert_eq!(h.tick_at("2025-06-02T11:00:00Z").fired.len(), 1);
+    // belay stops, and comes back hours later.
+    let h = h.restart();
+    h.events();
+    let report = h.tick_at("2025-06-02T15:30:00Z");
+    assert_eq!(fired_times(&report), ["2025-06-02T12:00:00.000Z"]);
+    assert!(report.fired[0].catch_up);
+    let skipped = &report.skipped[0];
+    assert_eq!(
+        (
+            skipped.reason,
+            skipped.fire_time,
+            skipped.last_fire_time,
+            skipped.count
+        ),
+        (
+            SkipReason::Misfire,
+            ts("2025-06-02T13:00:00Z"),
+            ts("2025-06-02T15:00:00Z"),
+            3
+        )
+    );
+    let events = h.sink.take();
+    match &events[0] {
+        belay_proto::event::EventKind::ScheduleMisfired {
+            fire_time,
+            missed,
+            policy,
+            ..
+        } => {
+            assert_eq!(*fire_time, ts("2025-06-02T12:00:00Z"));
+            assert_eq!(*missed, 4);
+            assert_eq!(*policy, MisfirePolicy::FireOnce);
+        }
+        other => panic!("expected a misfire event, got {other:?}"),
+    }
+    assert_eq!(events[1].type_name(), "schedule.fired");
+    assert_eq!(h.queue.job_count(), 2);
+}
+
+#[test]
 fn misfire_fire_all_catches_up_oldest_first_up_to_max() {
     let h = Harness::new(MONDAY);
     h.scheduler
@@ -455,6 +499,30 @@ fn a_crash_between_dispatch_and_save_does_not_fire_twice() {
     assert_eq!(saved.fire_count, 1);
     assert_eq!(saved.last_job, Some(job));
     assert_eq!(saved.next_fire_at, Some(ts("2025-06-02T10:30:00Z")));
+}
+
+#[test]
+fn a_crash_then_downtime_still_yields_one_job_per_fire() {
+    for (policy, jobs) in [
+        (MisfirePolicy::FireOnce, 1),
+        (MisfirePolicy::FireAll { max: 10 }, 4),
+    ] {
+        let flaky = FlakyKv::new(Arc::new(MemKv::new()));
+        let h = Harness::with(MONDAY, flaky.clone(), SchedulerOptions::new());
+        h.scheduler
+            .create(spec("hourly", "0 * * * *").misfire(policy))
+            .unwrap();
+        flaky.refuse_writes(true);
+        let job = h.tick_at("2025-06-02T11:00:00Z").fired[0].job;
+        flaky.refuse_writes(false);
+        // Down until 14:30: 11:00 (already dispatched), 12, 13 and 14 are
+        // all misfires now.
+        let h = h.restart();
+        let report = h.tick_at("2025-06-02T14:30:00Z");
+        assert_eq!(report.fired[0].job, job, "{policy}");
+        assert!(report.fired[0].duplicate, "{policy}");
+        assert_eq!(h.queue.job_count(), jobs, "{policy}");
+    }
 }
 
 #[test]
