@@ -152,3 +152,36 @@ mod options;
 mod placement;
 
 mod rate_limit;
+
+mod reply;
+
+mod routes;
+
+use std::net::TcpListener;
+use std::sync::Arc;
+
+use belay_core::Engine;
+use belay_http::Router;
+
+pub use auth::Access;
+pub use error::{Error, Result};
+pub use handle::ServerHandle;
+pub use observe::ACCESS_LOG_TARGET;
+pub use options::{RequestRate, ServerOptions};
+pub use placement::REMOTE_QUEUES_HEADER;
+pub use routes::Route;
+
+/// This crate's version, sent in the `Server` header.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Serves `engine` on `server.listen` from its configuration, with the
+/// default [`ServerOptions`].
+pub fn serve(engine: Arc<Engine>) -> Result<ServerHandle> {
+    serve_with(engine, ServerOptions::default())
+}
+
+/// Like [`serve`], with `options`.
+pub fn serve_with(engine: Arc<Engine>, options: ServerOptions) -> Result<ServerHandle> {
+    let listener = handle::bind(&engine.config().server.listen)?;
+    handle::start(engine, listener, options)
+}
