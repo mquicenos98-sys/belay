@@ -134,27 +134,16 @@
 #![warn(missing_docs, missing_debug_implementations)]
 
 mod app;
-
 mod auth;
-
 mod error;
-
 mod extract;
-
 mod guard;
-
 mod handle;
-
 mod observe;
-
 mod options;
-
 mod placement;
-
 mod rate_limit;
-
 mod reply;
-
 mod routes;
 
 use std::net::TcpListener;
@@ -184,4 +173,67 @@ pub fn serve(engine: Arc<Engine>) -> Result<ServerHandle> {
 pub fn serve_with(engine: Arc<Engine>, options: ServerOptions) -> Result<ServerHandle> {
     let listener = handle::bind(&engine.config().server.listen)?;
     handle::start(engine, listener, options)
+}
+
+/// Serves `engine` on an already bound `listener` (for example one bound
+/// to port 0 in tests), with the default [`ServerOptions`].
+pub fn serve_on(engine: Arc<Engine>, listener: TcpListener) -> Result<ServerHandle> {
+    serve_on_with(engine, listener, ServerOptions::default())
+}
+
+/// Like [`serve_on`], with `options`.
+pub fn serve_on_with(
+    engine: Arc<Engine>,
+    listener: TcpListener,
+    options: ServerOptions,
+) -> Result<ServerHandle> {
+    handle::start(engine, listener, options)
+}
+
+/// Every route with its middleware (request ids, access log, metrics,
+/// JSON errors, body limit), for embedding in another belay-http server
+/// or for calling directly in tests.
+///
+/// Stopping the engine is then up to the caller, and `POST
+/// /v1/admin/shutdown` triggers the shutdown signal of whichever server
+/// the request came through.
+///
+/// ```
+/// use std::sync::Arc;
+/// use belay_core::{Config, Engine};
+/// use belay_http::{Handler, Method, Request};
+///
+/// let engine = Arc::new(Engine::builder().config(Config::dev()).background(false).start()?);
+/// let router = belay_server::router(engine);
+/// let response = router.call(&mut Request::new(Method::Get, "/v1/nope"));
+/// assert_eq!(response.status, 404);
+/// assert_eq!(response.headers.get("content-type"), Some("application/json"));
+/// # Ok::<(), belay_core::Error>(())
+/// ```
+#[must_use]
+pub fn router(engine: Arc<Engine>) -> Router {
+    router_with(engine, ServerOptions::default())
+}
+
+/// Like [`router`], with `options`.
+#[must_use]
+pub fn router_with(engine: Arc<Engine>, options: ServerOptions) -> Router {
+    routes::build(Arc::new(app::App::new(engine, options)))
+}
+
+/// The route table: every endpoint with the [`Access`] it requires.
+///
+/// ```
+/// use belay_core::config::Scope;
+/// use belay_server::Access;
+///
+/// let lease = belay_server::routes()
+///     .iter()
+///     .find(|r| r.pattern() == "/v1/lease")
+///     .expect("the lease route exists");
+/// assert_eq!(lease.access(), Access::Token(Scope::Work));
+/// ```
+#[must_use]
+pub fn routes() -> &'static [Route] {
+    routes::ROUTES
 }
