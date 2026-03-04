@@ -1,0 +1,26 @@
+[package]
+name = "belay-server"
+description = "HTTP/JSON API server for belay: routes, bearer-token auth, rate limiting, event streaming and cluster redirects over the engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "belay_server"
+path = "src/lib.rs"
+
+[dependencies]
+belay-common = { path = "../belay-common" }
+belay-json = { path = "../belay-json" }
+belay-proto = { path = "../belay-proto" }
+belay-http = { path = "../belay-http" }
+belay-core = { path = "../belay-core" }
+belay-metrics = { path = "../belay-metrics" }
+
+[dev-dependencies]
+belay-client = { path = "../belay-client" }
+belay-cluster = { path = "../belay-cluster" }
+belay-worker = { path = "../belay-worker" }
