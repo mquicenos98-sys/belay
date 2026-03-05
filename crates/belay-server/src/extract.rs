@@ -75,3 +75,54 @@ pub(crate) fn paging(req: &Request, extra: &[&str]) -> Result<Paging, ApiError> 
     only_params(req, &allowed)?;
     Paging::from_pairs(req.query.iter())
 }
+
+/// The query parameter `key` parsed as `T`, if present and not empty.
+pub(crate) fn query_value<T>(req: &Request, key: &str) -> Result<Option<T>, ApiError>
+where
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    match req.query.get(key).map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(text) => text
+            .parse::<T>()
+            .map(Some)
+            .map_err(|e| ApiError::invalid_argument(format!("$.{key}: {e}"))),
+    }
+}
+
+/// A boolean query flag: `true`/`false`, `1`/`0`, or present without a
+/// value (`?force`), which means true.
+pub(crate) fn query_flag(req: &Request, key: &str) -> Result<bool, ApiError> {
+    match req.query.get(key).map(str::trim) {
+        None => Ok(false),
+        Some("" | "true" | "1") => Ok(true),
+        Some("false" | "0") => Ok(false),
+        Some(other) => Err(ApiError::invalid_argument(format!(
+            "$.{key}: expected true or false, got {other:?}"
+        ))),
+    }
+}
+
+/// The body as a JSON value; an empty body is refused with a message that
+/// says so rather than a parser position.
+pub(crate) fn body_value(req: &Request) -> Result<Value, ApiError> {
+    if req.body.iter().all(u8::is_ascii_whitespace) {
+        return Err(ApiError::invalid_argument(
+            "request body is empty; expected a JSON object",
+        ));
+    }
+    belay_json::parse_bytes(&req.body).map_err(|e| ApiError::from(belay_json::Error::from(e)))
+}
+
+/// Decodes and validates an already parsed body.
+pub(crate) fn decode<T: FromJson + Validate>(value: &Value) -> Result<T, ApiError> {
+    let decoded = T::from_json(value)?;
+    decoded.validate()?;
+    Ok(decoded)
+}
+
+/// The body decoded and validated as `T`.
+pub(crate) fn body<T: FromJson + Validate>(req: &Request) -> Result<T, ApiError> {
+    decode(&body_value(req)?)
+}
