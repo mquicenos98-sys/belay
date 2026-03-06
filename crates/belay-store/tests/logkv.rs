@@ -140,6 +140,26 @@ fn never_policy_syncs_only_when_asked() {
 }
 
 #[test]
+fn segments_roll_at_the_size_limit_and_replay_in_order() {
+    let fs = MemFs::new();
+    let kv = open(opts(&fs).segment_size(256));
+    write_batches(&kv, 1..=60);
+    let stats = kv.stats();
+    let files = inspect::list_files(&fs, &dir()).expect("list");
+    assert!(stats.wal_segments > 5, "{stats:?}");
+    assert_eq!(stats.wal_segments, files.segments.len() as u64);
+    assert_eq!(stats.wal_bytes, files.wal_bytes());
+    // Each segment is named after its first record.
+    for seg in &files.segments[..files.segments.len() - 1] {
+        let dump = inspect::read_segment(&fs, &seg.path, false).expect("dump");
+        assert_eq!(dump.records.first().map(|r| r.seq), Some(seg.seq));
+    }
+    kv.close().expect("close");
+    let kv = open(opts(&fs).segment_size(256));
+    assert_eq!(dump(&kv), states(60)[60]);
+}
+
+#[test]
 fn checkpoints_replace_the_log_with_a_snapshot() {
     let fs = MemFs::new();
     let kv = open(opts(&fs).segment_size(256));

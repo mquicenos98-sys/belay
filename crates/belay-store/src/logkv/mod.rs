@@ -90,7 +90,7 @@ impl Wal {
     }
 
     fn live_bytes(&self) -> u64 {
-        self.sealed_bytes
+        self.sealed_bytes + self.active.as_ref().map_or(0, SegmentWriter::len)
     }
 
     fn segment_count(&self) -> u64 {
