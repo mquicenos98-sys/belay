@@ -28,7 +28,7 @@ pub const MAX_CONCURRENCY: usize = 1024;
 ///     .queues(vec!["emails".parse()?, "default".parse()?])
 ///     .concurrency(8)
 ///     .lease_for(Duration::from_secs(60));
-/// assert_eq!(config.effective_heartbeat(), Duration::from_secs(30));
+/// assert_eq!(config.effective_heartbeat(), Duration::from_secs(20));
 /// assert!(config.validate().is_ok());
 /// # Ok::<(), belay_proto::ParseError>(())
 /// ```
@@ -51,7 +51,8 @@ pub struct WorkerConfig {
     /// hand out, so a source that ignores `poll_wait` is not hammered.
     /// Default 500ms.
     pub poll_interval: Duration,
-    /// Heartbeat period; `None` means half of `lease_for`.
+    /// Heartbeat period; `None` means a third of `lease_for`, which
+    /// survives one lost heartbeat.
     pub heartbeat_every: Option<Duration>,
     /// How long a shutdown waits for running jobs before failing them as
     /// retryable "worker shutting down". Default 30s.
@@ -192,7 +193,7 @@ impl WorkerConfig {
     /// The heartbeat period in effect.
     #[must_use]
     pub fn effective_heartbeat(&self) -> Duration {
-        self.heartbeat_every.unwrap_or(self.lease_for / 2)
+        self.heartbeat_every.unwrap_or(self.lease_for / 3)
     }
 
     /// Most jobs asked for in one lease call.
@@ -339,7 +340,7 @@ mod tests {
     fn defaults_are_valid() {
         assert!(WorkerConfig::default().validate().is_ok());
         let config = valid();
-        assert_eq!(config.effective_heartbeat(), Duration::from_secs(15));
+        assert_eq!(config.effective_heartbeat(), Duration::from_secs(10));
         assert_eq!(config.max_batch(), 4);
         assert_eq!(valid().concurrency(500).max_batch(), 100);
     }
