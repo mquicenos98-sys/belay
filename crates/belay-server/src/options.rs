@@ -109,3 +109,80 @@ impl Default for ServerOptions {
         }
     }
 }
+
+impl ServerOptions {
+    /// The defaults.
+    #[must_use]
+    pub fn new() -> ServerOptions {
+        ServerOptions::default()
+    }
+
+    /// Sets [`rate_limit`](Self::rate_limit).
+    #[must_use]
+    pub fn with_rate_limit(mut self, rate: Option<RequestRate>) -> ServerOptions {
+        self.rate_limit = rate;
+        self
+    }
+
+    /// Gives the token named `token` its own rate (`None`: unlimited).
+    #[must_use]
+    pub fn with_token_rate_limit(
+        mut self,
+        token: impl Into<String>,
+        rate: Option<RequestRate>,
+    ) -> ServerOptions {
+        self.token_rate_limits.insert(token.into(), rate);
+        self
+    }
+
+    /// The rate that applies to the token named `token`.
+    #[must_use]
+    pub fn rate_for(&self, token: &str) -> Option<RequestRate> {
+        match self.token_rate_limits.get(token) {
+            Some(rate) => *rate,
+            None => self.rate_limit,
+        }
+    }
+
+    /// The poll interval, never zero (a zero interval would spin).
+    pub(crate) fn poll(&self) -> Duration {
+        self.shutdown_poll.max(Duration::from_millis(1))
+    }
+}
+
+/// The largest body the HTTP layer reads at all for a configured
+/// `max_body`: twice the limit, and at least 64 KiB over it.
+///
+/// Bodies above `max_body` but within this are read and refused by the
+/// server's own middleware with a JSON `413`, which clients can decode.
+/// The HTTP layer refuses anything larger before reading it, with a
+/// plain-text `413`: reading unbounded bodies just to phrase the refusal
+/// nicely would hand every client a way to make the server buffer
+/// gigabytes.
+#[must_use]
+pub(crate) fn read_limit(max_body: u64) -> usize {
+    let limit = max_body
+        .saturating_mul(2)
+        .max(max_body.saturating_add(64 * 1024));
+    usize::try_from(limit).unwrap_or(usize::MAX)
+}
+
+/// The HTTP layer's settings for the engine's `[server]` section.
+///
+/// `server.threads` has no counterpart: belay-http serves each connection
+/// on its own thread from a pool that grows up to `max_connections` and
+/// shrinks when idle, which is what lets long polls and event streams
+/// block without starving anybody.
+pub(crate) fn http_config(server: &ApiServerConfig) -> HttpConfig {
+    HttpConfig {
+        max_connections: server.max_connections,
+        keep_alive_timeout: server.keep_alive,
+        header_timeout: server.request_timeout,
+        body_timeout: server.request_timeout,
+        max_body_bytes: read_limit(server.max_body),
+        shutdown_grace: server.shutdown_grace,
+        server_header: Some(format!("belay/{}", crate::VERSION)),
+        error_hook: Some(Arc::new(log_server_error)),
+        ..HttpConfig::default()
+    }
+}
