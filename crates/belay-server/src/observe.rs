@@ -45,3 +45,75 @@ const DURATION_BUCKETS: [f64; 14] = [
 
 /// Routes whose requests are logged at `debug`.
 const PROBES: [&str; 3] = ["/healthz", "/readyz", "/metrics"];
+
+/// Handles on the server's metric families.
+#[derive(Clone)]
+pub(crate) struct HttpMetrics {
+    requests: CounterVec,
+    duration: HistogramVec,
+    in_flight: Gauge,
+    streams: Gauge,
+    rate_limited: CounterVec,
+}
+
+impl fmt::Debug for HttpMetrics {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpMetrics")
+            .field("in_flight", &self.in_flight.get())
+            .field("streams", &self.streams.get())
+            .finish_non_exhaustive()
+    }
+}
+
+impl HttpMetrics {
+    /// Registers the families in `registry`. Registering again (a second
+    /// router over the same engine) returns the same families.
+    pub(crate) fn register(registry: &Registry) -> belay_metrics::Result<HttpMetrics> {
+        Ok(HttpMetrics {
+            requests: registry.counter_vec(
+                "belay_http_requests_total",
+                "HTTP requests answered, by route pattern, method and status.",
+                &["route", "method", "status"],
+            )?,
+            duration: registry.histogram_vec(
+                "belay_http_request_duration_seconds",
+                "Time to produce a response (for streams: until streaming starts).",
+                &["route"],
+                &DURATION_BUCKETS,
+            )?,
+            in_flight: registry.gauge(
+                "belay_http_requests_in_flight",
+                "Requests being handled, long polls included.",
+            )?,
+            streams: registry.gauge(
+                "belay_http_event_streams",
+                "Open event streams (GET /v1/events).",
+            )?,
+            rate_limited: registry.counter_vec(
+                "belay_http_rate_limited_total",
+                "Requests refused because their token was over its rate.",
+                &["token"],
+            )?,
+        })
+    }
+
+    fn record(&self, route: &str, method: &Method, status: StatusCode, elapsed: Duration) {
+        let status = status.as_u16().to_string();
+        self.requests
+            .with_label_values(&[route, method_label(method), &status])
+            .inc();
+        self.duration
+            .with_label_values(&[route])
+            .observe_duration(elapsed);
+    }
+
+    /// Counts a request refused for its token's rate.
+    pub(crate) fn rate_limited(&self, token: &str) {
+        self.rate_limited.with_label_values(&[token]).inc();
+    }
+
+    /// Counts an event stream as open until the guard is dropped.
+    pub(crate) fn stream_opened(&self) -> InFlight {
+        self.streams.track_in_flight()
+    }
+}
