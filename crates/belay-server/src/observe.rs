@@ -144,3 +144,188 @@ impl Observe {
         Observe { metrics }
     }
 }
+
+impl Middleware for Observe {
+    fn handle(&self, req: &mut Request, next: Next<'_>) -> Response {
+        let started = Instant::now();
+        let in_flight = self.metrics.as_ref().map(|m| m.in_flight.track_in_flight());
+        let response = next.run(req);
+        let elapsed = started.elapsed();
+        drop(in_flight);
+        let route = req
+            .extensions
+            .get::<MatchedRoute>()
+            .map(MatchedRoute::as_str);
+        if let Some(metrics) = &self.metrics {
+            metrics.record(
+                route.unwrap_or(UNMATCHED),
+                &req.method,
+                response.status,
+                elapsed,
+            );
+        }
+        log_access(req, &response, route, elapsed);
+        response
+    }
+}
+
+/// Probes stay at `debug` even when they fail: a draining node answers
+/// `/readyz` with 503 on purpose, every few seconds.
+fn access_level(route: Option<&str>, status: StatusCode) -> Level {
+    if route.is_some_and(|r| PROBES.contains(&r)) {
+        Level::Debug
+    } else if status.is_server_error() {
+        Level::Warn
+    } else {
+        Level::Info
+    }
+}
+
+fn log_access(req: &Request, response: &Response, route: Option<&str>, elapsed: Duration) {
+    let status = response.status.as_u16();
+    let principal = req.extensions.get::<Principal>().map(|p| p.name.as_str());
+    let request_id = req.extensions.get::<RequestId>().map(RequestId::as_str);
+    belay_common::log!(
+        access_level(route, response.status),
+        target: ACCESS_LOG_TARGET,
+        "{} {} {}", req.method, req.path, status;
+        route = route.unwrap_or("-"),
+        status,
+        duration = elapsed,
+        principal = principal.unwrap_or("-"),
+        request_id = request_id.unwrap_or("-"),
+        remote = req.remote_addr.map(|a| a.to_string()),
+        bytes_in = req.body.len(),
+        bytes_out = response.body.known_len(),
+    );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_common::log::CaptureLogger;
+    use belay_core::config::Scopes;
+    use belay_http::middleware::SetRequestId;
+    use belay_http::{Handler, Router};
+
+    fn router(metrics: Option<HttpMetrics>) -> Router {
+        let mut router = Router::new();
+        router
+            .wrap(SetRequestId::new())
+            .wrap(Observe::new(metrics))
+            .get("/v1/jobs/:id", |req: &mut Request| {
+                req.extensions.insert(Principal {
+                    name: "ci".to_owned(),
+                    scopes: Scopes::all(),
+                });
+                Response::text("job")
+            })
+            .get("/healthz", |_: &mut Request| Response::text("ok"))
+            .get("/boom", |_: &mut Request| {
+                Response::new(StatusCode::INTERNAL_SERVER_ERROR)
+            });
+        router
+    }
+
+    fn call(router: &Router, method: Method, target: &str) -> Response {
+        let mut req = Request::new(method, target).with_header("X-Request-Id", "req-7");
+        router.call(&mut req)
+    }
+
+    #[test]
+    fn access_lines_carry_route_principal_and_request_id() {
+        let capture = CaptureLogger::new();
+        let router = router(None);
+        capture.scope(|| call(&router, Method::Get, "/v1/jobs/01H"));
+        let records = capture.records();
+        assert_eq!(records.len(), 1);
+        let line = &records[0];
+        assert_eq!(line.target, ACCESS_LOG_TARGET);
+        assert_eq!(line.level, Level::Info);
+        assert_eq!(line.message, "GET /v1/jobs/01H 200");
+        assert_eq!(line.field("route"), Some("/v1/jobs/:id"));
+        assert_eq!(line.field("principal"), Some("ci"));
+        assert_eq!(line.field("request_id"), Some("req-7"));
+        assert_eq!(line.field("bytes_out"), Some("3"));
+    }
+
+    #[test]
+    fn probes_log_at_debug_and_server_errors_at_warn() {
+        let capture = CaptureLogger::new();
+        let router = router(None);
+        capture.scope(|| {
+            call(&router, Method::Get, "/healthz");
+            call(&router, Method::Get, "/boom");
+            call(&router, Method::Get, "/nowhere");
+        });
+        let levels: Vec<(Level, Option<String>)> = capture
+            .records()
+            .iter()
+            .map(|r| (r.level, r.field("route").map(str::to_owned)))
+            .collect();
+        assert_eq!(
+            levels,
+            [
+                (Level::Debug, Some("/healthz".to_owned())),
+                (Level::Warn, Some("/boom".to_owned())),
+                (Level::Info, Some("-".to_owned())),
+            ]
+        );
+    }
+
+    #[test]
+    fn metrics_use_route_patterns_and_bounded_labels() {
+        let registry = Registry::new();
+        let metrics = HttpMetrics::register(&registry).unwrap();
+        let router = router(Some(metrics.clone()));
+        call(&router, Method::Get, "/v1/jobs/a");
+        call(&router, Method::Get, "/v1/jobs/b");
+        call(&router, Method::Get, "/random/path");
+        call(
+            &router,
+            Method::parse("PURGE").expect("valid token"),
+            "/v1/jobs/a",
+        );
+        let text = registry.render_prometheus();
+        assert!(
+            text.contains(
+                "belay_http_requests_total{route=\"/v1/jobs/:id\",method=\"GET\",status=\"200\"} 2\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "belay_http_requests_total{route=\"unmatched\",method=\"GET\",status=\"404\"} 1\n"
+            ),
+            "{text}"
+        );
+        // A method the route does not take matches no route either.
+        assert!(
+            text.contains(
+                "belay_http_requests_total{route=\"unmatched\",method=\"other\",status=\"405\"} 1\n"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("belay_http_request_duration_seconds_count{route=\"/v1/jobs/:id\"} 2\n"),
+            "{text}"
+        );
+        assert!(text.contains("belay_http_requests_in_flight 0\n"), "{text}");
+        // A second registration hands back the same families.
+        let again = HttpMetrics::register(&registry).unwrap();
+        again.rate_limited("ci");
+        assert!(registry
+            .render_prometheus()
+            .contains("belay_http_rate_limited_total{token=\"ci\"} 1\n"));
+    }
+
+    #[test]
+    fn open_streams_are_counted_until_their_guard_drops() {
+        let registry = Registry::new();
+        let metrics = HttpMetrics::register(&registry).unwrap();
+        let guard = metrics.stream_opened();
+        assert_eq!(metrics.streams.get(), 1.0);
+        drop(guard);
+        assert_eq!(metrics.streams.get(), 0.0);
+    }
+}
