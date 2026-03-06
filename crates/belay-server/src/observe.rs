@@ -117,3 +117,30 @@ impl HttpMetrics {
         self.streams.track_in_flight()
     }
 }
+
+/// Methods outside the standard set share one label value: a method token
+/// is chosen by the client, and each distinct one would be a new series.
+fn method_label(method: &Method) -> &'static str {
+    match method {
+        Method::Get => "GET",
+        Method::Head => "HEAD",
+        Method::Post => "POST",
+        Method::Put => "PUT",
+        Method::Delete => "DELETE",
+        Method::Patch => "PATCH",
+        Method::Options => "OPTIONS",
+        _ => "other",
+    }
+}
+
+/// The access log and metrics middleware.
+#[derive(Debug, Clone)]
+pub(crate) struct Observe {
+    metrics: Option<HttpMetrics>,
+}
+
+impl Observe {
+    pub(crate) fn new(metrics: Option<HttpMetrics>) -> Observe {
+        Observe { metrics }
+    }
+}
