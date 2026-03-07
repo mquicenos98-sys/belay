@@ -76,8 +76,17 @@ fn different_definitions_conflict() {
 }
 
 #[test]
-fn summary_with_other_options_conflicts() -> Result<()> {
+fn histogram_with_other_buckets_conflicts() -> Result<()> {
     let registry = Registry::new();
+    registry.histogram("h", "", &[1.0, 2.0])?;
+    let err = registry.histogram("h", "", &[1.0, 5.0]).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        r#"metric "h" is already registered with a different bucket layout"#
+    );
+    // A trailing +Inf is implicit, so this is the same layout.
+    registry.histogram("h", "", &[1.0, 2.0, f64::INFINITY])?;
+
     registry.summary("s", "", SummaryOpts::new())?;
     let err = registry
         .summary("s", "", SummaryOpts::new().max_age(Duration::from_secs(60)))
