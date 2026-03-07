@@ -45,8 +45,8 @@ pub trait Collector: Send + Sync {
 ///
 /// Each constructor validates the name and labels, then either creates the
 /// family or, if a family of that name exists with an identical definition
-/// (type, help text, label names, and summary options), returns the
-/// existing one. Registration is therefore idempotent: two
+/// (type, help text, label names, and bucket layout or summary options),
+/// returns the existing one. Registration is therefore idempotent: two
 /// components may both declare `belay_jobs_enqueued_total` and will share
 /// its series. A same-named family with any difference in definition is an
 /// [`Error::Conflict`]; a family whose exposed series names overlap another
@@ -243,7 +243,7 @@ impl Registry {
         self.register(
             desc,
             |family| match family {
-                Family::Histogram(v) => Some(v.clone()),
+                Family::Histogram(v) if v.buckets() == &bounds[..] => Some(v.clone()),
                 _ => None,
             },
             |desc, time| {

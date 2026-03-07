@@ -278,8 +278,10 @@ impl Document {
         }
     }
 
-    /// Replaces or creates the value at `path`. `loc`, if given, becomes
-    /// the location of the new value and of any table created on the way.
+    /// Replaces or creates the value at `path`. Locations recorded for the
+    /// old value and everything below it are dropped; `loc`, if given,
+    /// becomes the location of the new value and of any table created on
+    /// the way.
     pub(crate) fn set_at(
         &mut self,
         path: &KeyPath,
@@ -295,6 +297,7 @@ impl Document {
             self.root = t;
         }
         let previous = result?;
+        self.locs.retain(|p, _| !p.starts_with(path));
         if let Some(loc) = loc {
             for p in created {
                 self.locs.insert(p, loc.clone());
@@ -408,5 +411,40 @@ mod tests {
         let err = doc.get_str("server[0]").unwrap_err();
         assert_eq!(err.message(), "expected array at server, found table");
         assert!(doc.get("server..x").is_none());
+    }
+
+    #[test]
+    fn set_creates_tables_and_forgets_stale_locations() {
+        let mut doc = Document::parse(SRC).unwrap();
+        let line = |doc: &Document, path: &str| match doc.origin(path) {
+            Some(Origin::Source(s)) => Some(s.line),
+            _ => None,
+        };
+        assert_eq!(line(&doc, "server.listen"), Some(2));
+        let prev = doc.set("server.listen", "127.0.0.1:1").unwrap();
+        assert_eq!(prev, Some(Value::from("0.0.0.0:7700")));
+        // The old span no longer describes the value; the table's still does.
+        assert_eq!(line(&doc, "server.listen"), Some(1));
+        doc.set("storage.dir", "/var/lib/belay").unwrap();
+        doc.set("schedules[0].id", "y").unwrap();
+        assert_eq!(doc.get_str("schedules[0].id").unwrap(), "y");
+        let errors = [
+            (
+                "schedules[3].id",
+                "index 3 is out of bounds; `schedules` has 1 element",
+            ),
+            (
+                "server.threads.x",
+                "`server.threads` is an integer, not a table",
+            ),
+            ("server[0]", "`server` is a table, not an array"),
+        ];
+        for (path, message) in errors {
+            let err = doc.set(path, 1).unwrap_err();
+            assert_eq!(
+                err.message(),
+                format!("invalid key path `{path}`: {message}")
+            );
+        }
     }
 }
