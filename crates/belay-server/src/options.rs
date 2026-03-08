@@ -186,3 +186,83 @@ pub(crate) fn http_config(server: &ApiServerConfig) -> HttpConfig {
         ..HttpConfig::default()
     }
 }
+
+fn log_server_error(e: &ServerError) {
+    match e {
+        ServerError::HandlerPanic { .. } | ServerError::InvalidResponse { .. } => {
+            error!("request failed inside the server"; error = %e);
+        }
+        ServerError::Accept(_) | ServerError::Spawn(_) => {
+            warn!("connection handling failed"; error = %e);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn token_overrides_take_precedence_over_the_default() {
+        let options = ServerOptions::new()
+            .with_rate_limit(Some(RequestRate::new(10.0, 20)))
+            .with_token_rate_limit("batch", Some(RequestRate::new(1.0, 1)))
+            .with_token_rate_limit("ops", None);
+        assert_eq!(options.rate_for("anyone"), Some(RequestRate::new(10.0, 20)));
+        assert_eq!(options.rate_for("batch"), Some(RequestRate::new(1.0, 1)));
+        assert_eq!(options.rate_for("ops"), None);
+        let unlimited = ServerOptions::new().with_rate_limit(None);
+        assert_eq!(unlimited.rate_for("anyone"), None);
+    }
+
+    #[test]
+    fn bursts_are_at_least_one() {
+        assert_eq!(RequestRate::new(5.0, 0).burst, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "must be positive and finite")]
+    fn a_rate_that_never_refills_is_rejected() {
+        let _ = RequestRate::new(0.0, 10);
+    }
+
+    #[test]
+    fn the_read_limit_leaves_room_for_a_json_refusal() {
+        assert_eq!(read_limit(4 << 20), 8 << 20);
+        assert_eq!(read_limit(1024), 1024 + 64 * 1024);
+        assert_eq!(read_limit(u64::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn server_settings_map_onto_the_http_layer() {
+        let server = ApiServerConfig {
+            max_connections: 64,
+            max_body: 1 << 20,
+            keep_alive: Duration::from_secs(7),
+            request_timeout: Duration::from_secs(3),
+            shutdown_grace: Duration::from_secs(9),
+            ..ApiServerConfig::default()
+        };
+        let http = http_config(&server);
+        assert_eq!(http.max_connections, 64);
+        assert_eq!(http.max_body_bytes, 2 << 20);
+        assert_eq!(http.keep_alive_timeout, Duration::from_secs(7));
+        assert_eq!(http.header_timeout, Duration::from_secs(3));
+        assert_eq!(http.body_timeout, Duration::from_secs(3));
+        assert_eq!(http.shutdown_grace, Duration::from_secs(9));
+        assert!(http.error_hook.is_some());
+        assert!(http
+            .server_header
+            .as_deref()
+            .is_some_and(|s| s.starts_with("belay/")));
+    }
+
+    #[test]
+    fn polling_never_spins() {
+        let options = ServerOptions {
+            shutdown_poll: Duration::ZERO,
+            ..ServerOptions::default()
+        };
+        assert_eq!(options.poll(), Duration::from_millis(1));
+    }
+}
