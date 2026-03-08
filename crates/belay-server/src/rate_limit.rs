@@ -85,3 +85,77 @@ impl RateLimiter {
         }
     }
 }
+
+/// A `Retry-After` value in whole seconds (RFC 9110 §10.2.3), at least 1.
+#[must_use]
+pub(crate) fn retry_after_secs(wait: Duration) -> u64 {
+    (wait.as_secs_f64().round() as u64).max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limiter(rate: Option<RequestRate>) -> RateLimiter {
+        RateLimiter::new(&ServerOptions::new().with_rate_limit(rate))
+    }
+
+    #[test]
+    fn a_fresh_token_may_burst_then_waits_for_refill() {
+        let limiter = limiter(Some(RequestRate::new(2.0, 3)));
+        let t0 = Instant::now();
+        for _ in 0..3 {
+            assert_eq!(limiter.check("ci", t0), Ok(()));
+        }
+        let wait = limiter.check("ci", t0).unwrap_err();
+        assert_eq!(wait, Duration::from_millis(500));
+        // Half a second later exactly one request fits again.
+        let t1 = t0 + Duration::from_millis(500);
+        assert_eq!(limiter.check("ci", t1), Ok(()));
+        assert!(limiter.check("ci", t1).is_err());
+    }
+
+    #[test]
+    fn tokens_have_separate_buckets() {
+        let limiter = limiter(Some(RequestRate::new(1.0, 1)));
+        let now = Instant::now();
+        assert_eq!(limiter.check("a", now), Ok(()));
+        assert!(limiter.check("a", now).is_err());
+        assert_eq!(limiter.check("b", now), Ok(()));
+    }
+
+    #[test]
+    fn refill_never_exceeds_the_burst() {
+        let limiter = limiter(Some(RequestRate::new(100.0, 2)));
+        let t0 = Instant::now();
+        assert_eq!(limiter.check("a", t0), Ok(()));
+        let later = t0 + Duration::from_secs(3600);
+        assert_eq!(limiter.check("a", later), Ok(()));
+        assert_eq!(limiter.check("a", later), Ok(()));
+        assert!(limiter.check("a", later).is_err());
+    }
+
+    #[test]
+    fn unlimited_tokens_are_never_refused() {
+        let options = ServerOptions::new()
+            .with_rate_limit(Some(RequestRate::new(1.0, 1)))
+            .with_token_rate_limit("ops", None);
+        let ops = RateLimiter::new(&options);
+        let now = Instant::now();
+        for _ in 0..100 {
+            assert_eq!(ops.check("ops", now), Ok(()));
+        }
+        assert!(limiter(None).check("anyone", now).is_ok());
+    }
+
+    // Regression: an Instant older than the bucket's last update (two
+    // requests racing for the lock) used to panic in the subtraction.
+    #[test]
+    fn out_of_order_instants_refill_nothing() {
+        let limiter = limiter(Some(RequestRate::new(1.0, 1)));
+        let later = Instant::now() + Duration::from_secs(10);
+        assert_eq!(limiter.check("a", later), Ok(()));
+        let earlier = later - Duration::from_secs(5);
+        assert!(limiter.check("a", earlier).is_err());
+    }
+}
