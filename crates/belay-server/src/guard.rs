@@ -100,3 +100,126 @@ impl Middleware for BodyLimit {
         reply::error_with_status(StatusCode::CONTENT_TOO_LARGE, &error)
     }
 }
+
+/// Catches handler panics, logs them with the request id, and answers
+/// `internal` without revealing the panic message to the client.
+pub(crate) fn catch_panics() -> CatchPanic {
+    CatchPanic::new()
+        .on_panic(|req, message| {
+            let request_id = req.extensions.get::<RequestId>().map(RequestId::as_str);
+            error!(
+                "handler panicked";
+                method = %req.method,
+                path = req.path.as_str(),
+                request_id = request_id.unwrap_or("-"),
+                panic = message,
+            );
+        })
+        .respond_with(|| {
+            reply::error(&ApiError::internal(
+                "internal error; the server log has the details",
+            ))
+        })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_common::log::CaptureLogger;
+    use belay_http::{Handler, Method, Router};
+    use belay_proto::api::decode_error;
+
+    fn app() -> Router {
+        let mut router = Router::new();
+        router
+            .wrap(ApiErrors)
+            .wrap(catch_panics())
+            .wrap(BodyLimit::new(8))
+            .get("/v1/info", |_: &mut Request| Response::text("fine"))
+            .post("/v1/jobs", |_: &mut Request| Response::no_content())
+            .get("/v1/teapot", |_: &mut Request| {
+                Response::error(StatusCode::from_u16(418).expect("valid"), "short and stout")
+            })
+            .get("/v1/boom", |_: &mut Request| -> Response {
+                panic!("kaboom")
+            });
+        router
+    }
+
+    fn call(req: Request) -> (u16, ApiError, Response) {
+        let mut req = req;
+        let response = app().call(&mut req);
+        let status = response.status.as_u16();
+        assert!(reply::is_json(&response), "{response:?}");
+        let error = decode_error(status, response.body_bytes().expect("json body"));
+        (status, error, response)
+    }
+
+    #[test]
+    fn unknown_routes_are_not_found_errors() {
+        let (status, error, _) = call(Request::new(Method::Get, "/v1/nope"));
+        assert_eq!(status, 404);
+        assert_eq!(error.code, ErrorCode::NotFound);
+        assert_eq!(error.message, "no route matches GET /v1/nope");
+    }
+
+    #[test]
+    fn wrong_methods_list_the_allowed_ones() {
+        let (status, error, response) = call(Request::new(Method::Delete, "/v1/info"));
+        assert_eq!(status, 405);
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(
+            error.message,
+            "DELETE is not allowed on /v1/info; allowed: GET, HEAD, OPTIONS"
+        );
+        assert_eq!(response.headers.get("allow"), Some("GET, HEAD, OPTIONS"));
+        assert_eq!(error.details.expect("details")["allow"][0], "GET");
+    }
+
+    #[test]
+    fn oversized_bodies_are_refused_as_json() {
+        let req = Request::new(Method::Post, "/v1/jobs").with_body("0123456789");
+        let (status, error, _) = call(req);
+        assert_eq!(status, 413);
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(
+            error.message,
+            "request body of 10 bytes exceeds the 8 byte limit (server.max_body)"
+        );
+    }
+
+    #[test]
+    fn other_plain_errors_keep_their_status_and_text() {
+        let (status, error, _) = call(Request::new(Method::Get, "/v1/teapot"));
+        assert_eq!(status, 418);
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(error.message, "short and stout");
+        let (status, error, _) = call(Request::new(Method::Get, "/v1/queues/%zz"));
+        assert_eq!(status, 400);
+        assert_eq!(error.message, "invalid percent-encoding in path");
+    }
+
+    #[test]
+    fn panics_become_internal_errors_logged_with_the_message() {
+        let capture = CaptureLogger::new();
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let (status, error, _) = capture.scope(|| call(Request::new(Method::Get, "/v1/boom")));
+        std::panic::set_hook(previous);
+        assert_eq!(status, 500);
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(!error.message.contains("kaboom"), "{}", error.message);
+        let logged = capture
+            .find(|r| r.message == "handler panicked")
+            .expect("the panic is logged");
+        assert_eq!(logged.field("panic"), Some("kaboom"));
+        assert_eq!(logged.field("path"), Some("/v1/boom"));
+    }
+
+    #[test]
+    fn successful_and_json_answers_pass_untouched() {
+        let mut req = Request::new(Method::Get, "/v1/info");
+        let response = app().call(&mut req);
+        assert_eq!(response.body_bytes(), Some(&b"fine"[..]));
+    }
+}
