@@ -34,3 +34,69 @@ impl Middleware for ApiErrors {
         response
     }
 }
+
+/// The `ApiError` for a plain error answer to `req`.
+fn describe(req: &Request, response: &Response) -> ApiError {
+    let (method, path) = (&req.method, &req.path);
+    match response.status {
+        StatusCode::NOT_FOUND => ApiError::new(
+            ErrorCode::NotFound,
+            format!("no route matches {method} {path}"),
+        ),
+        StatusCode::METHOD_NOT_ALLOWED => {
+            let allow: Vec<&str> = response
+                .headers
+                .get(ALLOW)
+                .map(|v| {
+                    v.split(',')
+                        .map(str::trim)
+                        .filter(|m| !m.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default();
+            ApiError::invalid_argument(format!(
+                "{method} is not allowed on {path}; allowed: {}",
+                allow.join(", ")
+            ))
+            .with_details(json!({ "allow": allow }))
+        }
+        status => {
+            let text = response
+                .body_bytes()
+                .map(|b| String::from_utf8_lossy(b).trim().to_owned())
+                .filter(|t| !t.is_empty())
+                .unwrap_or_else(|| status.to_string());
+            ApiError::new(ErrorCode::from_http_status(status.as_u16()), text)
+        }
+    }
+}
+
+/// Refuses bodies larger than `server.max_body`.
+///
+/// Runs after the HTTP layer has read the body, which it does up to a
+/// larger hard limit (see [`read_limit`](crate::options::read_limit)).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct BodyLimit {
+    max: u64,
+}
+
+impl BodyLimit {
+    pub(crate) fn new(max: u64) -> BodyLimit {
+        BodyLimit { max }
+    }
+}
+
+impl Middleware for BodyLimit {
+    fn handle(&self, req: &mut Request, next: Next<'_>) -> Response {
+        let size = req.body.len() as u64;
+        if size < self.max {
+            return next.run(req);
+        }
+        let error = ApiError::invalid_argument(format!(
+            "request body of {size} bytes exceeds the {} byte limit (server.max_body)",
+            self.max
+        ))
+        .with_details(json!({"limit": self.max, "size": size}));
+        reply::error_with_status(StatusCode::CONTENT_TOO_LARGE, &error)
+    }
+}
