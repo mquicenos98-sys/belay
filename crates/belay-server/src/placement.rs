@@ -109,3 +109,100 @@ pub(crate) fn path_and_query(req: &Request) -> String {
         None => req.path.clone(),
     }
 }
+
+/// The refusal of an enqueue batch whose queues live on several nodes.
+pub(crate) fn spread_batch(local: &[QueueName], remote: &[(QueueName, RemoteOwner)]) -> ApiError {
+    let mut owners: Vec<Value> = local
+        .iter()
+        .map(|q| json!({"queue": q.as_str(), "node": null}))
+        .collect();
+    owners.extend(remote.iter().map(
+        |(q, o)| json!({"queue": q.as_str(), "node": o.node.as_str(), "url": o.addr.as_str()}),
+    ));
+    let names: Vec<String> = remote
+        .iter()
+        .map(|(q, o)| format!("{q} on {}", o.node))
+        .collect();
+    ApiError::invalid_argument(format!(
+        "the batch names queues owned by different nodes ({}{}); send one batch per node",
+        if local.is_empty() { "" } else { "some here, " },
+        names.join(", ")
+    ))
+    .with_details(json!({ "owners": owners }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owner(node: &str) -> RemoteOwner {
+        RemoteOwner {
+            node: node.to_owned(),
+            addr: format!("http://{node}:7700"),
+        }
+    }
+
+    fn q(name: &'static str) -> QueueName {
+        QueueName::from_static(name)
+    }
+
+    /// Queues starting with `b` live on node b, `c` on node c, the rest here.
+    fn owners(queue: &QueueName) -> Ownership {
+        match queue.as_str().as_bytes()[0] {
+            b'b' => Ownership::Remote(owner("b")),
+            b'c' => Ownership::Remote(owner("c")),
+            _ => Ownership::Local,
+        }
+    }
+
+    #[test]
+    fn queues_split_by_owner() {
+        assert_eq!(split(&[q("a1"), q("a2")], owners), Split::Local);
+        assert_eq!(
+            split(&[q("b1"), q("b2")], owners),
+            Split::Remote(owner("b"))
+        );
+        assert_eq!(
+            split(&[q("b1"), q("a1"), q("c1")], owners),
+            Split::Mixed {
+                local: vec![q("a1")],
+                remote: vec![(q("b1"), owner("b")), (q("c1"), owner("c"))],
+            }
+        );
+        assert_eq!(
+            split(&[q("b1"), q("c1")], owners),
+            Split::Mixed {
+                local: vec![],
+                remote: vec![(q("b1"), owner("b")), (q("c1"), owner("c"))],
+            }
+        );
+        assert_eq!(split(&[], owners), Split::Local);
+    }
+
+    #[test]
+    fn repeated_queues_are_counted_once() {
+        assert_eq!(
+            split(&[q("b1"), q("b1")], owners),
+            Split::Remote(owner("b"))
+        );
+        assert_eq!(
+            split(&[q("a1"), q("a1"), q("b1")], owners),
+            Split::Mixed {
+                local: vec![q("a1")],
+                remote: vec![(q("b1"), owner("b"))],
+            }
+        );
+    }
+
+    #[test]
+    fn spread_batches_name_every_owner() {
+        let err = spread_batch(&[q("a1")], &[(q("b1"), owner("b"))]);
+        assert_eq!(
+            err.message,
+            "the batch names queues owned by different nodes (some here, b1 on b); send one batch per node"
+        );
+        let details = err.details.expect("owners are listed");
+        assert_eq!(details["owners"][1]["url"], "http://b:7700");
+        assert!(details["owners"][0]["node"].is_null());
+    }
+}
