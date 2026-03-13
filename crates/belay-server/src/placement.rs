@@ -50,3 +50,62 @@ pub(crate) enum Split {
         remote: Vec<(QueueName, RemoteOwner)>,
     },
 }
+
+/// Groups `queues` by owner, as reported by `owner_of`.
+pub(crate) fn split<'q>(
+    queues: impl IntoIterator<Item = &'q QueueName>,
+    owner_of: impl Fn(&QueueName) -> Ownership,
+) -> Split {
+    let mut local = Vec::new();
+    let mut remote: Vec<(QueueName, RemoteOwner)> = Vec::new();
+    for queue in queues {
+        if local.contains(queue) || remote.iter().any(|(q, _)| q == queue) {
+            continue;
+        }
+        match owner_of(queue) {
+            Ownership::Local => local.push(queue.clone()),
+            Ownership::Remote(owner) => remote.push((queue.clone(), owner)),
+        }
+    }
+    match remote.first() {
+        None => Split::Local,
+        Some((_, first)) if local.is_empty() && remote.iter().all(|(_, o)| o == first) => {
+            Split::Remote(first.clone())
+        }
+        Some(_) => Split::Mixed { local, remote },
+    }
+}
+
+/// The redirect for `req` if `queue` is owned elsewhere.
+pub(crate) fn for_queue(engine: &Engine, req: &Request, queue: &QueueName) -> Option<Response> {
+    remote(engine.owner_of(queue)).map(|owner| redirect(req, &owner))
+}
+
+/// The redirect for `req` if schedule `id` is owned elsewhere.
+pub(crate) fn for_schedule(engine: &Engine, req: &Request, id: &ScheduleId) -> Option<Response> {
+    remote(engine.owner_of_schedule(id)).map(|owner| redirect(req, &owner))
+}
+
+fn remote(ownership: Ownership) -> Option<RemoteOwner> {
+    match ownership {
+        Ownership::Local => None,
+        Ownership::Remote(owner) => Some(owner),
+    }
+}
+
+/// `307` to the same path and query on `owner`, with a small JSON body
+/// for people reading the answer with curl.
+pub(crate) fn redirect(req: &Request, owner: &RemoteOwner) -> Response {
+    let location = owner.url(&path_and_query(req));
+    let body = json!({"redirect": {"node": owner.node.as_str(), "location": location.as_str()}});
+    reply::json(StatusCode::TEMPORARY_REDIRECT, &body).header(LOCATION, location)
+}
+
+/// The request's path and query as received, without any scheme and
+/// authority a proxy may have sent in absolute form.
+pub(crate) fn path_and_query(req: &Request) -> String {
+    match req.path.split_once('?') {
+        Some((_, query)) => format!("{}?{}", req.path, query.split('#').next().unwrap_or("")),
+        None => req.path.clone(),
+    }
+}
