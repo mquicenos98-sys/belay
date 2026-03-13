@@ -119,7 +119,7 @@ impl FairQueue {
     /// lease commit does): the plan already dropped tenants whose flows it
     /// exhausted, and the removals then find nothing more to drop.
     pub(crate) fn install(&mut self, cursor: FairCursor) {
-        self.cursor.ring = cursor.ring;
+        self.cursor = cursor;
     }
 
     #[cfg(test)]
@@ -261,6 +261,21 @@ mod tests {
         q.insert(&tenant("b"), key(3, 1000));
         q.insert(&tenant("b"), key(4, 1000));
         assert_eq!(take(&mut q, 4, 1), [1, 3, 2, 4]);
+    }
+
+    #[test]
+    fn quantum_gives_bursts_and_turns_carry_over_between_requests() {
+        let mut q = FairQueue::default();
+        for i in 0..6 {
+            q.insert(&tenant("a"), key(i, 0));
+            q.insert(&tenant("b"), key(10 + i, 0));
+        }
+        // A turn of three is split across two single-job requests...
+        assert_eq!(take(&mut q, 1, 3), [0]);
+        assert_eq!(take(&mut q, 1, 3), [1]);
+        // ...and finishes before b gets its turn.
+        assert_eq!(take(&mut q, 4, 3), [2, 10, 11, 12]);
+        assert_eq!(take(&mut q, 20, 3), [3, 4, 5, 13, 14, 15]);
     }
 
     #[test]
