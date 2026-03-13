@@ -311,7 +311,7 @@ impl Membership {
     /// Moves the local incarnation past `claimed` and gossips `Alive`.
     fn refute(&mut self, claimed: u64) {
         let me = self.local_member_mut();
-        me.incarnation = me.incarnation.saturating_add(1);
+        me.incarnation = me.incarnation.max(claimed).saturating_add(1);
         let snapshot = me.clone();
         self.stats.refutations += 1;
         debug!(
