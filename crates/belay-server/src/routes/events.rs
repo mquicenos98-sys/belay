@@ -44,3 +44,41 @@ struct Pacing {
     retry: Duration,
     poll: Duration,
 }
+
+pub(super) fn stream(app: &App, req: &mut Request) -> Result<Response, ApiError> {
+    let mut filter = EventFilter::from_pairs(req.query.iter())?;
+    if let Some(last) = last_event_id(req)? {
+        filter.from = filter.from.or(Some(last.saturating_add(1)));
+    }
+    // The endpoint already turns requests away once the engine stops; a
+    // bus closed by other means ends streams just the same.
+    if app.engine.events().is_closed() {
+        return Err(ApiError::unavailable("the event stream is closed"));
+    }
+    let subscription = app.engine.subscribe(filter);
+    let shutdown = req.extensions.get::<ShutdownSignal>().cloned();
+    let open = app.metrics.as_ref().map(HttpMetrics::stream_opened);
+    let pacing = Pacing {
+        heartbeat: app.options.event_heartbeat.max(MIN_HEARTBEAT),
+        retry: app.options.event_retry,
+        poll: app.options.poll(),
+    };
+    Ok(Response::sse(move |sse| {
+        // Held until the stream ends, which is when the body is dropped.
+        let _open = &open;
+        pump(sse, &subscription, shutdown.as_ref(), pacing)
+    }))
+}
+
+/// The sequence number in `Last-Event-ID`, if the client sent one.
+fn last_event_id(req: &Request) -> Result<Option<u64>, ApiError> {
+    match req.last_event_id().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(id) => id.parse::<u64>().map(Some).map_err(|_| {
+            let shown: String = id.chars().take(64).collect();
+            ApiError::invalid_argument(format!(
+                "Last-Event-ID must be an event sequence number, got {shown:?}"
+            ))
+        }),
+    }
+}
