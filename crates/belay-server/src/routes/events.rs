@@ -82,3 +82,229 @@ fn last_event_id(req: &Request) -> Result<Option<u64>, ApiError> {
         }),
     }
 }
+
+/// Writes deliveries from `subscription` until the bus closes, the server
+/// shuts down or the client leaves.
+fn pump(
+    sse: &mut SseWriter<'_, '_>,
+    subscription: &Subscription,
+    shutdown: Option<&ShutdownSignal>,
+    pacing: Pacing,
+) -> io::Result<()> {
+    sse.set_heartbeat_interval(pacing.heartbeat);
+    sse.retry(pacing.retry)?;
+    let mut delivered: u64 = 0;
+    let mut lags: u64 = 0;
+    let ended = loop {
+        if shutdown.is_some_and(ShutdownSignal::is_triggered) {
+            break "server shutting down";
+        }
+        // Wake at least every poll interval: a shutdown or a vanished
+        // client is only noticed between waits.
+        let wait = sse.until_heartbeat().min(pacing.poll);
+        match subscription.recv_timeout(wait) {
+            Ok(Delivery::Event(event)) => {
+                sse.send(&frame(&event))?;
+                delivered += 1;
+            }
+            Ok(Delivery::Lagged { missed }) => {
+                sse.send(&lagged(missed))?;
+                lags += 1;
+            }
+            Err(RecvError::Timeout) => {
+                if !sse.is_open() {
+                    break "client left or server shutting down";
+                }
+                sse.heartbeat_if_due()?;
+            }
+            Err(RecvError::Closed) => break "event bus closed",
+        }
+    };
+    debug!("event stream ended: {ended}"; delivered, lags);
+    Ok(())
+}
+
+/// One event as an SSE frame.
+fn frame(event: &Event) -> SseEvent {
+    let data = String::from_utf8_lossy(&encode_body(event)).into_owned();
+    SseEvent::new(data)
+        .id(event.seq.to_string())
+        .event(event.type_name())
+}
+
+/// The frame telling a client it missed `missed` sequence numbers.
+fn lagged(missed: u64) -> SseEvent {
+    SseEvent::new(json!({"type": "lagged", "missed": missed}).to_string()).event("lagged")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_common::sync::lock;
+    use belay_core::{Config, Engine};
+    use belay_http::{BodyWriter, Method, SseParser};
+    use belay_proto::JobSpec;
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    fn engine(buffer: usize) -> Engine {
+        let mut config = Config::dev();
+        config.events.buffer = buffer;
+        Engine::builder()
+            .config(config)
+            .background(false)
+            .start()
+            .expect("engine starts")
+    }
+
+    const PACING: Pacing = Pacing {
+        heartbeat: Duration::from_secs(60),
+        retry: Duration::from_millis(1500),
+        poll: Duration::from_millis(5),
+    };
+
+    /// A sink the test can read while the stream writes to it.
+    #[derive(Clone, Default)]
+    struct Wire(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Wire {
+        fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+            lock(&self.0).extend_from_slice(data);
+            Ok(data.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn parse(text: &str) -> Vec<SseEvent> {
+        let mut parser = SseParser::new();
+        let mut events = Vec::new();
+        parser
+            .feed(text.as_bytes(), |e| events.push(e))
+            .expect("well-formed stream");
+        events
+    }
+
+    /// Streams until `frames` frames have been written, then shuts the
+    /// stream down and returns what it wrote.
+    fn stream(engine: &Engine, filter: EventFilter, frames: usize) -> (String, Vec<SseEvent>) {
+        let subscription = engine.subscribe(filter);
+        let shutdown = ShutdownSignal::new();
+        let wire = Wire::default();
+        let writer = {
+            let (shutdown, mut wire) = (shutdown.clone(), wire.clone());
+            std::thread::spawn(move || {
+                let mut out = BodyWriter::new(&mut wire);
+                let mut sse = SseWriter::new(&mut out);
+                pump(&mut sse, &subscription, Some(&shutdown), PACING)
+            })
+        };
+        let text = || String::from_utf8(lock(&wire.0).clone()).expect("utf-8");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while parse(&text()).len() < frames && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        shutdown.trigger();
+        writer.join().expect("no panic").expect("writes succeed");
+        let text = text();
+        let events = parse(&text);
+        (text, events)
+    }
+
+    #[test]
+    fn events_carry_their_sequence_number_type_and_json() {
+        let engine = engine(100);
+        let first = engine.events().next_seq();
+        let id = engine.enqueue(JobSpec::new("emails", "send")).unwrap().id;
+        let (text, events) = stream(&engine, EventFilter::new().from_seq(first), 1);
+        assert!(text.starts_with("retry: 1500\n\n"), "{text}");
+        assert_eq!(events.len(), 1, "{text}");
+        let event = &events[0];
+        assert_eq!(event.id.as_deref(), Some(first.to_string().as_str()));
+        assert_eq!(event.event_type(), "job.enqueued");
+        let data = belay_json::parse(&event.data).expect("json data");
+        assert_eq!(data["seq"], first);
+        assert_eq!(data["job"], id.to_string().as_str());
+    }
+
+    #[test]
+    fn filters_apply_to_the_stream() {
+        let engine = engine(100);
+        let first = engine.events().next_seq();
+        engine.enqueue(JobSpec::new("emails", "send")).unwrap();
+        engine.enqueue(JobSpec::new("sms", "send")).unwrap();
+        let filter = EventFilter::new()
+            .from_seq(first)
+            .for_queue("sms".parse().expect("queue name"));
+        // Wait for a frame the filter lets through after the one it drops.
+        engine.enqueue(JobSpec::new("sms", "send")).unwrap();
+        let (_, events) = stream(&engine, filter, 2);
+        let ids: Vec<Option<String>> = events.iter().map(|e| e.id.clone()).collect();
+        assert_eq!(
+            ids,
+            [Some((first + 1).to_string()), Some((first + 2).to_string())]
+        );
+    }
+
+    #[test]
+    fn a_closed_bus_ends_the_stream() {
+        let engine = engine(100);
+        let subscription = engine.events().subscribe_live(EventFilter::new());
+        engine.events().close();
+        let mut wire = Vec::new();
+        {
+            let mut out = BodyWriter::new(&mut wire);
+            let mut sse = SseWriter::new(&mut out);
+            pump(&mut sse, &subscription, None, PACING).expect("writes to a vec succeed");
+        }
+        assert_eq!(String::from_utf8(wire).unwrap(), "retry: 1500\n\n");
+    }
+
+    #[test]
+    fn idle_streams_send_heartbeats() {
+        let engine = engine(100);
+        let subscription = engine.events().subscribe_live(EventFilter::new());
+        let shutdown = ShutdownSignal::new();
+        let wire = Wire::default();
+        let writer = {
+            let (shutdown, mut wire) = (shutdown.clone(), wire.clone());
+            std::thread::spawn(move || {
+                let mut out = BodyWriter::new(&mut wire);
+                let mut sse = SseWriter::new(&mut out);
+                let pacing = Pacing {
+                    heartbeat: Duration::from_millis(10),
+                    ..PACING
+                };
+                pump(&mut sse, &subscription, Some(&shutdown), pacing)
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !lock(&wire.0).ends_with(b":\n\n:\n\n") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        shutdown.trigger();
+        writer.join().expect("no panic").expect("writes succeed");
+        let text = String::from_utf8(lock(&wire.0).clone()).expect("utf-8");
+        assert!(text.starts_with("retry: 1500\n\n:\n\n:\n\n"), "{text:?}");
+    }
+
+    #[test]
+    fn last_event_id_must_be_a_sequence_number() {
+        let req =
+            |id: &str| Request::new(Method::Get, "/v1/events").with_header("Last-Event-ID", id);
+        assert_eq!(last_event_id(&req("41")).unwrap(), Some(41));
+        assert_eq!(last_event_id(&req(" ")).unwrap(), None);
+        assert_eq!(
+            last_event_id(&Request::new(Method::Get, "/")).unwrap(),
+            None
+        );
+        let err = last_event_id(&req("abc")).unwrap_err();
+        assert_eq!(
+            err.message,
+            r#"Last-Event-ID must be an event sequence number, got "abc""#
+        );
+    }
+}
