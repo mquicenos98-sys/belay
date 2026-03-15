@@ -8,6 +8,37 @@ use belay_common::log::{CaptureLogger, Level};
 use super::*;
 
 #[test]
+fn refutes_claims_about_itself() {
+    let mut d = Driver::named("a").with_peers(&["b"]);
+    let claims = [
+        (suspect("a", 0, "b"), 1),
+        (dead("a", 1, "b"), 2),
+        (left("a", 2), 3),
+        // A newer record of ourselves, left over from a previous run.
+        (alive("a", 7), 8),
+    ];
+    for (claim, incarnation) in claims {
+        d.gossip("b", claim);
+        assert_eq!(d.m.incarnation(), incarnation);
+        assert_eq!(d.m.local_member().state, MemberState::Alive);
+    }
+    assert_eq!(d.m.stats().refutations, 4);
+
+    // Stale claims (older incarnations) need no answer.
+    d.gossip("b", suspect("a", 3, "b"));
+    assert_eq!(d.m.incarnation(), 8);
+
+    // The refutation goes out with the next datagram.
+    d.recv("b", ping(1, "a"), vec![]);
+    let refutations: Vec<u64> = updates_in(&d.take_sent())
+        .iter()
+        .filter(|u| *u.node() == "a")
+        .map(Update::incarnation)
+        .collect();
+    assert_eq!(refutations, [8]);
+}
+
+#[test]
 fn an_alive_record_with_our_incarnation_but_other_data_is_refuted() {
     // Regression: a node restarted with the same id and incarnation but a
     // new address was shadowed by its old record forever.
