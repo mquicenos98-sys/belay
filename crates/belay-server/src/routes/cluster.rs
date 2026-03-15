@@ -34,3 +34,43 @@ fn page_of(mut members: Vec<MemberInfo>, paging: &Paging) -> Result<Page<MemberI
     members.truncate(limit as usize + 1);
     Ok(Page::paginate(members, limit, |m| Cursor::from_name(&m.id)))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_proto::api::MemberState;
+    use belay_proto::JobId;
+
+    fn member(id: &str) -> MemberInfo {
+        MemberInfo {
+            id: id.to_owned(),
+            addr: format!("http://{id}:7700"),
+            state: MemberState::Alive,
+            leader: id == "a",
+        }
+    }
+
+    fn ids(page: &Page<MemberInfo>) -> Vec<&str> {
+        page.items.iter().map(|m| m.id.as_str()).collect()
+    }
+
+    #[test]
+    fn members_page_by_id() {
+        let all = || vec![member("c"), member("a"), member("b")];
+        let first = page_of(all(), &Paging::new().limit(2)).unwrap();
+        assert_eq!(ids(&first), ["a", "b"]);
+        let cursor = first.next_cursor.clone().expect("a second page");
+        let second = page_of(all(), &Paging::new().after(cursor).limit(2)).unwrap();
+        assert_eq!(ids(&second), ["c"]);
+        assert!(second.next_cursor.is_none());
+        let everything = page_of(all(), &Paging::new()).unwrap();
+        assert_eq!(ids(&everything), ["a", "b", "c"]);
+    }
+
+    #[test]
+    fn cursors_from_other_listings_are_refused() {
+        let foreign = Cursor::after_job(JobId::generate());
+        let err = page_of(vec![member("a")], &Paging::new().after(foreign)).unwrap_err();
+        assert_eq!(err.message, "$.cursor: was not issued by this listing");
+    }
+}
