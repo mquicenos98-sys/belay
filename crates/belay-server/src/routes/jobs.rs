@@ -89,3 +89,56 @@ pub(super) fn promote(app: &App, req: &mut Request) -> Result<Response, ApiError
     let job = app.engine.promote_job(&id).map_err(|e| locate(app, e))?;
     Ok(reply::ok(&job))
 }
+
+/// The canonical path of job `id`.
+pub(super) fn job_path(id: JobId) -> String {
+    format!("/v1/jobs/{id}")
+}
+
+/// In a cluster, a job this node does not know may well exist on another
+/// node; say which node answered so the caller knows where not to look.
+pub(super) fn locate(app: &App, error: ApiError) -> ApiError {
+    if error.code != ErrorCode::NotFound || !app.engine.is_clustered() {
+        return error;
+    }
+    let node = app.engine.node_id();
+    ApiError {
+        message: format!(
+            "{} on node {node} (jobs are kept by the node that owned their queue when they were enqueued)",
+            error.message
+        ),
+        ..error
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_http::Method;
+    use belay_proto::JobSpec;
+
+    use crate::options::ServerOptions;
+    use crate::routes::testing;
+
+    #[test]
+    fn a_single_node_reports_missing_jobs_plainly() {
+        let engine = testing::engine();
+        let app = testing::app(&engine, ServerOptions::default());
+        let error = locate(&app, ApiError::not_found("job", "x"));
+        assert_eq!(error.message, "job x not found");
+        let other = locate(&app, ApiError::conflict("busy"));
+        assert_eq!(other.message, "busy");
+    }
+
+    #[test]
+    fn listing_a_queue_on_a_single_node_is_served_here() {
+        let engine = testing::engine();
+        engine.enqueue(JobSpec::new("emails", "send")).unwrap();
+        let router = testing::router(&engine);
+        let list = testing::request(Method::Get, "/v1/jobs?queue=emails&state=ready", "");
+        let (status, page) = testing::call(&router, list);
+        assert_eq!(status, 200);
+        assert_eq!(page["items"].as_array().map(Vec::len), Some(1));
+        assert!(page["next_cursor"].is_null());
+    }
+}
