@@ -69,6 +69,24 @@ fn events_arrive_and_the_stream_resumes_from_the_last_id() {
 }
 
 #[test]
+fn resume_point_can_be_given_up_front() {
+    let mut router = Router::new();
+    router.get("/events", |req: &mut Request| match req.last_event_id() {
+        Some("41") => Response::sse(|sse| sse.send(&SseEvent::new("next").id("42"))),
+        _ => Response::no_content(),
+    });
+    let server = serve(router);
+    let mut events = Client::default()
+        .sse_with(&url(&server, "/events"), fast_options().last_event_id("41"))
+        .expect("connect");
+    let first = events.next().expect("an event").expect("no error");
+    assert_eq!(first.data, "next");
+    assert_eq!(events.last_event_id(), Some("42"));
+    assert!(events.next().is_none());
+    assert!(events.is_closed());
+}
+
+#[test]
 fn server_notices_when_the_client_goes_away() {
     let (ended_tx, ended_rx) = mpsc::channel::<usize>();
     let ended_tx = Mutex::new(ended_tx);
