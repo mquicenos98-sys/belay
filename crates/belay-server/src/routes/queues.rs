@@ -39,3 +39,22 @@ pub(super) fn get(app: &App, req: &mut Request) -> Result<Response, ApiError> {
         Ok(reply::ok(&app.engine.queue_info(name)?))
     })
 }
+
+pub(super) fn set_config(app: &App, req: &mut Request) -> Result<Response, ApiError> {
+    on_queue(app, req, &[], |app, req, name| {
+        let config: QueueConfig = extract::body(req)?;
+        Ok(reply::ok(&app.engine.set_queue_config(name, config)?))
+    })
+}
+
+pub(super) fn pause(app: &App, req: &mut Request) -> Result<Response, ApiError> {
+    on_queue(app, req, &[], |app, _, name| {
+        Ok(reply::ok(&app.engine.pause_queue(name)?))
+    })
+}
+
+pub(super) fn resume(app: &App, req: &mut Request) -> Result<Response, ApiError> {
+    on_queue(app, req, &[], |app, _, name| {
+        Ok(reply::ok(&app.engine.resume_queue(name)?))
+    })
+}
