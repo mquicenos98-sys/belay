@@ -22,11 +22,8 @@ pub const START: &str = "2025-03-03T08:00:00Z";
 
 /// Token secrets of [`TestServer::secured`], one per scope.
 pub const ADMIN: &str = "admin-secret-0123456789";
-
 pub const PRODUCER: &str = "producer-secret-0123456789";
-
 pub const WORKER: &str = "worker-secret-0123456789";
-
 pub const READER: &str = "reader-secret-0123456789";
 
 pub struct TestServer {
@@ -136,5 +133,69 @@ impl Drop for TestServer {
         if let Some(handle) = self.handle.take() {
             handle.shutdown_and_join();
         }
+    }
+}
+
+/// `Config::dev()` with a short shutdown grace.
+pub fn test_config() -> Config {
+    let mut config = Config::dev();
+    config.server.shutdown_grace = Duration::from_secs(5);
+    config
+}
+
+/// Near-instant retries and a generous timeout.
+pub fn client_config(url: &str) -> ClientConfig {
+    ClientConfig::new(url)
+        .backoff(BackoffPolicy::constant(Duration::from_millis(1)))
+        .timeout(Duration::from_secs(10))
+        .connect_timeout(Duration::from_secs(2))
+}
+
+/// A raw HTTP client that returns redirects instead of following them.
+pub fn http() -> belay_http::Client {
+    belay_http::Client::new(belay_http::ClientConfig {
+        read_timeout: Some(Duration::from_secs(10)),
+        ..belay_http::ClientConfig::default()
+    })
+}
+
+/// The `ApiError` in an error response, checking the JSON content type
+/// and that the status matches the code.
+pub fn api_error(response: &ClientResponse) -> ApiError {
+    assert_eq!(
+        response.header("content-type"),
+        Some("application/json"),
+        "error bodies are JSON: {}",
+        String::from_utf8_lossy(&response.body)
+    );
+    let status = response.status.as_u16();
+    let error = decode_error(status, &response.body);
+    if !matches!(status, 405 | 413) {
+        assert_eq!(error.http_status(), status, "{error:?}");
+    }
+    error
+}
+
+/// The response body as JSON.
+pub fn json(response: &ClientResponse) -> belay_json::Value {
+    belay_json::parse_bytes(&response.body).expect("JSON body")
+}
+
+/// Keeps test output readable: only warnings and errors are logged.
+pub fn quiet_logs() {
+    belay_common::log::set_max_level(belay_common::log::Level::Warn);
+}
+
+/// Polls `condition` until it holds or `timeout` passes.
+pub fn eventually(timeout: Duration, mut condition: impl FnMut() -> bool) -> bool {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if condition() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }
