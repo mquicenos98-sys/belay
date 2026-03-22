@@ -139,7 +139,10 @@ pub struct EventStream {
 
 impl EventStream {
     pub(crate) fn connect(client: Client, url: Url, options: SseOptions) -> Result<EventStream> {
-        let parser = SseParser::new().with_max_event_bytes(options.max_event_bytes);
+        let mut parser = SseParser::new().with_max_event_bytes(options.max_event_bytes);
+        if let Some(id) = &options.last_event_id {
+            parser.set_last_event_id(id);
+        }
         let mut stream = EventStream {
             client,
             url,
