@@ -122,3 +122,38 @@ fn broken_paths_are_json_bad_requests() {
     assert_eq!(error.code, ErrorCode::InvalidArgument);
     assert_eq!(error.message, "invalid percent-encoding in path");
 }
+
+#[test]
+fn trailing_slashes_redirect_to_the_route() {
+    let server = TestServer::start();
+    let response = server.get("/v1/queues/?limit=2", None);
+    assert_eq!(response.status, 308);
+    assert_eq!(response.header("location"), Some("/v1/queues?limit=2"));
+}
+
+#[test]
+fn head_and_options_are_answered_for_every_route() {
+    let server = TestServer::start();
+    let head = server.send(Method::Head, "/v1/info", "", None);
+    assert_eq!(head.status, 200);
+    assert!(head.body.is_empty());
+    let options = server.send(
+        Method::Options,
+        "/v1/jobs/01HQ3K9Z8N6V2T4R5S7W0X1Y2Z",
+        "",
+        None,
+    );
+    assert_eq!(options.status, 204);
+    assert_eq!(options.header("allow"), Some("GET, DELETE, HEAD, OPTIONS"));
+}
+
+#[test]
+fn errors_from_the_engine_keep_their_code_and_status() {
+    let server = TestServer::start();
+    let missing_calendar = server.send(Method::Delete, "/v1/calendars/missing", "", None);
+    assert_eq!(api_error(&missing_calendar).code, ErrorCode::NotFound);
+    let unknown_job = server.post("/v1/jobs/01HQ3K9Z8N6V2T4R5S7W0X1Y2Z/promote", "", None);
+    assert_eq!(api_error(&unknown_job).code, ErrorCode::NotFound);
+    let missing_schedule = server.post("/v1/schedules/none/trigger", "", None);
+    assert_eq!(api_error(&missing_schedule).code, ErrorCode::NotFound);
+}
