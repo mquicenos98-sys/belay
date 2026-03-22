@@ -111,3 +111,116 @@ pub(crate) fn bind(listen: &str) -> Result<TcpListener> {
         source,
     })
 }
+
+/// Serves `engine` on `listener` with `options`.
+pub(crate) fn start(
+    engine: Arc<Engine>,
+    listener: TcpListener,
+    options: ServerOptions,
+) -> Result<ServerHandle> {
+    let config = engine.config();
+    let server = Server::from_listener(listener, http_config(&config.server))?;
+    let local_addr = server.local_addr();
+    let signal = server.shutdown_signal();
+    let router = routes::build(Arc::new(App::new(Arc::clone(&engine), options)));
+    let running = server.spawn(router)?;
+
+    let stopping = Arc::clone(&engine);
+    let supervisor = thread::Builder::new()
+        .name("belay-server".to_owned())
+        .spawn(move || {
+            match running.join() {
+                Drain::Complete => info!("HTTP server drained"),
+                Drain::TimedOut { remaining } => warn!(
+                    "shutdown grace period ran out with connections still open";
+                    remaining
+                ),
+            }
+            stopping.shutdown();
+            info!("server stopped"; node = stopping.node_id());
+        })
+        // A failed spawn drops the closure and with it the HTTP server's
+        // handle, which stops that server before the error is returned.
+        .map_err(|e| Error::Http(belay_http::Error::Io(e)))?;
+
+    info!(
+        "serving the belay API";
+        addr = %local_addr,
+        node = engine.node_id(),
+        auth = config.auth.is_enforced(),
+        clustered = engine.is_clustered(),
+        max_connections = config.server.max_connections,
+    );
+    Ok(ServerHandle {
+        local_addr,
+        signal,
+        engine,
+        supervisor: Some(supervisor),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_core::Config;
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    fn engine() -> Arc<Engine> {
+        let engine = Engine::builder()
+            .config(Config::dev())
+            .background(false)
+            .start()
+            .expect("engine starts");
+        Arc::new(engine)
+    }
+
+    fn get(addr: SocketAddr, path: &str) -> String {
+        let mut stream = TcpStream::connect(addr).expect("connect");
+        write!(
+            stream,
+            "GET {path} HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write");
+        let mut response = String::new();
+        stream.read_to_string(&mut response).expect("read");
+        response
+    }
+
+    #[test]
+    fn serves_until_shut_down_then_stops_the_engine() {
+        let engine = engine();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let handle = start(Arc::clone(&engine), listener, ServerOptions::new()).expect("starts");
+        let addr = handle.local_addr();
+        assert!(get(addr, "/healthz").starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(!handle.is_shutting_down());
+
+        let started = Instant::now();
+        handle.shutdown_and_join();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(engine.is_shutting_down());
+        assert!(TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_err());
+    }
+
+    #[test]
+    fn dropping_the_handle_shuts_down() {
+        let engine = engine();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let handle = start(Arc::clone(&engine), listener, ServerOptions::new()).expect("starts");
+        assert!(format!("{handle:?}").contains("shutting_down: false"));
+        drop(handle);
+        assert!(engine.is_shutting_down());
+    }
+
+    #[test]
+    fn bind_failures_name_the_configured_address() {
+        let taken = TcpListener::bind("127.0.0.1:0").expect("ephemeral port");
+        let addr = taken.local_addr().expect("bound").to_string();
+        match bind(&addr) {
+            Err(Error::Bind { addr: reported, .. }) => assert_eq!(reported, addr),
+            other => panic!("expected a bind error, got {other:?}"),
+        }
+    }
+}
