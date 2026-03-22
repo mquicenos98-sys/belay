@@ -159,6 +159,21 @@ fn uniform_weights_of_any_value_agree_with_unit_weights() {
 }
 
 #[test]
+fn changing_a_weight_moves_keys_toward_the_heavier_node_only() {
+    let before = ring(&["a", "b", "c", "d"]);
+    let mut after = before.clone();
+    after.insert(id("b"), 2.0).unwrap();
+    assert_eq!(after.len(), 4);
+    assert_eq!(after.weight("b"), Some(2.0));
+    let diff = Ownership::diff(&before, &after, keys(5_000));
+    assert!(!diff.is_empty());
+    assert!(diff
+        .moves()
+        .iter()
+        .all(|m| m.to.as_ref().is_some_and(|to| to == "b")));
+}
+
+#[test]
 fn owners_lists_successors_in_score_order() {
     let full = ring(&["a", "b", "c", "d", "e"]);
     for key in keys(100) {

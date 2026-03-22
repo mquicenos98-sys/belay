@@ -97,7 +97,7 @@ impl Ring {
             return Err(Error::InvalidWeight(weight));
         }
         match self.nodes.binary_search_by(|n| n.id.cmp(&id)) {
-            Ok(_) => {}
+            Ok(i) => self.nodes[i].weight = weight,
             Err(i) => {
                 let seed = hash64(id.as_str().as_bytes(), NODE_SEED);
                 self.nodes.insert(i, RingNode { id, weight, seed });
