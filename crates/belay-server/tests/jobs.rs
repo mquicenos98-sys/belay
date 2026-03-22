@@ -175,3 +175,38 @@ fn cancel_retry_promote_and_delete() {
     assert_eq!(deleted.status, 204);
     assert!(jobs.get(waiting).unwrap_err().is_not_found());
 }
+
+#[test]
+fn job_ids_are_validated_before_lookup() {
+    let server = TestServer::start();
+    let malformed = api_error(&server.get("/v1/jobs/not-a-ulid", None));
+    assert_eq!(malformed.code, ErrorCode::InvalidArgument);
+    let missing = server.get("/v1/jobs/01HQ3K9Z8N6V2T4R5S7W0X1Y2Z", None);
+    assert_eq!(api_error(&missing).code, ErrorCode::NotFound);
+    match server
+        .client()
+        .jobs()
+        .cancel("01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().unwrap())
+    {
+        Err(Error::Api(e)) => assert_eq!(e.code, ErrorCode::NotFound),
+        other => panic!("expected not_found, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_and_malformed_bodies_are_explained() {
+    let server = TestServer::start();
+    let empty = api_error(&server.post("/v1/jobs", "", None));
+    assert_eq!(
+        empty.message,
+        "request body is empty; expected a JSON object"
+    );
+    let broken = api_error(&server.post("/v1/jobs", "{\"queue\": ", None));
+    assert!(
+        broken.message.starts_with("invalid JSON: "),
+        "{}",
+        broken.message
+    );
+    let details = broken.details.expect("parse errors carry a position");
+    assert_eq!(details["line"], 1);
+}
