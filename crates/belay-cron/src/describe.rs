@@ -259,7 +259,7 @@ fn hours_qualifier(h: &Shape, hours: &[u32]) -> Option<String> {
         Shape::Range(a, b) => Some(format!(
             "between {} and {}",
             clock(*a, 0, 0),
-            clock(*b, 0, 0)
+            clock(*b, 59, 0)
         )),
         Shape::Step { start, step, end } if end + step > 23 => {
             let base = format!("during every {} hour", ordinal(*step));
@@ -523,6 +523,28 @@ mod tests {
         assert_eq!(d("0 9,17 * * *"), "at 09:00 and 17:00 every day");
         assert_eq!(d("15 30 9 * * *"), "at 09:30:15 every day");
         assert_eq!(d("@daily"), "at 00:00 every day");
+    }
+
+    #[test]
+    fn times_within_hours() {
+        assert_eq!(
+            d("*/15 9-17 * * *"),
+            "every 15 minutes between 09:00 and 17:59"
+        );
+        assert_eq!(d("* 9 * * *"), "every minute between 09:00 and 09:59");
+        assert_eq!(d("0 9-17 * * *"), "every hour between 09:00 and 17:59");
+        assert_eq!(
+            d("0,15,45 * * * *"),
+            "at minutes 0, 15 and 45 past every hour"
+        );
+        assert_eq!(
+            d("10-20 * * * *"),
+            "at minutes 10 through 20 past every hour"
+        );
+        assert_eq!(
+            d("*/10 * 1,3,5,7,9,20,22 * * *"),
+            "every 10 seconds during hours 1, 3, 5, 7, 9, 20 and 22"
+        );
     }
 
     #[test]
