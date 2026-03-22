@@ -174,3 +174,55 @@ fn requests_follow_queue_and_schedule_ownership() {
     );
     assert_eq!(preview.status, 307);
 }
+
+#[test]
+fn batches_and_leases_are_split_by_owner() {
+    let (a, b) = cluster();
+    let on_a = owned_by(&a, &b, queue, |e, q| e.owner_of(q));
+    let on_b = owned_by(&b, &a, queue, |e, q| e.owner_of(q));
+
+    let batch = format!(
+        r#"{{"jobs": [{{"queue": "{on_a}", "kind": "k"}}, {{"queue": "{on_b}", "kind": "k"}}]}}"#
+    );
+    let refused = api_error(&a.send(Method::Post, "/v1/jobs", &batch));
+    assert_eq!(refused.code, ErrorCode::InvalidArgument);
+    assert!(
+        refused.message.contains(&format!("{on_b} on node-b")),
+        "{}",
+        refused.message
+    );
+
+    a.engine.enqueue(JobSpec::new(on_a.clone(), "k")).unwrap();
+    // A lease naming both queues is served from a's, skipping b's.
+    let lease = format!(r#"{{"worker": "w1", "queues": ["{on_b}", "{on_a}"]}}"#);
+    let served = a.send(Method::Post, "/v1/lease", &lease);
+    assert_eq!(served.status, 200);
+    assert_eq!(served.header(REMOTE_QUEUES_HEADER), Some(on_b.as_str()));
+    assert_eq!(json(&served)["jobs"].as_array().map(Vec::len), Some(1));
+    // Only b's queue: redirected to b.
+    let only_b = format!(r#"{{"worker": "w1", "queues": ["{on_b}"]}}"#);
+    let redirected = a.send(Method::Post, "/v1/lease", &only_b);
+    assert_eq!(redirected.status, 307);
+    assert_eq!(
+        redirected.header("location"),
+        Some(b.url("/v1/lease").as_str())
+    );
+}
+
+#[test]
+fn every_node_lists_the_members_and_is_ready() {
+    let (a, b) = cluster();
+    for node in [&a, &b] {
+        let members = node.client().members().expect("members");
+        let ids: Vec<&str> = members.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ["node-a", "node-b"]);
+        assert_eq!(members.iter().filter(|m| m.leader).count(), 1);
+        assert!(eventually(Duration::from_secs(10), || node
+            .client()
+            .ready()
+            .unwrap_or(false)));
+    }
+    assert_eq!(a.client().info().expect("info").cluster_size, 2);
+    a.handle.shutdown_and_join();
+    b.handle.shutdown_and_join();
+}
