@@ -41,3 +41,43 @@ pub(super) fn create(app: &App, req: &mut Request) -> Result<Response, ApiError>
     let schedule = app.engine.create_schedule(spec)?;
     Ok(reply::created(&schedule, &schedule_path(&schedule.spec.id)))
 }
+
+/// Runs `op` on the schedule named in the path, unless another node owns
+/// it.
+fn on_schedule(
+    app: &App,
+    req: &mut Request,
+    params: &[&str],
+    op: impl FnOnce(&App, &Request, &ScheduleId) -> Result<Response, ApiError>,
+) -> Result<Response, ApiError> {
+    only_params(req, params)?;
+    let id = extract::schedule_id(req)?;
+    if let Some(redirect) = placement::for_schedule(&app.engine, req, &id) {
+        return Ok(redirect);
+    }
+    op(app, req, &id)
+}
+
+pub(super) fn get(app: &App, req: &mut Request) -> Result<Response, ApiError> {
+    on_schedule(app, req, &[], |app, _, id| {
+        Ok(reply::ok(&app.engine.get_schedule(id)?))
+    })
+}
+
+pub(super) fn put(app: &App, req: &mut Request) -> Result<Response, ApiError> {
+    on_schedule(app, req, &[], |app, req, id| {
+        let spec: ScheduleSpec = extract::body_named(req, "id", id.as_str())?;
+        let (schedule, outcome) = app.engine.put_schedule(spec)?;
+        Ok(match outcome {
+            Upserted::Created => reply::created(&schedule, &schedule_path(id)),
+            Upserted::Updated | Upserted::Unchanged => reply::ok(&schedule),
+        })
+    })
+}
+
+/// Answers with the schedule's last state; jobs it created are kept.
+pub(super) fn delete(app: &App, req: &mut Request) -> Result<Response, ApiError> {
+    on_schedule(app, req, &[], |app, _, id| {
+        Ok(reply::ok(&app.engine.delete_schedule(id)?))
+    })
+}
