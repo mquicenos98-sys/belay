@@ -19,7 +19,6 @@ use crate::reply;
 
 /// Fire times returned by a preview without `?n=`.
 const DEFAULT_PREVIEW: usize = 10;
-
 /// Most fire times one preview returns.
 const MAX_PREVIEW: usize = 1000;
 
@@ -80,4 +79,87 @@ pub(super) fn delete(app: &App, req: &mut Request) -> Result<Response, ApiError>
     on_schedule(app, req, &[], |app, _, id| {
         Ok(reply::ok(&app.engine.delete_schedule(id)?))
     })
+}
+
+pub(super) fn pause(app: &App, req: &mut Request) -> Result<Response, ApiError> {
+    on_schedule(app, req, &[], |app, _, id| {
+        Ok(reply::ok(&app.engine.pause_schedule(id)?))
+    })
+}
+
+pub(super) fn resume(app: &App, req: &mut Request) -> Result<Response, ApiError> {
+    on_schedule(app, req, &[], |app, _, id| {
+        Ok(reply::ok(&app.engine.resume_schedule(id)?))
+    })
+}
+
+pub(super) fn trigger(app: &App, req: &mut Request) -> Result<Response, ApiError> {
+    on_schedule(app, req, &[], |app, _, id| {
+        Ok(reply::ok(&app.engine.trigger_schedule(id)?))
+    })
+}
+
+/// `?n=` fire times (default 10, at most 1000), before jitter and calendar
+/// exclusions.
+pub(super) fn preview(app: &App, req: &mut Request) -> Result<Response, ApiError> {
+    on_schedule(app, req, &["n"], |app, req, id| {
+        let n = extract::query_value::<usize>(req, "n")?.unwrap_or(DEFAULT_PREVIEW);
+        if !(1..=MAX_PREVIEW).contains(&n) {
+            return Err(ApiError::invalid_argument(format!(
+                "$.n: must be between 1 and {MAX_PREVIEW}, got {n}"
+            )));
+        }
+        Ok(reply::ok(&app.engine.preview_schedule(id, n)?))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use belay_http::Method;
+
+    use crate::routes::testing;
+
+    const SPEC: &str = r#"{"cron": "*/5 * * * *", "template": {"queue": "q", "kind": "k"}}"#;
+
+    #[test]
+    fn previews_default_to_ten_fire_times() {
+        let engine = testing::engine();
+        let router = testing::router(&engine);
+        let put = testing::request(Method::Put, "/v1/schedules/tick", SPEC);
+        assert_eq!(testing::call(&router, put).0, 201);
+        let preview = testing::request(Method::Get, "/v1/schedules/tick/preview", "");
+        let (_, body) = testing::call(&router, preview);
+        assert_eq!(body["times"].as_array().map(Vec::len), Some(10));
+        let zero = testing::request(Method::Get, "/v1/schedules/tick/preview?n=0", "");
+        assert_eq!(testing::call(&router, zero).0, 400);
+    }
+
+    #[test]
+    fn put_reports_whether_it_created_or_replaced() {
+        let engine = testing::engine();
+        let router = testing::router(&engine);
+        let put =
+            |target: &str| testing::call(&router, testing::request(Method::Put, target, SPEC)).0;
+        assert_eq!(put("/v1/schedules/tick"), 201);
+        assert_eq!(put("/v1/schedules/tick"), 200, "unchanged");
+        assert_eq!(put("/v1/schedules/Bad_Id"), 400);
+    }
+
+    #[test]
+    fn unknown_schedules_are_not_found_everywhere() {
+        let engine = testing::engine();
+        let router = testing::router(&engine);
+        for (method, target) in [
+            (Method::Get, "/v1/schedules/none"),
+            (Method::Delete, "/v1/schedules/none"),
+            (Method::Post, "/v1/schedules/none/pause"),
+            (Method::Post, "/v1/schedules/none/resume"),
+            (Method::Get, "/v1/schedules/none/preview"),
+        ] {
+            let label = format!("{method} {target}");
+            let (status, body) = testing::call(&router, testing::request(method, target, ""));
+            assert_eq!(status, 404, "{label}");
+            assert_eq!(body["error"]["code"], "not_found");
+        }
+    }
 }
