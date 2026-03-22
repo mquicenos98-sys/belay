@@ -403,6 +403,25 @@ fn with_redirects_disabled_a_redirect_is_an_error() {
 // ---- long polls and timeouts --------------------------------------------
 
 #[test]
+fn a_long_poll_may_outlast_the_client_timeout() {
+    let fake = Fake::start();
+    fake.reply_with(|_| {
+        thread::sleep(Duration::from_millis(250));
+        Response::json_bytes(belay_proto::api::encode_body(&LeaseResponse::default()))
+    });
+    let client = fake.client_with(|c| c.timeout(Duration::from_millis(150)));
+    let request = lease_request().wait(Duration::from_millis(200));
+
+    let jobs = client
+        .jobs()
+        .lease(&request)
+        .expect("answered within timeout + wait");
+
+    assert!(jobs.is_empty());
+    assert_eq!(fake.only().json()["wait"], json!("200ms"));
+}
+
+#[test]
 fn a_hung_lease_times_out_without_a_second_attempt() {
     let fake = Fake::start();
     fake.reply_with(|_| {

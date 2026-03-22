@@ -189,7 +189,7 @@ impl Client {
         let inner = &*self.inner;
         let url = self.url(&call.path, &call.query);
         let options = RequestOptions {
-            read_timeout: Some(inner.config.timeout.max(call.extra_wait)),
+            read_timeout: Some(inner.config.timeout.saturating_add(call.extra_wait)),
             redirects: None,
         };
         let mut attempt = 0;
