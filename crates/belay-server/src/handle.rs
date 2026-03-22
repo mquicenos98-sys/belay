@@ -84,3 +84,30 @@ impl ServerHandle {
         }
     }
 }
+
+impl Drop for ServerHandle {
+    fn drop(&mut self) {
+        if self.supervisor.is_some() {
+            self.signal.trigger();
+            self.join();
+        }
+    }
+}
+
+impl fmt::Debug for ServerHandle {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServerHandle")
+            .field("local_addr", &self.local_addr)
+            .field("shutting_down", &self.signal.is_triggered())
+            .field("node", &self.engine.node_id())
+            .finish()
+    }
+}
+
+/// Binds `listen`, reporting the address as written on failure.
+pub(crate) fn bind(listen: &str) -> Result<TcpListener> {
+    TcpListener::bind(listen).map_err(|source| Error::Bind {
+        addr: listen.to_owned(),
+        source,
+    })
+}
