@@ -15,3 +15,37 @@ pub(super) fn list(app: &App, req: &mut Request) -> Result<Response, ApiError> {
     let paging = extract::paging(req, &[])?;
     Ok(reply::ok(&app.engine.workers(&paging)?))
 }
+
+#[cfg(test)]
+mod tests {
+    use belay_http::Method;
+    use belay_proto::api::LeaseRequest;
+    use belay_proto::{JobSource, QueueName, WorkerId};
+
+    use crate::routes::testing;
+
+    #[test]
+    fn workers_appear_once_they_lease_and_page_by_id() {
+        let engine = testing::engine();
+        for id in ["w2", "w1", "w3"] {
+            let worker = WorkerId::new(id).expect("valid worker id");
+            let request = LeaseRequest::new(worker, vec![QueueName::from_static("emails")]);
+            engine.lease(&request).expect("lease");
+        }
+        let router = testing::router(&engine);
+        let (_, first) = testing::call(
+            &router,
+            testing::request(Method::Get, "/v1/workers?limit=2", ""),
+        );
+        assert_eq!(first["items"][0]["id"], "w1");
+        assert_eq!(first["items"][1]["id"], "w2");
+        let cursor = first["next_cursor"].as_str().expect("a second page");
+        let cursor = belay_http::percent::encode_component(cursor);
+        let (_, rest) = testing::call(
+            &router,
+            testing::request(Method::Get, &format!("/v1/workers?cursor={cursor}"), ""),
+        );
+        assert_eq!(rest["items"][0]["id"], "w3");
+        assert!(rest["next_cursor"].is_null());
+    }
+}
