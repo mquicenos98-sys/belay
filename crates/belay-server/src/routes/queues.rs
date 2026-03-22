@@ -58,3 +58,87 @@ pub(super) fn resume(app: &App, req: &mut Request) -> Result<Response, ApiError>
         Ok(reply::ok(&app.engine.resume_queue(name)?))
     })
 }
+
+/// `?state=` limits the purge to one state; without it every job but the
+/// running ones goes.
+pub(super) fn purge(app: &App, req: &mut Request) -> Result<Response, ApiError> {
+    on_queue(app, req, &["state"], |app, req, name| {
+        let state: Option<JobState> = extract::query_value(req, "state")?;
+        Ok(reply::ok(&app.engine.purge_queue(name, state)?))
+    })
+}
+
+/// Refused while the queue has unfinished jobs, unless `?force=true`.
+pub(super) fn delete(app: &App, req: &mut Request) -> Result<Response, ApiError> {
+    on_queue(app, req, &["force"], |app, req, name| {
+        let force = extract::query_flag(req, "force")?;
+        Ok(reply::ok(&app.engine.delete_queue(name, force)?))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use belay_http::Method;
+    use belay_proto::JobSpec;
+
+    use crate::routes::testing;
+
+    #[test]
+    fn purging_by_state_leaves_other_states_alone() {
+        let engine = testing::engine();
+        engine.enqueue(JobSpec::new("emails", "now")).unwrap();
+        let later = JobSpec::new("emails", "later").delay(Duration::from_secs(60));
+        engine.enqueue(later).unwrap();
+        let router = testing::router(&engine);
+        let purge =
+            |target: &str| testing::call(&router, testing::request(Method::Post, target, ""));
+        let (status, body) = purge("/v1/queues/emails/purge?state=scheduled");
+        assert_eq!(status, 200);
+        assert_eq!(body["purged"], 1);
+        let (_, info) = testing::call(
+            &router,
+            testing::request(Method::Get, "/v1/queues/emails", ""),
+        );
+        assert_eq!(info["counts"]["ready"], 1);
+        let (_, all) = purge("/v1/queues/emails/purge");
+        assert_eq!(all["purged"], 1);
+    }
+
+    #[test]
+    fn pausing_an_unknown_queue_creates_it() {
+        let engine = testing::engine();
+        let router = testing::router(&engine);
+        let (status, body) = testing::call(
+            &router,
+            testing::request(Method::Post, "/v1/queues/fresh/pause", ""),
+        );
+        assert_eq!(status, 200);
+        assert_eq!(body["paused"], true);
+        let (status, _) = testing::call(
+            &router,
+            testing::request(Method::Get, "/v1/queues/ghost", ""),
+        );
+        assert_eq!(status, 404);
+    }
+
+    #[test]
+    fn configurations_are_validated() {
+        let engine = testing::engine();
+        let router = testing::router(&engine);
+        let put = |body: &str| {
+            testing::call(
+                &router,
+                testing::request(Method::Put, "/v1/queues/emails/config", body),
+            )
+        };
+        let (status, body) = put(r#"{"max_concurrency": 4}"#);
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["config"]["max_concurrency"], 4);
+        let (status, body) = put(r#"{"max_concurency": 4}"#);
+        assert_eq!(status, 400);
+        let message = body["error"]["message"].as_str().unwrap_or_default();
+        assert!(message.contains("max_concurency"), "{message}");
+    }
+}
