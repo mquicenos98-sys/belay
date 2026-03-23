@@ -176,9 +176,14 @@ impl Ulid {
 
     /// Parses the text form, accepting upper or lower case.
     pub fn parse(s: &str) -> Result<Ulid, ParseUlidError> {
+        // A non-ASCII character is never valid; naming it beats reporting a
+        // byte length that does not match what the user sees.
+        if let Some((pos, ch)) = s.chars().enumerate().find(|(_, c)| !c.is_ascii()) {
+            return Err(ParseUlidError::InvalidChar { ch, pos });
+        }
         let bytes = s.as_bytes();
         if bytes.len() != Ulid::TEXT_LEN {
-            return Err(ParseUlidError::InvalidLength(s.chars().count()));
+            return Err(ParseUlidError::InvalidLength(bytes.len()));
         }
         let mut value: u128 = 0;
         for (i, &b) in bytes.iter().enumerate() {
@@ -352,11 +357,21 @@ mod tests {
     }
 
     #[test]
-    fn rejects_wrong_lengths() {
+    fn rejects_wrong_lengths_and_non_ascii() {
         assert_eq!("".parse::<Ulid>(), Err(ParseUlidError::InvalidLength(0)));
         assert_eq!(
             "01ARZ3NDEKTSV4RRFFQ69G5FA".parse::<Ulid>(),
             Err(ParseUlidError::InvalidLength(25))
+        );
+        // Regression: 26 characters but 27 bytes used to be reported as
+        // "expected 26 characters, got 26".
+        assert_eq!(
+            "01ARZ3NDEKTSV4RRFFQ69G5FAé".parse::<Ulid>(),
+            Err(ParseUlidError::InvalidChar { ch: 'é', pos: 25 })
+        );
+        assert_eq!(
+            "é".parse::<Ulid>(),
+            Err(ParseUlidError::InvalidChar { ch: 'é', pos: 0 })
         );
     }
 
