@@ -96,3 +96,83 @@ pub struct UsageError {
     path: Vec<String>,
     hint: Option<String>,
 }
+
+impl UsageError {
+    /// An error of `kind` in the command at `path` (names below the root).
+    #[must_use]
+    pub fn new(kind: UsageErrorKind, path: &[&str]) -> UsageError {
+        UsageError {
+            kind,
+            path: path.iter().map(|s| (*s).to_owned()).collect(),
+            hint: None,
+        }
+    }
+
+    /// Replaces the hint [`hint`](Self::hint) would otherwise derive, for
+    /// callers that know more about the command than the parser does.
+    #[must_use]
+    pub fn with_hint(mut self, hint: impl Into<String>) -> UsageError {
+        self.hint = Some(hint.into());
+        self
+    }
+
+    /// A [`Constraint`](UsageErrorKind::Constraint) error.
+    #[must_use]
+    pub fn constraint(message: impl Into<String>, path: &[&str]) -> UsageError {
+        UsageError::new(
+            UsageErrorKind::Constraint {
+                message: message.into(),
+            },
+            path,
+        )
+    }
+
+    /// What went wrong.
+    #[must_use]
+    pub fn kind(&self) -> &UsageErrorKind {
+        &self.kind
+    }
+
+    /// The command the error concerns, as names below the root.
+    #[must_use]
+    pub fn path(&self) -> Vec<&str> {
+        self.path.iter().map(String::as_str).collect()
+    }
+
+    /// `belay job list`, for messages.
+    #[must_use]
+    pub fn command_name(&self) -> String {
+        std::iter::once("belay")
+            .chain(self.path.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// A suggestion for fixing the mistake, when there is one.
+    #[must_use]
+    pub fn hint(&self) -> Option<String> {
+        if let Some(hint) = &self.hint {
+            return Some(hint.clone());
+        }
+        match &self.kind {
+            UsageErrorKind::UnknownCommand {
+                suggestion: Some(s),
+                ..
+            } => Some(format!("did you mean {s:?}?")),
+            UsageErrorKind::UnknownFlag {
+                suggestion: Some(s),
+                ..
+            } => Some(format!("did you mean {s}?")),
+            UsageErrorKind::UnknownFlag {
+                flag,
+                suggestion: None,
+            } if flag.starts_with('-') && flag[1..].parse::<f64>().is_ok() => Some(format!(
+                "to pass {flag} as a value, put it after `--` or write --flag={flag}"
+            )),
+            UsageErrorKind::MissingCommand { available } if !available.is_empty() => {
+                Some(format!("available commands: {}", available.join(", ")))
+            }
+            _ => None,
+        }
+    }
+}
