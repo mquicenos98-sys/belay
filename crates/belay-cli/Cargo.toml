@@ -1,0 +1,30 @@
+[package]
+name = "belay-cli"
+description = "The belay command-line tool: runs the server and workers, and manages jobs, queues, schedules and workflows over the HTTP API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[lib]
+name = "belay_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "belay"
+path = "src/main.rs"
+
+[dependencies]
+belay-common = { path = "../belay-common" }
+belay-json = { path = "../belay-json" }
+belay-conf = { path = "../belay-conf" }
+belay-cron = { path = "../belay-cron" }
+belay-proto = { path = "../belay-proto" }
+belay-store = { path = "../belay-store" }
+belay-http = { path = "../belay-http" }
+belay-client = { path = "../belay-client" }
+belay-worker = { path = "../belay-worker" }
+belay-core = { path = "../belay-core" }
+belay-server = { path = "../belay-server" }
