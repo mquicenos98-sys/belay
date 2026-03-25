@@ -220,7 +220,7 @@ impl<'a> Parser<'a> {
     fn skip_whitespace(&mut self) -> Result<(), ParseError> {
         loop {
             match self.peek() {
-                Some(b' ' | b'\t' | b'\n') => self.pos += 1,
+                Some(b' ' | b'\t' | b'\n' | b'\r') => self.pos += 1,
                 Some(b'/') if self.options.allow_comments => self.skip_comment()?,
                 _ => return Ok(()),
             }

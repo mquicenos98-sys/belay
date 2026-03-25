@@ -303,3 +303,11 @@ fn pretty_printer_golden_output() {
     assert_eq!(format!("{job:#}"), expected);
     assert_eq!(parse(expected).unwrap(), job);
 }
+
+#[test]
+fn documents_with_windows_line_endings_parse() {
+    let src = "{\r\n  \"a\": [\r\n    1\r\n  ]\r\n}\r\n";
+    assert_eq!(parse(src).unwrap(), json!({"a": [1]}));
+    let err = parse("{\r\n  \"a\": x\r\n}").unwrap_err();
+    assert_eq!((err.line(), err.column()), (2, 8));
+}
