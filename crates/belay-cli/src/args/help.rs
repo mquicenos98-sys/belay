@@ -106,3 +106,146 @@ fn capitalize(text: &str) -> String {
         None => String::new(),
     }
 }
+
+/// `-p, --priority <N>` and its description with default and
+/// environment variable.
+fn flag_row(flag: &Flag) -> (String, String) {
+    let mut name = match flag.short {
+        Some(short) => format!("-{short}, --{}", flag.long),
+        None => format!("    --{}", flag.long),
+    };
+    if let Some(value) = flag.value {
+        let _ = write!(name, " <{value}>");
+    }
+    let mut help = flag.help.to_owned();
+    if flag.repeated && flag.takes_value() {
+        help.push_str(" (repeatable)");
+    }
+    if let Some(var) = flag.env {
+        let _ = write!(help, " [env: {var}]");
+    }
+    if let Some(default) = flag.default {
+        let _ = write!(help, " [default: {default}]");
+    }
+    (name, help)
+}
+
+/// A titled two-column section, the first column padded to its widest
+/// entry.
+fn section(out: &mut String, title: &str, rows: &[(String, String)]) {
+    if rows.is_empty() {
+        return;
+    }
+    let width = rows
+        .iter()
+        .map(|(n, _)| n.chars().count())
+        .max()
+        .unwrap_or(0);
+    let _ = writeln!(out, "\n{title}:");
+    for (name, help) in rows {
+        let pad = width - name.chars().count();
+        let _ = writeln!(out, "  {name}{}  {help}", " ".repeat(pad));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::Arg;
+
+    fn tree() -> Command {
+        Command::new("belay", "durable job queue")
+            .global(Flag::switch("json", "Print JSON"))
+            .global(Flag::option("url", "URL", "Server URL").env("BELAY_URL"))
+            .subcommand(
+                Command::new("enqueue", "enqueue a job")
+                    .details("Adds one job to a queue.")
+                    .arg(Arg::required("queue", "Queue name"))
+                    .arg(Arg::optional("kind", "Handler name"))
+                    .flag(
+                        Flag::option("priority", "N", "Priority")
+                            .short('p')
+                            .default("0"),
+                    )
+                    .flag(Flag::option("tag", "TAG", "Tag").repeated())
+                    .flag(Flag::switch("wait", "Wait for the result"))
+                    .example("belay enqueue emails send --wait"),
+            )
+            .subcommand(
+                Command::new("job", "manage jobs")
+                    .subcommand(Command::new("list", "List jobs").alias("ls"))
+                    .subcommand(Command::new("get", "Show a job").arg(Arg::required("id", "Job"))),
+            )
+    }
+
+    #[test]
+    fn usage_lines_follow_the_command_shape() {
+        let root = tree();
+        assert_eq!(usage_line(&root, &[]), "belay [OPTIONS] <COMMAND>");
+        assert_eq!(usage_line(&root, &["job"]), "belay job <COMMAND>");
+        assert_eq!(
+            usage_line(&root, &["enqueue"]),
+            "belay enqueue [OPTIONS] <QUEUE> [KIND]"
+        );
+        assert_eq!(
+            usage_line(&root, &["job", "get"]),
+            "belay job get [OPTIONS] <ID>"
+        );
+    }
+
+    #[test]
+    fn leaf_help_snapshot() {
+        let text = render_help(&tree(), &["enqueue"]);
+        assert_eq!(
+            text,
+            "Enqueue a job
+
+Adds one job to a queue.
+
+Usage: belay enqueue [OPTIONS] <QUEUE> [KIND]
+
+Arguments:
+  <QUEUE>  Queue name
+  [KIND]   Handler name
+
+Options:
+  -p, --priority <N>  Priority [default: 0]
+      --tag <TAG>     Tag (repeatable)
+      --wait          Wait for the result
+  -h, --help          Print help (see more with 'belay help <COMMAND>')
+
+Global options:
+      --json       Print JSON
+      --url <URL>  Server URL [env: BELAY_URL]
+
+Examples:
+  belay enqueue emails send --wait
+"
+        );
+    }
+
+    #[test]
+    fn group_help_lists_commands_with_aliases() {
+        let text = render_help(&tree(), &["job"]);
+        assert!(
+            text.starts_with("Manage jobs\n\nUsage: belay job <COMMAND>\n"),
+            "{text}"
+        );
+        assert!(text.contains("\nCommands:\n  list  List jobs (alias: ls)\n  get   Show a job\n"));
+        assert!(text.ends_with("Run 'belay job <COMMAND> --help' for more on a command.\n"));
+    }
+
+    #[test]
+    fn root_help_merges_globals_into_options() {
+        let text = render_help(&tree(), &[]);
+        assert!(text.contains("\nOptions:\n      --json"), "{text}");
+        assert!(text.contains("-V, --version"));
+        assert!(!text.contains("Global options"));
+    }
+
+    #[test]
+    fn unknown_paths_fall_back_to_the_deepest_known_command() {
+        let text = render_help(&tree(), &["job", "nope"]);
+        assert!(text.starts_with("Manage jobs"));
+    }
+}
