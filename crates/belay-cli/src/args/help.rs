@@ -98,3 +98,11 @@ pub fn render_help(root: &Command, path: &[&str]) -> String {
     }
     out
 }
+
+fn capitalize(text: &str) -> String {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
