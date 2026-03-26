@@ -40,3 +40,32 @@
 mod error;
 
 mod help;
+
+mod matches;
+
+mod parse;
+
+mod suggest;
+
+mod value;
+
+pub use error::{UsageError, UsageErrorKind};
+pub use help::{render_help, usage_line};
+pub use matches::Matches;
+pub use parse::{parse, Parsed};
+pub use suggest::{edit_distance, suggest};
+pub use value::{FromArg, KeyValue};
+
+/// A flag: `--long`, optionally with a short form, either a switch or an
+/// option that takes a value.
+#[derive(Clone, Debug)]
+pub struct Flag {
+    pub(crate) long: &'static str,
+    pub(crate) short: Option<char>,
+    pub(crate) value: Option<&'static str>,
+    pub(crate) help: &'static str,
+    pub(crate) repeated: bool,
+    pub(crate) default: Option<&'static str>,
+    pub(crate) env: Option<&'static str>,
+    pub(crate) conflicts: Vec<&'static str>,
+}
