@@ -248,3 +248,24 @@ impl From<belay_client::Error> for Error {
         Error::Client(e)
     }
 }
+
+impl From<belay_core::config::ConfigError> for Error {
+    fn from(e: belay_core::config::ConfigError) -> Error {
+        Error::Config(e)
+    }
+}
+
+impl From<belay_core::Error> for Error {
+    fn from(e: belay_core::Error) -> Error {
+        match e {
+            belay_core::Error::Config(e) => Error::Config(e),
+            other => Error::Engine(other),
+        }
+    }
+}
+
+impl From<belay_server::Error> for Error {
+    fn from(e: belay_server::Error) -> Error {
+        Error::Server(e)
+    }
+}
