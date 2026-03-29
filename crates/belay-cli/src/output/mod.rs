@@ -8,9 +8,7 @@
 //! to stderr.
 
 pub(crate) mod grid;
-
 pub(crate) mod human;
-
 pub(crate) mod style;
 
 use std::fmt;
@@ -167,4 +165,128 @@ impl fmt::Debug for Output<'_> {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Fields {
     rows: Vec<(String, String, Option<Style>)>,
+}
+
+impl Fields {
+    pub(crate) fn new() -> Fields {
+        Fields::default()
+    }
+
+    /// Adds a line.
+    pub(crate) fn add(&mut self, label: &str, value: impl fmt::Display) -> &mut Fields {
+        self.rows.push((label.to_owned(), value.to_string(), None));
+        self
+    }
+
+    /// Adds a line when `value` is present.
+    pub(crate) fn opt<T: fmt::Display>(&mut self, label: &str, value: Option<T>) -> &mut Fields {
+        if let Some(value) = value {
+            self.add(label, value);
+        }
+        self
+    }
+
+    /// Adds a state line, colored like states elsewhere.
+    pub(crate) fn state(&mut self, label: &str, state: &str) -> &mut Fields {
+        self.rows
+            .push((label.to_owned(), state.to_owned(), state_style(state)));
+        self
+    }
+
+    pub(crate) fn render(&self, color: bool) -> String {
+        let width = self
+            .rows
+            .iter()
+            .map(|(label, _, _)| label.chars().count())
+            .max()
+            .unwrap_or(0);
+        let mut out = String::new();
+        for (label, value, style) in &self.rows {
+            let pad = " ".repeat(width - label.chars().count());
+            let indent = " ".repeat(width + 2);
+            let mut lines = value.lines();
+            let first = lines.next().unwrap_or("");
+            let first = match style {
+                Some(style) if color => style.paint(first),
+                _ => first.to_owned(),
+            };
+            let label = if color {
+                Style::Bold.paint(label)
+            } else {
+                label.clone()
+            };
+            let head = format!("{label}{pad}  {first}");
+            out.push_str(head.trim_end());
+            out.push('\n');
+            for line in lines {
+                let line = format!("{indent}{line}");
+                out.push_str(line.trim_end());
+                out.push('\n');
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fields_align_labels_and_indent_continuations() {
+        let mut f = Fields::new();
+        f.add("id", "01ABC")
+            .state("state", "dead")
+            .opt::<&str>("skipped", None)
+            .add("result", "{\n  \"ok\": true\n}");
+        assert_eq!(
+            f.render(false),
+            "id      01ABC\nstate   dead\nresult  {\n          \"ok\": true\n        }\n"
+        );
+        let colored = f.render(true);
+        assert!(colored.contains("\x1b[31mdead\x1b[0m"), "{colored}");
+    }
+
+    #[test]
+    fn quiet_and_json_modes_drop_confirmations() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        {
+            let mut o = Output::new(&mut out, &mut err);
+            o.done("paused").unwrap();
+            o.quiet = true;
+            o.done("hidden").unwrap();
+            o.note("hidden too").unwrap();
+            o.warn("still shown").unwrap();
+            o.line("data").unwrap();
+        }
+        assert_eq!(String::from_utf8(out).unwrap(), "paused\ndata\n");
+        assert_eq!(String::from_utf8(err).unwrap(), "warning: still shown\n");
+    }
+
+    #[test]
+    fn errors_carry_optional_hints() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        {
+            let mut o = Output::new(&mut out, &mut err);
+            o.error("job X not found", None).unwrap();
+            o.error("connection refused", Some("start one with `belay dev`"))
+                .unwrap();
+        }
+        assert_eq!(
+            String::from_utf8(err).unwrap(),
+            "error: job X not found\nerror: connection refused\nhint: start one with `belay dev`\n"
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn empty_grids_become_a_note() {
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        {
+            let mut o = Output::new(&mut out, &mut err);
+            o.grid(&Grid::new(&["A"]), "no queues").unwrap();
+        }
+        assert!(out.is_empty());
+        assert_eq!(String::from_utf8(err).unwrap(), "no queues\n");
+    }
 }
