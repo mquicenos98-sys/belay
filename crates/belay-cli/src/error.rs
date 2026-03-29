@@ -197,3 +197,54 @@ fn refused(e: &belay_http::Error) -> bool {
         io::ErrorKind::ConnectionRefused | io::ErrorKind::AddrNotAvailable
     ))
 }
+
+impl fmt::Display for Error {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Usage(e) => e.fmt(f),
+            // The code shows in the exit status and, with -v, in the
+            // details; the message is what people read.
+            Error::Client(belay_client::Error::Api(api)) => f.write_str(&api.message),
+            Error::Client(belay_client::Error::Transport(e)) => {
+                write!(f, "request failed: {e}")
+            }
+            Error::Client(e) => e.fmt(f),
+            Error::Config(e) => e.fmt(f),
+            Error::Engine(e) => e.fmt(f),
+            Error::Server(e) => e.fmt(f),
+            Error::Worker(e) => write!(f, "worker: {e}"),
+            Error::Store(e) => e.fmt(f),
+            Error::Io { context, source } => write!(f, "{context}: {source}"),
+            Error::Input(message) => f.write_str(message),
+            Error::Failed { message, .. } | Error::Partial { message, .. } => f.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Usage(e) => Some(e),
+            Error::Client(e) => Some(e),
+            Error::Config(e) => Some(e),
+            Error::Engine(e) => Some(e),
+            Error::Server(e) => Some(e),
+            Error::Worker(e) => Some(e),
+            Error::Store(e) => Some(e),
+            Error::Io { source, .. } => Some(source),
+            Error::Input(_) | Error::Failed { .. } | Error::Partial { .. } => None,
+        }
+    }
+}
+
+impl From<UsageError> for Error {
+    fn from(e: UsageError) -> Error {
+        Error::Usage(e)
+    }
+}
+
+impl From<belay_client::Error> for Error {
+    fn from(e: belay_client::Error) -> Error {
+        Error::Client(e)
+    }
+}
