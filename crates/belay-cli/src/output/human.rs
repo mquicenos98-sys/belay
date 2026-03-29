@@ -70,3 +70,61 @@ fn coarse(d: Duration) -> String {
 pub(crate) fn when(then: Timestamp, now: Timestamp) -> String {
     format!("{} ({})", then.to_rfc3339(), relative(then, now))
 }
+
+/// A progress fraction as a percentage with at most one decimal.
+#[must_use]
+pub(crate) fn percent(value: f32) -> String {
+    if (value - value.round()).abs() < 0.05 {
+        format!("{:.0}%", value)
+    } else {
+        format!("{value:.1}%")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ts(secs: i64) -> Timestamp {
+        Timestamp::from_secs(1_700_000_000 + secs)
+    }
+
+    #[test]
+    fn durations_round_to_two_units() {
+        let cases = [
+            (Duration::ZERO, "0ms"),
+            (Duration::from_millis(450), "450ms"),
+            (Duration::from_millis(4_260), "4.3s"),
+            (Duration::from_secs(12), "12s"),
+            (Duration::from_secs(200), "3m20s"),
+            (Duration::from_secs(180), "3m"),
+            (Duration::from_secs(7_500), "2h5m"),
+            (Duration::from_secs(3 * 86_400 + 4 * 3_600 + 59), "3d4h"),
+        ];
+        for (d, text) in cases {
+            assert_eq!(approx(d), text, "{d:?}");
+        }
+    }
+
+    #[test]
+    fn relative_times_read_naturally_both_ways() {
+        let now = ts(0);
+        assert_eq!(relative(now, now), "just now");
+        assert_eq!(relative(ts(-5), now), "5s ago");
+        assert_eq!(relative(ts(-190), now), "3m ago");
+        assert_eq!(relative(ts(-7_300), now), "2h ago");
+        assert_eq!(relative(ts(-90_000), now), "1d ago");
+        assert_eq!(relative(ts(125), now), "in 2m");
+        assert_eq!(
+            when(ts(-60), now),
+            format!("{} (1m ago)", ts(-60).to_rfc3339())
+        );
+    }
+
+    #[test]
+    fn percentages_drop_needless_decimals() {
+        assert_eq!(percent(50.0), "50%");
+        assert_eq!(percent(12.34), "12.3%");
+        assert_eq!(percent(99.98), "100%");
+    }
+}
