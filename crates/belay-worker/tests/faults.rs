@@ -318,3 +318,28 @@ fn undeliverable_results_are_counted_and_the_job_is_let_go() {
         Some("unavailable: injected report failure")
     );
 }
+
+#[test]
+fn progress_survives_failed_heartbeats() {
+    let source = Arc::new(MemorySource::new());
+    source.fail_next_heartbeats(3);
+    let id = source.push(spec("report"));
+    let gate = Gate::new();
+    let g = Arc::clone(&gate);
+    let registry = Registry::new().register(
+        "report",
+        handler_fn(move |ctx: &mut JobContext| {
+            ctx.progress(10.0, "started");
+            g.pass();
+            Ok(Outcome::done())
+        }),
+    );
+    let worker = start(&source, registry, config(1));
+
+    assert!(source.wait_until(PATIENCE, |v| !v.progress_for(&id).is_empty()));
+    gate.open();
+    assert!(source.wait_until(PATIENCE, |v| v.completed() == 1));
+    let stats = worker.stop().stats;
+    assert_eq!(stats.heartbeat_errors, 3);
+    assert_eq!(source.view(|v| v.progress_for(&id).len()), 1);
+}

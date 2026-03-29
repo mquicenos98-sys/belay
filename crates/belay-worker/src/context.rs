@@ -111,6 +111,15 @@ impl JobSignals {
         lock(&self.progress).take()
     }
 
+    /// Puts back progress whose heartbeat failed, unless the handler has
+    /// reported something newer meanwhile.
+    pub(crate) fn restore_progress(&self, progress: Progress) {
+        let mut slot = lock(&self.progress);
+        if slot.is_none() {
+            *slot = Some(progress);
+        }
+    }
+
     fn peek_progress(&self) -> Option<Progress> {
         lock(&self.progress).clone()
     }
@@ -455,6 +464,18 @@ mod tests {
         let message = p.message.expect("message was set");
         assert!(message.len() <= MAX_PROGRESS_MESSAGE_BYTES);
         assert!(message.chars().all(|c| c == 'é'));
+    }
+
+    #[test]
+    fn restored_progress_never_overwrites_newer_progress() {
+        let signals = JobSignals::default();
+        signals.set_progress(Progress::percent(10.0));
+        let sent = signals.take_progress().expect("set above");
+        signals.set_progress(Progress::percent(20.0));
+        signals.restore_progress(sent);
+        assert_eq!(signals.take_progress(), Some(Progress::percent(20.0)));
+        signals.restore_progress(Progress::percent(10.0));
+        assert_eq!(signals.take_progress(), Some(Progress::percent(10.0)));
     }
 
     #[test]

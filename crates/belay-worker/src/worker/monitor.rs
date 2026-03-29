@@ -42,10 +42,11 @@ pub(crate) fn heartbeat_pass(shared: &Shared) {
         if job.phase() == Phase::Abandoned {
             continue;
         }
+        let progress = job.signals.take_progress();
         let req = HeartbeatRequest {
             token: job.token,
             extend_by: None,
-            progress: job.signals.take_progress(),
+            progress: progress.clone(),
         };
         match shared.source.heartbeat(&job.id(), &req) {
             Ok(resp) => {
@@ -60,6 +61,9 @@ pub(crate) fn heartbeat_pass(shared: &Shared) {
             }
             Err(e) if e.is(ErrorCode::LeaseLost) => lease_lost(shared, &job),
             Err(e) => {
+                if let Some(p) = progress {
+                    job.signals.restore_progress(p);
+                }
                 Counters::bump(&shared.counters.heartbeat_errors);
                 failed += 1;
                 first_error.get_or_insert(e);
