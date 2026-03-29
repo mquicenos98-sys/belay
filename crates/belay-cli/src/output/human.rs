@@ -52,3 +52,21 @@ pub(crate) fn relative(then: Timestamp, now: Timestamp) -> String {
         }
     }
 }
+
+/// One unit only, for relative times: `5s`, `3m`, `2h`, `4d`.
+fn coarse(d: Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3_599 => format!("{}m", secs / 60),
+        3_600..=86_399 => format!("{}h", secs / 3_600),
+        _ => format!("{}d", secs / 86_400),
+    }
+}
+
+/// An absolute time with its relative reading, for detail views:
+/// `2025-03-04T05:06:07.089Z (3m ago)`.
+#[must_use]
+pub(crate) fn when(then: Timestamp, now: Timestamp) -> String {
+    format!("{} ({})", then.to_rfc3339(), relative(then, now))
+}
