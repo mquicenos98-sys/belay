@@ -269,3 +269,91 @@ impl From<belay_server::Error> for Error {
         Error::Server(e)
     }
 }
+
+impl From<belay_worker::Error> for Error {
+    fn from(e: belay_worker::Error) -> Error {
+        Error::Worker(e)
+    }
+}
+
+impl From<belay_store::StoreError> for Error {
+    fn from(e: belay_store::StoreError) -> Error {
+        Error::Store(e)
+    }
+}
+
+/// Writing to stdout or stderr failed.
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Error {
+        Error::io("writing output", e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_proto::api::ApiError;
+
+    fn api(e: ApiError) -> Error {
+        Error::Client(belay_client::Error::Api(e))
+    }
+
+    #[test]
+    fn exit_statuses_follow_the_documented_table() {
+        assert_eq!(
+            Error::Usage(UsageError::constraint("x", &[])).exit(),
+            Exit::Usage
+        );
+        assert_eq!(api(ApiError::not_found("job", "X")).exit(), Exit::NotFound);
+        assert_eq!(
+            api(ApiError::unavailable("draining")).exit(),
+            Exit::Unavailable
+        );
+        assert_eq!(api(ApiError::invalid_argument("bad")).exit(), Exit::Failure);
+        let refused = belay_http::Error::Io(io::Error::from(io::ErrorKind::ConnectionRefused));
+        assert_eq!(
+            Error::Client(belay_client::Error::Transport(refused)).exit(),
+            Exit::Unavailable
+        );
+        assert_eq!(Error::failed("job died").exit(), Exit::Failure);
+        let codes: Vec<u8> = [
+            Exit::Success,
+            Exit::Failure,
+            Exit::Usage,
+            Exit::NotFound,
+            Exit::Unavailable,
+        ]
+        .iter()
+        .map(|e| e.code())
+        .collect();
+        assert_eq!(codes, [0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn hints_point_at_the_fix() {
+        let refused = belay_http::Error::Io(io::Error::from(io::ErrorKind::ConnectionRefused));
+        let e = Error::Client(belay_client::Error::Transport(refused));
+        let hint = e.hint("http://127.0.0.1:7700").unwrap();
+        assert!(
+            hint.contains("http://127.0.0.1:7700") && hint.contains("belay dev"),
+            "{hint}"
+        );
+        let e = api(ApiError::unauthenticated("missing bearer token"));
+        assert!(e.hint("u").unwrap().contains("BELAY_TOKEN"));
+        assert_eq!(api(ApiError::not_found("job", "X")).hint("u"), None);
+    }
+
+    #[test]
+    fn api_errors_show_just_the_message() {
+        let e = api(ApiError::invalid_argument("bad spec")
+            .with_details(belay_json::json!({"path": "$.queue"})));
+        assert_eq!(e.to_string(), "bad spec");
+        assert!(e.api_details().is_some());
+    }
+
+    #[test]
+    fn broken_pipes_are_recognised() {
+        assert!(Error::from(io::Error::from(io::ErrorKind::BrokenPipe)).is_broken_pipe());
+        assert!(!Error::failed("x").is_broken_pipe());
+    }
+}
