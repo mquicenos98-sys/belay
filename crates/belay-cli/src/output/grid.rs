@@ -171,3 +171,79 @@ fn clean(text: &str) -> String {
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::output::style::state_style;
+
+    fn grid() -> Grid {
+        let mut g = Grid::new(&["ID", "STATE", "N"])
+            .right("N")
+            .paint("STATE", state_style)
+            .paint("N", |n| (n != "0").then_some(Style::Red));
+        g.push(["a", "dead", "12"]);
+        g.push(["bbbb", "ready", "0"]);
+        g.push(["c", "odd", "3"]);
+        g
+    }
+
+    #[test]
+    fn plain_rendering_is_the_common_table() {
+        assert_eq!(
+            grid().render(false),
+            "ID    STATE   N\na     dead   12\nbbbb  ready   0\nc     odd     3\n"
+        );
+    }
+
+    #[test]
+    fn colored_rendering_only_adds_escape_sequences() {
+        let colored = grid().render(true);
+        let stripped = strip(&colored);
+        assert_eq!(stripped, grid().render(false));
+        let lines: Vec<&str> = colored.lines().collect();
+        assert_eq!(lines[0], "\x1b[1mID    STATE   N\x1b[0m");
+        assert_eq!(lines[1], "a     \x1b[31mdead\x1b[0m   \x1b[31m12\x1b[0m");
+        assert_eq!(lines[2], "bbbb  \x1b[34mready\x1b[0m   0");
+        assert_eq!(lines[3], "c     odd     \x1b[31m3\x1b[0m");
+    }
+
+    #[test]
+    fn truncated_cells_are_painted_at_their_shortened_width() {
+        let mut g = Grid::new(&["ID", "STATE"])
+            .max_width("ID", 5)
+            .paint("STATE", state_style);
+        g.push(["0123456789", "succeeded"]);
+        let colored = g.render(true);
+        assert_eq!(strip(&colored), g.render(false));
+        assert!(
+            colored.contains("01…89  \x1b[32msucceeded\x1b[0m"),
+            "{colored}"
+        );
+    }
+
+    #[test]
+    fn short_rows_are_padded() {
+        let mut g = Grid::new(&["A", "B"]);
+        g.push(["x"]);
+        assert!(!g.is_empty());
+        assert_eq!(g.render(false), "A  B\nx\n");
+    }
+
+    fn strip(text: &str) -> String {
+        let mut out = String::new();
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                for c in chars.by_ref() {
+                    if c == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+}
