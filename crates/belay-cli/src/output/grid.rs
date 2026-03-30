@@ -14,3 +14,14 @@ use super::style::Style;
 
 /// Chooses a style for a cell from its text.
 pub(crate) type Painter = fn(&str) -> Option<Style>;
+
+/// Rows under headers, with per-column alignment, width limits and
+/// coloring.
+#[derive(Clone, Debug)]
+pub(crate) struct Grid {
+    headers: Vec<&'static str>,
+    rows: Vec<Vec<String>>,
+    align: Vec<Align>,
+    max_width: Vec<Option<usize>>,
+    painters: Vec<Option<Painter>>,
+}
