@@ -331,7 +331,7 @@ impl WorkflowEngine {
                     .index
                     .iter()
                     .rev()
-                    .filter(move |(id, _)| after.map_or(true, |a| **id > a)),
+                    .filter(move |(id, _)| after.map_or(true, |a| **id < a)),
             ),
         };
         let ids: Vec<WorkflowId> = candidates
