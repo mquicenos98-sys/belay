@@ -99,3 +99,86 @@ pub(crate) fn run(ctx: &mut Ctx<'_>, m: &Matches, action: &str) -> Result<()> {
         other => unreachable!("admin {other} is not declared"),
     }
 }
+
+/// A call the typed client does not cover, with the same URL, token and
+/// error decoding.
+fn call(ctx: &mut Ctx<'_>, method: Method, path: &str) -> Result<Value> {
+    let base = ctx.client()?.base_url().to_owned();
+    let http = belay_http::Client::new(belay_http::ClientConfig {
+        connect_timeout: Duration::from_secs(5),
+        read_timeout: Some(Duration::from_secs(120)),
+        user_agent: concat!("belay-cli/", env!("CARGO_PKG_VERSION")).to_owned(),
+        ..belay_http::ClientConfig::default()
+    });
+    let mut request = Request::new(method, format!("{base}{path}").as_str());
+    request.headers.insert(ACCEPT, "application/json");
+    if let Some(token) = &ctx.token {
+        request
+            .headers
+            .insert(AUTHORIZATION, format!("Bearer {token}").as_str());
+    }
+    let response = http
+        .request(request)
+        .map_err(|e| Error::Client(belay_client::Error::Transport(e)))?;
+    if !response.status.is_success() {
+        let api = decode_error(response.status.as_u16(), &response.body);
+        return Err(Error::Client(belay_client::Error::Api(api)));
+    }
+    if response.body.iter().all(u8::is_ascii_whitespace) {
+        return Ok(json!({}));
+    }
+    belay_json::parse_bytes(&response.body)
+        .map_err(|e| Error::failed(format!("unexpected response to {path}: {e}")))
+}
+
+fn verify(ctx: &mut Ctx<'_>) -> Result<()> {
+    let outcome = call(ctx, Method::Get, "/v1/admin/verify")?;
+    let count = |key: &str| outcome.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let problems: Vec<String> = outcome
+        .get("problems")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(|p| p.as_str().map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    let consistent = outcome.get("consistent").and_then(Value::as_bool) == Some(true);
+    if ctx.out.json {
+        ctx.out.json_value(&outcome)?;
+    } else {
+        let checked = format!(
+            "{}, {}, {}",
+            belay_common::text::plural(count("jobs"), "job"),
+            belay_common::text::plural(count("queues"), "queue"),
+            belay_common::text::plural(count("claims"), "uniqueness claim")
+        );
+        if consistent {
+            ctx.out.line(format!("consistent: checked {checked}"))?;
+        } else {
+            ctx.out.line(format!("inconsistent: checked {checked}"))?;
+            for problem in &problems {
+                ctx.out.line(format!("  {problem}"))?;
+            }
+            if count("more_problems") > 0 {
+                ctx.out
+                    .line(format!("  ... and {} more", count("more_problems")))?;
+            }
+        }
+    }
+    if consistent {
+        Ok(())
+    } else {
+        Err(Error::Failed {
+            message: format!(
+                "the server's indexes disagree with its store ({})",
+                belay_common::text::plural(
+                    problems.len() as u64 + count("more_problems"),
+                    "problem"
+                )
+            ),
+            hint: Some("restarting the server rebuilds the indexes from the store".to_owned()),
+        })
+    }
+}
