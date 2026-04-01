@@ -182,3 +182,164 @@ fn verify(ctx: &mut Ctx<'_>) -> Result<()> {
         })
     }
 }
+
+/// Storage statistics with byte counts made readable.
+fn store_fields(report: &Value) -> Fields {
+    let mut f = Fields::new();
+    let Some(map) = report.as_object() else {
+        f.add("store", belay_json::to_string_pretty(report));
+        return f;
+    };
+    for (key, value) in map.iter() {
+        let label = key.replace('_', " ");
+        let text = match value {
+            Value::Number(n) if key.ends_with("bytes") => {
+                n.as_u64().map_or_else(|| n.to_string(), humanize_bytes)
+            }
+            Value::String(s) => s.clone(),
+            Value::Object(inner) => inner
+                .iter()
+                .map(|(k, v)| format!("{k}={}", v))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            other => other.to_string(),
+        };
+        f.add(&label, text);
+    }
+    f
+}
+
+fn store_inspect(ctx: &mut Ctx<'_>, m: &Matches) -> Result<()> {
+    let dir: PathBuf = m.require("dir")?;
+    if !dir.is_dir() {
+        return Err(Error::failed(format!(
+            "{} is not a directory",
+            dir.display()
+        )));
+    }
+    let fs = OsFs::new();
+    let report = inspect::verify(&fs, &dir)?;
+    if ctx.out.json {
+        ctx.out.json_value(&report_json(&report))?;
+    } else {
+        ctx.out.text(&report.to_string())?;
+        let files = &report.files;
+        if files.locked {
+            ctx.out
+                .line("LOCK present: the store is open, or was not closed cleanly")?;
+        }
+        for name in &files.temp_files {
+            ctx.out.line(format!("leftover temporary file: {name}"))?;
+        }
+        for name in &files.other_files {
+            ctx.out.line(format!("not a store file: {name}"))?;
+        }
+        if m.flag("records") {
+            dump_records(ctx, &fs, &report)?;
+        }
+    }
+    if report.is_ok() {
+        return Ok(());
+    }
+    Err(Error::Failed {
+        message: format!(
+            "{} has {} that opening it would not survive",
+            dir.display(),
+            belay_common::text::plural(
+                report
+                    .problems
+                    .iter()
+                    .filter(|p| p.kind != inspect::ProblemKind::TornTail)
+                    .count() as u64,
+                "problem"
+            )
+        ),
+        hint: Some(
+            "storage.recovery = \"skip-corrupt\" opens it anyway, dropping the damaged records"
+                .to_owned(),
+        ),
+    })
+}
+
+fn dump_records(ctx: &mut Ctx<'_>, fs: &OsFs, report: &VerifyReport) -> Result<()> {
+    let count = report.segments.len();
+    for (i, segment) in report.segments.iter().enumerate() {
+        ctx.out.line(format!("\n{}:", segment.file.name))?;
+        let dump = inspect::read_segment(fs, &segment.file.path, i + 1 == count)?;
+        for record in &dump.records {
+            ctx.out
+                .line(format!("  {}", record.to_string().replace('\n', "\n  ")))?;
+        }
+    }
+    Ok(())
+}
+
+fn report_json(report: &VerifyReport) -> Value {
+    let files: Vec<Value> = report
+        .snapshots
+        .iter()
+        .map(|s| {
+            json!({
+                "name": s.file.name.as_str(),
+                "kind": "snapshot",
+                "seq": s.file.seq,
+                "size": s.file.size,
+                "keys": s.keys,
+                "valid": s.keys.is_some(),
+            })
+        })
+        .chain(report.segments.iter().map(|s| {
+            json!({
+                "name": s.file.name.as_str(),
+                "kind": "log",
+                "seq": s.file.seq,
+                "size": s.file.size,
+                "records": s.records,
+                "covered": s.covered,
+            })
+        }))
+        .collect();
+    let problems: Vec<Value> = report
+        .problems
+        .iter()
+        .map(|p| {
+            json!({
+                "kind": p.kind.to_string(),
+                "file": p.file.display().to_string(),
+                "offset": p.offset,
+                "detail": p.detail.as_str(),
+            })
+        })
+        .collect();
+    json!({
+        "dir": report.files.dir.display().to_string(),
+        "ok": report.is_ok(),
+        "locked": report.files.locked,
+        "snapshot_seq": report.snapshot_seq,
+        "last_seq": report.last_seq,
+        "files": files,
+        "problems": problems,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_statistics_humanize_byte_counts() {
+        let report = json!({
+            "storage": "disk",
+            "keys": 12,
+            "wal_bytes": 3_145_728,
+            "recovery": {"torn_tails": 0, "duration": "1ms"}
+        });
+        let text = store_fields(&report).render(false);
+        assert!(text.contains("storage    disk\n"), "{text}");
+        assert!(text.contains("wal bytes  3.0 MiB\n"), "{text}");
+        assert!(
+            text.contains("recovery   torn_tails=0\n           duration=\"1ms\"\n"),
+            "{text}"
+        );
+    }
+}
