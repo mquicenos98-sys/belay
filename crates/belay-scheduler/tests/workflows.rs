@@ -455,6 +455,25 @@ fn list_filters_by_state_and_pages_newest_first() {
 
     let first = f.engine.list(&WorkflowFilter::new().limit(2)).unwrap();
     assert_eq!(ids(&first), [runs[4], runs[3]]);
+    let second = f
+        .engine
+        .list(
+            &WorkflowFilter::new()
+                .limit(2)
+                .after(first.next_cursor.clone().unwrap()),
+        )
+        .unwrap();
+    assert_eq!(ids(&second), [runs[2], runs[1]]);
+    let third = f
+        .engine
+        .list(
+            &WorkflowFilter::new()
+                .limit(2)
+                .after(second.next_cursor.clone().unwrap()),
+        )
+        .unwrap();
+    assert_eq!(ids(&third), [runs[0]]);
+    assert!(!third.has_more());
 
     let oldest = f
         .engine

@@ -214,3 +214,98 @@ impl Matches {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(name: &'static str, source: Source, value: Option<&str>) -> Entry {
+        Entry {
+            name,
+            source,
+            value: value.map(str::to_owned),
+        }
+    }
+
+    fn matches(entries: Vec<Entry>) -> Matches {
+        Matches {
+            path: vec!["job", "list"],
+            entries,
+        }
+    }
+
+    #[test]
+    fn the_last_occurrence_wins_for_single_values() {
+        let m = matches(vec![
+            entry("limit", Source::Flag, Some("5")),
+            entry("limit", Source::Flag, Some("7")),
+        ]);
+        assert_eq!(m.get::<u32>("limit").unwrap(), Some(7));
+        assert_eq!(m.get_all::<u32>("limit").unwrap(), [5, 7]);
+    }
+
+    #[test]
+    fn switches_count_occurrences() {
+        let m = matches(vec![
+            entry("verbose", Source::Flag, None),
+            entry("verbose", Source::Flag, None),
+        ]);
+        assert_eq!(m.count("verbose"), 2);
+        assert!(m.flag("verbose"));
+        assert!(!m.flag("json"));
+    }
+
+    #[test]
+    fn lists_split_on_commas_across_occurrences() {
+        let m = matches(vec![
+            entry("state", Source::Flag, Some("dead,retrying")),
+            entry("state", Source::Flag, Some(" cancelled ,")),
+        ]);
+        let states: Vec<String> = m.get_list("state").unwrap();
+        assert_eq!(states, ["dead", "retrying", "cancelled"]);
+        let m = matches(vec![entry("queues", Source::Default, Some("default"))]);
+        assert_eq!(m.get_list::<String>("queues").unwrap(), ["default"]);
+    }
+
+    #[test]
+    fn invalid_values_name_their_source() {
+        let m = matches(vec![entry("limit", Source::Flag, Some("many"))]);
+        assert_eq!(
+            m.get::<u32>("limit").unwrap_err().to_string(),
+            r#"invalid value "many" for --limit: expected an integer"#
+        );
+        let m = matches(vec![entry("job-id", Source::Arg, Some("x"))]);
+        let err = m.get::<u32>("job-id").unwrap_err().to_string();
+        assert!(
+            err.starts_with(r#"invalid value "x" for <JOB_ID>"#),
+            "{err}"
+        );
+        let m = matches(vec![entry("url", Source::Env("BELAY_URL"), Some("x"))]);
+        let err = m.get::<u32>("url").unwrap_err().to_string();
+        assert!(err.contains("--url (from BELAY_URL)"), "{err}");
+        let m = matches(vec![entry("state", Source::Flag, Some("dead,zombie"))]);
+        let err = m.get_list::<belay_proto::JobState>("state").unwrap_err();
+        assert!(
+            err.to_string().starts_with(r#"invalid value "zombie""#),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn require_and_exclusive_report_usage_errors() {
+        let m = matches(vec![
+            entry("file", Source::Flag, Some("a.json")),
+            entry("cron", Source::Flag, Some("* * * * *")),
+        ]);
+        assert_eq!(
+            m.require::<String>("kind").unwrap_err().to_string(),
+            "--kind is required"
+        );
+        assert_eq!(
+            m.exclusive("file", "cron").unwrap_err().to_string(),
+            "--file cannot be used together with --cron"
+        );
+        assert!(m.exclusive("file", "kind").is_ok());
+        assert_eq!(m.get_or::<u32>("limit", 9).unwrap(), 9);
+    }
+}
