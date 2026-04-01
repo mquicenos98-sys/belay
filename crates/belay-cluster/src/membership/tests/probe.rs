@@ -158,6 +158,24 @@ fn relayed_pings_expire_after_a_protocol_period() {
 }
 
 #[test]
+fn an_unconfirmed_suspicion_runs_the_maximum_timeout_then_declares_dead() {
+    let mut d = Driver::named("a").with_peers(&["b", "c", "d", "e"]);
+    let since = d.suspect_silent_member("e");
+    // Five live members: minimum 4 s, maximum 6 x 4 s.
+    let max = d.m.config().suspicion_max_timeout(5);
+    assert_eq!(max, Duration::from_secs(24));
+    d.tick_until(since + max - Duration::from_millis(1));
+    assert_eq!(d.state_of("e"), Some(MemberState::Suspect));
+    d.tick_until(since + max);
+    assert_eq!(d.state_of("e"), Some(MemberState::Dead));
+    let events = d.m.drain_events();
+    assert!(matches!(events.last(), Some(MembershipEvent::Failed(m)) if m.id == "e"));
+    assert!(!d.m.ring().contains("e"));
+    d.advance(d.m.config().gossip_interval);
+    assert!(updates_in(&d.take_sent()).contains(&dead("e", 0, "a")));
+}
+
+#[test]
 fn independent_confirmations_shorten_the_suspicion() {
     let mut d = Driver::named("a").with_peers(&["b", "c", "d", "e"]);
     let since = d.suspect_silent_member("e");

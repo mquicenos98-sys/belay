@@ -58,7 +58,7 @@ impl Suspicion {
     /// this was a new confirmation that shortened the timeout, which is
     /// when it is worth gossiping on so that others can count it too.
     pub(crate) fn confirm(&mut self, from: &NodeId) -> bool {
-        if self.confirmations >= self.k {
+        if self.confirmations >= self.k || self.suspecters.contains(from) {
             return false;
         }
         self.suspecters.insert(from.clone());
@@ -135,6 +135,15 @@ mod tests {
         // Beyond k, confirmations change nothing and are not re-gossiped.
         assert!(!s.confirm(&id("d")));
         assert_eq!(s.confirmations(), 2);
+    }
+
+    #[test]
+    fn repeated_or_original_suspecters_do_not_count() {
+        let mut s = suspicion(3);
+        assert!(!s.confirm(&id("a")));
+        assert!(s.confirm(&id("b")));
+        assert!(!s.confirm(&id("b")));
+        assert_eq!(s.confirmations(), 1);
     }
 
     #[test]
