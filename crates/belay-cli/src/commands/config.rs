@@ -124,3 +124,74 @@ fn check(ctx: &mut Ctx<'_>, m: &Matches) -> Result<()> {
     }
     Ok(())
 }
+
+/// The settings that matter most at a glance.
+fn summary(config: &Config) -> Fields {
+    let mut f = Fields::new();
+    let storage = &config.storage;
+    f.add("listen", &config.server.listen).add(
+        "storage",
+        if storage.in_memory {
+            "in memory (lost on exit)".to_owned()
+        } else {
+            format!("{} (sync {})", storage.dir.display(), storage.sync)
+        },
+    );
+    let auth = &config.auth;
+    f.add(
+        "auth",
+        if auth.disabled {
+            "disabled".to_owned()
+        } else if auth.tokens.is_empty() {
+            "none (loopback only)".to_owned()
+        } else {
+            belay_common::text::plural(auth.tokens.len() as u64, "token")
+        },
+    );
+    if !config.queues.is_empty() {
+        let names: Vec<&str> = config.queues.keys().map(|q| q.as_str()).collect();
+        f.add("queues", names.join(", "));
+    }
+    if !config.schedules.is_empty() {
+        let ids: Vec<&str> = config.schedules.iter().map(|s| s.id.as_str()).collect();
+        f.add("schedules", ids.join(", "));
+    }
+    if !config.calendars.is_empty() {
+        let names: Vec<&str> = config.calendars.iter().map(|c| c.name.as_str()).collect();
+        f.add("calendars", names.join(", "));
+    }
+    let cluster = &config.cluster;
+    f.add(
+        "cluster",
+        if cluster.enabled {
+            format!(
+                "node {}, {}",
+                cluster.node_id,
+                belay_common::text::plural(cluster.seeds.len() as u64, "seed")
+            )
+        } else {
+            "off".to_owned()
+        },
+    );
+    f
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn summaries_show_the_essentials() {
+        let config = Config::from_str(
+            "[server]\nlisten = \"127.0.0.1:9000\"\n[storage]\nin_memory = true\n\
+             [queues.emails]\nmax_concurrency = 2\n",
+        )
+        .unwrap();
+        let text = summary(&config).render(false);
+        assert!(text.contains("listen   127.0.0.1:9000\n"), "{text}");
+        assert!(text.contains("storage  in memory"), "{text}");
+        assert!(text.contains("auth     none (loopback only)"), "{text}");
+        assert!(text.contains("queues   emails"), "{text}");
+        assert!(text.contains("cluster  off"), "{text}");
+    }
+}
