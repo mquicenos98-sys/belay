@@ -108,3 +108,95 @@ fn parse_tz(m: &Matches) -> Result<Tz> {
         Error::Usage(usage.with_hint("list known zones with `belay cron zones`"))
     })
 }
+
+fn zone_label(tz: &Tz, at: i64) -> String {
+    let offset = tz.format_rfc3339(at);
+    // The offset is the RFC 3339 suffix: `Z`, or `+hh:mm` after the seconds.
+    let offset = if offset.ends_with('Z') {
+        "+00:00".to_owned()
+    } else {
+        offset[offset.len() - 6..].to_owned()
+    };
+    let name = tz.name().map_or_else(|| offset.clone(), str::to_owned);
+    format!("{name} ({} {offset})", tz.abbreviation_at(at))
+}
+
+fn explain(
+    ctx: &mut Ctx<'_>,
+    text: &str,
+    expr: &CronExpr,
+    tz: &Tz,
+    from: Timestamp,
+    fires: &[i64],
+) -> Result<()> {
+    if ctx.out.json {
+        let times: Vec<Value> = fires
+            .iter()
+            .map(|t| Value::String(tz.format_rfc3339(*t)))
+            .collect();
+        ctx.out.json_value(&json!({
+            "expression": text,
+            "normalized": expr.to_string(),
+            "description": expr.describe(),
+            "timezone": tz.name().map_or_else(|| text_offset(tz, from), str::to_owned),
+            "next": times,
+        }))?;
+        return Ok(());
+    }
+    let mut f = Fields::new();
+    f.add("expression", text);
+    let normalized = expr.to_string();
+    if normalized != text.trim() {
+        f.add("normalized", normalized);
+    }
+    f.add("meaning", expr.describe())
+        .add("time zone", zone_label(tz, from.as_secs()));
+    if fires.is_empty() {
+        f.add("next", "never: no future time matches");
+    } else {
+        let lines: Vec<String> = fires
+            .iter()
+            .map(|t| {
+                let at = Timestamp::from_secs(*t);
+                let local = tz.to_local(*t);
+                format!(
+                    "{}  {}  {}",
+                    tz.format_rfc3339(*t),
+                    &local.weekday().name()[..3],
+                    relative(at, ctx.now())
+                )
+            })
+            .collect();
+        f.add(&format!("next {}", fires.len()), lines.join("\n"));
+        if let Some(change) = tz.next_transition(from.as_secs()) {
+            let last = fires[fires.len() - 1];
+            if change.at <= last {
+                let direction = if change.is_forward() {
+                    "forward"
+                } else {
+                    "back"
+                };
+                f.add(
+                    "note",
+                    format!(
+                        "clocks go {direction} at {} ({} to {}); fire times follow wall-clock time",
+                        Timestamp::from_secs(change.at).to_rfc3339(),
+                        offset_text(change.offset_before),
+                        offset_text(change.offset_after),
+                    ),
+                );
+            }
+        }
+    }
+    Ok(ctx.out.fields(&f)?)
+}
+
+fn text_offset(tz: &Tz, at: Timestamp) -> String {
+    offset_text(tz.offset_at(at.as_secs()))
+}
+
+fn offset_text(offset: i32) -> String {
+    let sign = if offset < 0 { '-' } else { '+' };
+    let abs = offset.unsigned_abs();
+    format!("{sign}{:02}:{:02}", abs / 3600, abs % 3600 / 60)
+}
