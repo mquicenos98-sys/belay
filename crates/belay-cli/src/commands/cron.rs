@@ -63,3 +63,48 @@ pub(crate) fn spec() -> Command {
                 .arg(Arg::optional("filter", "Only names containing this text")),
         )
 }
+
+pub(crate) fn run(ctx: &mut Ctx<'_>, m: &Matches, action: &str) -> Result<()> {
+    if action == "zones" {
+        return zones(ctx, m);
+    }
+    let text: String = m.require("expr")?;
+    let expr = parse_expr(m, &text)?;
+    let tz = parse_tz(m)?;
+    let count: usize = m.get_or("count", DEFAULT_COUNT)?;
+    if !(1..=MAX_COUNT).contains(&count) {
+        return Err(m
+            .constraint(format!(
+                "--count must be between 1 and {MAX_COUNT}, got {count}"
+            ))
+            .into());
+    }
+    let from = m.get::<Timestamp>("from")?.unwrap_or_else(|| ctx.now());
+    let fires: Vec<i64> = expr.upcoming(from.as_secs(), &tz).take(count).collect();
+    match action {
+        "explain" => explain(ctx, &text, &expr, &tz, from, &fires),
+        "next" => next(ctx, &text, &tz, &fires),
+        other => unreachable!("cron {other} is not declared"),
+    }
+}
+
+/// Parses the expression; errors show the expression with a caret under
+/// the column at fault.
+fn parse_expr(m: &Matches, text: &str) -> Result<CronExpr> {
+    CronExpr::parse(text).map_err(|e| {
+        let mut message = format!("invalid cron expression: {e}");
+        if let Some(column) = e.column() {
+            let caret = " ".repeat(column) + "^";
+            message.push_str(&format!("\n  {text}\n  {caret}"));
+        }
+        Error::Usage(m.constraint(message))
+    })
+}
+
+fn parse_tz(m: &Matches) -> Result<Tz> {
+    let name = m.value("tz").unwrap_or("UTC");
+    Tz::parse(name).map_err(|e| {
+        let usage = m.constraint(format!("invalid value {name:?} for --tz: {e}"));
+        Error::Usage(usage.with_hint("list known zones with `belay cron zones`"))
+    })
+}
