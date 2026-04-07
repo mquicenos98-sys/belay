@@ -13,7 +13,6 @@ use crate::output::Fields;
 
 /// Fire times listed when `--count` is not given.
 const DEFAULT_COUNT: usize = 5;
-
 /// More would only be a slow way to fill a terminal.
 const MAX_COUNT: usize = 1000;
 
@@ -199,4 +198,77 @@ fn offset_text(offset: i32) -> String {
     let sign = if offset < 0 { '-' } else { '+' };
     let abs = offset.unsigned_abs();
     format!("{sign}{:02}:{:02}", abs / 3600, abs % 3600 / 60)
+}
+
+fn next(ctx: &mut Ctx<'_>, text: &str, tz: &Tz, fires: &[i64]) -> Result<()> {
+    if fires.is_empty() {
+        return Err(Error::failed(format!(
+            "{text:?} never fires after the start time"
+        )));
+    }
+    if ctx.out.json {
+        let times = fires
+            .iter()
+            .map(|t| Value::String(tz.format_rfc3339(*t)))
+            .collect();
+        return Ok(ctx.out.json_value(&Value::Array(times))?);
+    }
+    for t in fires {
+        ctx.out.line(tz.format_rfc3339(*t))?;
+    }
+    Ok(())
+}
+
+fn zones(ctx: &mut Ctx<'_>, m: &Matches) -> Result<()> {
+    let filter = m.value("filter").map(str::to_ascii_lowercase);
+    let names: Vec<&str> = belay_cron::zone_names()
+        .filter(|n| {
+            filter
+                .as_deref()
+                .map_or(true, |f| n.to_ascii_lowercase().contains(f))
+        })
+        .collect();
+    if ctx.out.json {
+        let items = names
+            .iter()
+            .map(|n| Value::String((*n).to_owned()))
+            .collect();
+        return Ok(ctx.out.json_value(&Value::Array(items))?);
+    }
+    if names.is_empty() {
+        return Ok(ctx
+            .out
+            .note("no zone matches; fixed offsets (+05:30) and POSIX rules work too")?);
+    }
+    for name in names {
+        ctx.out.line(name)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offsets_render_with_sign_and_minutes() {
+        assert_eq!(offset_text(0), "+00:00");
+        assert_eq!(offset_text(19_800), "+05:30");
+        assert_eq!(offset_text(-18_000), "-05:00");
+    }
+
+    #[test]
+    fn zone_labels_name_the_zone_and_current_offset() {
+        let ny = Tz::named("America/New_York").unwrap();
+        // 2025-01-15T12:00:00Z, standard time.
+        assert_eq!(
+            zone_label(&ny, 1_736_942_400),
+            "America/New_York (EST -05:00)"
+        );
+        assert_eq!(zone_label(&Tz::Utc, 0), "UTC (UTC +00:00)");
+        assert_eq!(
+            zone_label(&Tz::fixed(19_800).unwrap(), 0),
+            "+05:30 (+0530 +05:30)"
+        );
+    }
 }
