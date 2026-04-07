@@ -84,3 +84,56 @@ fn render(event: &Event, color: bool) -> String {
     }
     line.trim_end().to_owned()
 }
+
+/// Strings bare unless they contain spaces or quotes, anything else as
+/// compact JSON.
+fn scalar(value: &Value) -> String {
+    match value {
+        Value::String(s) if !s.is_empty() && !s.contains([' ', '"', '=']) => s.clone(),
+        other => belay_json::to_string(other),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    use belay_common::Timestamp;
+    use belay_proto::event::EventKind;
+
+    #[test]
+    fn events_render_as_one_aligned_line() {
+        let event = Event {
+            seq: 42,
+            at: Timestamp::from_millis(1_741_064_767_089),
+            kind: EventKind::JobSucceeded {
+                job: "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().unwrap(),
+                queue: QueueName::from_static("emails"),
+                attempt: 1,
+                runtime: Duration::from_millis(1250),
+            },
+        };
+        assert_eq!(
+            render(&event, false),
+            "42  2025-03-04T05:06:07.089Z  job.succeeded      job=01HQ3K9Z8N6V2T4R5S7W0X1Y2Z queue=emails attempt=1 runtime=1s250ms"
+        );
+        assert!(render(&event, true).contains("\x1b[32mjob.succeeded"));
+    }
+
+    #[test]
+    fn messages_with_spaces_are_quoted() {
+        let event = Event {
+            seq: 7,
+            at: Timestamp::from_millis(0),
+            kind: EventKind::JobDead {
+                job: "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().unwrap(),
+                queue: QueueName::from_static("emails"),
+                attempt: 3,
+                error: "smtp timeout".into(),
+            },
+        };
+        let line = render(&event, false);
+        assert!(line.ends_with("attempt=3 error=\"smtp timeout\""), "{line}");
+    }
+}
