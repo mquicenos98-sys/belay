@@ -378,3 +378,283 @@ fn is_number(token: &str) -> bool {
         && token[1..].parse::<f64>().is_ok()
         && token[1..].starts_with(|c: char| c.is_ascii_digit())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::args::Arg;
+
+    fn tree() -> Command {
+        Command::new("belay", "test tree")
+            .global(Flag::switch("json", "JSON output"))
+            .global(Flag::switch("verbose", "More logs").short('v').repeated())
+            .global(Flag::switch("quiet", "Less output").short('q'))
+            .global(
+                Flag::option("url", "URL", "Server")
+                    .env("BELAY_URL")
+                    .default("http://127.0.0.1:7700"),
+            )
+            .subcommand(
+                Command::new("enqueue", "Enqueue")
+                    .arg(Arg::required("queue", "Queue"))
+                    .arg(Arg::required("kind", "Kind"))
+                    .flag(Flag::option("priority", "N", "Priority").short('p'))
+                    .flag(Flag::option("payload", "JSON", "Payload").short('d'))
+                    .flag(Flag::option("tag", "TAG", "Tag").short('t').repeated())
+                    .flag(Flag::option("delay", "DURATION", "Delay").conflicts_with("run-at"))
+                    .flag(Flag::option("run-at", "TIME", "When"))
+                    .flag(Flag::switch("wait", "Wait").short('w')),
+            )
+            .subcommand(
+                Command::new("job", "Jobs")
+                    .subcommand(Command::new("get", "Get").arg(Arg::required("id", "Job")))
+                    .subcommand(
+                        Command::new("list", "List")
+                            .alias("ls")
+                            .flag(Flag::option("state", "STATE", "State").repeated()),
+                    )
+                    .subcommand(
+                        Command::new("cancel", "Cancel").arg(Arg::required("id", "Jobs").many()),
+                    ),
+            )
+            .subcommand(
+                Command::new("config", "Config")
+                    .subcommand(Command::new("check", "Check").arg(Arg::optional("path", "File"))),
+            )
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    fn run(args: &[&str]) -> Matches {
+        match parse(&tree(), args, &no_env) {
+            Ok(Parsed::Run(m)) => m,
+            other => panic!("expected a command for {args:?}, got {other:?}"),
+        }
+    }
+
+    fn fail(args: &[&str]) -> UsageError {
+        match parse(&tree(), args, &no_env) {
+            Err(e) => e,
+            other => panic!("expected an error for {args:?}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_tree_is_consistent() {
+        assert_eq!(tree().lint(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn long_flags_take_values_inline_or_from_the_next_token() {
+        let m = run(&[
+            "enqueue",
+            "emails",
+            "send",
+            "--priority=5",
+            "--payload",
+            "{}",
+        ]);
+        assert_eq!(m.path(), ["enqueue"]);
+        assert_eq!(m.arg("queue"), Some("emails"));
+        assert_eq!(m.arg("kind"), Some("send"));
+        assert_eq!(m.get::<i16>("priority").unwrap(), Some(5));
+        assert_eq!(m.value("payload"), Some("{}"));
+    }
+
+    #[test]
+    fn short_flags_cluster_and_attach_values() {
+        let m = run(&["enqueue", "-qvvw", "-p7", "-t", "a", "-t=b", "q", "k"]);
+        assert!(m.flag("quiet") && m.flag("wait"));
+        assert_eq!(m.count("verbose"), 2);
+        assert_eq!(m.get::<i16>("priority").unwrap(), Some(7));
+        assert_eq!(m.values("tag"), ["a", "b"]);
+    }
+
+    #[test]
+    fn double_dash_ends_flag_parsing() {
+        let m = run(&["enqueue", "--", "-q", "--wait"]);
+        assert_eq!(m.arg("queue"), Some("-q"));
+        assert_eq!(m.arg("kind"), Some("--wait"));
+        assert!(!m.flag("quiet"));
+    }
+
+    #[test]
+    fn a_lone_dash_is_a_positional_value() {
+        let m = run(&["enqueue", "q", "k", "--payload", "-"]);
+        assert_eq!(m.value("payload"), Some("-"));
+        let m = run(&["config", "check", "-"]);
+        assert_eq!(m.arg("path"), Some("-"));
+    }
+
+    #[test]
+    fn global_flags_work_before_and_after_subcommands() {
+        let m = run(&["--json", "job", "-q", "get", "01ABC", "--url", "http://h:1"]);
+        assert_eq!(m.path(), ["job", "get"]);
+        assert!(m.flag("json") && m.flag("quiet"));
+        assert_eq!(m.value("url"), Some("http://h:1"));
+    }
+
+    #[test]
+    fn aliases_resolve_to_the_real_name() {
+        assert_eq!(run(&["job", "ls"]).path(), ["job", "list"]);
+    }
+
+    #[test]
+    fn many_arguments_collect_the_rest() {
+        let m = run(&["job", "cancel", "a", "b", "c"]);
+        assert_eq!(m.values("id"), ["a", "b", "c"]);
+        assert!(matches!(
+            fail(&["job", "cancel"]).kind(),
+            UsageErrorKind::MissingArgument { name } if name == "<ID>..."
+        ));
+    }
+
+    #[test]
+    fn environment_and_defaults_fill_absent_options() {
+        let env = |var: &str| (var == "BELAY_URL").then(|| "http://env:1".to_owned());
+        let Parsed::Run(m) = parse(&tree(), ["job", "ls"], &env).unwrap() else {
+            panic!("expected a command");
+        };
+        assert_eq!(m.value("url"), Some("http://env:1"));
+        assert_eq!(
+            run(&["job", "ls"]).value("url"),
+            Some("http://127.0.0.1:7700")
+        );
+        let blank = |_: &str| Some("  ".to_owned());
+        let Parsed::Run(m) = parse(&tree(), ["job", "ls"], &blank).unwrap() else {
+            panic!("expected a command");
+        };
+        assert_eq!(m.value("url"), Some("http://127.0.0.1:7700"));
+    }
+
+    #[test]
+    fn help_is_found_anywhere_and_beats_errors() {
+        let help = |args: &[&str]| match parse(&tree(), args, &no_env) {
+            Ok(Parsed::Help(path)) => path,
+            other => panic!("expected help for {args:?}, got {other:?}"),
+        };
+        assert!(help(&[]).is_empty());
+        assert_eq!(help(&["job", "--help"]), ["job"]);
+        assert_eq!(help(&["enqueue", "--prio", "x", "-h"]), ["enqueue"]);
+        assert_eq!(help(&["help", "job", "list"]), ["job", "list"]);
+        assert_eq!(help(&["job", "help", "cancel"]), ["job", "cancel"]);
+    }
+
+    #[test]
+    fn version_is_a_root_flag() {
+        assert!(matches!(
+            parse(&tree(), ["--version"], &no_env),
+            Ok(Parsed::Version)
+        ));
+        assert!(matches!(
+            fail(&["job", "list", "-V"]).kind(),
+            UsageErrorKind::UnknownFlag { flag, .. } if flag == "-V"
+        ));
+    }
+
+    #[test]
+    fn unknown_commands_and_flags_get_suggestions() {
+        let e = fail(&["jbo", "list"]);
+        assert_eq!(e.to_string(), r#"unknown command "jbo" for "belay""#);
+        assert_eq!(e.hint().as_deref(), Some(r#"did you mean "job"?"#));
+        let e = fail(&["job", "lsit"]);
+        assert_eq!(e.hint().as_deref(), Some(r#"did you mean "list"?"#));
+        assert_eq!(e.path(), ["job"]);
+        let e = fail(&["enqueue", "q", "k", "--prioriy", "1"]);
+        assert_eq!(
+            e.to_string(),
+            r#"unknown option --prioriy for "belay enqueue""#
+        );
+        assert_eq!(e.hint().as_deref(), Some("did you mean --priority?"));
+        let e = fail(&["enqueue", "q", "k", "-x"]);
+        assert_eq!(e.to_string(), r#"unknown option -x for "belay enqueue""#);
+    }
+
+    #[test]
+    fn missing_values_are_reported_instead_of_swallowing_flags() {
+        for args in [
+            &["enqueue", "q", "k", "--payload"][..],
+            &["enqueue", "q", "k", "--payload", "--wait"],
+            &["enqueue", "q", "k", "--payload", "-w"],
+        ] {
+            assert_eq!(
+                fail(args).to_string(),
+                "option --payload needs a value (--payload <JSON>)"
+            );
+        }
+    }
+
+    #[test]
+    fn switches_reject_inline_values() {
+        assert_eq!(
+            fail(&["enqueue", "q", "k", "--wait=yes"]).to_string(),
+            r#"option --wait does not take a value, got "yes""#
+        );
+    }
+
+    #[test]
+    fn arity_is_checked() {
+        assert_eq!(
+            fail(&["enqueue", "q"]).to_string(),
+            r#"missing argument <KIND> for "belay enqueue""#
+        );
+        assert_eq!(
+            fail(&["enqueue", "q", "k", "extra"]).to_string(),
+            r#"unexpected argument "extra" for "belay enqueue""#
+        );
+        assert_eq!(run(&["config", "check"]).arg("path"), None);
+    }
+
+    #[test]
+    fn groups_need_a_subcommand() {
+        let e = fail(&["job"]);
+        assert_eq!(e.to_string(), r#""belay job" needs a command"#);
+        assert_eq!(
+            e.hint().as_deref(),
+            Some("available commands: get, list, cancel")
+        );
+    }
+
+    #[test]
+    fn single_flags_may_not_repeat_and_conflicts_are_enforced() {
+        assert_eq!(
+            fail(&["enqueue", "q", "k", "-p", "1", "-p", "2"]).to_string(),
+            "option --priority was given more than once"
+        );
+        assert_eq!(
+            fail(&["enqueue", "q", "k", "--delay", "1s", "--run-at", "x"]).to_string(),
+            "--delay cannot be used together with --run-at"
+        );
+        let m = run(&["job", "list", "--state", "dead", "--state", "ready"]);
+        assert_eq!(m.values("state"), ["dead", "ready"]);
+    }
+
+    #[test]
+    fn non_utf8_arguments_are_rejected() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let bad = OsString::from_vec(vec![b'j', 0xff]);
+            let e = parse(&tree(), [bad], &no_env).unwrap_err();
+            assert!(matches!(e.kind(), UsageErrorKind::NotUtf8 { .. }));
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let bad = OsString::from_wide(&[0xD800]);
+            let e = parse(&tree(), [bad], &no_env).unwrap_err();
+            assert!(matches!(e.kind(), UsageErrorKind::NotUtf8 { .. }));
+        }
+    }
+
+    #[test]
+    fn numbers_are_recognised_conservatively() {
+        assert!(is_number("-5"));
+        assert!(is_number("-0.5"));
+        assert!(!is_number("-inf"));
+        assert!(!is_number("-v"));
+        assert!(!is_number("-"));
+    }
+}
