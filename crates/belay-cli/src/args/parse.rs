@@ -371,3 +371,10 @@ impl<'a> Parser<'a> {
         }
     }
 }
+
+/// `-5`, `-1.5`: negative numbers, which are values rather than flags.
+fn is_number(token: &str) -> bool {
+    token.len() > 1
+        && token[1..].parse::<f64>().is_ok()
+        && token[1..].starts_with(|c: char| c.is_ascii_digit())
+}
