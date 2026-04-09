@@ -114,3 +114,38 @@ pub(crate) fn job_options(command: Command) -> Command {
                 .repeated(),
         )
 }
+
+/// Applies the flags of [`job_options`] to `spec`.
+pub(crate) fn apply_job_options(ctx: &Ctx<'_>, m: &Matches, mut spec: JobSpec) -> Result<JobSpec> {
+    spec = spec.payload(input::payload(ctx, m.value("payload"))?);
+    if let Some(priority) = m.get::<i16>("priority")? {
+        spec = spec.priority(priority);
+    }
+    if let Some(n) = m.get::<u32>("max-attempts")? {
+        spec = spec.max_attempts(n);
+    }
+    if let Some(policy) = m.get::<BackoffPolicy>("retry")? {
+        spec = spec.retry(policy);
+    }
+    if let Some(timeout) = m.get::<Duration>("timeout")? {
+        spec = spec.timeout(timeout);
+    }
+    for tag in m.get_all::<String>("tag")? {
+        spec = spec.tag(tag);
+    }
+    if let Some(tenant) = m.get::<TenantId>("tenant")? {
+        spec = spec.tenant(tenant);
+    }
+    for pair in m.get_all::<KeyValue>("meta")? {
+        spec = spec.meta(pair.key, pair.value);
+    }
+    Ok(spec)
+}
+
+/// `--unique KEY[:SCOPE]`. Keys often contain colons themselves
+/// (`user:42`), so only a recognisable scope at the end is split off.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UniqueArg {
+    key: String,
+    scope: Option<UniqueScope>,
+}
