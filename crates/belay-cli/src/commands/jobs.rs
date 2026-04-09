@@ -149,3 +149,146 @@ struct UniqueArg {
     key: String,
     scope: Option<UniqueScope>,
 }
+
+impl FromArg for UniqueArg {
+    fn from_arg(text: &str) -> std::result::Result<UniqueArg, String> {
+        let (key, scope) = if let Some((key, period)) = text.rsplit_once(":for:") {
+            let scope = UniqueScope::from_arg(&format!("for:{period}"))?;
+            (key, Some(scope))
+        } else {
+            match text.split_once(':') {
+                Some((key, scope @ ("until_started" | "until_finished"))) => {
+                    (key, Some(UniqueScope::from_arg(scope)?))
+                }
+                _ => (text, None),
+            }
+        };
+        if key.is_empty() {
+            return Err("the key must not be empty".to_owned());
+        }
+        Ok(UniqueArg {
+            key: key.to_owned(),
+            scope,
+        })
+    }
+}
+
+pub(crate) fn enqueue(ctx: &mut Ctx<'_>, m: &Matches) -> Result<()> {
+    let queue: QueueName = m.require("queue")?;
+    let kind: String = m.require("kind")?;
+    let mut spec = apply_job_options(ctx, m, JobSpec::new(queue, kind))?;
+    if let Some(delay) = m.get::<Duration>("delay")? {
+        spec = spec.delay(delay);
+    }
+    if let Some(at) = m.get::<Timestamp>("run-at")? {
+        spec = spec.run_at(at);
+    }
+    if let Some(unique) = m.get::<UniqueArg>("unique")? {
+        let mut rule = Unique::new(unique.key, unique.scope.unwrap_or_default());
+        if let Some(policy) = m.get::<OnConflict>("on-conflict")? {
+            rule = rule.on_conflict(policy);
+        }
+        spec = spec.unique_with(rule);
+    } else if m.given("on-conflict") {
+        return Err(m.constraint("--on-conflict needs --unique").into());
+    }
+    if m.given("wait-timeout") && !m.flag("wait") {
+        return Err(m.constraint("--wait-timeout needs --wait").into());
+    }
+    spec.validate()
+        .map_err(|e| m.constraint(format!("invalid job: {e}")))?;
+
+    let client = ctx.client()?;
+    let result = client.jobs().enqueue(&spec)?;
+    if m.flag("wait") {
+        let timeout = m.get::<Duration>("wait-timeout")?;
+        let job = wait_for(ctx, &client, result.id, timeout)?;
+        return report_finished(ctx, &job);
+    }
+    if ctx.out.json {
+        ctx.out.json(&result)?;
+    } else if ctx.out.quiet {
+        ctx.out.line(result.id)?;
+    } else {
+        let state = ctx.out.state(result.state.as_str());
+        let line = match result.status {
+            EnqueueStatus::Created => format!("enqueued {} on {} ({state})", result.id, spec.queue),
+            EnqueueStatus::Duplicate => format!(
+                "job {} already holds the unique key; nothing enqueued ({state})",
+                result.id
+            ),
+            EnqueueStatus::Replaced => format!(
+                "enqueued {} on {}, replacing the previous holder of the key ({state})",
+                result.id, spec.queue
+            ),
+        };
+        ctx.out.line(line)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn spec() -> Command {
+    let id = || Arg::required("id", "Job id");
+    let ids = || Arg::required("id", "Job ids").many();
+    Command::new("job", "inspect and manage jobs")
+        .subcommand(
+            Command::new("get", "show a job: state, attempts, errors, result")
+                .alias("show")
+                .arg(id()),
+        )
+        .subcommand(
+            Command::new("list", "list jobs, newest first")
+                .alias("ls")
+                .flag(Flag::option("queue", "QUEUE", "Only this queue"))
+                .flag(
+                    Flag::option("state", "STATE", "Only these states (comma-separated)")
+                        .short('s')
+                        .repeated(),
+                )
+                .flag(Flag::option("kind", "KIND", "Only this kind"))
+                .flag(Flag::option("tag", "TAG", "Only jobs with this tag"))
+                .flag(Flag::option("tenant", "TENANT", "Only this tenant"))
+                .flag(Flag::option(
+                    "created-after",
+                    "TIME",
+                    "Only jobs created after this time",
+                ))
+                .flag(Flag::option(
+                    "created-before",
+                    "TIME",
+                    "Only jobs created before this time",
+                ))
+                .flag(Flag::option("order", "ORDER", "asc (oldest first) or desc").default("desc"))
+                .flag(Flag::option("limit", "N", "Jobs per page (server maximum 1000)").short('n'))
+                .flag(
+                    Flag::option("cursor", "CURSOR", "Continue after a previous page")
+                        .conflicts_with("all"),
+                )
+                .flag(Flag::switch("all", "Follow every page to the end"))
+                .example("belay job list --state dead,retrying --queue emails")
+                .example("belay job list -q --state dead | xargs belay job retry"),
+        )
+        .subcommand(
+            Command::new(
+                "cancel",
+                "cancel jobs; running ones stop at their next heartbeat",
+            )
+            .arg(ids()),
+        )
+        .subcommand(Command::new("retry", "send dead or cancelled jobs back to ready").arg(ids()))
+        .subcommand(Command::new("promote", "make scheduled or retrying jobs ready now").arg(ids()))
+        .subcommand(
+            Command::new("delete", "delete finished jobs")
+                .alias("rm")
+                .arg(ids()),
+        )
+        .subcommand(
+            Command::new("wait", "wait for a job to finish and print its result")
+                .arg(id())
+                .flag(Flag::option(
+                    "timeout",
+                    "DURATION",
+                    "Give up after this long",
+                )),
+        )
+}
