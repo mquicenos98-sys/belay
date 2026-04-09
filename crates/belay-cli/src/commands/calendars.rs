@@ -188,3 +188,100 @@ impl FromArg for WindowArg {
         Ok(WindowArg(TimeWindow::new(days, time(start)?, time(end)?)))
     }
 }
+
+#[derive(Debug)]
+struct DaysArg(WeekdaySet);
+
+impl FromArg for DaysArg {
+    fn from_arg(text: &str) -> std::result::Result<DaysArg, String> {
+        text.parse::<WeekdaySet>()
+            .map(DaysArg)
+            .map_err(|e| e.to_string())
+    }
+}
+
+#[derive(Debug)]
+struct DateArg(CalendarDate);
+
+impl FromArg for DateArg {
+    fn from_arg(text: &str) -> std::result::Result<DateArg, String> {
+        text.parse::<CalendarDate>()
+            .map(DateArg)
+            .map_err(|e| e.to_string())
+    }
+}
+
+fn windows_text(c: &CalendarSpec) -> String {
+    if c.windows.is_empty() {
+        return "all day".to_owned();
+    }
+    let windows: Vec<String> = c
+        .windows
+        .iter()
+        .map(|w| {
+            if w.days.is_empty() {
+                format!("{}-{}", w.start, w.end)
+            } else {
+                format!("{} {}-{}", w.days, w.start, w.end)
+            }
+        })
+        .collect();
+    windows.join("; ")
+}
+
+fn excludes_text(c: &CalendarSpec) -> String {
+    let mut parts = Vec::new();
+    if !c.exclude_weekdays.is_empty() {
+        parts.push(c.exclude_weekdays.to_string());
+    }
+    match c.exclude_dates.len() {
+        0 => {}
+        n if n <= 3 => parts.extend(c.exclude_dates.iter().map(ToString::to_string)),
+        n => parts.push(belay_common::text::plural(n as u64, "date")),
+    }
+    if parts.is_empty() {
+        "-".to_owned()
+    } else {
+        parts.join(", ")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn windows_parse_with_or_without_days() {
+        let w = WindowArg::from_arg("mon-fri 09:00-17:00").unwrap().0;
+        assert_eq!(w.days.len(), 5);
+        assert_eq!(
+            (w.start.to_string(), w.end.to_string()),
+            ("09:00".into(), "17:00".into())
+        );
+        let w = WindowArg::from_arg("22:00-06:00").unwrap().0;
+        assert!(w.days.is_empty());
+        assert!(WindowArg::from_arg("mon-fri")
+            .unwrap_err()
+            .contains("HH:MM-HH:MM"));
+        assert!(WindowArg::from_arg("mon-fri 0900").is_err());
+        assert!(WindowArg::from_arg("a b c").is_err());
+        assert!(WindowArg::from_arg("25:00-26:00").is_err());
+    }
+
+    #[test]
+    fn summaries_stay_short() {
+        let mut c = CalendarSpec::new("x");
+        assert_eq!(windows_text(&c), "all day");
+        assert_eq!(excludes_text(&c), "-");
+        c.windows
+            .push(WindowArg::from_arg("sat,sun 10:00-12:00").unwrap().0);
+        c.windows
+            .push(WindowArg::from_arg("08:00-09:00").unwrap().0);
+        assert_eq!(windows_text(&c), "sat,sun 10:00-12:00; 08:00-09:00");
+        for d in ["2025-12-24", "2025-12-25", "2025-12-26", "2025-12-31"] {
+            c.exclude_dates.insert(d.parse().unwrap());
+        }
+        c.exclude_weekdays = "sun".parse().unwrap();
+        assert_eq!(excludes_text(&c), "sun, 4 dates");
+    }
+}
