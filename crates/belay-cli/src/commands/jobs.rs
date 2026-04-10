@@ -292,3 +292,201 @@ pub(crate) fn spec() -> Command {
                 )),
         )
 }
+
+pub(crate) fn run(ctx: &mut Ctx<'_>, m: &Matches, action: &str) -> Result<()> {
+    match action {
+        "get" => get(ctx, m),
+        "list" => list(ctx, m),
+        "cancel" | "retry" | "promote" | "delete" => act(ctx, m, action),
+        "wait" => {
+            let id: JobId = m.require("id")?;
+            let client = ctx.client()?;
+            let job = wait_for(ctx, &client, id, m.get("timeout")?)?;
+            report_finished(ctx, &job)
+        }
+        other => unreachable!("job {other} is not declared"),
+    }
+}
+
+fn get(ctx: &mut Ctx<'_>, m: &Matches) -> Result<()> {
+    let id: JobId = m.require("id")?;
+    let job = ctx.client()?.jobs().get(id)?;
+    if ctx.out.json {
+        ctx.out.json(&job)?;
+    } else {
+        let fields = job_fields(&job, ctx.now());
+        ctx.out.fields(&fields)?;
+    }
+    Ok(())
+}
+
+/// Everything about a job, for `job get` and `--wait`.
+pub(crate) fn job_fields(job: &Job, now: Timestamp) -> Fields {
+    let spec = &job.spec;
+    let mut f = Fields::new();
+    f.add("id", job.id)
+        .add("queue", &spec.queue)
+        .add("kind", &spec.kind)
+        .state("state", job.state.as_str())
+        .add(
+            "attempt",
+            format!("{} of {}", job.attempt, job.max_attempts()),
+        )
+        .add("priority", spec.priority)
+        .add("created", when(job.created_at, now));
+    if !job.state.is_terminal() {
+        f.add("run at", when(job.run_at, now));
+    }
+    f.opt("started", job.started_at.map(|t| when(t, now)))
+        .opt("finished", job.finished_at.map(|t| when(t, now)))
+        .opt(
+            "runtime",
+            job.runtime().filter(|_| job.is_terminal()).map(approx),
+        );
+    if let Some(lease) = &job.lease {
+        f.add(
+            "lease",
+            format!(
+                "held by {}, expires {}",
+                lease.worker,
+                relative(lease.expires_at, now)
+            ),
+        );
+    }
+    if job.cancel_requested {
+        f.add(
+            "cancel",
+            "requested; the worker stops at its next heartbeat",
+        );
+    }
+    if let Some(progress) = &job.progress {
+        let pct = progress.percent.map(percent);
+        let text = match (pct, &progress.message) {
+            (Some(p), Some(msg)) => format!("{p} {msg}"),
+            (Some(p), None) => p,
+            (None, Some(msg)) => msg.clone(),
+            (None, None) => String::new(),
+        };
+        f.add("progress", text);
+    }
+    f.opt("timeout", spec.timeout.map(format_duration))
+        .opt("retry", spec.retry.as_ref())
+        .opt(
+            "unique",
+            spec.unique
+                .as_ref()
+                .map(|u| format!("{} ({}, {})", u.key, u.scope, u.on_conflict)),
+        );
+    if !spec.tags.is_empty() {
+        f.add("tags", spec.tags.join(", "));
+    }
+    f.opt("tenant", spec.tenant.as_ref());
+    if !spec.meta.is_empty() {
+        let meta: Vec<String> = spec.meta.iter().map(|(k, v)| format!("{k}={v}")).collect();
+        f.add("meta", meta.join("\n"));
+    }
+    f.opt(
+        "workflow",
+        spec.workflow
+            .as_ref()
+            .map(|w| format!("{} step {}", w.id, w.step)),
+    );
+    if !spec.payload.is_null() {
+        f.add("payload", belay_json::to_string_pretty(&spec.payload));
+    }
+    if let Some(result) = &job.result {
+        f.add("result", belay_json::to_string_pretty(result));
+    }
+    if !job.errors.is_empty() {
+        let lines: Vec<String> = job
+            .errors
+            .iter()
+            .map(|e| {
+                let mut line = format!("#{} {}", e.attempt, relative(e.at, now));
+                if let Some(worker) = &e.worker {
+                    line.push_str(&format!(" on {worker}"));
+                }
+                line.push_str(&format!(": {}", e.message));
+                if let Some(kind) = &e.kind {
+                    line.push_str(&format!(" [{kind}]"));
+                }
+                if !e.retryable {
+                    line.push_str(" (not retryable)");
+                }
+                line
+            })
+            .collect();
+        f.add("errors", lines.join("\n"));
+    }
+    f
+}
+
+fn filter(m: &Matches) -> Result<JobFilter> {
+    let mut filter = JobFilter::new();
+    filter.queue = m.get::<QueueName>("queue")?;
+    filter.states = m.get_list::<JobState>("state")?;
+    filter.kind = m.get::<String>("kind")?;
+    filter.tag = m.get::<String>("tag")?;
+    filter.tenant = m.get::<TenantId>("tenant")?;
+    filter.created_after = m.get::<Timestamp>("created-after")?;
+    filter.created_before = m.get::<Timestamp>("created-before")?;
+    filter.order = m.get_or("order", SortOrder::Desc)?;
+    filter.limit = m.get::<u32>("limit")?;
+    filter.cursor = match m.value("cursor") {
+        Some(text) => Some(
+            text.parse()
+                .map_err(|e| m.constraint(format!("invalid value {text:?} for --cursor: {e}")))?,
+        ),
+        None => None,
+    };
+    Ok(filter)
+}
+
+fn list(ctx: &mut Ctx<'_>, m: &Matches) -> Result<()> {
+    let filter = filter(m)?;
+    let client = ctx.client()?;
+    let (jobs, next) = if m.flag("all") {
+        let jobs: Vec<Job> = client
+            .jobs()
+            .list_all(filter)
+            .collect::<std::result::Result<_, _>>()?;
+        (jobs, None)
+    } else {
+        let page = client.jobs().list(&filter)?;
+        (page.items, page.next_cursor)
+    };
+    if ctx.out.json {
+        let page = belay_proto::api::Page::new(jobs, next);
+        return Ok(ctx.out.json(&page)?);
+    }
+    if ctx.out.quiet {
+        for job in &jobs {
+            ctx.out.line(job.id)?;
+        }
+        return Ok(());
+    }
+    let now = ctx.now();
+    let mut grid = Grid::new(&["ID", "QUEUE", "KIND", "STATE", "TRIES", "AGE", "INFO"])
+        .right("TRIES")
+        .paint("STATE", state_style)
+        .max_width("INFO", 60);
+    for job in &jobs {
+        grid.push([
+            job.id.to_string(),
+            job.queue().to_string(),
+            job.kind().to_owned(),
+            job.state.to_string(),
+            job.attempt.to_string(),
+            relative(job.created_at, now),
+            info(job, now),
+        ]);
+    }
+    ctx.out.grid(&grid, "no jobs match")?;
+    if let Some(cursor) = next {
+        ctx.out.note(format!(
+            "showing {}; continue with --cursor {cursor}, or use --all",
+            belay_common::text::plural(jobs.len() as u64, "job")
+        ))?;
+    }
+    Ok(())
+}
