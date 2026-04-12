@@ -303,3 +303,56 @@ fn inline_spec(ctx: &Ctx<'_>, m: &Matches) -> Result<ScheduleSpec> {
         .map_err(|e| m.constraint(format!("invalid schedule: {e}")))?;
     Ok(spec)
 }
+
+/// Parses the expression and zone here, where errors can point at the
+/// offending column, rather than waiting for the server's message.
+fn check_expression(m: &Matches, spec: &ScheduleSpec) -> Result<()> {
+    if let Err(e) = CronExpr::parse(&spec.cron) {
+        return Err(Error::Usage(
+            m.constraint(format!("invalid cron expression {:?}: {e}", spec.cron))
+                .with_hint("check it with `belay cron explain \"<expr>\"`"),
+        ));
+    }
+    Tz::parse(&spec.timezone).map_err(|e| m.constraint(format!("invalid time zone: {e}")))?;
+    Ok(())
+}
+
+fn list(ctx: &mut Ctx<'_>) -> Result<()> {
+    let schedules: Vec<Schedule> = ctx
+        .client()?
+        .schedules()
+        .list_all()
+        .collect::<std::result::Result<_, _>>()?;
+    if ctx.out.json {
+        let items = schedules.iter().map(ToJson::to_json).collect();
+        return Ok(ctx.out.json_value(&Value::Array(items))?);
+    }
+    if ctx.out.quiet {
+        for s in &schedules {
+            ctx.out.line(s.id())?;
+        }
+        return Ok(());
+    }
+    let now = ctx.now();
+    let mut grid = Grid::new(&["ID", "CRON", "TZ", "STATE", "NEXT", "LAST", "FIRES", "JOB"])
+        .right("FIRES")
+        .paint("STATE", state_style);
+    for s in &schedules {
+        let spec = &s.spec;
+        grid.push([
+            s.id().to_string(),
+            spec.cron.clone(),
+            spec.timezone.clone(),
+            if spec.paused { "paused" } else { "active" }.to_owned(),
+            s.next_fire_at
+                .map(|t| relative(t, now))
+                .unwrap_or_else(|| "-".to_owned()),
+            s.last_fire_at
+                .map(|t| relative(t, now))
+                .unwrap_or_else(|| "-".to_owned()),
+            s.fire_count.to_string(),
+            format!("{}/{}", spec.template.queue, spec.template.kind),
+        ]);
+    }
+    Ok(ctx.out.grid(&grid, "no schedules")?)
+}
