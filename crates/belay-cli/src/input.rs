@@ -131,3 +131,170 @@ fn table_to_json(table: &belay_conf::Table) -> Value {
     }
     Value::Object(map)
 }
+
+/// TOML to JSON; `None` for floats JSON cannot hold (`nan`, `inf`), which
+/// no belay spec uses.
+fn toml_to_json(value: &belay_conf::Value) -> Option<Value> {
+    use belay_conf::Value as T;
+    Some(match value {
+        T::String(s) | T::Datetime(s) => Value::String(s.clone()),
+        T::Integer(i) => Value::Number(Number::from(*i)),
+        T::Float(f) => Value::Number(Number::from_f64(*f)?),
+        T::Boolean(b) => Value::Bool(*b),
+        T::Array(items) => Value::Array(items.iter().filter_map(toml_to_json).collect()),
+        T::Table(table) => table_to_json(table),
+    })
+}
+
+/// Sets `path` (dotted, e.g. `retention.dead`) in a JSON object to a value
+/// typed from `raw`: `null`/`none` removes the key, `true`/`false` are
+/// booleans, numbers are numbers, JSON objects and arrays are parsed, and
+/// anything else is a string. Missing intermediate objects are created.
+pub(crate) fn set_path(root: &mut Value, path: &str, raw: &str) -> std::result::Result<(), String> {
+    let segments: Vec<&str> = path.split('.').collect();
+    if segments.iter().any(|s| s.trim().is_empty()) {
+        return Err(format!("{path:?} is not a valid key path"));
+    }
+    let typed = infer(raw);
+    let (last, parents) = segments
+        .split_last()
+        .expect("split always yields at least one segment");
+    let mut node = root;
+    for segment in parents {
+        let map = match node {
+            Value::Object(map) => map,
+            _ => return Err(format!("cannot set {path}: {segment} is not a table")),
+        };
+        let child = map
+            .entry(*segment)
+            .or_insert_with(|| Value::Object(Map::new()));
+        if child.is_null() {
+            *child = Value::Object(Map::new());
+        }
+        node = child;
+    }
+    let Value::Object(map) = node else {
+        return Err(format!("cannot set {path}: its parent is not a table"));
+    };
+    match typed {
+        Value::Null => {
+            map.remove(last);
+        }
+        value => {
+            map.insert(*last, value);
+        }
+    }
+    Ok(())
+}
+
+fn infer(raw: &str) -> Value {
+    let trimmed = raw.trim();
+    match trimmed {
+        "null" | "none" => return Value::Null,
+        "true" => return Value::Bool(true),
+        "false" => return Value::Bool(false),
+        _ => {}
+    }
+    if let Ok(i) = trimmed.parse::<i64>() {
+        return Value::Number(Number::from(i));
+    }
+    if trimmed.contains('.') {
+        if let Some(n) = trimmed.parse::<f64>().ok().and_then(Number::from_f64) {
+            return Value::Number(n);
+        }
+    }
+    if trimmed.starts_with(['{', '[']) {
+        if let Ok(v) = belay_json::parse(trimmed) {
+            return v;
+        }
+    }
+    Value::String(raw.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_json::json;
+    use belay_proto::QueueConfig;
+
+    #[test]
+    fn toml_documents_become_json_objects() {
+        let origin = Origin::File("spec.toml".into());
+        let text = "id = \"nightly\"\ncron = \"0 2 * * *\"\nstarts_at = 2025-01-01T00:00:00Z\n\
+                    [template]\nqueue = \"reports\"\nkind = \"build\"\npriority = 5\n";
+        let value = parse_document(&origin, text).unwrap();
+        assert_eq!(
+            value,
+            json!({
+                "id": "nightly",
+                "cron": "0 2 * * *",
+                "starts_at": "2025-01-01T00:00:00Z",
+                "template": {"queue": "reports", "kind": "build", "priority": 5}
+            })
+        );
+    }
+
+    #[test]
+    fn stdin_is_sniffed_for_json() {
+        assert!(!is_toml(&Origin::Stdin, "  {\"a\": 1}"));
+        assert!(is_toml(&Origin::Stdin, "a = 1"));
+        assert!(is_toml(&Origin::File("x.TOML".into()), "{"));
+        assert!(!is_toml(&Origin::File("x.json".into()), "a = 1"));
+    }
+
+    #[test]
+    fn syntax_errors_name_the_source() {
+        let err = parse_document(&Origin::File("bad.json".into()), "{").unwrap_err();
+        assert!(
+            err.to_string().starts_with("bad.json is not valid JSON"),
+            "{err}"
+        );
+        let err = parse_document(&Origin::File("bad.toml".into()), "a = ").unwrap_err();
+        assert!(err.to_string().contains("bad.toml"), "{err}");
+    }
+
+    #[test]
+    fn decoding_reports_the_json_path() {
+        let origin = Origin::File("q.json".into());
+        let err = decode::<QueueConfig>(&origin, &json!({"max_concurency": 3})).unwrap_err();
+        let text = err.to_string();
+        assert!(text.starts_with("q.json: "), "{text}");
+        assert!(text.contains("max_concurrency"), "{text}");
+        let err = decode::<QueueConfig>(&origin, &json!({"max_concurrency": 0})).unwrap_err();
+        assert!(err.to_string().contains("must be at least 1"), "{err}");
+    }
+
+    #[test]
+    fn set_path_types_values_and_creates_tables() {
+        let mut v = json!({"retention": {"dead": "7d"}, "rate_limit": null});
+        set_path(&mut v, "max_concurrency", "8").unwrap();
+        set_path(&mut v, "retention.dead", "30d").unwrap();
+        set_path(&mut v, "rate_limit.per_second", "2.5").unwrap();
+        set_path(&mut v, "flag", "true").unwrap();
+        set_path(&mut v, "list", "[1, 2]").unwrap();
+        assert_eq!(
+            v,
+            json!({
+                "retention": {"dead": "30d"},
+                "rate_limit": {"per_second": 2.5},
+                "max_concurrency": 8,
+                "flag": true,
+                "list": [1, 2]
+            })
+        );
+        set_path(&mut v, "rate_limit", "none").unwrap();
+        assert!(v.get("rate_limit").is_none());
+        assert!(set_path(&mut v, "max_concurrency.x", "1")
+            .unwrap_err()
+            .contains("not a table"));
+        assert!(set_path(&mut v, "a..b", "1").is_err());
+    }
+
+    #[test]
+    fn inference_keeps_ambiguous_text_as_strings() {
+        assert_eq!(infer("30s"), json!("30s"));
+        assert_eq!(infer("exp:1s*2..10m"), json!("exp:1s*2..10m"));
+        assert_eq!(infer("-3"), json!(-3));
+        assert_eq!(infer("{broken"), json!("{broken"));
+    }
+}
