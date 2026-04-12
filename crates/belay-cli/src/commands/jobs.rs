@@ -490,3 +490,66 @@ fn list(ctx: &mut Ctx<'_>, m: &Matches) -> Result<()> {
     }
     Ok(())
 }
+
+/// The most useful extra fact about a job for its state.
+fn info(job: &Job, now: Timestamp) -> String {
+    match job.state {
+        JobState::Scheduled | JobState::Retrying => format!("runs {}", relative(job.run_at, now)),
+        JobState::Running => match (&job.lease, &job.progress) {
+            (_, Some(p)) if p.percent.is_some() => {
+                format!("{} done", percent(p.percent.unwrap_or_default()))
+            }
+            (Some(lease), _) => format!("on {}", lease.worker),
+            _ => String::new(),
+        },
+        JobState::Succeeded => job
+            .runtime()
+            .map(|d| format!("took {}", approx(d)))
+            .unwrap_or_default(),
+        JobState::Dead => job
+            .last_error()
+            .map(|e| e.message.clone())
+            .unwrap_or_default(),
+        JobState::Ready | JobState::Cancelled => String::new(),
+    }
+}
+
+fn act(ctx: &mut Ctx<'_>, m: &Matches, action: &str) -> Result<()> {
+    let ids: Vec<JobId> = m.get_all("id")?;
+    let client = ctx.client()?;
+    let verb = match action {
+        "cancel" => "cancelled",
+        "retry" => "retried",
+        "promote" => "promoted",
+        _ => "deleted",
+    };
+    for_each(ctx, &ids, "jobs", verb, |ctx, id| {
+        let jobs = client.jobs();
+        let job = match action {
+            "cancel" => jobs.cancel(*id)?,
+            "retry" => jobs.retry(*id)?,
+            "promote" => jobs.promote(*id)?,
+            _ => {
+                jobs.delete(*id)?;
+                ctx.out.done(format!("deleted {id}"))?;
+                if ctx.out.quiet {
+                    ctx.out.line(id)?;
+                }
+                return Ok(belay_json::json!({"id": id.to_string(), "deleted": true}));
+            }
+        };
+        if ctx.out.quiet {
+            ctx.out.line(job.id)?;
+        } else if job.state == JobState::Running && job.cancel_requested {
+            let worker = job.lease.as_ref().map(|l| l.worker.to_string());
+            ctx.out.done(format!(
+                "cancel requested for {id}; {} stops it at its next heartbeat",
+                worker.unwrap_or_else(|| "its worker".to_owned())
+            ))?;
+        } else {
+            let state = ctx.out.state(job.state.as_str());
+            ctx.out.done(format!("{verb} {id} (now {state})"))?;
+        }
+        Ok(job.to_json())
+    })
+}
