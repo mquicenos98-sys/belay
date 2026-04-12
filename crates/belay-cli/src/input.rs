@@ -106,3 +106,28 @@ fn parse_document(origin: &Origin, text: &str) -> Result<Value> {
             .map_err(|e| Error::Input(format!("{} is not valid JSON: {e}", origin.describe())))
     }
 }
+
+/// Decodes and validates a spec of type `T` from a JSON value.
+pub(crate) fn decode<T: FromJson + Validate>(origin: &Origin, value: &Value) -> Result<T> {
+    let spec =
+        T::from_json(value).map_err(|e| Error::Input(format!("{}: {e}", origin.describe())))?;
+    spec.validate()
+        .map_err(|e| Error::Input(format!("{}: {e}", origin.describe())))?;
+    Ok(spec)
+}
+
+/// Reads, decodes and validates a spec file.
+pub(crate) fn spec_file<T: FromJson + Validate>(ctx: &Ctx<'_>, path: &str) -> Result<T> {
+    let (origin, value) = document(ctx, path)?;
+    decode(&origin, &value)
+}
+
+fn table_to_json(table: &belay_conf::Table) -> Value {
+    let mut map = Map::with_capacity(table.len());
+    for (key, value) in table.iter() {
+        if let Some(value) = toml_to_json(value) {
+            map.insert(key, value);
+        }
+    }
+    Value::Object(map)
+}
