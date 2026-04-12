@@ -213,3 +213,45 @@ fn info_fields(info: &QueueInfo) -> Fields {
     }
     f
 }
+
+/// `queue config`: print, `--set`, or `--file`.
+fn config(ctx: &mut Ctx<'_>, m: &Matches, name: &QueueName) -> Result<()> {
+    let client = ctx.client()?;
+    let sets: Vec<KeyValue> = m.get_all("set")?;
+    let new_config = if let Some(path) = m.value("file") {
+        input::spec_file::<QueueConfig>(ctx, path)?
+    } else if !sets.is_empty() {
+        let mut value = client.queues().get(name)?.config.to_json();
+        for set in &sets {
+            input::set_path(&mut value, &set.key, &set.value)
+                .map_err(|e| m.constraint(format!("invalid --set {}: {e}", set.key)))?;
+        }
+        input::decode::<QueueConfig>(&Origin::Inline, &value).map_err(|e| {
+            m.constraint(format!(
+                "invalid --set: {}",
+                e.to_string().trim_start_matches("the command line: ")
+            ))
+        })?
+    } else {
+        let config = client.queues().get(name)?.config;
+        return print_config(ctx, &config);
+    };
+    let info = client.queues().set_config(name, &new_config)?;
+    if !ctx.out.json {
+        ctx.out.done(format!("updated queue {name}"))?;
+    }
+    if ctx.out.quiet {
+        return Ok(());
+    }
+    print_config(ctx, &info.config)
+}
+
+fn print_config(ctx: &mut Ctx<'_>, config: &QueueConfig) -> Result<()> {
+    if ctx.out.json {
+        return Ok(ctx.out.json(config)?);
+    }
+    for (key, value) in flatten(&config.to_json()) {
+        ctx.out.line(format!("{key} = {value}"))?;
+    }
+    Ok(())
+}
