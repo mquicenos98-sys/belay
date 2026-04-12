@@ -227,3 +227,60 @@ where
 {
     Runner::new().run(args, out, err)
 }
+
+fn finish(written: io::Result<()>) -> Exit {
+    match written {
+        Err(e) if e.kind() != io::ErrorKind::BrokenPipe => Exit::Failure,
+        _ => Exit::Success,
+    }
+}
+
+/// `error:`, the hint, the usage line and where to find more help.
+fn report_usage(out: &mut Output<'_>, root: &args::Command, e: &UsageError) {
+    let path = e.path();
+    let usage = args::usage_line(root, &path);
+    let command = e.command_name();
+    let _ = out.error(&e.to_string(), e.hint().as_deref());
+    let _ = out.err_text(&format!(
+        "\nUsage: {usage}\nFor more information, try '{command} --help'.\n"
+    ));
+}
+
+fn report(out: &mut Output<'_>, e: &Error, url: &str) {
+    let hint = e.hint(url);
+    if let Error::Config(diagnostic) = e {
+        // Configuration errors render as compiler-style diagnostics that
+        // carry their own `error:` prefix.
+        let _ = out.err_text(&format!("{diagnostic}\n"));
+        if let Some(hint) = hint {
+            let _ = out.err_text(&format!("hint: {hint}\n"));
+        }
+        return;
+    }
+    let _ = out.error(&e.to_string(), hint.as_deref());
+}
+
+/// `-v` turns on debug logs and `-vv` trace logs, on stderr. Commands that
+/// run services (`server`, `dev`, `worker`) set up their own logging.
+fn install_logging(verbose: usize, path: &[&str]) {
+    if matches!(path, ["server"] | ["dev"] | ["worker"]) || verbose == 0 {
+        return;
+    }
+    let level = if verbose == 1 {
+        Level::Debug
+    } else {
+        Level::Trace
+    };
+    belay_common::log::init_stderr(Filter::new(level), LogFormat::Logfmt);
+}
+
+/// The log level for service commands: info, more with `-v`, only
+/// warnings and errors with `-q`.
+pub(crate) fn service_log_level(verbose: usize, quiet: bool) -> Level {
+    match verbose {
+        0 if quiet => Level::Warn,
+        0 => Level::Info,
+        1 => Level::Debug,
+        _ => Level::Trace,
+    }
+}
