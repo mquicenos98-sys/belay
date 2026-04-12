@@ -133,3 +133,83 @@ pub(crate) fn run(ctx: &mut Ctx<'_>, m: &Matches, action: &str) -> Result<()> {
     }
     Ok(())
 }
+
+fn list(ctx: &mut Ctx<'_>) -> Result<()> {
+    let queues: Vec<QueueInfo> = ctx
+        .client()?
+        .queues()
+        .list_all()
+        .collect::<std::result::Result<_, _>>()?;
+    if ctx.out.json {
+        return Ok(ctx
+            .out
+            .json_value(&Value::Array(queues.iter().map(ToJson::to_json).collect()))?);
+    }
+    if ctx.out.quiet {
+        for q in &queues {
+            ctx.out.line(&q.name)?;
+        }
+        return Ok(());
+    }
+    let mut grid = Grid::new(&[
+        "QUEUE", "STATE", "READY", "SCHED", "RUNNING", "RETRY", "DEAD", "OLDEST", "DONE/S",
+    ])
+    .paint("STATE", state_style)
+    .paint("DEAD", |n| (n != "0").then_some(crate::output::Style::Red));
+    for header in [
+        "READY", "SCHED", "RUNNING", "RETRY", "DEAD", "OLDEST", "DONE/S",
+    ] {
+        grid = grid.right(header);
+    }
+    for q in &queues {
+        let c = &q.counts;
+        grid.push([
+            q.name.to_string(),
+            if q.paused { "paused" } else { "active" }.to_owned(),
+            c.ready.to_string(),
+            c.scheduled.to_string(),
+            c.running.to_string(),
+            c.retrying.to_string(),
+            c.dead.to_string(),
+            q.oldest_ready_age
+                .map(approx)
+                .unwrap_or_else(|| "-".to_owned()),
+            format!("{:.1}", q.throughput.succeeded_per_second()),
+        ]);
+    }
+    Ok(ctx
+        .out
+        .grid(&grid, "no queues yet; they appear with their first job")?)
+}
+
+fn info_fields(info: &QueueInfo) -> Fields {
+    let mut f = Fields::new();
+    let c = &info.counts;
+    let t = &info.throughput;
+    f.add("name", &info.name)
+        .state("state", if info.paused { "paused" } else { "active" })
+        .add(
+            "jobs",
+            format!(
+                "{} ready, {} scheduled, {} running, {} retrying\n{} succeeded, {} dead, {} cancelled",
+                c.ready, c.scheduled, c.running, c.retrying, c.succeeded, c.dead, c.cancelled
+            ),
+        )
+        .opt("oldest ready", info.oldest_ready_age.map(approx))
+        .add(
+            "throughput",
+            format!(
+                "last {}: {} enqueued, {} succeeded, {} failed, {} dead ({:.2}/s)",
+                format_duration(t.window),
+                t.enqueued,
+                t.succeeded,
+                t.failed,
+                t.dead,
+                t.succeeded_per_second()
+            ),
+        );
+    for (key, value) in flatten(&info.config.to_json()) {
+        f.add(&key, value);
+    }
+    f
+}
