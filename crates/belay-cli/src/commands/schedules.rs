@@ -126,3 +126,180 @@ pub(crate) fn spec() -> Command {
                 .flag(Flag::option("count", "N", "How many").short('n').default("10")),
         )
 }
+
+pub(crate) fn run(ctx: &mut Ctx<'_>, m: &Matches, action: &str) -> Result<()> {
+    match action {
+        "add" => add(ctx, m),
+        "list" => list(ctx),
+        _ => {
+            let id: ScheduleId = m.require("id")?;
+            let client = ctx.client()?;
+            let schedules = client.schedules();
+            match action {
+                "get" => {
+                    let schedule = schedules.get(&id)?;
+                    if ctx.out.json {
+                        ctx.out.json(&schedule)?;
+                    } else {
+                        let fields = schedule_fields(&schedule, ctx.now());
+                        ctx.out.fields(&fields)?;
+                    }
+                }
+                "pause" | "resume" => {
+                    if action == "pause" {
+                        schedules.pause(&id)?;
+                    } else {
+                        schedules.resume(&id)?;
+                    }
+                    let state = if action == "pause" {
+                        "paused"
+                    } else {
+                        "active"
+                    };
+                    if ctx.out.json {
+                        ctx.out
+                            .json_value(&json!({"schedule": id.as_str(), "state": state}))?;
+                    }
+                    ctx.out
+                        .done(format!("schedule {id} is now {}", ctx.out.state(state)))?;
+                }
+                "rm" => {
+                    schedules.delete(&id)?;
+                    if ctx.out.json {
+                        ctx.out
+                            .json_value(&json!({"schedule": id.as_str(), "deleted": true}))?;
+                    }
+                    ctx.out.done(format!("deleted schedule {id}"))?;
+                }
+                "trigger" => {
+                    let job = schedules.trigger(&id)?;
+                    if ctx.out.json {
+                        ctx.out.json_value(
+                            &json!({"schedule": id.as_str(), "job": job.to_string()}),
+                        )?;
+                    } else if ctx.out.quiet {
+                        ctx.out.line(job)?;
+                    } else {
+                        ctx.out.line(format!("fired {id}: enqueued {job}"))?;
+                    }
+                }
+                "preview" => {
+                    let n: u32 = m.get_or("count", 10)?;
+                    let times = schedules.preview(&id, n)?;
+                    if ctx.out.json {
+                        let items = times
+                            .iter()
+                            .map(|t| Value::String(t.to_rfc3339()))
+                            .collect();
+                        ctx.out.json_value(&Value::Array(items))?;
+                    } else {
+                        let tz = Tz::parse(&schedules.get(&id)?.spec.timezone).unwrap_or(Tz::Utc);
+                        print_times(ctx, &times, &tz)?;
+                    }
+                }
+                other => unreachable!("schedule {other} is not declared"),
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Fire times in the schedule's zone with their distance from now.
+fn print_times(ctx: &mut Ctx<'_>, times: &[Timestamp], tz: &Tz) -> Result<()> {
+    if times.is_empty() {
+        return Ok(ctx.out.note("no upcoming fire times")?);
+    }
+    let now = ctx.now();
+    let mut grid = Grid::new(&["TIME", "UTC", "IN"]);
+    for t in times {
+        grid.push([
+            tz.format_rfc3339(t.as_secs()),
+            t.to_rfc3339(),
+            relative(*t, now),
+        ]);
+    }
+    Ok(ctx.out.grid(&grid, "")?)
+}
+
+fn add(ctx: &mut Ctx<'_>, m: &Matches) -> Result<()> {
+    let spec = if let Some(path) = m.value("file") {
+        if let Some(flag) = INLINE_FLAGS.iter().find(|f| m.given(f)) {
+            return Err(m
+                .constraint(format!(
+                    "--file cannot be combined with --{flag}; put it in the file"
+                ))
+                .into());
+        }
+        let spec: ScheduleSpec = input::spec_file(ctx, path)?;
+        if let Some(id) = m.get::<ScheduleId>("id")? {
+            if id != spec.id {
+                return Err(m
+                    .constraint(format!("the file defines schedule {}, not {id}", spec.id))
+                    .into());
+            }
+        }
+        spec
+    } else {
+        inline_spec(ctx, m)?
+    };
+    check_expression(m, &spec)?;
+
+    let client = ctx.client()?;
+    let schedule = if m.flag("replace") {
+        client.schedules().put(&spec)?
+    } else {
+        client.schedules().create(&spec)?
+    };
+    if ctx.out.json {
+        ctx.out.json(&schedule)?;
+    } else if ctx.out.quiet {
+        ctx.out.line(schedule.id())?;
+    } else {
+        let verb = if m.flag("replace") {
+            "saved"
+        } else {
+            "created"
+        };
+        let next = match schedule.next_fire_at {
+            Some(t) => format!("next fire {}", when(t, ctx.now())),
+            None => "it will not fire again".to_owned(),
+        };
+        ctx.out
+            .line(format!("{verb} schedule {}; {next}", schedule.id()))?;
+    }
+    Ok(())
+}
+
+fn inline_spec(ctx: &Ctx<'_>, m: &Matches) -> Result<ScheduleSpec> {
+    let Some(id) = m.get::<ScheduleId>("id")? else {
+        return Err(m
+            .constraint("give the schedule's <ID>, or load a spec with --file")
+            .into());
+    };
+    let cron: String = m.require("cron")?;
+    let queue: QueueName = m.require("queue")?;
+    let kind: String = m.require("kind")?;
+    let template = apply_job_options(ctx, m, JobSpec::new(queue, kind))?;
+    let mut spec = ScheduleSpec::new(id, cron, template)
+        .timezone(m.value("tz").unwrap_or(ScheduleSpec::DEFAULT_TIMEZONE));
+    if let Some(policy) = m.get::<MisfirePolicy>("misfire")? {
+        spec = spec.misfire(policy);
+    }
+    if let Some(policy) = m.get::<OverlapPolicy>("overlap")? {
+        spec = spec.overlap(policy);
+    }
+    if let Some(jitter) = m.get::<Duration>("jitter")? {
+        spec = spec.jitter(jitter);
+    }
+    if let Some(calendar) = m.get::<String>("calendar")? {
+        spec = spec.calendar(calendar);
+    }
+    if let Some(text) = m.get::<String>("description")? {
+        spec = spec.description(text);
+    }
+    spec = spec.between(m.get("starts-at")?, m.get("ends-at")?);
+    spec.paused = m.flag("paused");
+    spec.validate()
+        .map_err(|e| m.constraint(format!("invalid schedule: {e}")))?;
+    Ok(spec)
+}
