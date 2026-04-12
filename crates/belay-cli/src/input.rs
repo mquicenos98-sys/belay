@@ -75,3 +75,34 @@ pub(crate) fn payload(ctx: &Ctx<'_>, flag: Option<&str>) -> Result<Value> {
         )),
     })
 }
+
+/// Whether text from `origin` should be read as TOML: by extension for
+/// files, by sniffing for stdin (JSON documents start with `{` or `[`).
+fn is_toml(origin: &Origin, text: &str) -> bool {
+    match origin {
+        Origin::File(path) => Path::new(path)
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("toml")),
+        Origin::Stdin | Origin::Inline => {
+            !matches!(text.trim_start().chars().next(), Some('{' | '['))
+        }
+    }
+}
+
+/// Reads a JSON or TOML document as a JSON value.
+pub(crate) fn document(ctx: &Ctx<'_>, path: &str) -> Result<(Origin, Value)> {
+    let (origin, text) = read_source(ctx, path)?;
+    let value = parse_document(&origin, &text)?;
+    Ok((origin, value))
+}
+
+fn parse_document(origin: &Origin, text: &str) -> Result<Value> {
+    if is_toml(origin, text) {
+        let doc = belay_conf::Document::parse_named(&origin.describe(), text)
+            .map_err(|e| Error::Input(e.to_string()))?;
+        Ok(table_to_json(doc.root()))
+    } else {
+        belay_json::parse(text)
+            .map_err(|e| Error::Input(format!("{} is not valid JSON: {e}", origin.describe())))
+    }
+}
