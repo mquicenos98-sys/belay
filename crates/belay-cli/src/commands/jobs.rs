@@ -553,3 +553,95 @@ fn act(ctx: &mut Ctx<'_>, m: &Matches, action: &str) -> Result<()> {
         Ok(job.to_json())
     })
 }
+
+/// Polls job `id` until it reaches a terminal state, starting with short
+/// pauses so quick jobs return quickly.
+pub(crate) fn wait_for(
+    ctx: &mut Ctx<'_>,
+    client: &Client,
+    id: JobId,
+    timeout: Option<Duration>,
+) -> Result<Job> {
+    let started = Instant::now();
+    let mut pause = Duration::from_millis(25);
+    loop {
+        let job = client.jobs().get(id)?;
+        if job.is_terminal() {
+            return Ok(job);
+        }
+        if let Some(limit) = timeout {
+            let elapsed = started.elapsed();
+            if elapsed >= limit {
+                return Err(Error::Failed {
+                    message: format!("job {id} is still {} after {}", job.state, approx(limit)),
+                    hint: Some(format!("keep waiting with `belay job wait {id}`")),
+                });
+            }
+            pause = pause.min(limit - elapsed);
+        }
+        ctx.pause(pause);
+        pause = (pause * 2).min(MAX_POLL);
+    }
+}
+
+/// Prints a finished job's outcome; a job that did not succeed is an
+/// error (status 1) after its details are shown.
+pub(crate) fn report_finished(ctx: &mut Ctx<'_>, job: &Job) -> Result<()> {
+    if ctx.out.json {
+        ctx.out.json(job)?;
+    } else if ctx.out.quiet {
+        if let Some(result) = &job.result {
+            ctx.out.line(belay_json::to_string(result))?;
+        }
+    } else {
+        let state = ctx.out.state(job.state.as_str());
+        let runtime = job
+            .runtime()
+            .map(|d| format!(" in {}", approx(d)))
+            .unwrap_or_default();
+        ctx.out.line(format!(
+            "job {} {state} after {}{runtime}",
+            job.id,
+            belay_common::text::plural(u64::from(job.attempt), "attempt"),
+        ))?;
+        if let Some(result) = job.result.as_ref().filter(|r| !r.is_null()) {
+            ctx.out.line(belay_json::to_string_pretty(result))?;
+        }
+    }
+    match job.state {
+        JobState::Succeeded => Ok(()),
+        JobState::Dead => Err(Error::Failed {
+            message: match job.last_error() {
+                Some(e) => format!("job {} is dead: {}", job.id, e.message),
+                None => format!("job {} is dead", job.id),
+            },
+            hint: Some(format!("see its errors with `belay job get {}`", job.id)),
+        }),
+        other => Err(Error::failed(format!("job {} ended {other}", job.id))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn info_column_says_what_matters_per_state() {
+        let now = Timestamp::from_secs(1_700_000_000);
+        let mut job = Job::new(
+            "01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().unwrap(),
+            JobSpec::new("emails", "send"),
+            now,
+        );
+        job.state = JobState::Retrying;
+        job.run_at = now + Duration::from_secs(120);
+        assert_eq!(info(&job, now), "runs in 2m");
+        job.state = JobState::Dead;
+        job.record_error(belay_proto::JobError::new(now, 1, "smtp timeout"));
+        assert_eq!(info(&job, now), "smtp timeout");
+        job.state = JobState::Succeeded;
+        job.started_at = Some(now);
+        job.finished_at = Some(now + Duration::from_millis(1500));
+        assert_eq!(info(&job, now), "took 1.5s");
+    }
+}
