@@ -144,3 +144,45 @@ fn watch(handle: &WorkerHandle, limit: u64, idle_limit: Option<Duration>) {
         }
     }
 }
+
+fn summary(ctx: &mut Ctx<'_>, id: &WorkerId, stats: &WorkerStats) -> Result<()> {
+    if ctx.out.json {
+        ctx.out.json_value(&json!({
+            "worker": id.to_string(),
+            "leased": stats.leased,
+            "succeeded": stats.succeeded,
+            "failed": stats.failed,
+            "retried": stats.retried,
+            "abandoned": stats.abandoned,
+            "handed_back": stats.handed_back,
+        }))?;
+        return Ok(());
+    }
+    ctx.out.done(format!(
+        "worker {id} stopped: {} succeeded, {} failed, {} abandoned",
+        stats.succeeded, stats.failed, stats.abandoned
+    ))?;
+    if let Some(error) = &stats.last_error {
+        ctx.out.note(format!("last error: {error}"))?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shell_is_only_registered_on_request() {
+        let kinds = |r: Registry| r.kinds().map(str::to_owned).collect::<Vec<_>>();
+        assert_eq!(
+            kinds(registry(false, Vec::new())),
+            ["echo", "fail", "sleep"]
+        );
+        assert_eq!(
+            kinds(registry(true, Vec::new())),
+            ["echo", "fail", "shell", "sleep"]
+        );
+        assert!(registry(false, vec!["convert".into()]).contains("shell"));
+    }
+}

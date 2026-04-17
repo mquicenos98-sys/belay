@@ -1,0 +1,141 @@
+//! `belay workflow ...`: submitting DAGs of jobs and following their runs.
+
+use std::time::{Duration, Instant};
+
+use belay_client::ListOptions;
+use belay_common::Timestamp;
+use belay_json::{json, ToJson, Value};
+use belay_proto::workflow::WorkflowState;
+use belay_proto::{Workflow, WorkflowId, WorkflowSpec};
+
+use super::Ctx;
+use crate::args::{Arg, Command, Flag, Matches};
+use crate::error::{Error, Result};
+use crate::input;
+use crate::output::human::{approx, relative, when};
+use crate::output::{state_style, Fields, Grid};
+
+pub(crate) fn spec() -> Command {
+    let id = || Arg::required("id", "Workflow run id");
+    Command::new("workflow", "run and follow workflows (DAGs of jobs)")
+        .subcommand(
+            Command::new("submit", "start a workflow run from a JSON or TOML spec")
+                .details(
+                    "The spec has a name and steps; each step names a job and the steps it\n\
+                     depends_on. The server checks the graph (unique names, known dependencies,\n\
+                     no cycles) and enqueues the steps without dependencies at once.",
+                )
+                .arg(Arg::required("file", "Spec file, or - for stdin"))
+                .flag(Flag::switch("wait", "Wait for the run to finish").short('w'))
+                .flag(Flag::option(
+                    "wait-timeout",
+                    "DURATION",
+                    "Stop waiting after this long",
+                ))
+                .example("belay workflow submit etl.json --wait"),
+        )
+        .subcommand(
+            Command::new("get", "show a run and its steps")
+                .alias("show")
+                .arg(id()),
+        )
+        .subcommand(
+            Command::new("list", "list workflow runs")
+                .alias("ls")
+                .flag(Flag::option("limit", "N", "Runs per page").short('n'))
+                .flag(Flag::switch("all", "Follow every page to the end")),
+        )
+        .subcommand(Command::new("cancel", "cancel a run and its unfinished steps").arg(id()))
+}
+
+pub(crate) fn run(ctx: &mut Ctx<'_>, m: &Matches, action: &str) -> Result<()> {
+    let client = ctx.client()?;
+    let workflows = client.workflows();
+    match action {
+        "submit" => {
+            let path: String = m.require("file")?;
+            if m.given("wait-timeout") && !m.flag("wait") {
+                return Err(m.constraint("--wait-timeout needs --wait").into());
+            }
+            let spec: WorkflowSpec = input::spec_file(ctx, &path)?;
+            let run = workflows.submit(&spec)?;
+            if m.flag("wait") {
+                let timeout = m.get::<Duration>("wait-timeout")?;
+                let run = wait(ctx, &client, run.id, timeout)?;
+                return finished(ctx, &run);
+            }
+            if ctx.out.json {
+                ctx.out.json(&run)?;
+            } else if ctx.out.quiet {
+                ctx.out.line(run.id)?;
+            } else {
+                ctx.out.line(format!(
+                    "started workflow {} ({}, {})",
+                    run.id,
+                    run.spec.name,
+                    belay_common::text::plural(run.spec.steps.len() as u64, "step")
+                ))?;
+            }
+        }
+        "get" => {
+            let id: WorkflowId = m.require("id")?;
+            let run = workflows.get(id)?;
+            if ctx.out.json {
+                ctx.out.json(&run)?;
+            } else {
+                show(ctx, &run)?;
+            }
+        }
+        "list" => {
+            let runs: Vec<Workflow> = if m.flag("all") {
+                workflows
+                    .list_all()
+                    .collect::<std::result::Result<_, _>>()?
+            } else {
+                let mut options = ListOptions::new();
+                if let Some(limit) = m.get::<u32>("limit")? {
+                    options = options.limit(limit);
+                }
+                workflows.list(&options)?.items
+            };
+            if ctx.out.json {
+                let items = runs.iter().map(ToJson::to_json).collect();
+                return Ok(ctx.out.json_value(&Value::Array(items))?);
+            }
+            if ctx.out.quiet {
+                for r in &runs {
+                    ctx.out.line(r.id)?;
+                }
+                return Ok(());
+            }
+            let now = ctx.now();
+            let mut grid = Grid::new(&["ID", "NAME", "STATE", "STEPS", "CREATED", "TOOK"])
+                .paint("STATE", state_style);
+            for r in &runs {
+                let done = r.steps.values().filter(|s| s.state.is_finished()).count();
+                grid.push([
+                    r.id.to_string(),
+                    r.spec.name.clone(),
+                    r.state.to_string(),
+                    format!("{done}/{}", r.steps.len()),
+                    relative(r.created_at, now),
+                    r.finished_at
+                        .map(|f| approx(f.saturating_duration_since(r.created_at)))
+                        .unwrap_or_else(|| "-".to_owned()),
+                ]);
+            }
+            ctx.out.grid(&grid, "no workflow runs")?;
+        }
+        "cancel" => {
+            let id: WorkflowId = m.require("id")?;
+            workflows.cancel(id)?;
+            if ctx.out.json {
+                ctx.out
+                    .json_value(&json!({"workflow": id.to_string(), "cancelled": true}))?;
+            }
+            ctx.out.done(format!("cancelled workflow {id}"))?;
+        }
+        other => unreachable!("workflow {other} is not declared"),
+    }
+    Ok(())
+}
