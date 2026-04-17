@@ -446,6 +446,20 @@ fn handler_panic_becomes_500_and_the_connection_survives() {
 }
 
 #[test]
+fn invalid_response_header_is_never_sent() {
+    // Regression: a CR/LF in a header value must not split the response.
+    let (config, errors) = recorded_errors();
+    let server = serve_with(config, app());
+    let mut conn = Conn::open(server.local_addr());
+    conn.send(b"GET /bad-header HTTP/1.1\r\nHost: t\r\n\r\n");
+    let resp = conn.response();
+    assert_eq!(resp.status, 500);
+    assert!(resp.header("injected").is_none());
+    assert!(!resp.head.contains("X-Evil"));
+    assert!(errors.lock().expect("test lock")[0].contains("invalid value for header X-Evil"));
+}
+
+#[test]
 fn streaming_response_uses_chunked_encoding() {
     let server = serve(app());
     let mut conn = Conn::open(server.local_addr());

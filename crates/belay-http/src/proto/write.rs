@@ -9,7 +9,7 @@ use crate::error::Error;
 use crate::headers::names::{
     CONNECTION, CONTENT_LENGTH, DATE, HOST, KEEP_ALIVE, SERVER, TRANSFER_ENCODING, USER_AGENT,
 };
-use crate::headers::{is_valid_name, Headers};
+use crate::headers::{is_valid_name, is_valid_value, Headers};
 use crate::method::Method;
 use crate::status::StatusCode;
 
@@ -41,6 +41,11 @@ pub(crate) fn push_field(out: &mut Vec<u8>, name: &str, value: &str) -> Result<(
     if !is_valid_name(name) {
         return Err(Error::InvalidHeader(format!(
             "invalid header name {name:?}"
+        )));
+    }
+    if !is_valid_value(value) {
+        return Err(Error::InvalidHeader(format!(
+            "invalid value for header {name}: {value:?}"
         )));
     }
     out.extend_from_slice(name.as_bytes());
@@ -219,6 +224,20 @@ mod tests {
         encode_response_head(&mut out, status, &Headers::new(), &meta(OutFraming::None))
             .expect("valid head");
         assert!(out.starts_with(b"HTTP/1.1 599 \r\n"));
+    }
+
+    #[test]
+    fn refuses_header_injection() {
+        // Regression: a CR/LF in a value would let a handler forge headers or
+        // a second response on the same connection.
+        let err = response(
+            &[("X-User", "a\r\nSet-Cookie: x=1")],
+            meta(OutFraming::None),
+        )
+        .unwrap_err();
+        assert!(matches!(err, Error::InvalidHeader(_)), "{err}");
+        let err = response(&[("Bad Name", "v")], meta(OutFraming::None)).unwrap_err();
+        assert!(err.to_string().contains("invalid header name"), "{err}");
     }
 
     #[test]

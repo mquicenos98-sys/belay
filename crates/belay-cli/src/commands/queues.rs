@@ -255,3 +255,84 @@ fn print_config(ctx: &mut Ctx<'_>, config: &QueueConfig) -> Result<()> {
     }
     Ok(())
 }
+
+/// Dotted keys and scalar values of a JSON object, in order:
+/// `retention.dead`, `7d`. Unset optional settings (absent keys) are shown
+/// as `none` for the two that exist, so users see what they can set.
+fn flatten(value: &Value) -> Vec<(String, String)> {
+    fn walk(prefix: &str, value: &Value, out: &mut Vec<(String, String)>) {
+        match value {
+            Value::Object(map) => {
+                for (key, child) in map.iter() {
+                    let path = if prefix.is_empty() {
+                        key.to_owned()
+                    } else {
+                        format!("{prefix}.{key}")
+                    };
+                    walk(&path, child, out);
+                }
+            }
+            Value::String(s) => out.push((prefix.to_owned(), s.clone())),
+            other => out.push((prefix.to_owned(), other.to_string())),
+        }
+    }
+    // The optional settings come first in a configuration's JSON; keep
+    // that order whether or not they are set.
+    const OPTIONAL: [&str; 2] = ["max_concurrency", "rate_limit"];
+    let mut out = Vec::new();
+    for key in OPTIONAL {
+        match value.get(key) {
+            Some(child) => walk(key, child, &mut out),
+            None => out.push((key.to_owned(), "none".to_owned())),
+        }
+    }
+    if let Value::Object(map) = value {
+        for (key, child) in map.iter().filter(|(k, _)| !OPTIONAL.contains(k)) {
+            walk(key, child, &mut out);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_proto::RateLimit;
+
+    #[test]
+    fn configs_flatten_to_the_keys_set_accepts() {
+        let config = QueueConfig {
+            rate_limit: Some(RateLimit::new(2.5, 5)),
+            ..QueueConfig::default()
+        };
+        let flat = flatten(&config.to_json());
+        let keys: Vec<&str> = flat.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(
+            keys,
+            [
+                "max_concurrency",
+                "rate_limit.per_second",
+                "rate_limit.burst",
+                "default_timeout",
+                "default_retry",
+                "default_max_attempts",
+                "retention.succeeded",
+                "retention.dead",
+                "retention.cancelled"
+            ]
+        );
+        assert_eq!(flat[0].1, "none");
+        assert_eq!(flat[1].1, "2.5");
+        assert_eq!(flat[4].1, "exp:1s*2..1h~10%");
+    }
+
+    #[test]
+    fn every_flattened_key_can_be_set_back() {
+        let mut value = QueueConfig::default().to_json();
+        for (key, raw) in flatten(&value.clone()) {
+            input::set_path(&mut value, &key, &raw).unwrap();
+        }
+        let back = input::decode::<QueueConfig>(&Origin::Inline, &value).unwrap();
+        assert_eq!(back, QueueConfig::default());
+    }
+}
