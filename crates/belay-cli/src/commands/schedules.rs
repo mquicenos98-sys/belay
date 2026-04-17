@@ -356,3 +356,87 @@ fn list(ctx: &mut Ctx<'_>) -> Result<()> {
     }
     Ok(ctx.out.grid(&grid, "no schedules")?)
 }
+
+fn schedule_fields(schedule: &Schedule, now: Timestamp) -> Fields {
+    let spec = &schedule.spec;
+    let meaning = CronExpr::parse(&spec.cron)
+        .map(|e| e.describe())
+        .unwrap_or_else(|e| format!("(does not parse: {e})"));
+    let mut f = Fields::new();
+    f.add("id", &spec.id)
+        .state("state", if spec.paused { "paused" } else { "active" })
+        .add("cron", format!("{}  ({meaning})", spec.cron))
+        .add("time zone", &spec.timezone)
+        .add(
+            "next fire",
+            schedule
+                .next_fire_at
+                .map_or_else(|| "none".to_owned(), |t| when(t, now)),
+        )
+        .opt("last fire", schedule.last_fire_at.map(|t| when(t, now)))
+        .opt("last job", schedule.last_job)
+        .add("fires", schedule.fire_count)
+        .add(
+            "job",
+            format!(
+                "{} on queue {} (priority {})",
+                spec.template.kind, spec.template.queue, spec.template.priority
+            ),
+        );
+    if !spec.template.payload.is_null() {
+        f.add(
+            "payload",
+            belay_json::to_string_pretty(&spec.template.payload),
+        );
+    }
+    f.add("misfire", spec.misfire).add("overlap", spec.overlap);
+    if !spec.jitter.is_zero() {
+        f.add("jitter", format_duration(spec.jitter));
+    }
+    f.opt("calendar", spec.calendar.as_ref())
+        .opt("starts at", spec.starts_at)
+        .opt("ends at", spec.ends_at)
+        .opt("description", spec.description.as_ref())
+        .add("created", when(schedule.created_at, now))
+        .add("updated", when(schedule.updated_at, now));
+    f
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fields_describe_the_expression_in_words() {
+        let spec = ScheduleSpec::new(
+            ScheduleId::from_static("weekday-report"),
+            "30 9 * * MON-FRI",
+            JobSpec::new("reports", "build"),
+        )
+        .timezone("America/New_York");
+        let now = Timestamp::from_secs(1_741_359_600);
+        let schedule = Schedule::new(spec, Some(now + Duration::from_secs(3600)), now);
+        let text = schedule_fields(&schedule, now).render(false);
+        assert!(
+            text.contains("\ncron       30 9 * * MON-FRI  (at 09:30 on Monday through Friday)\n"),
+            "{text}"
+        );
+        assert!(text.contains("(in 1h)"), "{text}");
+        assert!(
+            text.contains("\njob        build on queue reports (priority 0)\n"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn inline_flags_are_all_declared() {
+        let tree = crate::commands::tree();
+        let add = &tree.walk(&["schedule", "add"])[2];
+        for flag in INLINE_FLAGS {
+            assert!(
+                add.flags().iter().any(|f| f.long() == *flag),
+                "--{flag} is not a flag of schedule add"
+            );
+        }
+    }
+}
