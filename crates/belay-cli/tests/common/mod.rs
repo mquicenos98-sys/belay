@@ -210,3 +210,206 @@ struct State {
 fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
 }
+
+/// The fake server; shut down when dropped.
+pub struct Fake {
+    handle: Option<ServerHandle>,
+    state: Arc<State>,
+}
+
+impl Fake {
+    pub fn start() -> Fake {
+        let state = Arc::new(State::default());
+        let mut router = Router::new();
+        for (method, pattern) in ROUTES {
+            let state = Arc::clone(&state);
+            router.route(method.clone(), pattern, move |req: &mut Request| {
+                answer(&state, req)
+            });
+        }
+        let config = ServerConfig {
+            keep_alive_timeout: Duration::from_secs(2),
+            shutdown_grace: Duration::from_secs(2),
+            poll_interval: Duration::from_millis(10),
+            ..ServerConfig::default()
+        };
+        let handle = Server::bind("127.0.0.1:0", config)
+            .expect("bind an ephemeral port")
+            .spawn(router)
+            .expect("spawn the fake server");
+        Fake {
+            handle: Some(handle),
+            state,
+        }
+    }
+
+    pub fn addr(&self) -> SocketAddr {
+        self.handle.as_ref().expect("running").local_addr()
+    }
+
+    pub fn url(&self) -> String {
+        format!("http://{}", self.addr())
+    }
+
+    /// A runner pointed at the fake, with the test clock.
+    pub fn runner(&self) -> Runner {
+        runner().env("BELAY_URL", self.url())
+    }
+
+    /// Runs `belay <line>` against the fake.
+    pub fn belay(&self, line: &str) -> Output {
+        run_with(&self.runner(), line)
+    }
+
+    pub fn reply_with(&self, reply: impl FnOnce(&Request) -> Response + Send + 'static) {
+        guard(&self.state.replies).push_back(Box::new(reply));
+    }
+
+    pub fn reply_json<T: ToJson + ?Sized>(&self, status: u16, body: &T) {
+        let bytes = encode_body(body);
+        self.reply_with(move |_| {
+            Response::json_bytes(bytes).with_status(StatusCode::from_u16(status).expect("status"))
+        });
+    }
+
+    pub fn reply_error(&self, error: ApiError) {
+        self.reply_json(error.http_status(), &error);
+    }
+
+    pub fn reply_status(&self, status: u16) {
+        self.reply_with(move |_| Response::status(StatusCode::from_u16(status).expect("status")));
+    }
+
+    pub fn requests(&self) -> Vec<Seen> {
+        guard(&self.state.seen).clone()
+    }
+
+    /// The only request seen; fails if there were more or none.
+    #[track_caller]
+    pub fn only(&self) -> Seen {
+        let seen = self.requests();
+        assert_eq!(seen.len(), 1, "expected exactly one request, saw {seen:#?}");
+        seen.into_iter().next().expect("one request")
+    }
+
+    pub fn calls(&self) -> Vec<String> {
+        self.requests().iter().map(Seen::call).collect()
+    }
+}
+
+impl Drop for Fake {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.shutdown_and_join();
+        }
+    }
+}
+
+fn answer(state: &State, req: &mut Request) -> Response {
+    let route = req
+        .extensions
+        .get::<MatchedRoute>()
+        .map(|r| r.as_str().to_owned())
+        .unwrap_or_default();
+    guard(&state.seen).push(Seen {
+        method: req.method.clone(),
+        route,
+        path: req.path.clone(),
+        query: req
+            .query
+            .iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect(),
+        authorization: req.headers.get("authorization").map(str::to_owned),
+        body: req.body.clone(),
+    });
+    let reply = guard(&state.replies).pop_front();
+    match reply {
+        Some(reply) => reply(req),
+        None => {
+            let error = ApiError::internal(format!(
+                "fake server has no reply queued for {} {}",
+                req.method, req.path
+            ));
+            Response::json_bytes(encode_body(&error)).with_status(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+pub fn job_id(n: u8) -> JobId {
+    format!("01HQ3K9Z8N6V2T4R5S7W0X1Y{n:02}")
+        .parse()
+        .expect("valid job id")
+}
+
+/// A ready job on queue `emails`, created a minute before [`t0`].
+pub fn sample_job(n: u8) -> Job {
+    Job::new(
+        job_id(n),
+        JobSpec::new("emails", "send"),
+        t0() - Duration::from_secs(60),
+    )
+}
+
+/// A real server over an in-memory engine on an ephemeral port.
+pub struct Live {
+    pub handle: Option<belay_server::ServerHandle>,
+    pub engine: Arc<Engine>,
+    pub url: String,
+}
+
+impl Live {
+    pub fn start() -> Live {
+        Live::with_config(Config::dev())
+    }
+
+    pub fn with_config(config: Config) -> Live {
+        let engine = Arc::new(Engine::start(config).expect("engine starts"));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port");
+        let handle = belay_server::serve_on(Arc::clone(&engine), listener).expect("server starts");
+        let url = format!("http://{}", handle.local_addr());
+        Live {
+            handle: Some(handle),
+            engine,
+            url,
+        }
+    }
+
+    /// A runner pointed at this server, with the real clock.
+    pub fn runner(&self) -> Runner {
+        Runner::isolated().env("BELAY_URL", self.url.clone())
+    }
+
+    /// Runs `belay <line>` against this server.
+    pub fn belay(&self, line: &str) -> Output {
+        run_with(&self.runner(), line)
+    }
+
+    /// Like [`belay`](Self::belay), reading `stdin`.
+    pub fn belay_stdin(&self, stdin: &str, line: &str) -> Output {
+        run_with(&self.runner().stdin(stdin.as_bytes().to_vec()), line)
+    }
+}
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.shutdown_and_join();
+        }
+    }
+}
+
+/// Polls `check` every few milliseconds until it holds or `timeout`
+/// passes; returns whether it held.
+pub fn eventually(timeout: Duration, mut check: impl FnMut() -> bool) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if check() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
