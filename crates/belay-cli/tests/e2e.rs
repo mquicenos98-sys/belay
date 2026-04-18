@@ -352,3 +352,35 @@ fn admin_shutdown_stops_the_server() {
     handle.wait();
     assert!(live.engine.is_shutting_down());
 }
+
+/// Output shared with a command running on another thread.
+#[derive(Clone, Default)]
+struct Shared(Arc<Mutex<Vec<u8>>>);
+
+impl Shared {
+    fn text(&self) -> String {
+        let bytes = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+}
+
+impl Write for Shared {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A long-lived command running on its own thread.
+struct Background {
+    out: Shared,
+    err: Shared,
+    thread: JoinHandle<Exit>,
+}
