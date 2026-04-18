@@ -135,3 +135,30 @@ fn version_flag_and_command() {
     assert_eq!(belay("version -q").ok().stdout, format!("{version}\n"));
     assert_eq!(belay("version --json").ok().json()["version"], version);
 }
+
+#[test]
+fn unknown_commands_suggest_the_closest_one() {
+    let out = belay("schedul list").exits(Exit::Usage);
+    assert!(out.stdout.is_empty());
+    assert_eq!(
+        out.stderr,
+        "error: unknown command \"schedul\" for \"belay\"\n\
+         hint: did you mean \"schedule\"?\n\
+         \n\
+         Usage: belay [OPTIONS] <COMMAND>\n\
+         For more information, try 'belay --help'.\n"
+    );
+}
+
+#[test]
+fn unknown_flags_suggest_and_show_the_command_usage() {
+    let out = belay("enqueue emails send --prioirty 5").exits(Exit::Usage);
+    assert_eq!(
+        out.stderr,
+        "error: unknown option --prioirty for \"belay enqueue\"\n\
+         hint: did you mean --priority?\n\
+         \n\
+         Usage: belay enqueue [OPTIONS] <QUEUE> <KIND>\n\
+         For more information, try 'belay enqueue --help'.\n"
+    );
+}
