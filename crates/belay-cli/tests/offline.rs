@@ -74,3 +74,52 @@ fn cron_explain_json_is_structured() {
         json!(["2025-03-04T05:15:00Z", "2025-03-04T05:30:00Z"])
     );
 }
+
+#[test]
+fn cron_errors_point_at_the_column() {
+    let out = belay("cron next '0 61 * * *'").exits(Exit::Usage);
+    assert!(
+        out.stderr.starts_with(
+            "error: invalid cron expression: invalid value 61 in hour field (0-23) at column 3\n"
+        ),
+        "{}",
+        out.stderr
+    );
+    let out = belay("cron next '* * * * *' --tz Europe/Berln").exits(Exit::Usage);
+    assert!(
+        out.stderr.contains("did you mean \"Europe/Berlin\"?"),
+        "{}",
+        out.stderr
+    );
+    assert!(out
+        .stderr
+        .contains("hint: list known zones with `belay cron zones`"));
+}
+
+#[test]
+fn cron_that_never_fires_fails_next_but_explains() {
+    let out = belay("cron next '0 0 30 2 *'").exits(Exit::Failure);
+    assert!(out.stderr.contains("never fires"), "{}", out.stderr);
+    let out = belay("cron explain '0 0 30 2 *'").ok();
+    assert!(
+        out.stdout.contains("never: no future time matches"),
+        "{}",
+        out.stdout
+    );
+    let out = belay("cron next '* * * * *' -n 0").exits(Exit::Usage);
+    assert!(out.stderr.contains("--count must be between 1 and 1000"));
+}
+
+#[test]
+fn cron_zones_filters_case_insensitively() {
+    assert_eq!(
+        belay("cron zones new_york").ok().stdout,
+        "America/New_York\n"
+    );
+    let out = belay("cron zones nowhere").ok();
+    assert!(out.stdout.is_empty());
+    assert!(out.stderr.contains("no zone matches"));
+    assert!(belay("cron zones").ok().stdout.lines().count() > 50);
+}
+
+// ---- config ---------------------------------------------------------------
