@@ -284,3 +284,124 @@ fn job_list_all_follows_cursors() {
     assert!(seen[1].query.iter().any(|(k, _)| k == "cursor"));
     fake.belay("job list --all --cursor abc").exits(Exit::Usage);
 }
+
+#[test]
+fn job_get_shows_a_detail_block() {
+    let fake = Fake::start();
+    let mut job = sample_job(1);
+    job.spec.payload = json!({"user": 42});
+    job.spec.tags = vec!["vip".into()];
+    job.record_error(JobError::new(t0() - Duration::from_secs(30), 1, "timeout").kind("io"));
+    fake.reply_json(200, &job);
+    let text = fake.belay(&format!("job get {}", job_id(1))).ok().stdout;
+    assert!(
+        text.starts_with(&format!("id        {}\n", job_id(1))),
+        "{text}"
+    );
+    for line in [
+        "\nstate     ready\n",
+        "\nattempt   0 of 25\n",
+        "\ncreated   2025-03-04T05:05:07.089Z (1m ago)\n",
+        "\ntags      vip\n",
+        "\npayload   {\n            \"user\": 42\n          }\n",
+        "\nerrors    #1 30s ago: timeout [io]\n",
+    ] {
+        assert!(text.contains(line), "{line:?} missing from\n{text}");
+    }
+}
+
+#[test]
+fn job_actions_accept_several_ids_and_report_each_failure() {
+    let fake = Fake::start();
+    let mut cancelled = sample_job(1);
+    cancelled.state = JobState::Cancelled;
+    fake.reply_json(200, &cancelled);
+    fake.reply_error(ApiError::not_found("job", job_id(2)));
+    let out = fake
+        .belay(&format!("job cancel {} {}", job_id(1), job_id(2)))
+        .exits(Exit::NotFound);
+    assert_eq!(
+        out.stdout,
+        format!("cancelled {} (now cancelled)\n", job_id(1))
+    );
+    assert_eq!(
+        out.stderr,
+        format!(
+            "error: {id}: job {id} not found\nerror: 1 of 2 jobs could not be cancelled\n",
+            id = job_id(2)
+        )
+    );
+    assert_eq!(
+        fake.calls(),
+        ["POST /v1/jobs/:id/cancel", "POST /v1/jobs/:id/cancel"]
+    );
+}
+
+#[test]
+fn deleting_and_retrying_jobs() {
+    let fake = Fake::start();
+    fake.reply_status(204);
+    let out = fake.belay(&format!("job rm {}", job_id(1))).ok();
+    assert_eq!(out.stdout, format!("deleted {}\n", job_id(1)));
+    fake.reply_json(200, &sample_job(2));
+    let json = fake
+        .belay(&format!("job retry {} --json", job_id(2)))
+        .ok()
+        .json();
+    assert_eq!(json["state"], "ready");
+    assert_eq!(
+        fake.calls(),
+        ["DELETE /v1/jobs/:id", "POST /v1/jobs/:id/retry"]
+    );
+}
+
+// ---- queues -------------------------------------------------------------------
+
+#[test]
+fn queue_list_shows_counts() {
+    let fake = Fake::start();
+    let mut emails = QueueInfo::new(QueueName::from_static("emails"));
+    emails.counts.ready = 12;
+    emails.counts.dead = 2;
+    emails.oldest_ready_age = Some(Duration::from_secs(200));
+    let mut paused = QueueInfo::new(QueueName::from_static("reports"));
+    paused.paused = true;
+    fake.reply_json(200, &Page::last(vec![emails, paused]));
+    assert_eq!(
+        fake.belay("queue list").ok().stdout,
+        "QUEUE    STATE   READY  SCHED  RUNNING  RETRY  DEAD  OLDEST  DONE/S\n\
+         emails   active     12      0        0      0     2   3m20s     0.0\n\
+         reports  paused      0      0        0      0     0       -     0.0\n"
+    );
+}
+
+#[test]
+fn queue_config_set_merges_into_the_current_configuration() {
+    let fake = Fake::start();
+    let info = QueueInfo::new(QueueName::from_static("emails"));
+    fake.reply_json(200, &info);
+    let mut updated = info.clone();
+    updated.config.max_concurrency = Some(8);
+    updated.config.rate_limit = Some(RateLimit::new(5.0, 10));
+    fake.reply_json(200, &updated);
+    let out = fake
+        .belay(
+            "queue config emails --set max_concurrency=8 --set rate_limit.per_second=5 \
+             --set rate_limit.burst=10 --set retention.dead=30d",
+        )
+        .ok();
+    assert!(
+        out.stdout
+            .starts_with("updated queue emails\nmax_concurrency = 8\n"),
+        "{}",
+        out.stdout
+    );
+    let seen = fake.requests();
+    assert_eq!(seen[1].call(), "PUT /v1/queues/:name/config");
+    let body = seen[1].json();
+    assert_eq!(body["max_concurrency"], 8);
+    assert_eq!(body["rate_limit"]["per_second"].as_f64(), Some(5.0));
+    assert_eq!(body["rate_limit"]["burst"], 10);
+    assert_eq!(body["retention"]["dead"], "30d");
+    assert_eq!(body["retention"]["succeeded"], "1d");
+}
