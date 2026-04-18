@@ -110,3 +110,99 @@ pub(crate) fn server(ctx: &mut Ctx<'_>, m: &Matches) -> Result<()> {
     ctx.out.done("server stopped")?;
     Ok(())
 }
+
+pub(crate) fn dev(ctx: &mut Ctx<'_>, m: &Matches) -> Result<()> {
+    let mut config = Config::dev();
+    config.server.listen = m.require("listen")?;
+    if !config.server.is_loopback() {
+        return Err(m
+            .constraint(format!(
+                "dev serves without authentication, so it only listens on loopback addresses, \
+                 not {}",
+                config.server.listen
+            ))
+            .with_hint("use `belay server` with [[auth.tokens]] to serve other hosts")
+            .into());
+    }
+    if let Some(dir) = m.get::<PathBuf>("data")? {
+        config.storage.in_memory = false;
+        config.storage.dir = dir;
+    }
+    config.server.shutdown_grace = Duration::from_secs(5);
+    let slots: usize = m.get_or("workers", 4)?;
+    let queues: Vec<QueueName> = m.get_list("queues")?;
+    if queues.is_empty() && !m.flag("no-worker") {
+        return Err(m.constraint("--queues needs at least one queue").into());
+    }
+    let storage = if config.storage.in_memory {
+        "memory (lost on exit)".to_owned()
+    } else {
+        format!("{} (kept)", config.storage.dir.display())
+    };
+    belay_common::log::init_stderr(
+        Filter::new(service_log_level(ctx.verbose, ctx.out.quiet)),
+        LogFormat::Logfmt,
+    );
+
+    let engine = Arc::new(Engine::start(config)?);
+    let handle = belay_server::serve(Arc::clone(&engine))?;
+    let url = format!("http://{}", handle.local_addr());
+    let worker = if m.flag("no-worker") {
+        None
+    } else {
+        let registry = worker::registry(true, m.get_all("allow")?);
+        let worker_config = WorkerConfig::new(WorkerId::from_static("dev-worker"), queues.clone())
+            .concurrency(slots)
+            .poll_wait(Duration::from_secs(1))
+            .shutdown_grace(Duration::from_secs(5));
+        let kinds: Vec<String> = registry.kinds().map(str::to_owned).collect();
+        let started = engine.embedded_worker(registry, worker_config)?;
+        Some((started, kinds))
+    };
+
+    if ctx.out.json {
+        ctx.out
+            .json_line(&json!({"url": url.as_str(), "node": engine.node_id()}))?;
+    } else if !ctx.out.quiet {
+        let worker_line = match &worker {
+            Some((_, kinds)) => {
+                let names: Vec<&str> = queues.iter().map(QueueName::as_str).collect();
+                format!(
+                    "{slots} slots on {}; kinds {}",
+                    names.join(", "),
+                    kinds.join(", ")
+                )
+            }
+            None => "off".to_owned(),
+        };
+        let url_flag = if url == belay_client::DEFAULT_URL {
+            String::new()
+        } else {
+            format!("--url {url} ")
+        };
+        let first_queue = queues.first().map_or("default", QueueName::as_str);
+        ctx.out.text(&format!(
+            "belay {} dev server\n  api      {url}\n  storage  {storage}\n  worker   {worker_line}\n\
+             try:  belay {url_flag}enqueue {first_queue} echo --payload '{{\"hello\": \"world\"}}' --wait\n\
+             stop: belay {url_flag}admin shutdown (or Ctrl-C)\n",
+            env!("CARGO_PKG_VERSION"),
+        ))?;
+    } else {
+        ctx.out.line(&url)?;
+    }
+    ctx.out.flush()?;
+    drop(engine);
+
+    // Stop the worker as soon as the drain starts, while the engine still
+    // takes its results; the server stops the engine once it has drained.
+    while !handle.is_shutting_down() {
+        std::thread::sleep(SHUTDOWN_POLL);
+    }
+    if let Some((worker, _)) = worker {
+        let report = worker.stop();
+        belay_common::info!("dev worker stopped"; stats = %report.stats);
+    }
+    handle.wait();
+    ctx.out.done("dev server stopped")?;
+    Ok(())
+}
