@@ -186,3 +186,27 @@ fn steps_grid(run: &Workflow, now: Timestamp) -> Grid {
     }
     grid
 }
+
+fn wait(
+    ctx: &mut Ctx<'_>,
+    client: &belay_client::Client,
+    id: WorkflowId,
+    timeout: Option<Duration>,
+) -> Result<Workflow> {
+    let started = Instant::now();
+    let mut pause = Duration::from_millis(50);
+    loop {
+        let run = client.workflows().get(id)?;
+        if run.state.is_terminal() {
+            return Ok(run);
+        }
+        if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+            return Err(Error::Failed {
+                message: format!("workflow {id} is still running"),
+                hint: Some(format!("follow it with `belay workflow get {id}`")),
+            });
+        }
+        ctx.pause(pause);
+        pause = (pause * 2).min(Duration::from_millis(500));
+    }
+}
