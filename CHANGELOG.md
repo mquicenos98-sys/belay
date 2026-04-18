@@ -5,6 +5,106 @@ All notable changes to belay are documented here. The format is based on
 follows [Semantic Versioning](https://semver.org/) (while it is at 0.x, a
 minor version may break things; the notes say when it does).
 
+## [0.3.0] - 2026-04-17
+
+The server. belay is now a single binary that serves an HTTP/JSON API
+from its own storage, runs workers, and joins other nodes in a cluster;
+the libraries of 0.1 and 0.2 are its engine.
+
+### Added
+
+- `belay-http`: HTTP/1.1 on `std::net`. A server that gives each
+  connection a thread from an elastic pool, with keep-alive, chunked
+  bodies, `Expect: 100-continue`, limits and timeouts answered with the
+  right status, a router with parameters, `405` with `Allow` and
+  automatic `HEAD` and `OPTIONS`, middleware (request ids, access log,
+  panic catcher, CORS), and server-sent events. A client with connection
+  pooling, opt-in redirects, and an event stream reader that resumes
+  with `Last-Event-ID`. Plain HTTP only.
+- `belay-metrics`: counters, gauges, histograms and sliding-window
+  summaries with labels, rendered in the Prometheus text format, and
+  process metrics.
+- `belay-cluster`: SWIM membership over UDP with suspicion, dynamic
+  suspicion timeouts, gossip, push-pull anti-entropy and graceful leave,
+  and rendezvous hashing of keys over the live members. A pure,
+  tick-driven state machine, simulated in the tests under loss and
+  partitions. Ownership only: there is no replication.
+- `belay-core`: the `Engine`, which wires the store, the queue, the
+  scheduler, workflows, an event bus, metrics and clustering together,
+  runs their periodic duties, and implements `JobSource` for in-process
+  workers. Configured from one TOML file with `BELAY_<SECTION>__<KEY>`
+  environment overrides, errors pointing at the offending line, and
+  warnings for unknown keys.
+- `belay-server`: the HTTP/JSON API, version 1: jobs, the worker
+  protocol with long-polling leases, queues, schedules, calendars,
+  workflows, workers, cluster members and administration. Bearer tokens
+  (in the clear or as SHA-256) with `admin`, `enqueue`, `work` and `read`
+  scopes, per-token rate limits, request ids and access logs,
+  `/metrics`, `/healthz` and `/readyz`, an event stream at `/v1/events`
+  with resume and lag frames, `307` redirects to the node that owns a
+  queue or schedule, and graceful shutdown with
+  `POST /v1/admin/shutdown`.
+- `belay-client`: a typed Rust client for every endpoint, with retries
+  of safe requests, cluster redirects, lazy pagination and resuming
+  event streams. It implements `JobSource`, so the worker runtime can
+  lease jobs over HTTP.
+- `belay-cli`: the `belay` binary. `server` runs from a configuration
+  file, `dev` runs an in-memory server with a built-in worker, `worker`
+  runs the built-in handlers against a server; commands manage jobs,
+  queues, schedules, calendars, workflows and events; `cron`, `config`
+  and `admin store-inspect` work offline. Aligned tables or `--json`,
+  and documented exit statuses.
+
+### Fixed
+
+- Job listings from the queue engine exposed the lease tokens of
+  running jobs, letting anyone who could list jobs report on them in
+  place of their workers; they are now redacted like single-job reads.
+- `fire_once` stamped its catch-up job with the latest missed time
+  instead of the first, so a fire retried after a crash could run twice.
+- `skip_dependents` skipped only the direct dependents of a failed step;
+  steps further down with an `always` or `any_failed` condition still
+  ran.
+- A string result placed inside a longer workflow payload string kept
+  its JSON quotes.
+- Paging through workflow runs newest first repeated the newest run on
+  the second page.
+- Tenant weights had no effect when workers leased one job at a time:
+  the front tenant got a fresh turn on every lease.
+- Workers renewed leases every half `lease_for` by default, leaving no
+  room for a failed heartbeat; the default is now every third.
+- Progress reported by a handler was lost when the heartbeat carrying it
+  failed.
+- A POSIX time zone rule for the last weekday of a month (`Mm.5.d`)
+  could land on the 1st of the next month: Europe/Berlin's switch back
+  to winter time in 2026 came out as November 1.
+- A numeric last-weekday item (`5L`) ignored the dialect's weekday
+  numbering: in the Quartz dialect it meant the wrong day, and `7L`
+  never matched.
+- Expressions that repeat within a minute through the seconds field
+  (`*/10 0 1 * * *`) were not treated as periodic, and skipped the
+  repeated hour when clocks went back.
+- `@weekly` did not parse in the Quartz dialect.
+- The description of an hour range ended on the hour ("between 09:00
+  and 17:00" for `*/15 9-17 * * *`); it now ends at 17:59.
+- Timestamps with fewer than three fraction digits (`.5Z`) were read as
+  milliseconds rather than tenths of a second.
+- A ULID containing a non-ASCII character was rejected with a misleading
+  length.
+- The JSON parser rejected carriage returns between tokens, so documents
+  with Windows line endings failed.
+- Writing JSON to a stream reported I/O errors as a formatting failure,
+  losing the error kind.
+- `EventFilter` treated `from` as exclusive, so resuming after
+  `Last-Event-ID` dropped one event.
+- The store's `wal_bytes` statistic left out the active log segment, and
+  size-triggered checkpoints came up to a segment late.
+- A log filter directive for a module also matched modules whose names
+  merely began with it (`belay_cluster::member` matched
+  `belay_cluster::membership`).
+- A configuration value replaced by an environment variable was still
+  reported at its old line in error messages.
+
 ## [0.2.0] - 2025-09-12
 
 Schedules, calendars and workflows. Still an embeddable library; the
