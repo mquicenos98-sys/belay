@@ -139,3 +139,50 @@ pub(crate) fn run(ctx: &mut Ctx<'_>, m: &Matches, action: &str) -> Result<()> {
     }
     Ok(())
 }
+
+/// The run's summary and a table of its steps in declaration order.
+fn show(ctx: &mut Ctx<'_>, run: &Workflow) -> Result<()> {
+    let now = ctx.now();
+    let mut f = Fields::new();
+    f.add("id", run.id)
+        .add("name", &run.spec.name)
+        .state("state", run.state.as_str())
+        .add("created", when(run.created_at, now))
+        .opt("finished", run.finished_at.map(|t| when(t, now)));
+    ctx.out.fields(&f)?;
+    ctx.out.line("")?;
+    ctx.out.grid(&steps_grid(run, now), "no steps")?;
+    Ok(())
+}
+
+fn steps_grid(run: &Workflow, now: Timestamp) -> Grid {
+    let mut grid = Grid::new(&["STEP", "STATE", "JOB", "AFTER", "STARTED", "TOOK"])
+        .paint("STATE", state_style);
+    for step in &run.spec.steps {
+        let Some(status) = run.steps.get(&step.name) else {
+            continue;
+        };
+        grid.push([
+            step.name.clone(),
+            status.state.to_string(),
+            status
+                .job
+                .map(|j| j.to_string())
+                .unwrap_or_else(|| "-".to_owned()),
+            if step.depends_on.is_empty() {
+                "-".to_owned()
+            } else {
+                step.depends_on.join(",")
+            },
+            status
+                .started_at
+                .map(|t| relative(t, now))
+                .unwrap_or_else(|| "-".to_owned()),
+            match (status.started_at, status.finished_at) {
+                (Some(s), Some(f)) => approx(f.saturating_duration_since(s)),
+                _ => "-".to_owned(),
+            },
+        ]);
+    }
+    grid
+}
