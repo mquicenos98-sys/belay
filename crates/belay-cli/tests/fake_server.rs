@@ -500,3 +500,141 @@ fn schedule_add_builds_the_spec_and_checks_the_expression_first() {
         json!({"queue": "reports", "kind": "build", "payload": {"full": true}, "priority": 0})
     );
 }
+
+#[test]
+fn schedule_add_from_a_toml_file_uses_put_with_replace() {
+    let fake = Fake::start();
+    let dir = belay_common::fs::TempDir::new().unwrap();
+    let file = dir.join("nightly.toml");
+    std::fs::write(
+        &file,
+        "id = \"nightly\"\ncron = \"@daily\"\n[template]\nqueue = \"reports\"\nkind = \"build\"\n",
+    )
+    .unwrap();
+    let path = file.to_string_lossy().into_owned();
+    let out = fake
+        .belay(&format!("schedule add --file '{path}' --cron @hourly"))
+        .exits(Exit::Usage);
+    assert!(
+        out.stderr.contains("--file cannot be combined with --cron"),
+        "{}",
+        out.stderr
+    );
+    let out = fake
+        .belay(&format!("schedule add other --file '{path}'"))
+        .exits(Exit::Usage);
+    assert!(out
+        .stderr
+        .contains("the file defines schedule nightly, not other"));
+
+    let spec = ScheduleSpec::new(
+        "nightly".parse().unwrap(),
+        "@daily",
+        JobSpec::new("reports", "build"),
+    );
+    fake.reply_json(200, &Schedule::new(spec, None, t0()));
+    let out = fake
+        .belay(&format!("schedule add --file '{path}' --replace"))
+        .ok();
+    assert_eq!(
+        out.stdout,
+        "saved schedule nightly; it will not fire again\n"
+    );
+    let seen = fake.only();
+    assert_eq!(seen.call(), "PUT /v1/schedules/:id");
+    assert_eq!(seen.json()["cron"], "@daily");
+}
+
+#[test]
+fn schedule_trigger_and_preview() {
+    let fake = Fake::start();
+    fake.reply_json(200, &TriggerResponse { job: job_id(9) });
+    let out = fake.belay("schedule trigger nightly -q").ok();
+    assert_eq!(out.stdout, format!("{}\n", job_id(9)));
+
+    let times = vec![t0() + Duration::from_secs(3600)];
+    fake.reply_json(200, &PreviewResponse { times });
+    let out = fake.belay("schedule preview nightly -n 1 --json").ok();
+    assert_eq!(out.json(), json!(["2025-03-04T06:06:07.089Z"]));
+    assert_eq!(fake.requests()[1].query_pairs(), [("n", "1")]);
+}
+
+// ---- system and admin -------------------------------------------------------------
+
+#[test]
+fn info_flags_clock_skew() {
+    let fake = Fake::start();
+    let info = ServerInfo {
+        version: env!("CARGO_PKG_VERSION").into(),
+        node: "n1".into(),
+        started_at: t0() - Duration::from_secs(3600),
+        uptime: Duration::from_secs(3600),
+        time: t0() + Duration::from_secs(90),
+        storage: "memory".into(),
+        cluster_size: 1,
+    };
+    fake.reply_json(200, &info);
+    fake.reply_status(200);
+    let text = fake.belay("info").ok().stdout;
+    for line in [
+        "node     n1\n",
+        "uptime   1h\n",
+        "clock    server clock is 1m30s ahead of this machine\n",
+        "ready    yes\n",
+    ] {
+        assert!(text.contains(line), "{line:?} missing from\n{text}");
+    }
+}
+
+#[test]
+fn admin_checkpoint_and_verify() {
+    let fake = Fake::start();
+    let done = CheckpointResponse {
+        seq: 42,
+        took: Duration::from_millis(12),
+    };
+    fake.reply_json(200, &done);
+    assert_eq!(
+        fake.belay("admin checkpoint").ok().stdout,
+        "checkpoint written through seq 42 in 12ms\n"
+    );
+
+    fake.reply_json(
+        200,
+        &json!({
+            "consistent": false, "jobs": 3, "queues": 1, "claims": 0,
+            "problems": ["job X indexed as ready but stored as dead"], "more_problems": 0
+        }),
+    );
+    let out = fake.belay("admin verify").exits(Exit::Failure);
+    assert!(
+        out.stdout
+            .starts_with("inconsistent: checked 3 jobs, 1 queue, 0 uniqueness claims\n"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("  job X indexed as ready"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stderr.contains("disagree with its store (1 problem)"),
+        "{}",
+        out.stderr
+    );
+    assert_eq!(
+        fake.calls(),
+        ["POST /v1/admin/checkpoint", "GET /v1/admin/verify"]
+    );
+}
+
+// ---- failures ------------------------------------------------------------------------
+
+#[test]
+fn missing_resources_exit_with_status_3() {
+    let fake = Fake::start();
+    fake.reply_error(ApiError::not_found("queue", "nope"));
+    let out = fake.belay("queue info nope").exits(Exit::NotFound);
+    assert_eq!(out.stderr, "error: queue nope not found\n");
+}
