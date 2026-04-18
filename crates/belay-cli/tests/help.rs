@@ -162,3 +162,112 @@ fn unknown_flags_suggest_and_show_the_command_usage() {
          For more information, try 'belay enqueue --help'.\n"
     );
 }
+
+#[test]
+fn typed_values_are_checked_before_anything_is_sent() {
+    // No server is configured: a request would fail with status 4, not 2.
+    let cases = [
+        (
+            "enqueue q k --priority abc",
+            r#"invalid value "abc" for --priority: expected an integer"#,
+        ),
+        (
+            "enqueue q k --priority 40000",
+            r#"invalid value "40000" for --priority: expected an integer between -32768 and 32767"#,
+        ),
+        (
+            "enqueue q k --priority 5000",
+            "invalid job: $.priority: must be between -1000 and 1000, got 5000",
+        ),
+        ("enqueue Emails k", r#"invalid value "Emails" for <QUEUE>:"#),
+        (
+            "job list --state dead,zombie",
+            r#"invalid value "zombie" for --state: unknown job state "zombie""#,
+        ),
+        (
+            "enqueue q k --delay soon",
+            r#"invalid value "soon" for --delay:"#,
+        ),
+        (
+            "enqueue q k --payload {oops",
+            "invalid value for --payload: invalid JSON:",
+        ),
+        (
+            "enqueue q k --meta novalue",
+            r#"invalid value "novalue" for --meta: expected KEY=VALUE"#,
+        ),
+        (
+            "job get not-an-id",
+            r#"invalid value "not-an-id" for <ID>:"#,
+        ),
+        (
+            "enqueue q k --delay 1m --run-at 2025-01-01T00:00:00Z",
+            "--delay cannot be used together with --run-at",
+        ),
+        (
+            "enqueue q k --on-conflict reject",
+            "--on-conflict needs --unique",
+        ),
+        ("job", "\"belay job\" needs a command"),
+        ("job get", "missing argument <ID> for \"belay job get\""),
+        (
+            "queue info a b",
+            "unexpected argument \"b\" for \"belay queue info\"",
+        ),
+        (
+            "enqueue q k --wait=yes",
+            "option --wait does not take a value, got \"yes\"",
+        ),
+        (
+            "enqueue q k --payload",
+            "option --payload needs a value (--payload <JSON>)",
+        ),
+        (
+            "enqueue q k -p 1 -p 2",
+            "option --priority was given more than once",
+        ),
+    ];
+    for (line, message) in cases {
+        let out = belay(line).exits(Exit::Usage);
+        assert!(
+            out.stderr.starts_with(&format!("error: {message}")),
+            "{line}: {}",
+            out.stderr
+        );
+        assert!(out.stdout.is_empty(), "{line}");
+    }
+}
+
+#[test]
+fn invalid_environment_values_name_their_variable() {
+    let out = run_with(&runner().env("BELAY_URL", "ftp://nowhere"), "info").exits(Exit::Failure);
+    assert!(
+        out.stderr.contains("base_url must use http://"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("hint: --url takes an address"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn test_command_lines_split_like_a_shell() {
+    assert_eq!(
+        words(r#"enqueue q k -d '{"a": 1}' --cron "0 9 * * MON"  x''"#),
+        [
+            "enqueue",
+            "q",
+            "k",
+            "-d",
+            r#"{"a": 1}"#,
+            "--cron",
+            "0 9 * * MON",
+            "x"
+        ]
+    );
+    assert_eq!(words("a '' b"), ["a", "", "b"]);
+    assert!(words("  ").is_empty());
+}
