@@ -102,3 +102,81 @@ pub fn t0() -> Timestamp {
 pub fn runner() -> Runner {
     Runner::isolated().clock(ManualClock::new(t0()).shared())
 }
+
+/// Runs `belay <line>` with `runner`.
+pub fn run_with(runner: &Runner, line: &str) -> Output {
+    run_args(runner, words(line))
+}
+
+/// Runs `belay` with already split arguments.
+pub fn run_args(runner: &Runner, args: Vec<String>) -> Output {
+    let (mut out, mut err) = (Vec::new(), Vec::new());
+    let exit = runner.run(args, &mut out, &mut err);
+    Output {
+        exit,
+        stdout: String::from_utf8(out).expect("stdout is UTF-8"),
+        stderr: String::from_utf8(err).expect("stderr is UTF-8"),
+    }
+}
+
+/// Runs `belay <line>` in an isolated environment.
+pub fn belay(line: &str) -> Output {
+    run_with(&runner(), line)
+}
+
+/// Every route of the v1 API, so wrong paths and methods get the router's
+/// 404/405 rather than a canned success.
+const ROUTES: &[(Method, &str)] = &[
+    (Method::Get, "/healthz"),
+    (Method::Get, "/readyz"),
+    (Method::Get, "/v1/info"),
+    (Method::Post, "/v1/jobs"),
+    (Method::Get, "/v1/jobs"),
+    (Method::Get, "/v1/jobs/:id"),
+    (Method::Delete, "/v1/jobs/:id"),
+    (Method::Post, "/v1/jobs/:id/cancel"),
+    (Method::Post, "/v1/jobs/:id/retry"),
+    (Method::Post, "/v1/jobs/:id/promote"),
+    (Method::Get, "/v1/queues"),
+    (Method::Get, "/v1/queues/:name"),
+    (Method::Delete, "/v1/queues/:name"),
+    (Method::Put, "/v1/queues/:name/config"),
+    (Method::Post, "/v1/queues/:name/pause"),
+    (Method::Post, "/v1/queues/:name/resume"),
+    (Method::Post, "/v1/queues/:name/purge"),
+    (Method::Get, "/v1/schedules"),
+    (Method::Post, "/v1/schedules"),
+    (Method::Get, "/v1/schedules/:id"),
+    (Method::Put, "/v1/schedules/:id"),
+    (Method::Delete, "/v1/schedules/:id"),
+    (Method::Post, "/v1/schedules/:id/pause"),
+    (Method::Post, "/v1/schedules/:id/resume"),
+    (Method::Post, "/v1/schedules/:id/trigger"),
+    (Method::Get, "/v1/schedules/:id/preview"),
+    (Method::Get, "/v1/calendars"),
+    (Method::Get, "/v1/calendars/:name"),
+    (Method::Put, "/v1/calendars/:name"),
+    (Method::Delete, "/v1/calendars/:name"),
+    (Method::Post, "/v1/workflows"),
+    (Method::Get, "/v1/workflows"),
+    (Method::Get, "/v1/workflows/:id"),
+    (Method::Post, "/v1/workflows/:id/cancel"),
+    (Method::Get, "/v1/workers"),
+    (Method::Get, "/v1/cluster/members"),
+    (Method::Post, "/v1/admin/checkpoint"),
+    (Method::Get, "/v1/admin/store"),
+    (Method::Get, "/v1/admin/verify"),
+    (Method::Post, "/v1/admin/shutdown"),
+];
+
+/// A request as the fake server saw it.
+#[derive(Clone, Debug)]
+pub struct Seen {
+    pub method: Method,
+    /// The route pattern that matched, e.g. `/v1/jobs/:id/cancel`.
+    pub route: String,
+    pub path: String,
+    pub query: Vec<(String, String)>,
+    pub authorization: Option<String>,
+    pub body: Vec<u8>,
+}
