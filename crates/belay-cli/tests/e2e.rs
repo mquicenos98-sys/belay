@@ -74,3 +74,191 @@ fn unique_keys_deduplicate_enqueues() {
         .exits(Exit::Failure);
     assert!(out.stderr.starts_with("error: "), "{}", out.stderr);
 }
+
+#[test]
+fn enqueue_wait_returns_the_result_or_the_failure() {
+    let live = Live::start();
+    let worker = embedded_worker(&live);
+    let out = live
+        .belay(r#"enqueue default echo -d '{"hello": "world"}' --wait"#)
+        .ok();
+    assert!(
+        out.stdout.contains(" succeeded after 1 attempt"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("\"hello\": \"world\""),
+        "{}",
+        out.stdout
+    );
+
+    let out = live
+        .belay("enqueue default fail --max-attempts 1 --wait --wait-timeout 20s")
+        .exits(Exit::Failure);
+    assert!(
+        out.stdout.contains(" dead after 1 attempt"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stderr.contains("is dead: failed on purpose"),
+        "{}",
+        out.stderr
+    );
+    assert!(worker.stop().drained);
+}
+
+#[test]
+fn queues_can_be_paused_configured_and_purged() {
+    let live = Live::start();
+    for _ in 0..3 {
+        live.belay("enqueue emails send -q").ok();
+    }
+    let out = live.belay("queue list").ok();
+    assert!(
+        out.stdout.contains("\nemails  active      3"),
+        "{}",
+        out.stdout
+    );
+
+    live.belay("queue pause emails").ok();
+    let info = live.belay("queue info emails --json").ok().json();
+    assert_eq!(info["paused"], true);
+    live.belay("queue resume emails -q").ok();
+
+    let out = live
+        .belay("queue config emails --set max_concurrency=2 --set default_timeout=90s")
+        .ok();
+    assert!(
+        out.stdout.contains("max_concurrency = 2\n"),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("default_timeout = 1m30s\n"),
+        "{}",
+        out.stdout
+    );
+    let shown = live.belay("queue config emails").ok();
+    assert!(
+        shown
+            .stdout
+            .starts_with("max_concurrency = 2\nrate_limit = none\n"),
+        "{}",
+        shown.stdout
+    );
+
+    let out = live.belay("queue purge emails --yes").ok();
+    assert_eq!(out.stdout, "purged 3 jobs from emails\n");
+    live.belay("queue delete emails -y").ok();
+}
+
+#[test]
+fn schedules_and_calendars() {
+    let live = Live::start();
+    let out = live
+        .belay(
+            "calendar put business --tz America/Bogota --window 'mon-fri 09:00-17:00' \
+             --exclude-date 2025-12-25",
+        )
+        .ok();
+    assert_eq!(out.stdout, "saved calendar business\n");
+    let out = live.belay("calendar list").ok();
+    assert!(
+        out.stdout
+            .contains("business  America/Bogota  mon,tue,wed,thu,fri 09:00-17:00  2025-12-25"),
+        "{}",
+        out.stdout
+    );
+
+    let standup = "schedule add standup --cron '30 9 * * MON-FRI' --tz America/Bogota \
+                   --queue reports --kind build";
+    let out = live
+        .belay(&format!(
+            "{standup} --calendar business --description 'standup notes'"
+        ))
+        .ok();
+    assert!(
+        out.stdout
+            .starts_with("created schedule standup; next fire "),
+        "{}",
+        out.stdout
+    );
+    live.belay("schedule add standup --cron @daily --queue q --kind k")
+        .exits(Exit::Failure);
+    live.belay("schedule add standup --cron @daily --queue q --kind k --replace")
+        .ok();
+    live.belay(&format!("{standup} --replace")).ok();
+
+    let get = live.belay("schedule get standup").ok();
+    assert!(
+        get.stdout.contains("(at 09:30 on Monday through Friday)"),
+        "{}",
+        get.stdout
+    );
+    let preview = live.belay("schedule preview standup -n 3").ok();
+    assert_eq!(preview.stdout.lines().count(), 4, "{}", preview.stdout);
+    assert!(
+        preview.stdout.contains("T09:30:00-05:00"),
+        "{}",
+        preview.stdout
+    );
+
+    let job = live.belay("schedule trigger standup -q").ok().id();
+    let fired = live.belay(&format!("job get {job} --json")).ok().json();
+    assert_eq!(fired["spec"]["queue"], "reports");
+
+    live.belay("schedule pause standup").ok();
+    let listed = live.belay("schedule list").ok();
+    assert!(
+        listed
+            .stdout
+            .contains("standup  30 9 * * MON-FRI  America/Bogota  paused"),
+        "{}",
+        listed.stdout
+    );
+    live.belay("schedule resume standup").ok();
+    live.belay("schedule rm standup").ok();
+    live.belay("schedule get standup").exits(Exit::NotFound);
+    live.belay("calendar rm business").ok();
+    live.belay("calendar get business").exits(Exit::NotFound);
+}
+
+#[test]
+fn workflows_run_to_completion() {
+    let live = Live::start();
+    let worker = embedded_worker(&live);
+    let spec = r#"{
+        "name": "etl",
+        "steps": [
+            {"name": "extract", "job": {"queue": "default", "kind": "echo", "payload": {"rows": 3}}},
+            {"name": "load", "job": {"queue": "default", "kind": "echo"}, "depends_on": ["extract"]}
+        ]
+    }"#;
+    let out = live
+        .belay_stdin(spec, "workflow submit - --wait --wait-timeout 20s")
+        .ok();
+    for line in [
+        "state     succeeded",
+        "\nextract  succeeded",
+        "\nload     succeeded",
+    ] {
+        assert!(
+            out.stdout.contains(line),
+            "{line:?} missing from\n{}",
+            out.stdout
+        );
+    }
+    let listed = live.belay("workflow list --json").ok().json();
+    assert_eq!(listed.as_array().map(Vec::len), Some(1));
+
+    let cyclic = r#"{"name": "loop", "steps": [
+        {"name": "a", "job": {"queue": "q", "kind": "k"}, "depends_on": ["b"]},
+        {"name": "b", "job": {"queue": "q", "kind": "k"}, "depends_on": ["a"]}]}"#;
+    let out = live
+        .belay_stdin(cyclic, "workflow submit -")
+        .exits(Exit::Failure);
+    assert!(out.stderr.contains("dependency cycle"), "{}", out.stderr);
+    assert!(worker.stop().drained);
+}
