@@ -186,3 +186,101 @@ fn waiting_on_a_job_that_dies_fails_with_its_error() {
         .stderr
         .contains("hint: see its errors with `belay job get"));
 }
+
+#[test]
+fn waiting_gives_up_after_the_timeout() {
+    let fake = Fake::start();
+    for _ in 0..20 {
+        fake.reply_json(200, &sample_job(8));
+    }
+    let out = fake
+        .belay(&format!("job wait {} --timeout 60ms", job_id(8)))
+        .exits(Exit::Failure);
+    assert!(
+        out.stderr.contains("is still ready after 60ms"),
+        "{}",
+        out.stderr
+    );
+}
+
+// ---- job --------------------------------------------------------------------
+
+#[test]
+fn job_list_passes_filters_as_query_parameters() {
+    let fake = Fake::start();
+    fake.reply_json(200, &Page::<Job>::last(Vec::new()));
+    let out = fake
+        .belay(
+            "job list --queue emails -s dead,retrying --kind send \
+             --created-after 2025-03-01T00:00:00Z --order asc -n 50",
+        )
+        .ok();
+    assert!(out.stdout.is_empty());
+    assert_eq!(out.stderr, "no jobs match\n");
+    assert_eq!(
+        fake.only().query_pairs(),
+        [
+            ("queue", "emails"),
+            ("state", "dead,retrying"),
+            ("kind", "send"),
+            ("created_after", "2025-03-01T00:00:00.000Z"),
+            ("order", "asc"),
+            ("limit", "50"),
+        ]
+    );
+}
+
+#[test]
+fn job_list_table_json_and_quiet() {
+    let fake = Fake::start();
+    let mut dead = sample_job(2);
+    dead.state = JobState::Dead;
+    dead.attempt = 25;
+    dead.record_error(JobError::new(t0(), 25, "boom"));
+    let page = Page::new(
+        vec![sample_job(1), dead],
+        Some(Cursor::after_job(job_id(2))),
+    );
+    for _ in 0..3 {
+        fake.reply_json(200, &page);
+    }
+    let out = fake.belay("job list").ok();
+    assert_eq!(
+        out.stdout,
+        format!(
+            "ID                          QUEUE   KIND  STATE  TRIES  AGE     INFO\n\
+             {}  emails  send  ready      0  1m ago\n\
+             {}  emails  send  dead      25  1m ago  boom\n",
+            job_id(1),
+            job_id(2)
+        )
+    );
+    assert!(
+        out.stderr
+            .starts_with("showing 2 jobs; continue with --cursor "),
+        "{}",
+        out.stderr
+    );
+
+    let json = fake.belay("job list --json").ok().json();
+    assert_eq!(json["items"].as_array().map(Vec::len), Some(2));
+    assert!(json["next_cursor"].is_string());
+
+    let quiet = fake.belay("job ls -q").ok();
+    assert_eq!(quiet.stdout, format!("{}\n{}\n", job_id(1), job_id(2)));
+    assert!(quiet.stderr.is_empty());
+}
+
+#[test]
+fn job_list_all_follows_cursors() {
+    let fake = Fake::start();
+    let first = Page::new(vec![sample_job(1)], Some(Cursor::after_job(job_id(1))));
+    fake.reply_json(200, &first);
+    fake.reply_json(200, &Page::last(vec![sample_job(2)]));
+    let out = fake.belay("job list --all -q").ok();
+    assert_eq!(out.stdout, format!("{}\n{}\n", job_id(1), job_id(2)));
+    let seen = fake.requests();
+    assert_eq!(seen.len(), 2);
+    assert!(seen[1].query.iter().any(|(k, _)| k == "cursor"));
+    fake.belay("job list --all --cursor abc").exits(Exit::Usage);
+}
