@@ -384,3 +384,106 @@ struct Background {
     err: Shared,
     thread: JoinHandle<Exit>,
 }
+
+impl Background {
+    fn start(runner: Runner, line: &str) -> Background {
+        let (out, err) = (Shared::default(), Shared::default());
+        let args = words(line);
+        let thread = {
+            let (mut out, mut err) = (out.clone(), err.clone());
+            std::thread::spawn(move || runner.run(args, &mut out, &mut err))
+        };
+        Background { out, err, thread }
+    }
+
+    /// The URL the command prints once it is serving.
+    fn url(&self) -> String {
+        let found = eventually(Duration::from_secs(20), || {
+            self.out.text().contains("http://")
+        });
+        assert!(found, "no URL printed; stderr:\n{}", self.err.text());
+        let text = self.out.text();
+        let start = text.find("http://").expect("checked above");
+        text[start..]
+            .split_whitespace()
+            .next()
+            .expect("a URL")
+            .to_owned()
+    }
+}
+
+#[test]
+fn dev_serves_with_a_worker_until_shut_down() {
+    let dev = Background::start(
+        Runner::isolated(),
+        "dev --listen 127.0.0.1:0 --workers 2 -q",
+    );
+    let url = dev.url();
+    let client = Runner::isolated().env("BELAY_URL", url.clone());
+    let done = run_with(
+        &client,
+        r#"enqueue default echo -d '{"n": 1}' --wait --wait-timeout 20s"#,
+    )
+    .ok();
+    assert!(done.stdout.contains("succeeded"), "{}", done.stdout);
+    let shell = run_with(
+        &client,
+        r#"enqueue default shell -d '{"cmd": ["no-such-program-anywhere"]}'
+           --max-attempts 1 --wait --wait-timeout 20s"#,
+    )
+    .exits(Exit::Failure);
+    assert!(shell.stdout.contains("dead"), "{}", shell.stdout);
+    run_with(&client, "admin shutdown -q").ok();
+    assert_eq!(dev.thread.join().expect("dev thread"), Exit::Success);
+    assert_eq!(dev.out.text(), format!("{url}\n"));
+}
+
+#[test]
+fn dev_refuses_to_serve_other_hosts() {
+    let out = belay("dev --listen 0.0.0.0:0").exits(Exit::Usage);
+    assert!(
+        out.stderr.contains("only listens on loopback addresses"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("hint: use `belay server`"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn server_runs_from_a_config_file_and_keeps_its_data() {
+    let dir = TempDir::new().unwrap();
+    let data = dir.join("data");
+    let config = dir.join("belay.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nlisten = \"127.0.0.1:0\"\n\n[storage]\ndir = {:?}\n\n\
+             [queues.emails]\nmax_concurrency = 3\n",
+            data.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let runner = Runner::isolated().env("BELAY_CONFIG", config.to_string_lossy().into_owned());
+    let server = Background::start(runner, "server -q");
+    let client = Runner::isolated().env("BELAY_URL", server.url());
+    let info = run_with(&client, "info --json").ok().json();
+    assert_eq!(info["storage"], "disk");
+    let queue = run_with(&client, "queue info emails --json").ok().json();
+    assert_eq!(queue["config"]["max_concurrency"], 3);
+    run_with(&client, "enqueue emails send -q").ok();
+    run_with(&client, "admin checkpoint -q").ok();
+    run_with(&client, "admin shutdown -q").ok();
+    assert_eq!(server.thread.join().expect("server thread"), Exit::Success);
+
+    // Closed cleanly: the directory verifies and is no longer locked.
+    let path = data.to_string_lossy().into_owned();
+    let report = belay(&format!("admin store-inspect '{path}' --json"))
+        .ok()
+        .json();
+    assert_eq!(report["ok"], true);
+    assert_eq!(report["locked"], false);
+}
