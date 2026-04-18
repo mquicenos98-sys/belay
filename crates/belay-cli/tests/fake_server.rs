@@ -405,3 +405,98 @@ fn queue_config_set_merges_into_the_current_configuration() {
     assert_eq!(body["retention"]["dead"], "30d");
     assert_eq!(body["retention"]["succeeded"], "1d");
 }
+
+#[test]
+fn queue_config_rejects_bad_settings_before_sending() {
+    let fake = Fake::start();
+    fake.reply_json(200, &QueueInfo::new(QueueName::from_static("emails")));
+    let out = fake
+        .belay("queue config emails --set max_concurency=3")
+        .exits(Exit::Usage);
+    assert!(out.stderr.contains("max_concurency"), "{}", out.stderr);
+    assert_eq!(fake.calls(), ["GET /v1/queues/:name"]);
+}
+
+#[test]
+fn destructive_queue_commands_need_confirmation() {
+    let fake = Fake::start();
+    let out = fake
+        .belay("queue purge emails --state dead")
+        .exits(Exit::Usage);
+    assert!(
+        out.stderr
+            .starts_with("error: refusing to purge every dead job from emails without --yes"),
+        "{}",
+        out.stderr
+    );
+    fake.belay("queue delete emails").exits(Exit::Usage);
+    assert!(fake.requests().is_empty());
+
+    fake.reply_json(200, &PurgeResponse { purged: 7 });
+    let out = fake.belay("queue purge emails --state dead -y").ok();
+    assert_eq!(out.stdout, "purged 7 jobs from emails\n");
+    assert_eq!(fake.only().query_pairs(), [("state", "dead")]);
+}
+
+#[test]
+fn pausing_is_confirmed_unless_quiet() {
+    let fake = Fake::start();
+    fake.reply_status(204);
+    fake.reply_status(204);
+    assert_eq!(
+        fake.belay("queue pause emails").ok().stdout,
+        "queue emails is now paused\n"
+    );
+    assert!(fake.belay("queue resume emails -q").ok().stdout.is_empty());
+    assert_eq!(
+        fake.calls(),
+        [
+            "POST /v1/queues/:name/pause",
+            "POST /v1/queues/:name/resume"
+        ]
+    );
+}
+
+// ---- schedules ------------------------------------------------------------------
+
+#[test]
+fn schedule_add_builds_the_spec_and_checks_the_expression_first() {
+    let fake = Fake::start();
+    let out = fake
+        .belay("schedule add nightly --cron '0 25 * * *' --queue q --kind k")
+        .exits(Exit::Usage);
+    assert!(
+        out.stderr.contains("invalid cron expression"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("belay cron explain"), "{}", out.stderr);
+    assert!(fake.requests().is_empty());
+
+    let spec = ScheduleSpec::new(
+        "nightly".parse().unwrap(),
+        "0 2 * * *",
+        JobSpec::new("reports", "build"),
+    );
+    let next = Some(t0() + Duration::from_secs(7200));
+    fake.reply_json(201, &Schedule::new(spec, next, t0()));
+    let out = fake
+        .belay(
+            r#"schedule add nightly --cron '0 2 * * *' --tz America/Bogota --queue reports
+               --kind build --overlap skip --jitter 30s --payload '{"full": true}'"#,
+        )
+        .ok();
+    assert_eq!(
+        out.stdout,
+        "created schedule nightly; next fire 2025-03-04T07:06:07.089Z (in 2h)\n"
+    );
+    let body = fake.only().json();
+    assert_eq!(body["cron"], "0 2 * * *");
+    assert_eq!(body["timezone"], "America/Bogota");
+    assert_eq!(body["overlap"], "skip");
+    assert_eq!(body["jitter"], "30s");
+    assert_eq!(
+        body["template"],
+        json!({"queue": "reports", "kind": "build", "payload": {"full": true}, "priority": 0})
+    );
+}
