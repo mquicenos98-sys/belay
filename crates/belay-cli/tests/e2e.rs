@@ -262,3 +262,93 @@ fn workflows_run_to_completion() {
     assert!(out.stderr.contains("dependency cycle"), "{}", out.stderr);
     assert!(worker.stop().drained);
 }
+
+#[test]
+fn a_burst_worker_drains_the_queue_over_http() {
+    let live = Live::start();
+    let ids: Vec<String> = (0..3)
+        .map(|n| {
+            live.belay(&format!("enqueue default echo -d '{{\"n\": {n}}}' -q"))
+                .ok()
+                .id()
+        })
+        .collect();
+    let out = live
+        .belay("worker --queues default --burst --poll-wait 200ms -c 2 -q")
+        .ok();
+    assert!(out.stdout.is_empty(), "{}", out.stdout);
+    for id in &ids {
+        let job = live.belay(&format!("job get {id} --json")).ok().json();
+        assert_eq!(job["state"], "succeeded", "{job}");
+    }
+    let workers = live.belay("workers --json").ok().json();
+    assert_eq!(workers[0]["succeeded"], 3);
+
+    live.belay("enqueue default echo -q").ok();
+    let summary = live
+        .belay("worker --max-jobs 1 --poll-wait 100ms --json")
+        .ok()
+        .json();
+    assert_eq!(summary["succeeded"], 1);
+}
+
+#[test]
+fn events_tail_replays_and_filters() {
+    let live = Live::start();
+    live.belay("enqueue emails send -q").ok();
+    live.belay("queue pause emails").ok();
+    let out = live.belay("events tail --types queue.* -n 1").ok();
+    let line = out.stdout.trim();
+    assert!(line.contains("queue.paused"), "{line}");
+    assert!(line.ends_with("queue=emails"), "{line}");
+    let event = live
+        .belay("events tail --types job.enqueued -n 1 --json")
+        .ok()
+        .json();
+    assert_eq!(event["type"], "job.enqueued");
+    assert_eq!(event["queue"], "emails");
+    live.belay("events tail --types job.nope -n 1")
+        .exits(Exit::Usage);
+}
+
+#[test]
+fn system_and_admin_commands() {
+    let live = Live::start();
+    let info = live.belay("info").ok().stdout;
+    let version = format!("version  {}", env!("CARGO_PKG_VERSION"));
+    for line in [version.as_str(), "storage  memory", "ready    yes"] {
+        assert!(info.contains(line), "{line:?} missing from\n{info}");
+    }
+    assert_eq!(live.belay("info --json").ok().json()["ready"], true);
+
+    let members = live.belay("members").ok().stdout;
+    assert!(
+        members.contains("alive") && members.contains("yes"),
+        "{members}"
+    );
+
+    live.belay("enqueue emails send -q").ok();
+    let out = live.belay("admin verify").ok();
+    assert!(
+        out.stdout.starts_with("consistent: checked 1 job, 1 queue"),
+        "{}",
+        out.stdout
+    );
+    assert!(live.belay("admin store").ok().stdout.contains("storage"));
+    assert_eq!(
+        live.belay("admin store --json").ok().json()["storage"],
+        "memory"
+    );
+    live.belay("admin checkpoint -q").ok();
+}
+
+#[test]
+fn admin_shutdown_stops_the_server() {
+    let mut live = Live::start();
+    let out = live.belay("admin shutdown").ok();
+    assert!(out.stdout.contains("is shutting down"), "{}", out.stdout);
+    // Returns only once the HTTP server has drained and the engine stopped.
+    let handle = live.handle.take().expect("running");
+    handle.wait();
+    assert!(live.engine.is_shutting_down());
+}
