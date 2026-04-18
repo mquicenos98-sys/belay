@@ -210,3 +210,51 @@ fn wait(
         pause = (pause * 2).min(Duration::from_millis(500));
     }
 }
+
+fn finished(ctx: &mut Ctx<'_>, run: &Workflow) -> Result<()> {
+    if ctx.out.json {
+        ctx.out.json(run)?;
+    } else if ctx.out.quiet {
+        ctx.out.line(run.state)?;
+    } else {
+        show(ctx, run)?;
+    }
+    match run.state {
+        WorkflowState::Succeeded => Ok(()),
+        other => Err(Error::Failed {
+            message: format!("workflow {} {other}", run.id),
+            hint: None,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_proto::workflow::{StepSpec, StepState};
+    use belay_proto::JobSpec;
+
+    #[test]
+    fn steps_are_listed_in_declaration_order_with_dependencies() {
+        let spec = WorkflowSpec::new("etl")
+            .step(StepSpec::new("extract", JobSpec::new("etl", "extract")))
+            .step(StepSpec::new("load", JobSpec::new("etl", "load")).after("extract"));
+        let now = Timestamp::from_secs(1_700_000_000);
+        let mut run = Workflow::new("01HQ3K9Z8N6V2T4R5S7W0X1Y2Z".parse().unwrap(), spec, now);
+        if let Some(step) = run.steps.get_mut("extract") {
+            step.state = StepState::Succeeded;
+            step.started_at = Some(now);
+            step.finished_at = Some(now + Duration::from_secs(3));
+        }
+        let text = steps_grid(&run, now).render(false);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(
+            lines[1].starts_with("extract  succeeded  -    -        just now  3.0s"),
+            "{text}"
+        );
+        assert!(
+            lines[2].starts_with("load     pending    -    extract"),
+            "{text}"
+        );
+    }
+}
