@@ -180,3 +180,33 @@ pub struct Seen {
     pub authorization: Option<String>,
     pub body: Vec<u8>,
 }
+
+impl Seen {
+    /// `METHOD route`, for compact assertions.
+    pub fn call(&self) -> String {
+        format!("{} {}", self.method, self.route)
+    }
+
+    pub fn json(&self) -> Value {
+        belay_json::parse_bytes(&self.body).expect("request body is JSON")
+    }
+
+    pub fn query_pairs(&self) -> Vec<(&str, &str)> {
+        self.query
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect()
+    }
+}
+
+type Reply = Box<dyn FnOnce(&Request) -> Response + Send>;
+
+#[derive(Default)]
+struct State {
+    seen: Mutex<Vec<Seen>>,
+    replies: Mutex<VecDeque<Reply>>,
+}
+
+fn guard<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
