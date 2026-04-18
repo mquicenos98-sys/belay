@@ -123,3 +123,226 @@ fn cron_zones_filters_case_insensitively() {
 }
 
 // ---- config ---------------------------------------------------------------
+
+fn write(dir: &TempDir, name: &str, text: &str) -> String {
+    let path = dir.join(name);
+    fs::write(&path, text).expect("write file");
+    path.to_string_lossy().into_owned()
+}
+
+#[test]
+fn config_check_accepts_a_valid_file_and_summarizes_it() {
+    let dir = TempDir::new().unwrap();
+    let path = write(
+        &dir,
+        "belay.toml",
+        "[server]\nlisten = \"127.0.0.1:9100\"\n\n[queues.emails]\nmax_concurrency = 4\n\n\
+         [[schedules]]\nid = \"nightly\"\ncron = \"0 2 * * *\"\n\
+         template = { queue = \"reports\", kind = \"build\" }\n",
+    );
+    let out = belay(&format!("config check '{path}'")).ok();
+    assert!(
+        out.stdout.starts_with(&format!("{path}: ok\n")),
+        "{}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("listen     127.0.0.1:9100"),
+        "{}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("queues     emails"), "{}", out.stdout);
+    assert!(out.stdout.contains("schedules  nightly"), "{}", out.stdout);
+    assert!(out.stderr.is_empty(), "{}", out.stderr);
+}
+
+#[test]
+fn config_check_warns_about_typos_and_strict_fails_on_them() {
+    let dir = TempDir::new().unwrap();
+    let path = write(&dir, "belay.toml", "[sever]\nlisten = \"127.0.0.1:9100\"\n");
+    let out = belay(&format!("config check '{path}'")).ok();
+    assert!(
+        out.stderr.contains("warning: unknown key `sever"),
+        "{}",
+        out.stderr
+    );
+    assert!(
+        out.stderr.contains("did you mean `server"),
+        "{}",
+        out.stderr
+    );
+    let out = belay(&format!("config check '{path}' --strict")).exits(Exit::Failure);
+    assert!(
+        out.stderr.contains("has 1 warning (--strict)"),
+        "{}",
+        out.stderr
+    );
+    let json = belay(&format!("config check '{path}' --json")).ok().json();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["warnings"].as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn config_check_reports_errors_as_diagnostics() {
+    let dir = TempDir::new().unwrap();
+    let path = write(
+        &dir,
+        "bad.toml",
+        "[server]\nlisten = \"127.0.0.1:9100\"\n\n[queues.emails]\nmax_concurrency = 0\n",
+    );
+    let out = belay(&format!("config check '{path}'")).exits(Exit::Failure);
+    assert!(
+        out.stderr.starts_with(
+            "error: invalid value for queues.emails.max_concurrency: must be at least 1"
+        ),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("max_concurrency = 0"), "{}", out.stderr);
+    assert!(out.stderr.contains('^'), "{}", out.stderr);
+    assert!(out.stdout.is_empty());
+}
+
+#[test]
+fn config_applies_environment_overrides_like_the_server() {
+    let dir = TempDir::new().unwrap();
+    let path = write(
+        &dir,
+        "belay.toml",
+        "[server]\nlisten = \"127.0.0.1:9100\"\n",
+    );
+    let runner = runner().env("BELAY_SERVER__THREADS", "3");
+    let out = run_with(&runner, &format!("config print '{path}'")).ok();
+    assert!(out.stdout.contains("threads = 3"), "{}", out.stdout);
+    let runner = runner.env("BELAY_SERVER__THREADS", "many");
+    let out = run_with(&runner, &format!("config check '{path}'")).exits(Exit::Failure);
+    assert!(
+        out.stderr.contains("BELAY_SERVER__THREADS"),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn config_print_output_loads_back() {
+    let dir = TempDir::new().unwrap();
+    let out = belay("config print").ok();
+    assert!(out.stdout.contains("[server]"), "{}", out.stdout);
+    let path = write(&dir, "printed.toml", &out.stdout);
+    assert_eq!(
+        belay(&format!("config print '{path}'")).ok().stdout,
+        out.stdout
+    );
+}
+
+#[test]
+fn config_default_is_a_valid_configuration() {
+    let dir = TempDir::new().unwrap();
+    let out = belay("config default").ok();
+    assert!(out.stdout.contains("[server]"));
+    let path = write(&dir, "example.toml", &out.stdout);
+    belay(&format!("config check '{path}' --strict")).ok();
+    belay("config default --json").exits(Exit::Usage);
+}
+
+#[test]
+fn config_names_missing_files() {
+    let out = belay("config check no/such/belay.toml").exits(Exit::Failure);
+    assert!(
+        out.stderr
+            .starts_with("error: reading no/such/belay.toml: "),
+        "{}",
+        out.stderr
+    );
+    let runner = runner().env("BELAY_CONFIG", "also/missing.toml");
+    let out = run_with(&runner, "config check").exits(Exit::Failure);
+    assert!(out.stderr.contains("also/missing.toml"), "{}", out.stderr);
+}
+
+// ---- store-inspect --------------------------------------------------------
+
+/// A closed store with a checkpoint and a few batches after it.
+fn populated_store() -> TempDir {
+    let dir = TempDir::new().unwrap();
+    let kv = LogKv::open(dir.path(), Options::new().segment_size(4096)).expect("open store");
+    for i in 0..40u32 {
+        let mut batch = WriteBatch::new();
+        batch.put(format!("job/{i:03}"), vec![b'x'; 200]);
+        kv.write(batch).expect("write");
+        if i == 19 {
+            kv.checkpoint().expect("checkpoint");
+        }
+    }
+    kv.close().expect("close");
+    dir
+}
+
+#[test]
+fn store_inspect_lists_files_and_verifies_them() {
+    let dir = populated_store();
+    let path = dir.path().to_string_lossy().into_owned();
+    let out = belay(&format!("admin store-inspect '{path}'")).ok();
+    let text = &out.stdout;
+    assert!(text.starts_with("FILE"), "{text}");
+    assert!(text.contains("snap-") && text.contains("wal-"), "{text}");
+    assert!(
+        text.contains("snapshot seq 20, recoverable through seq 40"),
+        "{text}"
+    );
+    assert!(text.contains("no problems found"), "{text}");
+
+    let json = belay(&format!("admin store-inspect '{path}' --json"))
+        .ok()
+        .json();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["last_seq"], 40);
+    assert!(json["files"].as_array().is_some_and(|f| f.len() >= 2));
+
+    let out = belay(&format!("admin store-inspect '{path}' --records")).ok();
+    assert!(
+        out.stdout.contains("put \"job/039\" (200 bytes)"),
+        "{}",
+        out.stdout
+    );
+}
+
+#[test]
+fn store_inspect_fails_on_corruption_in_the_middle_of_the_log() {
+    let dir = populated_store();
+    let mut segments: Vec<_> = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.file_name()
+                .is_some_and(|n| n.to_string_lossy().starts_with("wal-"))
+        })
+        .collect();
+    segments.sort();
+    assert!(
+        segments.len() >= 2,
+        "the test needs a segment that is not the last"
+    );
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(&segments[0])
+        .unwrap();
+    file.seek(SeekFrom::Start(200)).unwrap();
+    file.write_all(b"garbage!").unwrap();
+    drop(file);
+
+    let path = dir.path().to_string_lossy().into_owned();
+    let out = belay(&format!("admin store-inspect '{path}'")).exits(Exit::Failure);
+    assert!(out.stdout.contains("corrupt"), "{}", out.stdout);
+    assert!(
+        out.stderr.contains("that opening it would not survive"),
+        "{}",
+        out.stderr
+    );
+    assert!(out.stderr.contains("skip-corrupt"), "{}", out.stderr);
+}
+
+#[test]
+fn store_inspect_needs_a_directory() {
+    let out = belay("admin store-inspect no/such/dir").exits(Exit::Failure);
+    assert!(out.stderr.contains("is not a directory"), "{}", out.stderr);
+}
