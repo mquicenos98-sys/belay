@@ -638,3 +638,55 @@ fn missing_resources_exit_with_status_3() {
     let out = fake.belay("queue info nope").exits(Exit::NotFound);
     assert_eq!(out.stderr, "error: queue nope not found\n");
 }
+
+#[test]
+fn server_error_details_are_shown_with_verbose() {
+    let fake = Fake::start();
+    fake.reply_error(ApiError::not_found("queue", "nope"));
+    let out = fake.belay("queue info nope -v").exits(Exit::NotFound);
+    assert!(
+        out.stderr
+            .contains("details (not_found): {\n  \"resource\": \"queue\""),
+        "{}",
+        out.stderr
+    );
+}
+
+#[test]
+fn auth_failures_hint_at_the_token() {
+    let fake = Fake::start();
+    fake.reply_error(ApiError::unauthenticated("missing bearer token"));
+    let out = fake.belay("workers").exits(Exit::Failure);
+    assert_eq!(
+        out.stderr,
+        "error: missing bearer token\nhint: pass a token with --token or set BELAY_TOKEN\n"
+    );
+}
+
+#[test]
+fn an_unavailable_server_exits_with_status_4() {
+    let fake = Fake::start();
+    // Enqueueing without a uniqueness key is not retried, so the first 503
+    // is final.
+    fake.reply_error(ApiError::unavailable("draining"));
+    let out = fake.belay("enqueue q k").exits(Exit::Unavailable);
+    assert_eq!(out.stderr, "error: draining\n");
+}
+
+#[test]
+fn a_server_that_hangs_up_exits_with_status_4() {
+    // Accepts and immediately closes every connection.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            drop(stream);
+        }
+    });
+    let out = run_with(&runner().env("BELAY_URL", url), "enqueue q k").exits(Exit::Unavailable);
+    assert!(
+        out.stderr.starts_with("error: request failed: "),
+        "{}",
+        out.stderr
+    );
+}
