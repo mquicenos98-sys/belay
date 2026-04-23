@@ -127,3 +127,27 @@ impl From<belay_client::Error> for Error {
         Error::Client(e)
     }
 }
+
+impl From<ApiError> for Error {
+    fn from(e: ApiError) -> Error {
+        Error::Api(e)
+    }
+}
+
+impl From<belay_store::StoreError> for Error {
+    fn from(e: belay_store::StoreError) -> Error {
+        Error::Store(e)
+    }
+}
+
+impl From<belay_worker::Error> for Error {
+    fn from(e: belay_worker::Error) -> Error {
+        Error::Worker(e)
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(e: io::Error) -> Error {
+        Error::Io(e)
+    }
+}
