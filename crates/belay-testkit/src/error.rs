@@ -151,3 +151,51 @@ impl From<io::Error> for Error {
         Error::Io(e)
     }
 }
+
+impl From<belay_proto::ParseError> for Error {
+    fn from(e: belay_proto::ParseError) -> Error {
+        Error::Invalid(e.to_string())
+    }
+}
+
+impl From<belay_json::ParseError> for Error {
+    fn from(e: belay_json::ParseError) -> Error {
+        Error::Invalid(format!("not JSON: {e}"))
+    }
+}
+
+impl From<belay_json::Error> for Error {
+    fn from(e: belay_json::Error) -> Error {
+        Error::Invalid(format!("JSON: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_proto::api::ErrorCode;
+
+    #[test]
+    fn timeouts_say_what_and_how_long() {
+        let e = Error::timeout("job 01J to succeed", Duration::from_millis(1500));
+        assert_eq!(
+            e.to_string(),
+            "timed out after 1s500ms waiting for job 01J to succeed"
+        );
+        assert!(e.is_timeout());
+        assert!(std::error::Error::source(&e).is_none());
+    }
+
+    #[test]
+    fn api_errors_are_found_behind_client_errors() {
+        let denied = ApiError::permission_denied("token r lacks the enqueue scope");
+        let over_http = Error::from(belay_client::Error::Api(denied.clone()));
+        assert_eq!(
+            over_http.api_error().map(|e| e.code),
+            Some(ErrorCode::PermissionDenied)
+        );
+        let in_process = Error::from(denied);
+        assert!(in_process.to_string().starts_with("api: "));
+        assert!(Error::Invalid("x".into()).api_error().is_none());
+    }
+}
