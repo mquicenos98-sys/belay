@@ -41,3 +41,43 @@ pub fn connect(url: &str, token: Option<&str>) -> Result<Client> {
     }
     Ok(Client::new(config)?)
 }
+
+/// The current base URL of a harness server, shared with whatever talks
+/// to it.
+#[derive(Clone, Debug)]
+pub(crate) struct Endpoint(Arc<RwLock<String>>);
+
+impl Endpoint {
+    pub(crate) fn new(url: impl Into<String>) -> Endpoint {
+        Endpoint(Arc::new(RwLock::new(url.into())))
+    }
+
+    pub(crate) fn url(&self) -> String {
+        read(&self.0).clone()
+    }
+
+    pub(crate) fn set(&self, url: String) {
+        *write(&self.0) = url;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clones_follow_a_moved_endpoint() {
+        let endpoint = Endpoint::new("http://127.0.0.1:7700");
+        let seen_by_worker = endpoint.clone();
+        endpoint.set("http://127.0.0.1:7701".to_owned());
+        assert_eq!(seen_by_worker.url(), "http://127.0.0.1:7701");
+    }
+
+    #[test]
+    fn clients_are_configured_for_local_servers() {
+        let config = client_config("http://127.0.0.1:1");
+        assert_eq!(config.connect_timeout, CONNECT_TIMEOUT);
+        assert!(connect("http://127.0.0.1:1", Some("0123456789abcdef")).is_ok());
+        assert!(connect("ftp://127.0.0.1:1", None).is_err());
+    }
+}
