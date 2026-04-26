@@ -215,3 +215,22 @@ impl EventLog {
         })
     }
 }
+
+impl Drop for EventLog {
+    fn drop(&mut self) {
+        // The reader is blocked on the stream; it notices at its next
+        // event or when the stream ends with the server.
+        self.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+impl fmt::Debug for EventLog {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let collected = lock(&self.shared.collected);
+        f.debug_struct("EventLog")
+            .field("events", &collected.events.len())
+            .field("ended", &collected.ended)
+            .field("error", &collected.error)
+            .finish()
+    }
+}
