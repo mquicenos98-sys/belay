@@ -110,7 +110,8 @@ impl Matches {
         for entry in self.occurrences(name).filter(|e| e.value.is_some()) {
             let better = match (&found, &entry.source) {
                 (None, _) => true,
-                (Some(_), Source::Flag | Source::Arg | Source::Env(_)) => true,
+                (Some(_), Source::Flag | Source::Arg) => true,
+                (Some(current), Source::Env(_)) => current.source == Source::Default,
                 (Some(_), Source::Default) => false,
             };
             if better {
@@ -232,6 +233,23 @@ mod tests {
             path: vec!["job", "list"],
             entries,
         }
+    }
+
+    #[test]
+    fn command_line_beats_environment_beats_default() {
+        let m = matches(vec![
+            entry("url", Source::Default, Some("http://default")),
+            entry("url", Source::Env("BELAY_URL"), Some("http://env")),
+        ]);
+        assert_eq!(m.value("url"), Some("http://env"));
+        assert!(!m.given("url"));
+        let m = matches(vec![
+            entry("url", Source::Flag, Some("http://flag")),
+            entry("url", Source::Default, Some("http://default")),
+            entry("url", Source::Env("BELAY_URL"), Some("http://env")),
+        ]);
+        assert_eq!(m.value("url"), Some("http://flag"));
+        assert!(m.given("url"));
     }
 
     #[test]
