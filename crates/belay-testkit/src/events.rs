@@ -234,3 +234,49 @@ impl fmt::Debug for EventLog {
             .finish()
     }
 }
+
+/// Checks that `events` have consecutive sequence numbers, starting after
+/// `after` if given: what a subscriber that resumed correctly receives.
+/// Returns the first gap or repeat found as `(expected, got)`.
+#[must_use]
+pub fn first_gap(events: &[Event], after: Option<u64>) -> Option<(u64, u64)> {
+    let mut expected = match (after, events.first()) {
+        (Some(seq), _) => seq,
+        (None, Some(first)) => first.seq,
+        (None, None) => return None,
+    };
+    for event in events {
+        if event.seq != expected {
+            return Some((expected, event.seq));
+        }
+        expected += 1;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_common::Timestamp;
+    use belay_proto::event::EventKind;
+    use belay_proto::QueueName;
+
+    fn event(seq: u64) -> Event {
+        Event {
+            seq,
+            at: Timestamp::EPOCH,
+            kind: EventKind::QueuePaused {
+                queue: QueueName::from_static("q"),
+            },
+        }
+    }
+
+    #[test]
+    fn gaps_and_repeats_are_found() {
+        let run: Vec<Event> = (10..14).map(event).collect();
+        assert_eq!(first_gap(&run, None), None);
+        let repeated = vec![event(3), event(4), event(4)];
+        assert_eq!(first_gap(&repeated, None), Some((5, 4)));
+        assert_eq!(first_gap(&[], Some(1)), None);
+    }
+}
