@@ -52,6 +52,33 @@ fn in_flight_request_completes_before_shutdown_finishes() {
 }
 
 #[test]
+fn idle_keep_alive_connections_do_not_delay_shutdown() {
+    let config = ServerConfig {
+        keep_alive_timeout: Duration::from_secs(60),
+        ..fast_config()
+    };
+    let server = serve_with(config, |_: &mut Request| Response::text("ok"));
+    let mut idle: Vec<Conn> = (0..5)
+        .map(|_| {
+            let mut conn = Conn::open(server.local_addr());
+            conn.send(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+            assert_eq!(conn.response().status, 200);
+            conn
+        })
+        .collect();
+    let start = Instant::now();
+    assert_eq!(server.shutdown_and_join(), Drain::Complete);
+    assert!(
+        start.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        start.elapsed()
+    );
+    for conn in &mut idle {
+        assert!(conn.closed_by_server());
+    }
+}
+
+#[test]
 fn partially_received_request_is_still_answered() {
     let server = serve(|_: &mut Request| Response::text("late but served"));
     let mut conn = Conn::open(server.local_addr());

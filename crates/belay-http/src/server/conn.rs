@@ -284,14 +284,14 @@ impl<'s> Connection<'s> {
     /// Reads once into the buffer, waiting until `deadline`. While `idle`
     /// (no partial request buffered) a shutdown ends the wait early.
     fn fill(&mut self, deadline: Instant, idle: bool) -> io::Result<Fill> {
-        if idle && self.shared.shutdown.is_triggered() {
-            return Ok(Fill::Shutdown);
-        }
         loop {
             match self.buf.read_from(&mut &self.stream, READ_CHUNK) {
                 Ok(0) => return Ok(Fill::Eof),
                 Ok(_) => return Ok(Fill::Data),
                 Err(e) if is_timeout(&e) => {
+                    if idle && self.shared.shutdown.is_triggered() {
+                        return Ok(Fill::Shutdown);
+                    }
                     if Instant::now() >= deadline {
                         return Ok(Fill::Timeout);
                     }
