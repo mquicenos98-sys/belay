@@ -76,3 +76,116 @@ pub fn queue_name(name: impl Into<String>) -> Result<QueueName> {
     let name = name.into();
     QueueName::new(name.as_str()).map_err(|e| Error::Invalid(format!("queue {name:?}: {e}")))
 }
+
+/// A UTC schedule `id` firing on `cron`, whose template is
+/// `job("scheduled", id)`: the job kind is the schedule's id, which keeps
+/// the jobs of several schedules apart. Chain the [`ScheduleSpec`] builder
+/// methods for a zone or policies, or replace the template.
+///
+/// # Panics
+///
+/// If `id` is not a valid schedule id; like
+/// [`ScheduleId::from_static`], this is meant for literals.
+#[must_use]
+pub fn schedule(id: &'static str, cron: &str) -> ScheduleSpec {
+    let id = ScheduleId::from_static(id);
+    let template = job(QueueName::from_static(SCHEDULED_QUEUE), id.as_str());
+    ScheduleSpec::new(id, cron, template)
+}
+
+/// A workflow step running `job`; chain [`StepSpec::after`] for its
+/// dependencies.
+#[must_use]
+pub fn step(name: &str, job: JobSpec) -> StepSpec {
+    StepSpec::new(name, job)
+}
+
+/// A workflow made of `steps`, in order.
+#[must_use]
+pub fn workflow(name: &str, steps: impl IntoIterator<Item = StepSpec>) -> WorkflowSpec {
+    steps
+        .into_iter()
+        .fold(WorkflowSpec::new(name), WorkflowSpec::step)
+}
+
+/// A payload placeholder for the result of step `step`: `path` is empty
+/// for the whole result, `.a.b` for dotted keys or `/a/0` for a JSON
+/// pointer. A string that is exactly one placeholder is replaced by the
+/// value itself; inside a longer string it is spliced in as text.
+#[must_use]
+pub fn placeholder(step: &str, path: &str) -> String {
+    format!("{{{{steps.{step}.result{path}}}}}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_common::Rng;
+    use belay_proto::Validate;
+
+    #[test]
+    fn test_jobs_retry_on_a_predictable_curve() {
+        let spec = job("emails", "send");
+        let retry = spec.retry.expect("job() sets a retry policy");
+        let mut rng = Rng::seed_from_u64(1);
+        let delays: Vec<Duration> = (1..=7).map(|a| retry.delay_for(a, &mut rng)).collect();
+        let secs: Vec<u64> = delays.iter().map(Duration::as_secs).collect();
+        assert_eq!(secs, [1, 2, 4, 8, 16, 32, 60]);
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn numbered_jobs_carry_their_index() {
+        let queue = queue_name("batch-7").unwrap();
+        let specs = numbered_jobs(&queue, "work", 3);
+        let ns: Vec<Option<u64>> = specs.iter().map(|s| number_of(&s.payload)).collect();
+        assert_eq!(ns, [Some(0), Some(1), Some(2)]);
+        assert!(specs.iter().all(|s| s.queue == queue && s.kind == "work"));
+    }
+
+    #[test]
+    fn bad_runtime_queue_names_are_invalid_arguments() {
+        let err = queue_name("Upper Case").unwrap_err();
+        assert!(matches!(err, Error::Invalid(ref m) if m.starts_with("queue \"Upper Case\"")));
+    }
+
+    #[test]
+    fn schedules_name_their_jobs_after_themselves() {
+        let spec = schedule("nightly-report", "0 3 * * *").timezone("America/Bogota");
+        assert_eq!(spec.template.kind, "nightly-report");
+        assert_eq!(spec.template.queue.as_str(), SCHEDULED_QUEUE);
+        assert_eq!(spec.timezone, "America/Bogota");
+        assert!(spec.validate().is_ok());
+    }
+
+    #[test]
+    fn workflows_keep_step_order_and_validate() {
+        let spec = workflow(
+            "diamond",
+            [
+                step("a", job("wf", "a")),
+                step("b", job("wf", "b")).after("a"),
+                step("c", job("wf", "c")).after("a"),
+                step(
+                    "d",
+                    job("wf", "d").payload(json!({"x": placeholder("b", "/x")})),
+                )
+                .after("b")
+                .after("c"),
+            ],
+        );
+        let names: Vec<&str> = spec.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, ["a", "b", "c", "d"]);
+        assert!(spec.validate().is_ok(), "{:?}", spec.validate());
+        assert_eq!(placeholder("b", ""), "{{steps.b.result}}");
+    }
+
+    #[test]
+    fn the_default_start_is_a_monday_morning() {
+        let civil = start_time().to_civil();
+        assert_eq!(
+            (civil.year, civil.month, civil.day, civil.hour),
+            (2025, 3, 3, 8)
+        );
+    }
+}
