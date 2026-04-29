@@ -232,13 +232,13 @@ fn parse_kib(value: &str) -> Option<u64> {
     }
 }
 
-/// Extracts the limit from the `Max open files` row of
+/// Extracts the soft limit from the `Max open files` row of
 /// `/proc/<pid>/limits`; `unlimited` yields `None`.
 fn parse_max_open_files(text: &str) -> Option<u64> {
-    // The row name has spaces in it, so count from the end: the limit
-    // sits just before the units column.
-    let line = text.lines().find(|line| line.starts_with("Max open files"))?;
-    line.split_whitespace().rev().nth(1)?.parse().ok()
+    text.lines()
+        .find_map(|line| line.strip_prefix("Max open files"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|soft| soft.parse().ok())
 }
 
 #[cfg(test)]
@@ -248,6 +248,12 @@ mod tests {
     const STATUS: &str = "Name:\tbelay\nUmask:\t0022\nState:\tS (sleeping)\n\
         VmPeak:\t  230000 kB\nVmSize:\t  220000 kB\nVmRSS:\t   15360 kB\n\
         Threads:\t12\nSigQ:\t0/63432\n";
+
+    const LIMITS: &str =
+        "Limit                     Soft Limit           Hard Limit           Units     \n\
+        Max cpu time              unlimited            unlimited            seconds   \n\
+        Max open files            1024                 524288               files     \n\
+        Max locked memory         8388608              8388608              bytes     \n";
 
     #[test]
     fn parses_memory_and_threads_from_status() {
@@ -265,6 +271,17 @@ mod tests {
     fn missing_or_malformed_status_fields_are_none() {
         let status = parse_status("VmRSS:\tlots kB\nVmSize:\t12 MB\nThreads:\n");
         assert_eq!(status, Status::default());
+    }
+
+    #[test]
+    fn parses_the_soft_open_files_limit() {
+        assert_eq!(parse_max_open_files(LIMITS), Some(1024));
+        let unlimited = LIMITS.replace(
+            "1024                 524288",
+            "unlimited            unlimited",
+        );
+        assert_eq!(parse_max_open_files(&unlimited), None);
+        assert_eq!(parse_max_open_files(""), None);
     }
 
     #[test]
