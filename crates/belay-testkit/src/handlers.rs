@@ -60,3 +60,24 @@ pub struct Execution {
     /// What it returned.
     pub outcome: Recorded,
 }
+
+impl Execution {
+    /// Whether the handler returned success.
+    #[must_use]
+    pub fn succeeded(&self) -> bool {
+        matches!(self.outcome, Recorded::Succeeded(_))
+    }
+}
+
+#[derive(Default)]
+struct State {
+    executions: Vec<Execution>,
+    /// Index into `executions` of every attempt still running, by job.
+    running: HashMap<JobId, Vec<usize>>,
+    running_by_queue: BTreeMap<QueueName, usize>,
+    peak_by_queue: BTreeMap<QueueName, usize>,
+    /// Jobs that started while another attempt of theirs was running.
+    overlaps: Vec<JobId>,
+    /// Bumped on every start and finish, so waiters miss no change.
+    version: u64,
+}
