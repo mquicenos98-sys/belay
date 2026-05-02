@@ -328,3 +328,128 @@ impl Recorder {
             .count()
     }
 }
+
+fn count_for(map: &BTreeMap<QueueName, usize>, queue: &str) -> usize {
+    map.iter()
+        .find(|(name, _)| name.as_str() == queue)
+        .map_or(0, |(_, n)| *n)
+}
+
+impl fmt::Debug for Recorder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = lock(&self.shared.state);
+        f.debug_struct("Recorder")
+            .field("executions", &state.executions.len())
+            .field("running", &state.running.len())
+            .field("overlaps", &state.overlaps.len())
+            .finish()
+    }
+}
+
+/// A barrier that holds handlers until the test opens it. Clones share
+/// the gate.
+///
+/// Waiting handlers still notice cancellation and worker shutdown, so a
+/// gate that is never opened does not hang a test.
+#[derive(Clone, Default)]
+pub struct Gate {
+    shared: Arc<(Mutex<bool>, Condvar)>,
+}
+
+impl Gate {
+    /// A closed gate.
+    #[must_use]
+    pub fn new() -> Gate {
+        Gate::default()
+    }
+
+    /// Lets every waiting and future handler through.
+    pub fn open(&self) {
+        *lock(&self.shared.0) = true;
+        self.shared.1.notify_all();
+    }
+
+    /// Holds future handlers again.
+    pub fn close(&self) {
+        *lock(&self.shared.0) = false;
+    }
+
+    /// Whether the gate is open.
+    #[must_use]
+    pub fn is_open(&self) -> bool {
+        *lock(&self.shared.0)
+    }
+
+    /// Waits until the gate opens (`true`), or until `stop` says to give up
+    /// (`false`), looking at `stop` every few milliseconds.
+    fn wait_unless(&self, stop: impl Fn() -> bool) -> bool {
+        let mut open = lock(&self.shared.0);
+        loop {
+            if *open {
+                return true;
+            }
+            if stop() {
+                return false;
+            }
+            open = wait_timeout(&self.shared.1, open, CHECK_EVERY).0;
+        }
+    }
+}
+
+impl fmt::Debug for Gate {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Gate")
+            .field("open", &self.is_open())
+            .finish()
+    }
+}
+
+/// What a recording handler does with each attempt. Every behavior that
+/// succeeds returns the payload as the job's result, so tests can check
+/// results (and workflow steps can template on them).
+#[derive(Clone, Debug)]
+pub enum Behavior {
+    /// Succeed at once.
+    Succeed,
+    /// Fail (retryably) the first `n` times this recorder sees a job, then
+    /// succeed. Counting per recorder rather than by the server's attempt
+    /// number keeps working across an operator retry, which restarts the
+    /// attempt count.
+    FailTimes(u32),
+    /// Fail every attempt, non-retryably: the job goes straight to `dead`.
+    FailAlways,
+    /// Sleep this long (waking early if cancelled), then succeed.
+    Sleep(Duration),
+    /// Wait at the gate, then succeed.
+    Gated(Gate),
+    /// Fail retryably with probability `probability`, decided by
+    /// [`Behavior::flaky_fails`] so the same job and attempt always get the
+    /// same answer.
+    Flaky {
+        /// Chance that an attempt fails, 0 to 1.
+        probability: f64,
+        /// Seed of the decision.
+        seed: u64,
+    },
+}
+
+impl Behavior {
+    /// Whether a [`Flaky`](Behavior::Flaky) handler fails attempt `attempt`
+    /// of job `job`. Deterministic, so a test can predict each job's fate.
+    #[must_use]
+    pub fn flaky_fails(job: JobId, attempt: u32, probability: f64, seed: u64) -> bool {
+        let mut key = job.to_string().into_bytes();
+        key.extend_from_slice(&attempt.to_le_bytes());
+        // The top 53 bits make an exactly representable fraction in [0, 1).
+        let fraction = (hash64(&key, seed) >> 11) as f64 / (1u64 << 53) as f64;
+        fraction < probability
+    }
+}
+
+/// A [`Handler`] that records every attempt in a [`Recorder`] and then
+/// acts out its [`Behavior`].
+#[derive(Clone, Debug)]
+pub struct RecordingHandler {
+    recorder: Recorder,
+    behavior: Behavior,
+}
