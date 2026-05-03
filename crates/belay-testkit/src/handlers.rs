@@ -453,3 +453,213 @@ pub struct RecordingHandler {
     recorder: Recorder,
     behavior: Behavior,
 }
+
+impl RecordingHandler {
+    /// A handler recording into `recorder`.
+    #[must_use]
+    pub fn new(recorder: Recorder, behavior: Behavior) -> RecordingHandler {
+        RecordingHandler { recorder, behavior }
+    }
+
+    fn act(&self, ctx: &JobContext, previous: usize) -> std::result::Result<Outcome, HandlerError> {
+        let done = || Ok(Outcome::with(ctx.payload().clone()));
+        match &self.behavior {
+            Behavior::Succeed => done(),
+            Behavior::FailTimes(n) if previous < *n as usize => Err(HandlerError::retry(format!(
+                "{} fails on purpose ({} of {n})",
+                ctx.kind(),
+                previous + 1
+            ))),
+            Behavior::FailTimes(_) => done(),
+            Behavior::FailAlways => {
+                Err(HandlerError::fatal(format!("{} always fails", ctx.kind())))
+            }
+            Behavior::Sleep(d) => {
+                let until = Instant::now() + *d;
+                loop {
+                    if ctx.is_cancelled() {
+                        return Err(HandlerError::cancelled());
+                    }
+                    if ctx.is_shutting_down() {
+                        return Err(HandlerError::retry("worker shutting down"));
+                    }
+                    let left = until.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return done();
+                    }
+                    let _ = ctx.sleep_or_cancel(left.min(CHECK_EVERY));
+                }
+            }
+            Behavior::Gated(gate) => {
+                if gate.wait_unless(|| ctx.is_cancelled() || ctx.is_shutting_down()) {
+                    done()
+                } else if ctx.is_cancelled() {
+                    Err(HandlerError::cancelled())
+                } else {
+                    Err(HandlerError::retry("worker shutting down"))
+                }
+            }
+            Behavior::Flaky { probability, seed } => {
+                if Behavior::flaky_fails(ctx.id(), ctx.attempt(), *probability, *seed) {
+                    Err(HandlerError::retry(format!(
+                        "{} failed at random on attempt {}",
+                        ctx.kind(),
+                        ctx.attempt()
+                    )))
+                } else {
+                    done()
+                }
+            }
+        }
+    }
+}
+
+impl Handler for RecordingHandler {
+    fn handle(&self, ctx: &mut JobContext) -> std::result::Result<Outcome, HandlerError> {
+        let previous = self.recorder.previous_attempts(ctx.id());
+        let index = self.recorder.start(ctx);
+        let result = self.act(ctx, previous);
+        let recorded = match &result {
+            Ok(outcome) => Recorded::Succeeded(outcome.result().cloned()),
+            Err(e) if e.is_cancellation() => Recorded::Cancelled,
+            Err(e) => Recorded::Failed {
+                message: e.message.clone(),
+                retryable: e.retryable,
+            },
+        };
+        self.recorder.finish(index, recorded);
+        result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_common::Timestamp;
+    use belay_json::json;
+    use belay_proto::{Job, JobSpec};
+    use std::thread;
+
+    fn context(queue: &'static str, payload: Value) -> JobContext {
+        let spec = JobSpec::new(queue, "k").payload(payload);
+        let mut job = Job::new(JobId::generate(), spec, Timestamp::EPOCH);
+        job.attempt = 1;
+        JobContext::detached(job)
+    }
+
+    #[test]
+    fn successes_echo_the_payload_and_are_recorded() {
+        let recorder = Recorder::new();
+        let handler = RecordingHandler::new(recorder.clone(), Behavior::Succeed);
+        let mut ctx = context("emails", json!({"to": "a@example.com"}));
+        let outcome = handler.handle(&mut ctx).unwrap();
+        assert_eq!(outcome.result(), Some(&json!({"to": "a@example.com"})));
+        let runs = recorder.of_job(ctx.id());
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].attempt, 1);
+        assert_eq!(
+            runs[0].outcome,
+            Recorded::Succeeded(Some(json!({"to": "a@example.com"})))
+        );
+        assert_eq!(recorder.peak_running("emails"), 1);
+        assert_eq!(recorder.running_in("emails"), 0);
+        assert!(recorder.overlaps().is_empty());
+    }
+
+    #[test]
+    fn fail_times_counts_what_this_recorder_saw() {
+        let recorder = Recorder::new();
+        let handler = RecordingHandler::new(recorder.clone(), Behavior::FailTimes(2));
+        let mut ctx = context("q", Value::Null);
+        let outcomes: Vec<bool> = (0..4).map(|_| handler.handle(&mut ctx).is_ok()).collect();
+        assert_eq!(outcomes, [false, false, true, true]);
+        let failures: Vec<Recorded> = recorder
+            .of_job(ctx.id())
+            .into_iter()
+            .take(2)
+            .map(|e| e.outcome)
+            .collect();
+        assert!(
+            matches!(&failures[0], Recorded::Failed { retryable: true, message } if message.contains("1 of 2"))
+        );
+        assert_eq!(recorder.finished(), 4);
+        assert_eq!(recorder.succeeded(), 2);
+    }
+
+    #[test]
+    fn fatal_failures_are_not_retryable() {
+        let handler = RecordingHandler::new(Recorder::new(), Behavior::FailAlways);
+        let err = handler.handle(&mut context("q", Value::Null)).unwrap_err();
+        assert!(!err.retryable);
+    }
+
+    #[test]
+    fn cancellation_ends_sleeps_and_gates_early() {
+        for behavior in [
+            Behavior::Sleep(Duration::from_secs(60)),
+            Behavior::Gated(Gate::new()),
+        ] {
+            let recorder = Recorder::new();
+            let handler = RecordingHandler::new(recorder.clone(), behavior);
+            let mut ctx = context("q", Value::Null);
+            let cancel = ctx.cancel_handle();
+            let canceller = thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                cancel.cancel();
+            });
+            let started = Instant::now();
+            let err = handler.handle(&mut ctx).unwrap_err();
+            canceller.join().expect("the canceller does not panic");
+            assert!(err.is_cancellation());
+            assert!(started.elapsed() < Duration::from_secs(5));
+            assert_eq!(recorder.executions()[0].outcome, Recorded::Cancelled);
+        }
+    }
+
+    #[test]
+    fn an_open_gate_lets_handlers_through_and_counts_concurrency() {
+        let recorder = Recorder::new();
+        let gate = Gate::new();
+        let handler = Arc::new(RecordingHandler::new(
+            recorder.clone(),
+            Behavior::Gated(gate.clone()),
+        ));
+        let workers: Vec<_> = (0..3)
+            .map(|_| {
+                let handler = Arc::clone(&handler);
+                thread::spawn(move || handler.handle(&mut context("render", Value::Null)).is_ok())
+            })
+            .collect();
+        recorder
+            .wait_until(Duration::from_secs(5), |r| r.running_in("render") == 3)
+            .unwrap();
+        gate.open();
+        assert!(workers.into_iter().all(|w| w.join().unwrap_or(false)));
+        assert_eq!(recorder.peak_running("render"), 3);
+        assert_eq!(recorder.running_in("render"), 0);
+    }
+
+    #[test]
+    fn a_job_running_twice_at_once_is_an_overlap() {
+        let recorder = Recorder::new();
+        let ctx = context("q", Value::Null);
+        let first = recorder.start(&ctx);
+        let second = recorder.start(&ctx);
+        recorder.finish(first, Recorded::Cancelled);
+        recorder.finish(second, Recorded::Succeeded(None));
+        assert_eq!(recorder.overlaps(), [ctx.id()]);
+    }
+
+    #[test]
+    fn flaky_decisions_are_stable_and_roughly_proportional() {
+        let ids: Vec<JobId> = (0..2000).map(|_| JobId::generate()).collect();
+        let fails = |id: &JobId| Behavior::flaky_fails(*id, 1, 0.25, 42);
+        let first: Vec<bool> = ids.iter().map(fails).collect();
+        let again: Vec<bool> = ids.iter().map(fails).collect();
+        assert_eq!(first, again);
+        let failed = first.iter().filter(|f| **f).count();
+        assert!((350..650).contains(&failed), "{failed} of 2000 failed");
+        assert!(!Behavior::flaky_fails(ids[0], 1, 0.0, 42));
+        assert!(Behavior::flaky_fails(ids[0], 1, 1.0, 42));
+    }
+}
