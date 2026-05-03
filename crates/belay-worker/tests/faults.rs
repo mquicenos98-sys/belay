@@ -8,6 +8,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use belay_common::log::CaptureLogger;
 use belay_proto::api::ApiError;
 use belay_worker::builtin::EchoHandler;
 use belay_worker::testing::{JobOutcome, MemorySource};
@@ -16,7 +17,7 @@ use belay_worker::{
     Registry,
 };
 
-use support::{config, eventually, spec, start, Gate, PATIENCE};
+use support::{config, config_logging_to, eventually, spec, start, Gate, PATIENCE};
 
 /// What a cooperative handler saw.
 #[derive(Default)]
@@ -258,6 +259,41 @@ fn a_stuck_handler_keeps_its_slot() {
     gate.open();
     assert!(source.wait_until(PATIENCE, |v| v.outcome(&next).is_some()));
     drop(worker);
+}
+
+#[test]
+fn source_outages_back_off_and_log_once_per_streak() {
+    let source = Arc::new(MemorySource::new());
+    source.fail_next_leases(5);
+    let id = source.push(spec("echo"));
+    let capture = CaptureLogger::new();
+    let worker = start(
+        &source,
+        Registry::new().register("echo", EchoHandler),
+        config_logging_to(1, capture.clone()),
+    );
+
+    assert!(source.wait_until(PATIENCE, |v| v.outcome(&id).is_some()));
+    let stats = worker.stop().stats;
+    assert_eq!(stats.lease_errors, 5);
+    assert_eq!(
+        stats.last_error.as_deref(),
+        Some("unavailable: injected lease failure")
+    );
+    let count = |needle: &str| {
+        capture
+            .messages()
+            .iter()
+            .filter(|m| m.contains(needle))
+            .count()
+    };
+    assert_eq!(count("leasing jobs failed; backing off"), 1);
+    assert_eq!(count("leasing jobs failed again"), 4);
+    assert_eq!(count("job source reachable again"), 1);
+    let recovered = capture
+        .find(|r| r.message == "job source reachable again")
+        .expect("recovery logged");
+    assert_eq!(recovered.field("failed_attempts"), Some("5"));
 }
 
 #[test]

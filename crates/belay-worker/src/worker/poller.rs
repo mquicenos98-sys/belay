@@ -3,8 +3,9 @@
 //! while the source is failing.
 //!
 //! The capacity rule lives in [`State::lease_capacity`]. Source errors
-//! start a streak, logged as a warning per failed call and closed by one
-//! line at info when the source answers again.
+//! start a streak: the first failure is logged as a warning, later ones
+//! at debug level, and the recovery once at info, so an outage of any
+//! length costs two lines in the log instead of one per retry.
 //!
 //! [`State::lease_capacity`]: crate::worker::state::State::lease_capacity
 
@@ -66,12 +67,15 @@ pub(crate) fn run_poller(shared: &Shared) {
                     }
                 };
                 let delay = config.source_backoff.delay_for(failures, &mut rng);
-                warn!(
-                    "leasing jobs failed; backing off";
-                    error = %e,
-                    attempt = failures,
-                    retry_in = delay,
-                );
+                if failures == 1 {
+                    warn!(
+                        "leasing jobs failed; backing off until the source recovers";
+                        error = %e,
+                        retry_in = delay,
+                    );
+                } else {
+                    debug!("leasing jobs failed again"; error = %e, attempt = failures, retry_in = delay);
+                }
                 if shared.draining.wait_timeout(delay) {
                     return;
                 }
