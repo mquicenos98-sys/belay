@@ -89,7 +89,7 @@ impl BodyLimit {
 impl Middleware for BodyLimit {
     fn handle(&self, req: &mut Request, next: Next<'_>) -> Response {
         let size = req.body.len() as u64;
-        if size < self.max {
+        if size <= self.max {
             return next.run(req);
         }
         let error = ApiError::invalid_argument(format!(
@@ -186,6 +186,8 @@ mod tests {
             error.message,
             "request body of 10 bytes exceeds the 8 byte limit (server.max_body)"
         );
+        let mut small = Request::new(Method::Post, "/v1/jobs").with_body("01234567");
+        assert_eq!(app().call(&mut small).status, 204);
     }
 
     #[test]
