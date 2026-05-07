@@ -146,3 +146,48 @@ impl fmt::Debug for TcpProxy {
             .finish()
     }
 }
+
+fn accept_loop(listener: &TcpListener, target: SocketAddr, state: &Arc<State>) {
+    let mut next_id = 0u64;
+    for incoming in listener.incoming() {
+        if state.closing.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(client) = incoming else { continue };
+        state.accepted.fetch_add(1, Ordering::SeqCst);
+        if state.refusing.load(Ordering::SeqCst) {
+            let _ = client.shutdown(Shutdown::Both);
+            continue;
+        }
+        let Ok(server) = TcpStream::connect(target) else {
+            let _ = client.shutdown(Shutdown::Both);
+            continue;
+        };
+        next_id += 1;
+        if let Err(e) = relay(next_id, client, server, state) {
+            belay_common::debug!("proxy relay failed to start"; error = %e);
+        }
+    }
+}
+
+fn relay(id: u64, client: TcpStream, server: TcpStream, state: &Arc<State>) -> io::Result<()> {
+    let _ = client.set_nodelay(true);
+    let _ = server.set_nodelay(true);
+    lock(&state.live).push((id, client.try_clone()?, server.try_clone()?));
+    let upstream = (client.try_clone()?, server.try_clone()?);
+    let heads = Arc::clone(state);
+    thread::Builder::new()
+        .name("belay-testkit-proxy-up".to_owned())
+        .spawn(move || {
+            let (from, to) = upstream;
+            pump(from, to, Some(&heads.heads));
+        })?;
+    let finished = Arc::clone(state);
+    thread::Builder::new()
+        .name("belay-testkit-proxy-down".to_owned())
+        .spawn(move || {
+            pump(server, client, None);
+            lock(&finished.live).retain(|(live, _, _)| *live != id);
+        })?;
+    Ok(())
+}
