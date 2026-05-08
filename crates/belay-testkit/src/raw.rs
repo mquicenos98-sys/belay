@@ -184,3 +184,64 @@ fn parse_frame(frame: &str) -> Option<RawEvent> {
     event.data = data.join("\n");
     Some(event)
 }
+
+/// Splits `http://host:port/path?query` into the authority and the target.
+fn split_url(url: &str) -> Result<(&str, &str)> {
+    let rest = url
+        .strip_prefix("http://")
+        .ok_or_else(|| Error::Invalid(format!("only http:// URLs are supported, got {url:?}")))?;
+    Ok(match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    })
+}
+
+fn send(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<BufReader<TcpStream>> {
+    let (authority, target) = split_url(url)?;
+    let mut stream = TcpStream::connect(authority)?;
+    stream.set_read_timeout(Some(Duration::from_secs(15)))?;
+    let mut head = format!(
+        "{method} {target} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\nContent-Length: {}\r\n",
+        body.len()
+    );
+    if !body.is_empty()
+        && !headers
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("content-type"))
+    {
+        head.push_str("Content-Type: application/json\r\n");
+    }
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes())?;
+    stream.write_all(body)?;
+    Ok(BufReader::new(stream))
+}
+
+type Head = (u16, Vec<(String, String)>);
+
+fn read_head(reader: &mut impl BufRead) -> Result<Head> {
+    let status_line = read_line(reader)?;
+    let status = status_line
+        .split(' ')
+        .nth(1)
+        .and_then(|code| code.parse::<u16>().ok())
+        .ok_or_else(|| Error::Invalid(format!("malformed status line {status_line:?}")))?;
+    let mut headers = Vec::new();
+    loop {
+        let line = read_line(reader)?;
+        if line.is_empty() {
+            return Ok((status, headers));
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            headers.push((name.trim().to_ascii_lowercase(), value.trim().to_owned()));
+        }
+    }
+}
