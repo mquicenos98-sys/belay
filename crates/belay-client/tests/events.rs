@@ -191,6 +191,30 @@ fn a_malformed_event_is_an_error_but_the_stream_goes_on() {
 }
 
 #[test]
+fn a_bad_last_event_is_not_reported_again_after_reconnecting() {
+    // Regression guard: the resume point must move past an event that
+    // failed to decode, or every reconnection would replay the failure.
+    let fake = Fake::start();
+    fake.reply_with(stream_of(vec![
+        frame(&event(1)),
+        SseEvent::new("{oops").id("2"),
+    ]));
+    fake.reply_with(|_| Response::no_content());
+
+    let items: Vec<_> = fake
+        .client()
+        .events_with(&EventFilter::new(), fast())
+        .expect("subscribed")
+        .collect();
+
+    assert_eq!(items.len(), 2);
+    assert!(items[1].is_err());
+    let resumed = fake.last();
+    assert_eq!(resumed.query_pairs(), [("from", "3")]);
+    assert_eq!(resumed.header("last-event-id"), Some("2"));
+}
+
+#[test]
 fn an_error_answer_on_subscribe_is_returned_at_once() {
     let fake = Fake::start();
     fake.reply_error(ApiError::unauthenticated("missing token"));

@@ -255,17 +255,16 @@ impl Subscription {
         }
     }
 
-    /// Decodes one frame, moving the resume point to its sequence number
-    /// (from the JSON, or else the SSE id).
+    /// Decodes one frame. Every frame consumed, good or bad, moves the
+    /// resume point to its sequence number (from the JSON, or else the SSE
+    /// id), so a bad event is reported once rather than on every
+    /// reconnection.
     fn decode(&mut self, sse: &SseEvent) -> Decoded {
-        let value = match belay_json::parse(&sse.data) {
-            Ok(value) => value,
-            Err(e) => {
-                return Decoded::Invalid(bad_event(format!("event data is not JSON: {e}")));
-            }
-        };
-        let seq = value
-            .get("seq")
+        let parsed = belay_json::parse(&sse.data);
+        let seq = parsed
+            .as_ref()
+            .ok()
+            .and_then(|v| v.get("seq"))
             .and_then(Value::as_u64)
             .or_else(|| sse.id.as_deref().and_then(|id| id.parse().ok()));
         if let Some(seq) = seq {
@@ -275,6 +274,12 @@ impl Subscription {
             }
             self.last_seq = Some(seq);
         }
+        let value = match parsed {
+            Ok(value) => value,
+            Err(e) => {
+                return Decoded::Invalid(bad_event(format!("event data is not JSON: {e}")));
+            }
+        };
         let known = value
             .get("type")
             .and_then(Value::as_str)
