@@ -191,3 +191,109 @@ fn relay(id: u64, client: TcpStream, server: TcpStream, state: &Arc<State>) -> i
         })?;
     Ok(())
 }
+
+/// Copies `from` to `to` until either side closes, then closes both
+/// directions so the peer notices. With `heads`, the first request head
+/// is recorded.
+fn pump(mut from: TcpStream, mut to: TcpStream, heads: Option<&Mutex<Vec<String>>>) {
+    let mut head: Option<Vec<u8>> = heads.map(|_| Vec::new());
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => n,
+        };
+        if let (Some(bytes), Some(heads)) = (head.as_mut(), heads) {
+            bytes.extend_from_slice(&buf[..n]);
+            if let Some(end) = find_head_end(bytes) {
+                lock(heads).push(String::from_utf8_lossy(&bytes[..end]).into_owned());
+                head = None;
+            } else if bytes.len() > MAX_HEAD {
+                head = None;
+            }
+        }
+        if to.write_all(&buf[..n]).is_err() {
+            break;
+        }
+    }
+    let _ = to.shutdown(Shutdown::Both);
+    let _ = from.shutdown(Shutdown::Both);
+}
+
+fn find_head_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|w| w == b"\r\n\r\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A server that answers every connection with its first line echoed.
+    fn echo_server() -> SocketAddr {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = stream.read(&mut buf) {
+                        if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    fn round_trip(stream: &mut TcpStream, text: &[u8]) -> io::Result<Vec<u8>> {
+        stream.write_all(text)?;
+        let mut back = vec![0u8; text.len()];
+        stream.read_exact(&mut back)?;
+        Ok(back)
+    }
+
+    #[test]
+    fn relays_both_ways_and_records_request_heads() {
+        let proxy = TcpProxy::start(echo_server()).unwrap();
+        let mut stream = TcpStream::connect(proxy.addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let request = b"GET /x HTTP/1.1\r\nLast-Event-ID: 42\r\n\r\n";
+        assert_eq!(round_trip(&mut stream, request).unwrap(), request);
+        assert_eq!(
+            proxy.request_heads(),
+            ["GET /x HTTP/1.1\r\nLast-Event-ID: 42"]
+        );
+        assert_eq!(proxy.connections(), 1);
+    }
+
+    #[test]
+    fn cutting_ends_live_connections_and_refusing_blocks_new_ones() {
+        let proxy = TcpProxy::start(echo_server()).unwrap();
+        let mut stream = TcpStream::connect(proxy.addr()).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        round_trip(&mut stream, b"hello").unwrap();
+        assert_eq!(proxy.cut(), 1);
+        assert!(round_trip(&mut stream, b"again").is_err());
+
+        proxy.refuse(true);
+        let mut refused = TcpStream::connect(proxy.addr()).unwrap();
+        refused
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert!(round_trip(&mut refused, b"x").is_err());
+        proxy.refuse(false);
+        let mut fresh = TcpStream::connect(proxy.addr()).unwrap();
+        fresh
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert_eq!(round_trip(&mut fresh, b"back").unwrap(), b"back");
+    }
+}
