@@ -22,7 +22,6 @@ use crate::error::{Error, Result};
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 
 const FIRST_NAP: Duration = Duration::from_millis(1);
-
 const LONGEST_NAP: Duration = Duration::from_millis(25);
 
 /// Polls `condition` until it returns `true` or `timeout` passes.
@@ -134,4 +133,106 @@ enum Probe<T> {
 enum Stop {
     TimedOut(Duration),
     Failed(Error),
+}
+
+impl Stop {
+    fn into_error(self, what: impl FnOnce() -> String) -> Error {
+        match self {
+            Stop::TimedOut(waited) => Error::timeout(what(), waited),
+            Stop::Failed(e) => e,
+        }
+    }
+}
+
+fn poll<T>(timeout: Duration, mut probe: impl FnMut() -> Probe<T>) -> Result<T, Stop> {
+    let started = Instant::now();
+    let mut nap = FIRST_NAP;
+    loop {
+        match probe() {
+            Probe::Ready(value) => return Ok(value),
+            Probe::Failed(e) => return Err(Stop::Failed(e)),
+            Probe::Pending => {}
+        }
+        let waited = started.elapsed();
+        if waited >= timeout {
+            return Err(Stop::TimedOut(waited));
+        }
+        thread::sleep(nap.min(timeout - waited));
+        nap = (nap * 2).min(LONGEST_NAP);
+    }
+}
+
+/// The last state of a job seen while waiting, for timeout messages.
+fn describe(job: Option<&Job>) -> String {
+    let Some(job) = job else {
+        return "never read".to_owned();
+    };
+    let mut text = format!("last seen {} at attempt {}", job.state, job.attempt);
+    if let Some(error) = job.last_error() {
+        text.push_str(&format!(", last error {:?}", error.message));
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    use belay_common::Timestamp;
+    use belay_proto::{JobError, JobSpec};
+
+    #[test]
+    fn eventually_returns_as_soon_as_the_condition_holds() {
+        let polls = Cell::new(0);
+        let started = Instant::now();
+        eventually(Duration::from_secs(5), || {
+            polls.set(polls.get() + 1);
+            polls.get() == 4
+        })
+        .unwrap();
+        assert_eq!(polls.get(), 4);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn eventually_some_hands_back_the_value_or_names_the_wait() {
+        let value = eventually_some(Duration::from_secs(1), "a value", || Some(7)).unwrap();
+        assert_eq!(value, 7);
+        let err =
+            eventually_some::<()>(Duration::from_millis(20), "the moon", || None).unwrap_err();
+        assert!(err.to_string().ends_with("waiting for the moon"), "{err}");
+        match err {
+            Error::Timeout { waited, .. } => assert!(waited >= Duration::from_millis(20)),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_failed_probe_ends_the_wait_without_timing_out() {
+        let started = Instant::now();
+        let outcome = poll::<()>(Duration::from_secs(30), || {
+            Probe::Failed(Error::Invalid("gone".into()))
+        });
+        let err = outcome.map_err(|s| s.into_error(|| "never used".into()));
+        assert!(matches!(err, Err(Error::Invalid(_))));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn job_descriptions_mention_the_last_error() {
+        let mut job = Job::new(
+            JobId::generate(),
+            JobSpec::new("default", "k"),
+            Timestamp::EPOCH,
+        );
+        assert_eq!(describe(None), "never read");
+        assert_eq!(describe(Some(&job)), "last seen ready at attempt 0");
+        job.attempt = 2;
+        job.record_error(JobError::new(Timestamp::EPOCH, 2, "smtp down"));
+        assert_eq!(
+            describe(Some(&job)),
+            "last seen ready at attempt 2, last error \"smtp down\""
+        );
+    }
 }
