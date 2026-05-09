@@ -42,3 +42,96 @@ pub fn eventually(timeout: Duration, mut condition: impl FnMut() -> bool) -> Res
         condition().then_some(())
     })
 }
+
+/// Polls `probe` until it returns `Some`, and returns that value; `what`
+/// describes the wait in the timeout error.
+pub fn eventually_some<T>(
+    timeout: Duration,
+    what: &str,
+    mut probe: impl FnMut() -> Option<T>,
+) -> Result<T> {
+    poll(timeout, || match probe() {
+        Some(value) => Probe::Ready(value),
+        None => Probe::Pending,
+    })
+    .map_err(|stop| stop.into_error(|| what.to_owned()))
+}
+
+/// Polls `GET /v1/jobs/:id` until the job is in `state`, and returns it.
+///
+/// Transport errors while polling count as "not yet" (a server being
+/// restarted is briefly unreachable); an API error such as `not_found`
+/// ends the wait at once.
+pub fn wait_for_state(
+    client: &Client,
+    id: JobId,
+    state: JobState,
+    timeout: Duration,
+) -> Result<Job> {
+    wait_for_job(client, id, &state.to_string(), timeout, |job| {
+        job.state == state
+    })
+}
+
+/// Polls until the job reaches any terminal state (`succeeded`, `dead` or
+/// `cancelled`), and returns it.
+pub fn wait_for_terminal(client: &Client, id: JobId, timeout: Duration) -> Result<Job> {
+    wait_for_job(client, id, "finished", timeout, Job::is_terminal)
+}
+
+/// Polls until `accept` holds for the job, and returns it; `what` completes
+/// the sentence "waiting for job `<id>` to be ...".
+pub fn wait_for_job(
+    client: &Client,
+    id: JobId,
+    what: &str,
+    timeout: Duration,
+    mut accept: impl FnMut(&Job) -> bool,
+) -> Result<Job> {
+    let mut last: Option<Job> = None;
+    let outcome = poll(timeout, || match client.jobs().get(id) {
+        Ok(job) if accept(&job) => Probe::Ready(job),
+        Ok(job) => {
+            last = Some(job);
+            Probe::Pending
+        }
+        Err(e) if e.api_error().is_some() => Probe::Failed(e.into()),
+        Err(_) => Probe::Pending,
+    });
+    outcome.map_err(|stop| {
+        stop.into_error(|| format!("job {id} to be {what} ({})", describe(last.as_ref())))
+    })
+}
+
+/// Polls `GET /v1/workflows/:id` until the run is over, and returns it.
+pub fn wait_for_workflow(client: &Client, id: WorkflowId, timeout: Duration) -> Result<Workflow> {
+    let mut last: Option<WorkflowState> = None;
+    let outcome = poll(timeout, || match client.workflows().get(id) {
+        Ok(run) if run.state.is_terminal() => Probe::Ready(run),
+        Ok(run) => {
+            last = Some(run.state);
+            Probe::Pending
+        }
+        Err(e) if e.api_error().is_some() => Probe::Failed(e.into()),
+        Err(_) => Probe::Pending,
+    });
+    outcome.map_err(|stop| {
+        stop.into_error(|| {
+            let seen = last.map_or_else(|| "never read".to_owned(), |s| format!("last seen {s}"));
+            format!("workflow {id} to finish ({seen})")
+        })
+    })
+}
+
+/// One look at the condition being waited for.
+enum Probe<T> {
+    Ready(T),
+    Pending,
+    Failed(Error),
+}
+
+/// Why [`poll`] gave up.
+enum Stop {
+    TimedOut(Duration),
+    Failed(Error),
+}
