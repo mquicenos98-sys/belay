@@ -245,3 +245,89 @@ fn read_head(reader: &mut impl BufRead) -> Result<Head> {
         }
     }
 }
+
+fn header_value<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(n, _)| n == name)
+        .map(|(_, v)| v.as_str())
+}
+
+/// One chunk of a chunked body; `None` after the last one.
+fn read_chunk(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
+    let size_line = read_line(reader)?;
+    let size_text = size_line.split(';').next().unwrap_or("").trim();
+    let size = usize::from_str_radix(size_text, 16)
+        .map_err(|_| Error::Invalid(format!("malformed chunk size {size_line:?}")))?;
+    if size == 0 {
+        // Trailers, if any, end with an empty line.
+        while !read_line(reader)?.is_empty() {}
+        return Ok(None);
+    }
+    let mut chunk = vec![0u8; size];
+    reader.read_exact(&mut chunk)?;
+    read_line(reader)?;
+    Ok(Some(chunk))
+}
+
+fn read_line(reader: &mut impl BufRead) -> Result<String> {
+    let mut line = String::new();
+    if reader.read_line(&mut line)? == 0 {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "the connection closed mid-response",
+        )));
+    }
+    Ok(line.trim_end_matches(['\r', '\n']).to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    #[test]
+    fn urls_split_into_authority_and_target() {
+        assert_eq!(
+            split_url("http://127.0.0.1:7700/v1/jobs?limit=5").unwrap(),
+            ("127.0.0.1:7700", "/v1/jobs?limit=5")
+        );
+        assert_eq!(split_url("http://h:1").unwrap(), ("h:1", "/"));
+        assert!(split_url("https://h:1/").is_err());
+    }
+
+    #[test]
+    fn chunked_bodies_are_reassembled() {
+        let wire = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n1;ext=1\r\n!\r\n0\r\n\r\n";
+        let mut reader = Cursor::new(&wire[..]);
+        let (status, headers) = read_head(&mut reader).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(header_value(&headers, "transfer-encoding"), Some("chunked"));
+        let mut body = Vec::new();
+        while let Some(chunk) = read_chunk(&mut reader).unwrap() {
+            body.extend(chunk);
+        }
+        assert_eq!(body, b"hello!");
+    }
+
+    #[test]
+    fn frames_without_data_are_not_events() {
+        assert_eq!(parse_frame("retry: 50\n\n"), None);
+        assert_eq!(parse_frame(":\n\n"), None);
+        let event = parse_frame("id: 7\nevent: job.enqueued\ndata: {\"a\":\ndata: 1}\n\n").unwrap();
+        assert_eq!(event.id.as_deref(), Some("7"));
+        assert_eq!(event.event.as_deref(), Some("job.enqueued"));
+        assert_eq!(event.data, "{\"a\":\n1}");
+    }
+
+    #[test]
+    fn header_lookups_ignore_case() {
+        let response = RawResponse {
+            status: 307,
+            headers: vec![("location".into(), "http://b/v1/jobs".into())],
+            body: Vec::new(),
+        };
+        assert_eq!(response.header("Location"), Some("http://b/v1/jobs"));
+        assert_eq!(response.header("etag"), None);
+    }
+}
