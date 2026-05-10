@@ -54,3 +54,87 @@ pub struct LogCapture {
     id: u64,
     logger: CaptureLogger,
 }
+
+impl LogCapture {
+    /// Captures `info` and above.
+    #[must_use]
+    pub fn start() -> LogCapture {
+        LogCapture::with_level(Level::Info)
+    }
+
+    /// Captures `level` and above.
+    #[must_use]
+    pub fn with_level(level: Level) -> LogCapture {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(1);
+        let capture = LogCapture {
+            id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
+            logger: CaptureLogger::with_level(level),
+        };
+        let tee = tee();
+        lock(&tee.captures).push((capture.id, level, capture.logger.clone()));
+        tee.update_max_level();
+        capture
+    }
+
+    /// Every record captured so far.
+    #[must_use]
+    pub fn records(&self) -> Vec<CapturedRecord> {
+        self.logger.records()
+    }
+
+    /// Records logged under `target` (a module path such as
+    /// `belay_queue::engine::tick`, or a named target like
+    /// [`belay_server::ACCESS_LOG_TARGET`]).
+    #[must_use]
+    pub fn with_target(&self, target: &str) -> Vec<CapturedRecord> {
+        self.records()
+            .into_iter()
+            .filter(|r| r.target == target)
+            .collect()
+    }
+
+    /// The first record matching `predicate`.
+    pub fn find(&self, predicate: impl Fn(&CapturedRecord) -> bool) -> Option<CapturedRecord> {
+        self.logger.find(predicate)
+    }
+
+    /// Whether any message contains `needle`.
+    #[must_use]
+    pub fn contains(&self, needle: &str) -> bool {
+        self.logger.contains(needle)
+    }
+
+    /// Waits for a record matching `predicate`, e.g. an access log line
+    /// written after the response was sent.
+    pub fn wait_for(
+        &self,
+        timeout: Duration,
+        predicate: impl Fn(&CapturedRecord) -> bool,
+    ) -> Result<CapturedRecord> {
+        eventually_some(timeout, "a matching log record", || {
+            self.logger.find(&predicate)
+        })
+    }
+
+    /// Discards what has been captured so far.
+    pub fn clear(&self) {
+        self.logger.clear();
+    }
+}
+
+impl Drop for LogCapture {
+    fn drop(&mut self) {
+        let tee = tee();
+        lock(&tee.captures).retain(|(id, _, _)| *id != self.id);
+        tee.update_max_level();
+    }
+}
+
+impl std::fmt::Debug for LogCapture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LogCapture")
+            .field("id", &self.id)
+            .field("records", &self.logger.len())
+            .finish()
+    }
+}
