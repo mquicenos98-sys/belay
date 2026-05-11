@@ -138,3 +138,27 @@ impl std::fmt::Debug for LogCapture {
             .finish()
     }
 }
+
+/// The global logger: stderr (filtered by `BELAY_TEST_LOG`) plus every
+/// active capture.
+struct Tee {
+    stderr: StreamLogger,
+    stderr_level: LevelFilter,
+    captures: Mutex<Vec<(u64, Level, CaptureLogger)>>,
+}
+
+impl Tee {
+    /// Keeps the global level just verbose enough for stderr and the most
+    /// verbose capture, so disabled statements stay cheap.
+    fn update_max_level(&self) {
+        let captures = lock(&self.captures);
+        let most_verbose = captures
+            .iter()
+            .map(|(_, level, _)| LevelFilter::from(*level))
+            .fold(self.stderr_level, LevelFilter::max);
+        log::set_max_level(most_verbose);
+    }
+}
+
+/// Handed to [`log::set_logger`], which takes ownership of a box.
+struct TeeHandle(Arc<Tee>);
