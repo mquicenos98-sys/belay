@@ -162,3 +162,106 @@ impl Tee {
 
 /// Handed to [`log::set_logger`], which takes ownership of a box.
 struct TeeHandle(Arc<Tee>);
+
+impl Logger for TeeHandle {
+    fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+        self.0.stderr.enabled(metadata)
+            || lock(&self.0.captures)
+                .iter()
+                .any(|(_, _, c)| c.enabled(metadata))
+    }
+
+    fn log(&self, record: &Record<'_>) {
+        let metadata = record.metadata();
+        if self.0.stderr.enabled(&metadata) {
+            self.0.stderr.log(record);
+        }
+        // Clone the handles out so a slow capture never holds the lock
+        // other threads need to log.
+        let captures: Vec<CaptureLogger> = lock(&self.0.captures)
+            .iter()
+            .map(|(_, _, c)| c.clone())
+            .collect();
+        for capture in captures {
+            if capture.enabled(&metadata) {
+                capture.log(record);
+            }
+        }
+    }
+
+    fn flush(&self) {
+        self.0.stderr.flush();
+    }
+}
+
+fn tee() -> &'static Arc<Tee> {
+    static TEE: OnceLock<Arc<Tee>> = OnceLock::new();
+    TEE.get_or_init(|| {
+        let filter = std::env::var(ENV_TEST_LOG)
+            .ok()
+            .and_then(|spec| Filter::parse(&spec).ok())
+            .unwrap_or_else(|| Filter::new(LevelFilter::Off));
+        let tee = Arc::new(Tee {
+            stderr_level: filter.max_level(),
+            stderr: StreamLogger::stderr().with_filter(filter),
+            captures: Mutex::new(Vec::new()),
+        });
+        log::set_logger(Box::new(TeeHandle(Arc::clone(&tee))));
+        tee.update_max_level();
+        tee
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+
+    #[test]
+    fn records_from_other_threads_are_captured() {
+        let capture = LogCapture::start();
+        thread::spawn(|| belay_common::warn!("disk nearly full"; test = "logs-threads"))
+            .join()
+            .expect("the logging thread does not panic");
+        let record = capture
+            .find(|r| r.field("test") == Some("logs-threads"))
+            .expect("the record from the other thread is captured");
+        assert_eq!(record.level, Level::Warn);
+        assert!(capture.contains("disk nearly full"));
+    }
+
+    #[test]
+    fn captures_respect_their_level_and_raise_the_global_one() {
+        let capture = LogCapture::with_level(Level::Debug);
+        assert!(log::max_level() >= LevelFilter::Debug);
+        belay_common::debug!("fine detail"; test = "logs-level");
+        belay_common::trace!("too fine"; test = "logs-level");
+        let mine: Vec<String> = capture
+            .records()
+            .into_iter()
+            .filter(|r| r.field("test") == Some("logs-level"))
+            .map(|r| r.message)
+            .collect();
+        assert_eq!(mine, ["fine detail"]);
+    }
+
+    #[test]
+    fn waiting_finds_records_logged_later() {
+        let capture = LogCapture::start();
+        let writer = thread::spawn(|| {
+            thread::sleep(Duration::from_millis(20));
+            belay_common::info!("worker lost"; test = "logs-wait");
+        });
+        let record = capture
+            .wait_for(Duration::from_secs(5), |r| {
+                r.field("test") == Some("logs-wait")
+            })
+            .unwrap();
+        assert_eq!(record.message, "worker lost");
+        writer.join().expect("the writer does not panic");
+        capture.clear();
+        assert!(capture
+            .find(|r| r.field("test") == Some("logs-wait"))
+            .is_none());
+    }
+}
