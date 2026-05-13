@@ -285,4 +285,13 @@ mod tests {
         query.append("c", "x y");
         assert_eq!(query.to_query_string(), "a=9&c=x%20y");
     }
+
+    #[test]
+    fn encoding_round_trips_through_parse() {
+        let original: Query = [("k&y", "v=1 +2"), ("empty", ""), ("uni", "\u{e9}")]
+            .into_iter()
+            .collect();
+        let reparsed = Query::parse(&original.to_string());
+        assert_eq!(reparsed, original);
+    }
 }

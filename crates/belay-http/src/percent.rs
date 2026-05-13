@@ -197,14 +197,13 @@ pub fn decode_lossy(input: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Decodes one `application/x-www-form-urlencoded` component: escapes
-/// are decoded leniently and `+` means space.
+/// Decodes one `application/x-www-form-urlencoded` component: `+` means
+/// space, then escapes are decoded leniently.
 pub fn decode_form(input: &str) -> String {
-    let decoded = decode_lossy(input);
-    if decoded.contains('+') {
-        decoded.replace('+', " ")
+    if input.contains('+') {
+        decode_lossy(&input.replace('+', " "))
     } else {
-        decoded
+        decode_lossy(input)
     }
 }
 
@@ -252,6 +251,12 @@ mod tests {
         assert_eq!(decode_lossy("100%"), "100%");
         assert_eq!(decode_lossy("%%41"), "%A");
         assert_eq!(decode_lossy("%FF"), "\u{fffd}");
+    }
+
+    #[test]
+    fn form_decoding_treats_plus_as_space() {
+        assert_eq!(decode_form("a+b%2Bc"), "a b+c");
+        assert_eq!(decode_form("plain"), "plain");
     }
 
     #[test]
