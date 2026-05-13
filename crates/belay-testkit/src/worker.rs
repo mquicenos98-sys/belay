@@ -379,3 +379,112 @@ impl fmt::Debug for TestWorker {
             .finish()
     }
 }
+
+/// The worker's [`JobSource`]: the typed client, behind a switch.
+struct Link {
+    endpoint: Endpoint,
+    token: Option<String>,
+    /// The client for the URL it was built for; rebuilt if the server
+    /// moved.
+    client: Mutex<Option<(String, Client)>>,
+    connected: AtomicBool,
+    lease_calls: AtomicU64,
+    empty_leases: AtomicU64,
+    failed_calls: AtomicU64,
+}
+
+impl Link {
+    fn client(&self) -> Result<Client, ApiError> {
+        if !self.connected.load(Ordering::SeqCst) {
+            self.failed_calls.fetch_add(1, Ordering::SeqCst);
+            return Err(ApiError::unavailable(
+                "the test harness has cut this worker off from the server",
+            ));
+        }
+        let url = self.endpoint.url();
+        let mut cached = lock(&self.client);
+        if let Some((built_for, client)) = cached.as_ref() {
+            if *built_for == url {
+                return Ok(client.clone());
+            }
+        }
+        let client = connect(&url, self.token.as_deref())
+            .map_err(|e| ApiError::invalid_argument(format!("test worker client: {e}")))?;
+        *cached = Some((url, client.clone()));
+        Ok(client)
+    }
+
+    fn count<T>(&self, result: Result<T, ApiError>) -> Result<T, ApiError> {
+        if result.is_err() {
+            self.failed_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        result
+    }
+}
+
+impl JobSource for Link {
+    fn lease(&self, req: &LeaseRequest) -> Result<Vec<LeasedJob>, ApiError> {
+        let client = self.client()?;
+        self.lease_calls.fetch_add(1, Ordering::SeqCst);
+        let leased = self.count(JobSource::lease(&client, req))?;
+        if leased.is_empty() {
+            self.empty_leases.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(leased)
+    }
+
+    fn heartbeat(&self, id: &JobId, req: &HeartbeatRequest) -> Result<HeartbeatResponse, ApiError> {
+        let client = self.client()?;
+        self.count(JobSource::heartbeat(&client, id, req))
+    }
+
+    fn complete(&self, id: &JobId, req: &CompleteRequest) -> Result<(), ApiError> {
+        let client = self.client()?;
+        self.count(JobSource::complete(&client, id, req))
+    }
+
+    fn fail(&self, id: &JobId, req: &FailRequest) -> Result<(), ApiError> {
+        let client = self.client()?;
+        self.count(JobSource::fail(&client, id, req))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builders_reject_bad_names_at_start() {
+        let err = TestWorker::builder("http://127.0.0.1:1")
+            .queue("Bad Queue")
+            .recording("k")
+            .start()
+            .unwrap_err();
+        assert!(matches!(err, Error::Invalid(ref m) if m.starts_with("queue \"Bad Queue\"")));
+        let err = TestWorker::builder("http://127.0.0.1:1")
+            .recording("k")
+            .start()
+            .unwrap_err();
+        assert!(err.to_string().contains("at least one queue"), "{err}");
+    }
+
+    #[test]
+    fn a_disconnected_link_refuses_every_call() {
+        let worker = TestWorker::builder("http://127.0.0.1:1")
+            .queue("q")
+            .recording("k")
+            .start()
+            .unwrap();
+        worker.disconnect();
+        assert!(!worker.is_connected());
+        worker
+            .wait_for_failed_calls(2, Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(worker.lease_calls(), 0);
+        worker.reconnect();
+        assert!(worker.is_connected());
+        let report = worker.stop();
+        assert!(report.drained);
+        assert_eq!(report.stats.leased, 0);
+    }
+}
