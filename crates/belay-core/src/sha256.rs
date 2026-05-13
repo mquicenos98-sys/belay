@@ -182,7 +182,7 @@ impl Sha256 {
         tail[self.filled] = 0x80;
         // The 64-bit length must fit after the 0x80 byte; if it does not,
         // the padding spills into a second block.
-        let total = if self.filled + 8 <= BLOCK_LEN {
+        let total = if self.filled + 1 + 8 <= BLOCK_LEN {
             BLOCK_LEN
         } else {
             2 * BLOCK_LEN
@@ -337,6 +337,10 @@ mod tests {
         assert_eq!(
             hex(b"abc"),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
         );
         assert_eq!(
             hex(b"abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"),
