@@ -184,3 +184,212 @@ impl ClusterSeat {
         }
     }
 }
+
+/// A [`MemTransport`] the kit can unbind while the engine holding it lives
+/// on.
+#[derive(Debug)]
+struct SeatTransport {
+    addr: SocketAddr,
+    endpoint: RwLock<Option<MemTransport>>,
+}
+
+impl SeatTransport {
+    fn released() -> io::Error {
+        io::Error::new(io::ErrorKind::NotConnected, "the node has stopped")
+    }
+}
+
+impl Transport for SeatTransport {
+    fn local_addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    fn send_to(&self, to: SocketAddr, bytes: &[u8]) -> io::Result<()> {
+        match &*read(&self.endpoint) {
+            Some(endpoint) => endpoint.send_to(to, bytes),
+            None => Err(SeatTransport::released()),
+        }
+    }
+
+    fn recv_timeout(&self, timeout: Duration) -> io::Result<Option<Datagram>> {
+        match &*read(&self.endpoint) {
+            Some(endpoint) => endpoint.recv_timeout(timeout),
+            None => Err(SeatTransport::released()),
+        }
+    }
+}
+
+/// Builds a [`TestServer`].
+#[must_use]
+pub struct TestServerBuilder {
+    config: Config,
+    options: ServerOptions,
+    clock: TestClock,
+    background: Option<bool>,
+    storage: Storage,
+    seed: u64,
+    cluster: Option<ClusterSeat>,
+}
+
+impl TestServerBuilder {
+    fn new() -> TestServerBuilder {
+        let mut config = Config::dev();
+        config.server.shutdown_grace = Duration::from_secs(5);
+        config.metrics.process = false;
+        let options = ServerOptions {
+            // Requests are only limited while tokens are in use; tests that
+            // hammer the API with one token should not be throttled.
+            rate_limit: None,
+            event_heartbeat: Duration::from_millis(200),
+            event_retry: Duration::from_millis(50),
+            shutdown_poll: Duration::from_millis(20),
+            ..ServerOptions::default()
+        };
+        TestServerBuilder {
+            config,
+            options,
+            clock: TestClock::Manual(ManualClock::new(start_time())),
+            background: None,
+            storage: Storage::Memory,
+            seed: 7,
+            cluster: None,
+        }
+    }
+
+    /// Replaces the whole configuration (default: [`Config::dev`] with a
+    /// 5 s shutdown grace). The storage and cluster sections are
+    /// overridden by [`storage`](Self::storage) and by clusters.
+    pub fn config(mut self, config: Config) -> TestServerBuilder {
+        self.config = config;
+        self
+    }
+
+    /// Adjusts the configuration: queues, schedules, retention, ...
+    pub fn configure(mut self, f: impl FnOnce(&mut Config)) -> TestServerBuilder {
+        f(&mut self.config);
+        self
+    }
+
+    /// Adds a bearer token; authentication is enforced from the first one.
+    pub fn token(mut self, name: &str, secret: &str, scopes: &[Scope]) -> TestServerBuilder {
+        let scopes = scopes.iter().copied().collect();
+        self.config
+            .auth
+            .tokens
+            .push(ApiToken::new(name, secret, scopes));
+        self
+    }
+
+    /// Adds the tokens in [`tokens`]: `admin`, `producer` (enqueue),
+    /// `worker` (work) and `reader` (read).
+    pub fn standard_tokens(self) -> TestServerBuilder {
+        self.token("admin", tokens::ADMIN, &[Scope::Admin])
+            .token("producer", tokens::PRODUCER, &[Scope::Enqueue])
+            .token("worker", tokens::WORKER, &[Scope::Work])
+            .token("reader", tokens::READER, &[Scope::Read])
+    }
+
+    /// A manual clock starting at `start` (default
+    /// [`START`](crate::fixtures::START)).
+    pub fn starting_at(mut self, start: Timestamp) -> TestServerBuilder {
+        self.clock = TestClock::Manual(ManualClock::new(start));
+        self
+    }
+
+    /// Shares `clock` with other harnesses (a cluster's nodes, say).
+    pub fn clock(mut self, clock: TestClock) -> TestServerBuilder {
+        self.clock = clock;
+        self
+    }
+
+    /// Real time, with background threads unless
+    /// [`background`](Self::background) says otherwise.
+    pub fn system_clock(mut self) -> TestServerBuilder {
+        self.clock = TestClock::System;
+        self
+    }
+
+    /// Whether the engine runs its background threads (default: only on
+    /// the system clock).
+    pub fn background(mut self, on: bool) -> TestServerBuilder {
+        self.background = Some(on);
+        self
+    }
+
+    /// Where data lives (default [`Storage::Memory`]).
+    pub fn storage(mut self, storage: Storage) -> TestServerBuilder {
+        self.storage = storage;
+        self
+    }
+
+    /// Server options (default: no per-token rate limit, 200 ms event
+    /// heartbeats, 50 ms reconnect hint, 20 ms shutdown polling).
+    pub fn options(mut self, options: ServerOptions) -> TestServerBuilder {
+        self.options = options;
+        self
+    }
+
+    /// Adjusts the server options, keeping the kit's other defaults.
+    pub fn configure_options(mut self, f: impl FnOnce(&mut ServerOptions)) -> TestServerBuilder {
+        f(&mut self.options);
+        self
+    }
+
+    /// Seeds the engine's lease tokens and retry jitter (default 7).
+    pub fn seed(mut self, seed: u64) -> TestServerBuilder {
+        self.seed = seed;
+        self
+    }
+
+    pub(crate) fn cluster_seat(mut self, seat: ClusterSeat) -> TestServerBuilder {
+        self.cluster = Some(seat);
+        self
+    }
+
+    /// Opens the store, starts the engine and serves it.
+    pub fn start(self) -> Result<TestServer> {
+        init_test_logging();
+        let background = self
+            .background
+            .unwrap_or(matches!(self.clock, TestClock::System));
+        let mut setup = Setup {
+            config: self.config,
+            options: self.options,
+            clock: self.clock,
+            background,
+            seed: self.seed,
+            cluster: self.cluster,
+        };
+        let mut store = Store::create(self.storage)?;
+        let running = launch(&mut setup, &mut store, 0)?;
+        Ok(TestServer {
+            endpoint: Endpoint::new(format!("http://{}", running.addr)),
+            setup,
+            store,
+            engine: running.engine,
+            handle: Some(running.handle),
+            addr: running.addr,
+        })
+    }
+}
+
+impl fmt::Debug for TestServerBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TestServerBuilder")
+            .field("clock", &self.clock)
+            .field("background", &self.background)
+            .field("storage", &self.storage)
+            .field("clustered", &self.cluster.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// What a (re)start needs besides the store.
+struct Setup {
+    config: Config,
+    options: ServerOptions,
+    clock: TestClock,
+    background: bool,
+    seed: u64,
+    cluster: Option<ClusterSeat>,
+}
