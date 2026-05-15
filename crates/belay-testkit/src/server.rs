@@ -393,3 +393,78 @@ struct Setup {
     seed: u64,
     cluster: Option<ClusterSeat>,
 }
+
+/// The store, held by the kit so that it outlives the engine.
+enum Store {
+    Memory(Arc<MemKv>),
+    Disk {
+        dir: TempDir,
+        sync: SyncPolicy,
+    },
+    Simulated {
+        fs: MemFs,
+        sync: SyncPolicy,
+        /// Open while the engine runs; the engine does not close stores
+        /// it was handed.
+        kv: Option<Arc<LogKv>>,
+    },
+}
+
+/// Where the simulated disk keeps the store.
+const SIMULATED_DIR: &str = "belay-data";
+
+impl Store {
+    fn create(storage: Storage) -> Result<Store> {
+        Ok(match storage {
+            Storage::Memory => Store::Memory(Arc::new(MemKv::new())),
+            Storage::Disk { sync } => Store::Disk {
+                dir: TempDir::with_prefix("belay-testkit")?,
+                sync,
+            },
+            Storage::SimulatedDisk { sync } => Store::Simulated {
+                fs: MemFs::new(),
+                sync,
+                kv: None,
+            },
+        })
+    }
+
+    /// Points the engine at the store: a handed-over store, or the
+    /// `[storage]` section for a real directory.
+    fn attach(&mut self, builder: EngineBuilder, config: &mut Config) -> Result<EngineBuilder> {
+        match self {
+            Store::Memory(kv) => Ok(builder.kv(kv.clone())),
+            Store::Disk { dir, sync } => {
+                config.storage.in_memory = false;
+                config.storage.dir = dir.join("data");
+                config.storage.sync = *sync;
+                Ok(builder)
+            }
+            Store::Simulated { fs, sync, kv } => {
+                let options = belay_store::Options::new().sync(*sync).fs(fs.clone());
+                let opened = Arc::new(LogKv::open(SIMULATED_DIR, options)?);
+                *kv = Some(Arc::clone(&opened));
+                Ok(builder.kv(opened))
+            }
+        }
+    }
+
+    /// Closes what the kit opened, after the engine has stopped.
+    fn release(&mut self) {
+        if let Store::Simulated { kv, .. } = self {
+            if let Some(kv) = kv.take() {
+                // After a simulated crash the handle's files are gone and
+                // closing fails; that is the point of the crash.
+                if let Err(e) = kv.close() {
+                    debug!("closing the simulated store failed"; error = %e);
+                }
+            }
+        }
+    }
+}
+
+struct Running {
+    engine: Arc<Engine>,
+    handle: ServerHandle,
+    addr: SocketAddr,
+}
