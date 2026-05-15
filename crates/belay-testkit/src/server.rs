@@ -468,3 +468,97 @@ struct Running {
     handle: ServerHandle,
     addr: SocketAddr,
 }
+
+/// Binds a listener (on `port`, or any port for 0), opens the store,
+/// starts the engine and serves it.
+fn launch(setup: &mut Setup, store: &mut Store, port: u16) -> Result<Running> {
+    let listener = bind_listener(port)?;
+    let addr = listener.local_addr()?;
+    let mut config = setup.config.clone();
+    let mut builder = Engine::builder()
+        .clock(setup.clock.shared())
+        .background(setup.background)
+        .seed(setup.seed);
+    if let Some(seat) = &mut setup.cluster {
+        // The API address is gossiped, so it must be known before the
+        // node starts: that is why the listener is bound first.
+        config.cluster.enabled = true;
+        config.cluster.api_addr = Some(format!("http://{addr}"));
+        builder = builder.cluster_transport(seat.bind());
+    }
+    builder = store.attach(builder, &mut config)?;
+    let engine = match builder.config(config).start() {
+        Ok(engine) => Arc::new(engine),
+        Err(e) => {
+            store.release();
+            return Err(e.into());
+        }
+    };
+    let handle = belay_server::serve_on_with(Arc::clone(&engine), listener, setup.options.clone())?;
+    Ok(Running {
+        engine,
+        handle,
+        addr,
+    })
+}
+
+/// Binds `127.0.0.1:port`. A restarted server asks for its old port, which
+/// the previous listener released a moment ago; if it stays taken, the
+/// server moves to a fresh one.
+fn bind_listener(port: u16) -> Result<TcpListener> {
+    if port == 0 {
+        return Ok(TcpListener::bind(("127.0.0.1", 0))?);
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match TcpListener::bind(("127.0.0.1", port)) {
+            Ok(listener) => return Ok(listener),
+            Err(_) if Instant::now() < deadline => thread::sleep(Duration::from_millis(20)),
+            Err(e) => {
+                debug!("the old port stays taken, moving"; port, error = %e);
+                return Ok(TcpListener::bind(("127.0.0.1", 0))?);
+            }
+        }
+    }
+}
+
+/// A belay engine and its HTTP server on `127.0.0.1:0`, in this process,
+/// with a clock the test controls and a store that outlives restarts.
+///
+/// By default the clock is a [`ManualClock`] at
+/// [`START`](crate::fixtures::START) and the engine runs no background
+/// threads: nothing happens by itself, and [`tick`](TestServer::tick)
+/// moves time and runs one round of the periodic duties (promotions, lease
+/// expiry, schedules, workflow chores). Workers still lease and report in
+/// real time, so a test should let running jobs finish before jumping the
+/// clock past their lease or timeout. [`TestServerBuilder::system_clock`]
+/// switches to real time with the background threads on.
+///
+/// [`Storage`] decides where jobs live: in memory (kept across
+/// [`restart`](TestServer::restart)), in a log-structured store in a
+/// temporary directory, or in a log-structured store on a simulated disk
+/// that can lose power ([`crash`](TestServer::crash)).
+///
+/// ```
+/// use belay_testkit::{fixtures::job, wait_for_state, TestServer, DEFAULT_TIMEOUT};
+/// use belay_proto::JobState;
+///
+/// let server = TestServer::start()?;
+/// let worker = server.worker().queue("emails").recording("send").start()?;
+/// let client = server.client();
+/// let id = client.jobs().enqueue(&job("emails", "send"))?.id;
+/// let done = wait_for_state(&client, id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+/// assert_eq!(done.attempt, 1);
+/// assert_eq!(worker.recorder().of_job(id).len(), 1);
+/// # Ok::<(), belay_testkit::Error>(())
+/// ```
+pub struct TestServer {
+    setup: Setup,
+    store: Store,
+    endpoint: Endpoint,
+    /// The current engine; after [`stop`](TestServer::stop) (or a failed
+    /// restart) a stopped one, whose calls answer `unavailable`.
+    engine: Arc<Engine>,
+    handle: Option<ServerHandle>,
+    addr: SocketAddr,
+}
