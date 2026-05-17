@@ -562,3 +562,273 @@ pub struct TestServer {
     handle: Option<ServerHandle>,
     addr: SocketAddr,
 }
+
+impl TestServer {
+    /// A server with every default: manual clock, no background threads,
+    /// in-memory store, no authentication.
+    pub fn start() -> Result<TestServer> {
+        TestServer::builder().start()
+    }
+
+    /// A builder for anything else.
+    pub fn builder() -> TestServerBuilder {
+        TestServerBuilder::new()
+    }
+
+    /// The API's base URL, `http://127.0.0.1:<port>`.
+    #[must_use]
+    pub fn url(&self) -> String {
+        self.endpoint.url()
+    }
+
+    /// The address the server listens on.
+    #[must_use]
+    pub fn addr(&self) -> SocketAddr {
+        self.addr
+    }
+
+    /// A typed client without a token. Take a new one after a restart:
+    /// pooled connections do not survive it.
+    #[must_use]
+    pub fn client(&self) -> Client {
+        connect(&self.url(), None).expect("the kit's own URL and settings form a valid client")
+    }
+
+    /// A typed client presenting `token`.
+    pub fn client_with_token(&self, token: &str) -> Result<Client> {
+        connect(&self.url(), Some(token))
+    }
+
+    /// The engine behind the server, for looking under the hood.
+    #[must_use]
+    pub fn engine(&self) -> &Arc<Engine> {
+        &self.engine
+    }
+
+    /// The configuration the engine runs with.
+    #[must_use]
+    pub fn config(&self) -> &Config {
+        self.engine.config()
+    }
+
+    /// The harness clock.
+    #[must_use]
+    pub fn clock(&self) -> &TestClock {
+        &self.setup.clock
+    }
+
+    /// The current time by the harness clock.
+    #[must_use]
+    pub fn now(&self) -> Timestamp {
+        self.setup.clock.now()
+    }
+
+    /// Advances the manual clock by `d`, then runs one round of the
+    /// engine's periodic duties.
+    pub fn tick(&self, d: Duration) -> Result<TickReport> {
+        let now = self.setup.clock.advance(d)?;
+        Ok(self.engine.tick(now))
+    }
+
+    /// Sets the manual clock to `t`, then runs one round of duties.
+    pub fn tick_at(&self, t: Timestamp) -> Result<TickReport> {
+        self.setup.clock.set(t)?;
+        Ok(self.engine.tick(t))
+    }
+
+    /// Runs one round of duties at the current time, on any clock.
+    #[must_use]
+    pub fn tick_now(&self) -> TickReport {
+        self.engine.tick(self.now())
+    }
+
+    /// A worker builder talking to this server; it follows the server
+    /// across restarts.
+    pub fn worker(&self) -> TestWorkerBuilder {
+        TestWorkerBuilder::new(self.endpoint.clone())
+    }
+
+    /// Follows the server's event stream over HTTP from its oldest
+    /// buffered event.
+    pub fn event_log(&self) -> Result<EventLog> {
+        EventLog::start(&self.client(), &EventFilter::new())
+    }
+
+    /// Whether the server is serving (not stopped).
+    #[must_use]
+    pub fn is_running(&self) -> bool {
+        self.handle.is_some()
+    }
+
+    /// The store directory, for [`Storage::Disk`].
+    #[must_use]
+    pub fn data_dir(&self) -> Option<PathBuf> {
+        match &self.store {
+            Store::Disk { dir, .. } => Some(dir.join("data")),
+            _ => None,
+        }
+    }
+
+    /// The simulated disk, for [`Storage::SimulatedDisk`].
+    #[must_use]
+    pub fn simulated_disk(&self) -> Option<&MemFs> {
+        match &self.store {
+            Store::Simulated { fs, .. } => Some(fs),
+            _ => None,
+        }
+    }
+
+    /// Stops gracefully: the server drains, the engine shuts down, the
+    /// store is closed. [`restart`](Self::restart) brings it back.
+    pub fn stop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.shutdown_and_join();
+        }
+        self.engine.shutdown();
+        self.store.release();
+        if let Some(seat) = &mut self.setup.cluster {
+            seat.release();
+        }
+    }
+
+    /// Stops (if running) and starts again on the same store and, when it
+    /// is still free, the same port.
+    pub fn restart(&mut self) -> Result<()> {
+        self.stop();
+        self.relaunch()
+    }
+
+    /// Stops, moves the manual clock forward by `downtime`, and starts
+    /// again: what the engine sees after being down that long.
+    pub fn restart_after(&mut self, downtime: Duration) -> Result<()> {
+        self.setup
+            .clock
+            .require_manual("a restart after downtime")?;
+        self.stop();
+        self.setup.clock.advance(downtime)?;
+        self.relaunch()
+    }
+
+    /// Cuts the power ([`Crash::PowerLoss`]): only what the store synced
+    /// survives. Then tears the dead server down and starts again on what
+    /// is left. Needs [`Storage::SimulatedDisk`].
+    pub fn crash(&mut self) -> Result<()> {
+        self.crash_with(&Crash::PowerLoss)
+    }
+
+    /// [`crash`](Self::crash) with another kind of crash.
+    pub fn crash_with(&mut self, crash: &Crash) -> Result<()> {
+        let Store::Simulated { fs, .. } = &self.store else {
+            return Err(Error::Unsupported(
+                "crashes can only be simulated on Storage::SimulatedDisk".to_owned(),
+            ));
+        };
+        // First the crash, at this instant; shutting down afterwards cannot
+        // sync anything any more, as the old handles are dead.
+        fs.crash(crash);
+        self.stop();
+        self.relaunch()
+    }
+
+    pub(crate) fn set_seeds(&mut self, seeds: Vec<String>) {
+        self.setup.config.cluster.seeds = seeds;
+    }
+
+    pub(crate) fn gossip_addr(&self) -> Option<SocketAddr> {
+        self.setup.cluster.as_ref().map(|seat| seat.gossip)
+    }
+
+    fn relaunch(&mut self) -> Result<()> {
+        let running = launch(&mut self.setup, &mut self.store, 0)?;
+        if running.addr != self.addr {
+            self.endpoint.set(format!("http://{}", running.addr));
+            self.addr = running.addr;
+        }
+        self.engine = running.engine;
+        self.handle = Some(running.handle);
+        Ok(())
+    }
+}
+
+impl Drop for TestServer {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
+impl fmt::Debug for TestServer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TestServer")
+            .field("url", &self.url())
+            .field("node", &self.engine.node_id())
+            .field("running", &self.is_running())
+            .field("clock", &self.setup.clock)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn file_names(dir: &Path) -> Vec<String> {
+        std::fs::read_dir(dir)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    #[test]
+    fn a_manual_clock_moves_only_when_told() {
+        let server = TestServer::start().unwrap();
+        let before = server.now();
+        assert_eq!(before, start_time());
+        let report = server.tick(Duration::from_secs(90)).unwrap();
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(server.now(), before + Duration::from_secs(90));
+        assert_eq!(server.engine().info().time, server.now());
+    }
+
+    #[test]
+    fn the_system_clock_cannot_be_advanced() {
+        let clock = TestClock::System;
+        assert!(matches!(
+            clock.advance(Duration::from_secs(1)),
+            Err(Error::Unsupported(_))
+        ));
+        assert!(clock.manual().is_none());
+    }
+
+    #[test]
+    fn crashing_needs_a_simulated_disk() {
+        let mut server = TestServer::start().unwrap();
+        let err = server.crash().unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err}");
+        assert!(server.is_running());
+    }
+
+    #[test]
+    fn a_stopped_server_answers_nothing() {
+        let mut server = TestServer::start().unwrap();
+        server.stop();
+        assert!(!server.is_running());
+        assert!(server.client().health().is_err());
+        assert!(server.engine().is_shutting_down());
+    }
+
+    #[test]
+    fn disk_stores_live_in_a_temporary_directory() {
+        let server = TestServer::builder()
+            .storage(Storage::disk())
+            .start()
+            .unwrap();
+        let dir = server.data_dir().expect("a disk store has a directory");
+        assert!(file_names(&dir).iter().any(|f| f == "LOCK"));
+        assert_eq!(server.engine().store_report().storage, "disk");
+    }
+}
