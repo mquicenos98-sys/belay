@@ -28,3 +28,80 @@ pub struct TestClusterBuilder {
     seed: u64,
     configure: Vec<Configure>,
 }
+
+impl TestClusterBuilder {
+    /// Adjusts every node's configuration; `f` gets the node's index.
+    pub fn configure(mut self, f: impl Fn(usize, &mut Config) + 'static) -> TestClusterBuilder {
+        self.configure.push(Box::new(f));
+        self
+    }
+
+    /// A manual clock starting at `start`, shared by every node.
+    pub fn starting_at(mut self, start: Timestamp) -> TestClusterBuilder {
+        self.clock = TestClock::Manual(belay_common::ManualClock::new(start));
+        self
+    }
+
+    /// Real time with background threads on every node.
+    pub fn system_clock(mut self) -> TestClusterBuilder {
+        self.clock = TestClock::System;
+        self
+    }
+
+    /// Seeds the gossip network's random decisions.
+    pub fn seed(mut self, seed: u64) -> TestClusterBuilder {
+        self.seed = seed;
+        self
+    }
+
+    /// Starts every node. Does not wait for them to find each other; see
+    /// [`TestCluster::wait_converged`].
+    pub fn start(self) -> Result<TestCluster> {
+        if self.size == 0 {
+            return Err(Error::Invalid(
+                "a cluster needs at least one node".to_owned(),
+            ));
+        }
+        init_test_logging();
+        let net = MemNetwork::new(self.seed);
+        let mut nodes: Vec<TestServer> = Vec::with_capacity(self.size);
+        for i in 0..self.size {
+            let name = node_name(i);
+            let seeds: Vec<String> = nodes
+                .iter()
+                .filter_map(TestServer::gossip_addr)
+                .map(|a| a.to_string())
+                .collect();
+            let gossip = net.bind_next().local_addr();
+            let node = TestServer::builder()
+                .configure(|config| {
+                    config.cluster.node_id = name;
+                    config.cluster.profile = ClusterProfile::Local;
+                    config.cluster.seeds = seeds;
+                    for f in &self.configure {
+                        f(i, config);
+                    }
+                })
+                .clock(self.clock.clone())
+                .seed(self.seed.wrapping_add(i as u64))
+                .cluster_seat(ClusterSeat::new(net.clone(), gossip))
+                .start()?;
+            nodes.push(node);
+        }
+        Ok(TestCluster {
+            net,
+            clock: self.clock,
+            nodes,
+        })
+    }
+}
+
+impl fmt::Debug for TestClusterBuilder {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TestClusterBuilder")
+            .field("size", &self.size)
+            .field("clock", &self.clock)
+            .field("seed", &self.seed)
+            .finish_non_exhaustive()
+    }
+}
