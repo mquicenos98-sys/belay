@@ -308,7 +308,7 @@ impl Plan {
 /// ```
 #[must_use]
 pub fn jitter_offset(id: &ScheduleId, fire_time: Timestamp, jitter: Duration) -> Duration {
-    let bound = jitter.as_secs();
+    let bound = u64::try_from(jitter.as_millis()).unwrap_or(u64::MAX);
     if bound == 0 {
         return Duration::ZERO;
     }
@@ -452,5 +452,28 @@ mod tests {
         );
         assert!(parse_timezone("+05:30").is_ok());
         assert!(parse_timezone("EST5EDT,M3.2.0,M11.1.0").is_ok());
+    }
+
+    #[test]
+    fn jitter_is_deterministic_bounded_and_spread() {
+        let id = ScheduleId::from_static("reports");
+        let jitter = Duration::from_secs(60);
+        let base = ts("2025-06-02T00:00:00Z");
+        let offsets: Vec<Duration> = (0..500)
+            .map(|i| jitter_offset(&id, base + Duration::from_secs(60 * i), jitter))
+            .collect();
+        assert!(offsets.iter().all(|o| *o < jitter));
+        // Spread over the whole range: every 6-second bucket is hit.
+        let mut buckets = [0u32; 10];
+        for o in &offsets {
+            buckets[(o.as_millis() / 6_000) as usize] += 1;
+        }
+        assert!(buckets.iter().all(|&n| n > 20), "{buckets:?}");
+        let other = ScheduleId::from_static("billing");
+        assert_ne!(
+            jitter_offset(&id, base, jitter),
+            jitter_offset(&other, base, jitter),
+            "schedules on the same minute spread out"
+        );
     }
 }
