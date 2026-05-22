@@ -105,3 +105,31 @@ impl fmt::Debug for TestClusterBuilder {
             .finish_non_exhaustive()
     }
 }
+
+/// Several [`TestServer`]s gossiping over one in-memory network
+/// ([`MemNetwork`]), each with its own HTTP server and store.
+///
+/// Membership runs in real time with the `local` timing profile (failures
+/// are noticed within a second or two), while the engines share one
+/// [`TestClock`], manual by default, so schedules fire only when the test
+/// ticks. Node `i` is named `node-a`, `node-b`, ...; node 0 starts alone
+/// and every later node joins through the ones before it.
+///
+/// [`kill`](TestCluster::kill) cuts a node off the network before stopping
+/// it, so its goodbye never arrives and the others have to detect the
+/// failure, as after a crash. Its store is kept, and
+/// [`restart`](TestCluster::restart) brings it back with its jobs.
+///
+/// ```no_run
+/// use belay_testkit::TestCluster;
+///
+/// let cluster = TestCluster::start(3)?; // waits until they agree
+/// let queue = cluster.queue_owned_by(1, "emails")?;
+/// assert_eq!(cluster.owner_of_queue(&queue), Some(1));
+/// # Ok::<(), belay_testkit::Error>(())
+/// ```
+pub struct TestCluster {
+    net: MemNetwork,
+    clock: TestClock,
+    nodes: Vec<TestServer>,
+}
