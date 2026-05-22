@@ -154,7 +154,7 @@ impl YearSet {
         let last_word = (end / 64) as usize;
         for w in (0..=last_word).rev() {
             let mut word = self.0[w];
-            if w == last_word {
+            if w == last_word && end % 64 != 63 {
                 word &= (1u64 << (end % 64 + 1)) - 1;
             }
             if word != 0 {
@@ -651,6 +651,35 @@ mod tests {
         s.insert(2025);
         s.insert(2199);
         assert_eq!(s.iter().collect::<Vec<_>>(), vec![2025, 2199]);
+    }
+
+    #[test]
+    fn year_set_jumps_to_neighbouring_members() {
+        let mut s = YearSet::EMPTY;
+        for y in [1970, 2033, 2034, 2100, 2199] {
+            s.insert(y);
+        }
+        assert_eq!(s.next_from(1900), Some(1970));
+        assert_eq!(s.next_from(1971), Some(2033));
+        assert_eq!(s.next_from(2034), Some(2034));
+        assert_eq!(s.next_from(2035), Some(2100));
+        assert_eq!(s.next_from(2101), Some(2199));
+        assert_eq!(s.next_from(2200), None);
+        assert_eq!(s.prev_from(2300), Some(2199));
+        assert_eq!(s.prev_from(2198), Some(2100));
+        assert_eq!(s.prev_from(2033), Some(2033));
+        assert_eq!(s.prev_from(2032), Some(1970));
+        assert_eq!(s.prev_from(1969), None);
+        // Word boundaries sit at offsets 64 and 128 from 1970 (2034, 2098).
+        let mut w = YearSet::EMPTY;
+        w.insert(2033);
+        w.insert(2098);
+        assert_eq!(w.next_from(2034), Some(2098));
+        assert_eq!(w.prev_from(2097), Some(2033));
+        assert_eq!(YearSet::ALL.next_from(2150), Some(2150));
+        assert_eq!(YearSet::ALL.prev_from(2161), Some(2161));
+        assert_eq!(YearSet::EMPTY.next_from(1970), None);
+        assert_eq!(YearSet::EMPTY.prev_from(2199), None);
     }
 
     #[test]
