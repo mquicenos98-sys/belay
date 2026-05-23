@@ -156,3 +156,90 @@ fn refusals_carry_a_bearer_challenge_and_probes_need_no_token() -> Result<()> {
     assert!(reader.metrics()?.contains("belay_http_requests_total"));
     Ok(())
 }
+
+#[test]
+fn the_access_log_names_the_token_behind_each_request() -> Result<()> {
+    let capture = LogCapture::start();
+    let server = TestServer::builder()
+        .token("auditor", "auditor-token-0123456789", &[Scope::Read])
+        .token("loader", "loader-token-0123456789", &[Scope::Enqueue])
+        .start()?;
+    let auditor = server.client_with_token("auditor-token-0123456789")?;
+    let loader = server.client_with_token("loader-token-0123456789")?;
+    let target = belay_server::ACCESS_LOG_TARGET;
+
+    let id = loader.jobs().enqueue(&job("audit", "check"))?.id;
+    let created = capture.wait_for(DEFAULT_TIMEOUT, |r| {
+        r.target == target && r.field("principal") == Some("loader")
+    })?;
+    assert_eq!(created.field("route"), Some("/v1/jobs"));
+    assert_eq!(created.field("status"), Some("201"));
+
+    auditor.jobs().get(id)?;
+    let read = capture.wait_for(DEFAULT_TIMEOUT, |r| {
+        r.target == target && r.field("principal") == Some("auditor")
+    })?;
+    assert_eq!(read.field("route"), Some("/v1/jobs/:id"));
+    assert_eq!(read.message, format!("GET /v1/jobs/{id} 200"));
+
+    // A refusal is found by the request id the server hands back.
+    let refused = raw::request(
+        "POST",
+        &format!("{}/v1/jobs", server.url()),
+        &[("Authorization", "Bearer auditor-token-0123456789")],
+        br#"{"queue": "audit", "kind": "check"}"#,
+    )?;
+    assert_eq!(refused.status, 403);
+    let request_id = refused
+        .header("x-request-id")
+        .expect("every response carries its request id")
+        .to_owned();
+    let line = capture.wait_for(DEFAULT_TIMEOUT, |r| {
+        r.target == target && r.field("request_id") == Some(request_id.as_str())
+    })?;
+    assert_eq!(line.field("status"), Some("403"));
+    assert_eq!(line.field("route"), Some("/v1/jobs"));
+    Ok(())
+}
+
+#[test]
+fn a_token_over_its_request_rate_is_told_when_to_come_back() -> Result<()> {
+    const BURSTY: &str = "bursty-token-0123456789";
+    const CALM: &str = "calm-token-0123456789";
+    // One request every ten seconds after a burst of two: the third
+    // request in a row is always over.
+    let server = TestServer::builder()
+        .token("bursty", BURSTY, &[Scope::Read])
+        .token("calm", CALM, &[Scope::Read])
+        .configure_options(|options| {
+            options
+                .token_rate_limits
+                .insert("bursty".to_owned(), Some(RequestRate::new(0.1, 2)));
+        })
+        .start()?;
+    let queues = format!("{}/v1/queues", server.url());
+    let bursty = format!("Bearer {BURSTY}");
+    let statuses: Vec<u16> = (0..3)
+        .map(|_| Ok(raw::request("GET", &queues, &[("Authorization", &bursty)], b"")?.status))
+        .collect::<Result<_>>()?;
+    assert_eq!(statuses, [200, 200, 429]);
+
+    let limited = raw::request("GET", &queues, &[("Authorization", &bursty)], b"")?;
+    assert_eq!(limited.status, 429);
+    assert_eq!(limited.json()?["error"]["code"], "resource_exhausted");
+    let retry_after: u64 = limited
+        .header("retry-after")
+        .and_then(|v| v.parse().ok())
+        .expect("a 429 says when to retry");
+    assert!((1..=10).contains(&retry_after), "{retry_after}");
+
+    // Limits are per token.
+    let calm = raw::request(
+        "GET",
+        &queues,
+        &[("Authorization", &format!("Bearer {CALM}"))],
+        b"",
+    )?;
+    assert_eq!(calm.status, 200);
+    Ok(())
+}
