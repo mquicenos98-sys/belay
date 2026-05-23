@@ -277,7 +277,9 @@ fn checkpoints_happen_on_demand_and_on_the_interval() {
     assert_eq!(report.stats.checkpoints, 1);
 
     engine.enqueue(JobSpec::new("q", "k2")).unwrap();
-    let due = engine.tick(clock.advance(Duration::from_secs(3600)));
+    let early = engine.tick(clock.advance(Duration::from_secs(1800)));
+    assert!(early.checkpoint.is_none());
+    let due = engine.tick(clock.advance(Duration::from_secs(1800)));
     assert!(due.checkpoint.is_some_and(|c| c.written));
     assert_eq!(engine.store_report().stats.checkpoints, 2);
     let json = belay_json::ToJson::to_json(&engine.store_report());

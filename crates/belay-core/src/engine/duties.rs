@@ -226,11 +226,10 @@ impl Shared {
         }
         {
             let mut last = lock(&self.last_checkpoint);
-            let elapsed = now.saturating_duration_since(*last);
-            *last = now;
-            if elapsed < interval {
+            if now.saturating_duration_since(*last) < interval {
                 return Ok(None);
             }
+            *last = now;
         }
         let info = self.kv.checkpoint()?;
         if info.written {
