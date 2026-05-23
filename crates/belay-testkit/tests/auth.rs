@@ -92,3 +92,67 @@ fn each_token_does_what_its_scope_allows_and_nothing_more() -> Result<()> {
     assert!(reader.queues().get(&emails)?.paused);
     Ok(())
 }
+
+#[test]
+fn a_worker_without_the_work_scope_is_turned_away_on_every_lease() -> Result<()> {
+    let server = TestServer::builder().standard_tokens().start()?;
+    let producer = server.client_with_token(tokens::PRODUCER)?;
+    let reader = server.client_with_token(tokens::READER)?;
+    let id = producer.jobs().enqueue(&job("emails", "send"))?.id;
+    let worker = server
+        .worker()
+        .token(tokens::READER)
+        .queue("emails")
+        .recording("send")
+        .start()?;
+    worker.wait_for_failed_calls(3, DEFAULT_TIMEOUT)?;
+    assert!(worker.recorder().is_empty());
+    assert!(worker.stats().lease_errors >= 3);
+    let last = worker.stats().last_error.unwrap_or_default();
+    assert!(last.contains("lacks the work scope"), "{last}");
+    assert_eq!(reader.jobs().get(id)?.state, JobState::Ready);
+    Ok(())
+}
+
+#[test]
+fn the_event_stream_needs_the_read_scope() -> Result<()> {
+    let server = TestServer::builder().standard_tokens().start()?;
+    let producer = server.client_with_token(tokens::PRODUCER)?;
+    let refused = EventLog::start(&producer, &EventFilter::new()).expect_err("no read scope");
+    assert_eq!(
+        refused.api_error().map(|e| e.code),
+        Some(ErrorCode::PermissionDenied)
+    );
+    let reader = server.client_with_token(tokens::READER)?;
+    let events = EventLog::start(&reader, &EventFilter::new())?;
+    let id = producer.jobs().enqueue(&job("emails", "send"))?.id;
+    events.wait_for_job_event(id, "job.enqueued", DEFAULT_TIMEOUT)?;
+    Ok(())
+}
+
+#[test]
+fn refusals_carry_a_bearer_challenge_and_probes_need_no_token() -> Result<()> {
+    let server = TestServer::builder().standard_tokens().start()?;
+    let jobs = format!("{}/v1/jobs", server.url());
+
+    let missing = raw::request("GET", &jobs, &[], b"")?;
+    assert_eq!(missing.status, 401);
+    let challenge = missing.header("www-authenticate").unwrap_or_default();
+    assert!(challenge.starts_with("Bearer"), "{challenge:?}");
+    assert_eq!(missing.json()?["error"]["code"], "unauthenticated");
+
+    let bearer = format!("Bearer {}", tokens::PRODUCER);
+    let denied = raw::request("GET", &jobs, &[("Authorization", &bearer)], b"")?;
+    assert_eq!(denied.status, 403);
+    assert_eq!(denied.json()?["error"]["code"], "permission_denied");
+
+    for probe in ["/healthz", "/readyz"] {
+        let answer = raw::request("GET", &format!("{}{probe}", server.url()), &[], b"")?;
+        assert_eq!(answer.status, 200, "{probe}");
+    }
+    let metrics = raw::request("GET", &format!("{}/metrics", server.url()), &[], b"")?;
+    assert_eq!(metrics.status, 401);
+    let reader = server.client_with_token(tokens::READER)?;
+    assert!(reader.metrics()?.contains("belay_http_requests_total"));
+    Ok(())
+}
