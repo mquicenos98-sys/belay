@@ -123,7 +123,7 @@ impl Error {
             Error::Client(e) => match e {
                 belay_client::Error::Api(api) => match api.code {
                     ErrorCode::NotFound => Exit::NotFound,
-                    ErrorCode::Unavailable => Exit::Unavailable,
+                    ErrorCode::Unavailable | ErrorCode::ResourceExhausted => Exit::Unavailable,
                     _ => Exit::Failure,
                 },
                 belay_client::Error::Transport(t) if t.is_transient() || refused(t) => {
@@ -307,6 +307,10 @@ mod tests {
         assert_eq!(api(ApiError::not_found("job", "X")).exit(), Exit::NotFound);
         assert_eq!(
             api(ApiError::unavailable("draining")).exit(),
+            Exit::Unavailable
+        );
+        assert_eq!(
+            api(ApiError::resource_exhausted("slow down")).exit(),
             Exit::Unavailable
         );
         assert_eq!(api(ApiError::invalid_argument("bad")).exit(), Exit::Failure);
