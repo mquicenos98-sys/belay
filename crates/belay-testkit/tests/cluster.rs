@@ -13,3 +13,7 @@ use belay_testkit::prelude::*;
 use belay_testkit::raw;
 
 const MEMBERSHIP_TIMEOUT: Duration = Duration::from_secs(30);
+
+fn worker_name(cluster: &TestCluster, i: usize) -> String {
+    format!("w-{}", cluster.node_id(i))
+}
