@@ -146,3 +146,61 @@ fn schedules_fire_exactly_once_across_the_cluster() -> Result<()> {
     assert!(nodes_with_jobs >= 2, "rendezvous hashing spreads schedules");
     Ok(())
 }
+
+#[test]
+fn a_killed_node_is_declared_dead_and_its_queues_move_to_the_survivors() -> Result<()> {
+    let mut cluster = TestCluster::start(3)?;
+    let orders = cluster.queue_owned_by(2, "orders")?;
+    let entry = cluster.node(0).client();
+    let stranded = entry.jobs().enqueue(&job(&orders, "charge"))?.id;
+    assert!(cluster.node(2).client().jobs().get(stranded).is_ok());
+
+    cluster.kill(2)?;
+    cluster.wait_converged(MEMBERSHIP_TIMEOUT)?;
+    let members = entry.members()?;
+    let dead = members
+        .iter()
+        .find(|m| m.id == "node-c")
+        .expect("the dead node is still listed");
+    assert_eq!(dead.state, MemberState::Dead);
+
+    // The queue has a new owner, which takes new work for it.
+    let heir = cluster
+        .owner_of_queue(&orders)
+        .expect("the survivors agree on the owner");
+    assert_ne!(heir, 2);
+    let heir_worker = cluster
+        .node(heir)
+        .worker()
+        .queue(orders.as_str())
+        .recording("charge")
+        .start()?;
+    let fresh = entry.jobs().enqueue(&job(&orders, "charge"))?.id;
+    let heir_client = cluster.node(heir).client();
+    wait_for_state(&heir_client, fresh, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    // Nothing is replicated: the dead node's job is nowhere to be seen.
+    assert!(heir_client.jobs().get(stranded).is_err());
+    // Stop leasing from the heir before the owner returns: a lease the
+    // heir redirected to node 2 would be reported back to the heir.
+    drop(heir_worker);
+
+    cluster.restart(2)?;
+    cluster.wait_converged(MEMBERSHIP_TIMEOUT)?;
+    assert_eq!(cluster.owner_of_queue(&orders), Some(2));
+    let returned = cluster.node(2).client();
+    assert_eq!(returned.jobs().get(stranded)?.state, JobState::Ready);
+    let _worker = cluster
+        .node(2)
+        .worker()
+        .queue(orders.as_str())
+        .recording("charge")
+        .start()?;
+    wait_for_state(&returned, stranded, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    let alive = entry
+        .members()?
+        .iter()
+        .filter(|m| m.state == MemberState::Alive)
+        .count();
+    assert_eq!(alive, 3);
+    Ok(())
+}
