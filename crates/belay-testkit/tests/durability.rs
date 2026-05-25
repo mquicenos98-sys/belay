@@ -118,3 +118,41 @@ fn without_syncs_a_power_loss_keeps_a_prefix_of_what_was_acknowledged() -> Resul
     assert!(server.engine().verify()?.is_consistent());
     Ok(())
 }
+
+#[test]
+fn a_lease_survives_a_crash_and_its_worker_finishes_the_job() -> Result<()> {
+    let mut server = TestServer::builder()
+        .storage(Storage::simulated_disk())
+        .start()?;
+    let gate = Gate::new();
+    let worker = server
+        .worker()
+        .queue("exports")
+        .gated("export", &gate)
+        .start()?;
+    let client = server.client();
+    let id = client
+        .jobs()
+        .enqueue(&job("exports", "export").payload(json!({"table": "orders"})))?
+        .id;
+    worker.recorder().wait_for_start(id, DEFAULT_TIMEOUT)?;
+    let before = client.jobs().get(id)?;
+
+    server.crash()?;
+    let client = server.client();
+    let after = client.jobs().get(id)?;
+    assert_eq!(after.state, JobState::Running);
+    assert_eq!(
+        after.lease.as_ref().map(|l| &l.worker),
+        before.lease.as_ref().map(|l| &l.worker)
+    );
+
+    // The worker never noticed more than a few failed heartbeats; its
+    // lease token is still good, so its result is accepted.
+    gate.open();
+    let done = wait_for_state(&client, id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(done.attempt, 1);
+    assert_eq!(done.result, Some(json!({"table": "orders"})));
+    assert_eq!(worker.recorder().len(), 1);
+    Ok(())
+}
