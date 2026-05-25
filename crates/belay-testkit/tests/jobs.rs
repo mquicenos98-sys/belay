@@ -120,3 +120,73 @@ fn a_unique_key_admits_one_job_however_many_threads_race_for_it() -> Result<()> 
     assert_eq!(stored.items.len(), KEYS);
     Ok(())
 }
+
+#[test]
+fn a_rejecting_unique_key_fails_every_racer_but_one() -> Result<()> {
+    const THREADS: usize = 12;
+    let server = TestServer::start()?;
+    let barrier = Arc::new(Barrier::new(THREADS));
+    let racers: Vec<_> = (0..THREADS)
+        .map(|_| {
+            let (barrier, url) = (Arc::clone(&barrier), server.url());
+            thread::spawn(move || -> Result<std::result::Result<JobId, ErrorCode>> {
+                let client = belay_testkit::connect(&url, None)?;
+                let unique = Unique::new("refund:9", UniqueScope::UntilFinished)
+                    .on_conflict(OnConflict::Reject);
+                barrier.wait();
+                Ok(
+                    match client
+                        .jobs()
+                        .enqueue(&job("refunds", "refund").unique_with(unique))
+                    {
+                        Ok(created) => Ok(created.id),
+                        Err(e) => Err(e.code().expect("refusals are API errors")),
+                    },
+                )
+            })
+        })
+        .collect();
+    let outcomes: Vec<_> = racers
+        .into_iter()
+        .map(|r| r.join().expect("a racing thread panicked"))
+        .collect::<Result<_>>()?;
+    let winners: Vec<&JobId> = outcomes.iter().filter_map(|o| o.as_ref().ok()).collect();
+    assert_eq!(winners.len(), 1, "{outcomes:?}");
+    assert!(outcomes
+        .iter()
+        .filter_map(|o| o.as_ref().err())
+        .all(|code| *code == ErrorCode::AlreadyExists));
+    Ok(())
+}
+
+#[test]
+fn higher_priorities_run_first_and_ties_keep_their_enqueue_order() -> Result<()> {
+    let server = TestServer::start()?;
+    let client = server.client();
+    let priorities: [i16; 8] = [0, 5, -3, 10, 5, 1, -3, 7];
+    for (n, priority) in priorities.iter().enumerate() {
+        let spec = job("ranked", "rank")
+            .priority(*priority)
+            .payload(numbered(n));
+        client.jobs().enqueue(&spec)?;
+    }
+    // One executor slot: the worker leases one job at a time, so the order
+    // of executions is the order the server handed them out.
+    let worker = server
+        .worker()
+        .queue("ranked")
+        .concurrency(1)
+        .recording("rank")
+        .start()?;
+    worker
+        .recorder()
+        .wait_until(DEFAULT_TIMEOUT, |r| r.succeeded() == priorities.len())?;
+    let order: Vec<u64> = worker
+        .recorder()
+        .executions()
+        .iter()
+        .filter_map(|e| number_of(&e.payload))
+        .collect();
+    assert_eq!(order, [3, 7, 1, 4, 5, 0, 2, 6]);
+    Ok(())
+}
