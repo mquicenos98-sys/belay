@@ -352,7 +352,7 @@ pub fn decode(bytes: &[u8], cluster: u32) -> Result<Packet, WireError> {
     dec.get_raw(HEADER_LEN)?;
     let sender = fields::get_node_id(&mut dec)?;
     let message = fields::get_message(&mut dec)?;
-    let count = dec.get_uvarint()? as usize;
+    let count = dec.get_count()?;
     let mut updates = Vec::with_capacity(count);
     for _ in 0..count {
         updates.push(fields::get_update(&mut dec)?);

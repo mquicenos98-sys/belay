@@ -225,6 +225,11 @@ fn rejects_malformed_bodies_even_with_a_valid_checksum() {
         decode_kind(&[1, b'a', MSG_GOSSIP, 0, 0]),
         DecodeErrorKind::TrailingBytes(1)
     ));
+    // Update count larger than the input.
+    assert!(matches!(
+        decode_kind(&[1, b'a', MSG_GOSSIP, 100]),
+        DecodeErrorKind::CountTooLarge { .. }
+    ));
     // Unknown update tag.
     assert!(
         matches!(decode_kind(&[1, b'a', MSG_GOSSIP, 1, 7, 1, b'b', 0]), DecodeErrorKind::Invalid(m) if m.contains("update tag 7"))
