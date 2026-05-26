@@ -190,3 +190,69 @@ fn higher_priorities_run_first_and_ties_keep_their_enqueue_order() -> Result<()>
     assert_eq!(order, [3, 7, 1, 4, 5, 0, 2, 6]);
     Ok(())
 }
+
+#[test]
+fn delayed_jobs_wait_for_the_clock_and_run_once_a_tick_promotes_them() -> Result<()> {
+    let server = TestServer::start()?;
+    let worker = server
+        .worker()
+        .queue("reminders")
+        .recording("remind")
+        .start()?;
+    let client = server.client();
+    let start = server.now();
+
+    let later = client.jobs().enqueue(
+        &job("reminders", "remind")
+            .delay(Duration::from_secs(90))
+            .payload(numbered(90)),
+    )?;
+    let sooner = client.jobs().enqueue(
+        &job("reminders", "remind")
+            .run_at(start + Duration::from_secs(30))
+            .payload(numbered(30)),
+    )?;
+    assert_eq!(later.state, JobState::Scheduled);
+    assert_eq!(sooner.state, JobState::Scheduled);
+
+    // The worker keeps asking and keeps being told there is nothing due.
+    worker.wait_for_empty_leases(3, DEFAULT_TIMEOUT)?;
+    assert!(worker.recorder().is_empty());
+
+    let report = server.tick(Duration::from_secs(30))?;
+    assert!(report.errors.is_empty(), "{:?}", report.errors);
+    let first = wait_for_state(&client, sooner.id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(first.started_at, Some(start + Duration::from_secs(30)));
+    worker.wait_for_empty_leases(2, DEFAULT_TIMEOUT)?;
+    assert_eq!(client.jobs().get(later.id)?.state, JobState::Scheduled);
+
+    server.tick(Duration::from_secs(60))?;
+    let second = wait_for_state(&client, later.id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(second.run_at, start + Duration::from_secs(90));
+    assert_eq!(second.started_at, Some(start + Duration::from_secs(90)));
+    let ran: Vec<u64> = worker
+        .recorder()
+        .executions()
+        .iter()
+        .filter_map(|e| number_of(&e.payload))
+        .collect();
+    assert_eq!(ran, [30, 90]);
+    Ok(())
+}
+
+#[test]
+fn an_operator_can_promote_a_delayed_job_to_run_now() -> Result<()> {
+    let server = TestServer::start()?;
+    let worker = server.worker().queue("digest").recording("send").start()?;
+    let client = server.client();
+    let id = client
+        .jobs()
+        .enqueue(&job("digest", "send").delay(Duration::from_secs(3600)))?
+        .id;
+    worker.wait_for_empty_leases(2, DEFAULT_TIMEOUT)?;
+    let promoted = client.jobs().promote(id)?;
+    assert_eq!(promoted.state, JobState::Ready);
+    let done = wait_for_state(&client, id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(done.started_at, Some(server.now()));
+    Ok(())
+}
