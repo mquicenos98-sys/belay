@@ -400,3 +400,221 @@ fn a_lease_left_behind_by_a_vanished_worker_expires_and_another_worker_finishes_
     gate.open();
     Ok(())
 }
+
+#[test]
+fn a_batch_with_one_bad_spec_enqueues_nothing() -> Result<()> {
+    let server = TestServer::start()?;
+    let client = server.client();
+    let good = job("bulk", "load");
+    let bad = job("bulk", "load").priority(5000);
+    let err = client
+        .jobs()
+        .enqueue_batch(&[good.clone(), bad])
+        .expect_err("a priority of 5000 is out of range");
+    assert_eq!(err.code(), Some(ErrorCode::InvalidArgument));
+    let message = err
+        .api_error()
+        .map(|e| e.message.clone())
+        .unwrap_or_default();
+    assert!(message.contains("priority"), "{message}");
+    let stored = client
+        .jobs()
+        .list(&JobFilter::new().queue(QueueName::from_static("bulk")))?;
+    assert!(stored.items.is_empty(), "{:?}", stored.items);
+
+    let results = client.jobs().enqueue_batch(&[good.clone(), good])?;
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r.status == EnqueueStatus::Created));
+    Ok(())
+}
+
+#[test]
+fn tenants_take_turns_within_a_queue() -> Result<()> {
+    let server = TestServer::start()?;
+    let client = server.client();
+    let big = belay_proto::TenantId::new("big-customer")?;
+    let small = belay_proto::TenantId::new("small-customer")?;
+    // The big tenant's backlog arrives first, all of it.
+    for n in 0..12 {
+        let spec = job("exports", "export")
+            .tenant(big.clone())
+            .payload(json!({"tenant": "big", "n": n}));
+        client.jobs().enqueue(&spec)?;
+    }
+    for n in 0..4 {
+        let spec = job("exports", "export")
+            .tenant(small.clone())
+            .payload(json!({"tenant": "small", "n": n}));
+        client.jobs().enqueue(&spec)?;
+    }
+    let worker = server
+        .worker()
+        .queue("exports")
+        .concurrency(1)
+        .recording("export")
+        .start()?;
+    worker
+        .recorder()
+        .wait_until(DEFAULT_TIMEOUT, |r| r.succeeded() == 16)?;
+    let tenants: Vec<String> = worker
+        .recorder()
+        .executions()
+        .iter()
+        .map(|e| e.payload["tenant"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    // Deficit round robin: the small tenant is not stuck behind the big
+    // one's backlog; the two alternate until the small one runs dry.
+    assert!(tenants[..8].windows(2).all(|w| w[0] != w[1]), "{tenants:?}");
+    assert!(tenants[8..].iter().all(|t| t == "big"), "{tenants:?}");
+    // Within a tenant, jobs keep their order.
+    let small_order: Vec<u64> = worker
+        .recorder()
+        .executions()
+        .iter()
+        .filter(|e| e.payload["tenant"] == "small")
+        .filter_map(|e| e.payload["n"].as_u64())
+        .collect();
+    assert_eq!(small_order, [0, 1, 2, 3]);
+    Ok(())
+}
+
+#[test]
+fn an_attempt_past_its_timeout_is_cancelled_and_reported_as_a_timeout() -> Result<()> {
+    let server = TestServer::start()?;
+    let worker = server
+        .worker()
+        .queue("crawl")
+        .sleeping("fetch", Duration::from_secs(60))
+        .start()?;
+    let client = server.client();
+    let id = client
+        .jobs()
+        .enqueue(&job("crawl", "fetch").timeout(Duration::from_secs(1)))?
+        .id;
+    let retrying = wait_for_state(&client, id, JobState::Retrying, DEFAULT_TIMEOUT)?;
+    let error = retrying.last_error().expect("the timeout is recorded");
+    assert_eq!(error.kind.as_deref(), Some("timeout"));
+    assert!(error.retryable);
+    let runs = worker.recorder().of_job(id);
+    assert_eq!(runs[0].outcome, Recorded::Cancelled);
+    let took = runs[0].took.expect("the attempt ended");
+    assert!(took < Duration::from_secs(30), "the handler ran {took:?}");
+    assert_eq!(worker.stats().timed_out, 1);
+    Ok(())
+}
+
+#[test]
+fn uniqueness_scopes_release_their_keys_at_the_right_moment() -> Result<()> {
+    let server = TestServer::start()?;
+    let gate = Gate::new();
+    let worker = server
+        .worker()
+        .queue("digests")
+        .gated("digest", &gate)
+        .recording("rollup")
+        .start()?;
+    let client = server.client();
+
+    // until_started: duplicates collapse while the job waits (the queue is
+    // held so that it does wait), and the key is free again once it runs.
+    let digests = QueueName::from_static("digests");
+    client.queues().pause(&digests)?;
+    let started = job("digests", "digest").unique("digest:alice", UniqueScope::UntilStarted);
+    let first = client.jobs().enqueue(&started)?;
+    let duplicate = client.jobs().enqueue(&started)?;
+    assert_eq!(
+        (duplicate.status, duplicate.id),
+        (EnqueueStatus::Duplicate, first.id)
+    );
+    client.queues().resume(&digests)?;
+    worker
+        .recorder()
+        .wait_for_start(first.id, DEFAULT_TIMEOUT)?;
+    let second = client.jobs().enqueue(&started)?;
+    assert_eq!(second.status, EnqueueStatus::Created);
+    assert_ne!(second.id, first.id);
+    // Both finish before the clock moves: a jump past a running job's
+    // timeout would expire it.
+    gate.open();
+    wait_for_state(&client, first.id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    wait_for_state(&client, second.id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+
+    // for:1h: the key is held for an hour whatever happens to the job.
+    let hourly = job("digests", "rollup")
+        .unique("rollup:hourly", UniqueScope::For(Duration::from_secs(3600)));
+    let held = client.jobs().enqueue(&hourly)?;
+    wait_for_state(&client, held.id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    let again = client.jobs().enqueue(&hourly)?;
+    assert_eq!(
+        (again.status, again.id),
+        (EnqueueStatus::Duplicate, held.id)
+    );
+    server.tick(Duration::from_secs(3600))?;
+    let later = client.jobs().enqueue(&hourly)?;
+    assert_eq!(later.status, EnqueueStatus::Created);
+    wait_for_state(&client, later.id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(worker.recorder().of_kind("rollup").len(), 2);
+    Ok(())
+}
+
+#[test]
+fn a_job_of_a_kind_no_worker_handles_dies_without_blocking_the_queue() -> Result<()> {
+    let server = TestServer::start()?;
+    let worker = server.worker().queue("mixed").recording("known").start()?;
+    let client = server.client();
+    let unknown = client
+        .jobs()
+        .enqueue(&job("mixed", "mystery").max_attempts(5))?
+        .id;
+    let known = client.jobs().enqueue(&job("mixed", "known"))?.id;
+    let dead = wait_for_state(&client, unknown, JobState::Dead, DEFAULT_TIMEOUT)?;
+    assert_eq!(dead.attempt, 1, "an unknown kind is not retried");
+    let error = dead.last_error().expect("the refusal is recorded");
+    assert_eq!(error.kind.as_deref(), Some("unknown_kind"));
+    assert!(error.message.contains("\"mystery\""), "{error:?}");
+    wait_for_state(&client, known, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(worker.recorder().len(), 1);
+    Ok(())
+}
+
+#[test]
+fn a_per_kind_limit_holds_on_a_worker_with_more_slots() -> Result<()> {
+    let server = TestServer::start()?;
+    let gate = Gate::new();
+    // One unlimited kind makes the worker lease for all its free slots;
+    // transcodes beyond their limit then wait on the worker.
+    let worker = server
+        .worker()
+        .queue("heavy")
+        .concurrency(4)
+        .gated("transcode", &gate)
+        .kind_options("transcode", belay_worker::KindOptions::new().concurrency(1))
+        .recording("thumbnail")
+        .start()?;
+    let client = server.client();
+    let ids: Vec<JobId> = (0..3)
+        .map(|n| {
+            let spec = job("heavy", "transcode").payload(numbered(n));
+            Ok(client.jobs().enqueue(&spec)?.id)
+        })
+        .collect::<Result<_>>()?;
+    worker
+        .recorder()
+        .wait_until(DEFAULT_TIMEOUT, |r| r.running_in("heavy") == 1)?;
+    eventually(DEFAULT_TIMEOUT, || worker.stats().waiting == 2)?;
+    // Leased, heartbeated, but not started.
+    assert_eq!(worker.recorder().running_in("heavy"), 1);
+    let counts = client
+        .queues()
+        .get(&QueueName::from_static("heavy"))?
+        .counts;
+    assert_eq!(counts.get(JobState::Running), 3);
+
+    gate.open();
+    for id in &ids {
+        wait_for_state(&client, *id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    }
+    assert_eq!(worker.recorder().peak_running("heavy"), 1);
+    assert_eq!(worker.recorder().len(), 3);
+    Ok(())
+}
