@@ -256,3 +256,147 @@ fn an_operator_can_promote_a_delayed_job_to_run_now() -> Result<()> {
     assert_eq!(done.started_at, Some(server.now()));
     Ok(())
 }
+
+#[test]
+fn progress_reported_by_a_handler_travels_with_its_heartbeats() -> Result<()> {
+    let server = TestServer::start()?;
+    let gate = Gate::new();
+    let held = gate.clone();
+    let worker = server
+        .worker()
+        .queue("video")
+        .handler(
+            "encode",
+            handler_fn(move |ctx| {
+                ctx.progress(40.0, "pass 1 of 2");
+                while !held.is_open() {
+                    if !ctx.sleep_or_cancel(Duration::from_millis(5)) {
+                        return Err(HandlerError::cancelled());
+                    }
+                }
+                Ok(Outcome::with(json!({"frames": 1200})))
+            }),
+        )
+        .start()?;
+    let client = server.client();
+    let id = client.jobs().enqueue(&job("video", "encode"))?.id;
+    let running = wait_for_job(&client, id, "running with progress", DEFAULT_TIMEOUT, |j| {
+        j.progress.is_some()
+    })?;
+    let progress = running.progress.expect("the wait checked it");
+    assert_eq!(progress.percent, Some(40.0));
+    assert_eq!(progress.message.as_deref(), Some("pass 1 of 2"));
+    assert_eq!(running.state, JobState::Running);
+    gate.open();
+    let done = wait_for_state(&client, id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(done.result, Some(json!({"frames": 1200})));
+    drop(worker);
+    Ok(())
+}
+
+#[test]
+fn cancelling_a_running_job_reaches_its_handler_through_the_next_heartbeat() -> Result<()> {
+    let server = TestServer::start()?;
+    let events = server.event_log()?;
+    let worker = server
+        .worker()
+        .queue("reports")
+        .sleeping("render", Duration::from_secs(60))
+        .heartbeat_every(Duration::from_millis(50))
+        .start()?;
+    let client = server.client();
+    let id = client.jobs().enqueue(&job("reports", "render"))?.id;
+    worker.recorder().wait_for_start(id, DEFAULT_TIMEOUT)?;
+
+    // A running job is only flagged; its worker hears of it on the next
+    // heartbeat and cancels the handler, which then reports back.
+    let flagged = client.jobs().cancel(id)?;
+    assert_eq!(flagged.state, JobState::Running);
+    assert!(flagged.cancel_requested);
+
+    let cancelled = wait_for_state(&client, id, JobState::Cancelled, DEFAULT_TIMEOUT)?;
+    assert!(cancelled.finished_at.is_some());
+    let runs = worker.recorder().of_job(id);
+    assert_eq!(runs.len(), 1);
+    assert_eq!(runs[0].outcome, Recorded::Cancelled);
+    let took = runs[0].took.expect("the attempt has ended");
+    assert!(took < Duration::from_secs(30), "the handler ran {took:?}");
+    events.wait_for_job_event(id, "job.cancelled", DEFAULT_TIMEOUT)?;
+    eventually(DEFAULT_TIMEOUT, || worker.stats().cancelled == 1)?;
+
+    // Cancelling again changes nothing; the attempt count stays at one.
+    let again = client.jobs().cancel(id)?;
+    assert_eq!((again.state, again.attempt), (JobState::Cancelled, 1));
+    Ok(())
+}
+
+#[test]
+fn a_lease_left_behind_by_a_vanished_worker_expires_and_another_worker_finishes_the_job(
+) -> Result<()> {
+    let server = TestServer::start()?;
+    let events = server.event_log()?;
+    let gate = Gate::new();
+    let doomed = server
+        .worker()
+        .id("doomed")
+        .queue("imports")
+        .gated("import", &gate)
+        .lease_for(Duration::from_secs(30))
+        .start()?;
+    let client = server.client();
+    let id = client
+        .jobs()
+        .enqueue(&job("imports", "import").payload(json!({"file": "a.csv"})))?
+        .id;
+    doomed.recorder().wait_for_start(id, DEFAULT_TIMEOUT)?;
+
+    // The worker disappears without a word; the server still thinks it
+    // is working on the job.
+    let report = doomed.crash();
+    assert_eq!(report.stats.succeeded, 0);
+    let stranded = client.jobs().get(id)?;
+    assert_eq!(stranded.state, JobState::Running);
+    let lease = stranded.lease.expect("a running job has a lease");
+    assert_eq!(lease.worker.as_str(), "doomed");
+
+    // Not yet: the lease has time left.
+    server.tick(Duration::from_secs(20))?;
+    assert_eq!(client.jobs().get(id)?.state, JobState::Running);
+    // Now it has run out; the attempt counts as failed and the job waits
+    // out its retry delay (1 s for fixtures::job).
+    let tick = server.tick(Duration::from_secs(11))?;
+    assert_eq!(tick.queue.expired, 1);
+    let expired = client.jobs().get(id)?;
+    assert_eq!(expired.state, JobState::Retrying);
+    let error = expired.last_error().expect("the expiry is recorded");
+    assert!(error.message.contains("lease expired"), "{error:?}");
+    assert_eq!(error.worker.as_ref().map(|w| w.as_str()), Some("doomed"));
+    events.wait_for_job_event(id, "job.expired", DEFAULT_TIMEOUT)?;
+
+    let rescuer = server
+        .worker()
+        .id("rescuer")
+        .queue("imports")
+        .recording("import")
+        .start()?;
+    server.tick(Duration::from_secs(1))?;
+    let done = wait_for_state(&client, id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(done.attempt, 2);
+    assert_eq!(done.result, Some(json!({"file": "a.csv"})));
+    let rescued = rescuer.recorder().of_job(id);
+    assert_eq!(rescued.len(), 1);
+    assert_eq!(rescued[0].attempt, 2);
+    assert_eq!(
+        events.types_of_job(id),
+        [
+            "job.enqueued",
+            "job.started",
+            "job.expired",
+            "job.failed",
+            "job.started",
+            "job.succeeded"
+        ]
+    );
+    gate.open();
+    Ok(())
+}
