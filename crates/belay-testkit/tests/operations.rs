@@ -218,3 +218,66 @@ fn metrics_count_job_outcomes_by_queue() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn stopping_is_prompt_while_workers_long_poll_and_they_carry_on_after_a_restart() -> Result<()> {
+    let mut server = TestServer::start()?;
+    let worker = server
+        .worker()
+        .queue("idle")
+        .recording("wake")
+        .poll_wait(Duration::from_secs(10))
+        .start()?;
+    // The worker sits in a ten-second long poll.
+    eventually(DEFAULT_TIMEOUT, || worker.lease_calls() >= 1)?;
+    let started = Instant::now();
+    server.stop();
+    let took = started.elapsed();
+    assert!(took < Duration::from_secs(3), "stopping took {took:?}");
+    worker.wait_for_failed_calls(1, DEFAULT_TIMEOUT)?;
+
+    server.restart()?;
+    let client = server.client();
+    let id = client.jobs().enqueue(&job("idle", "wake"))?.id;
+    wait_for_state(&client, id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(worker.recorder().len(), 1);
+    // A worker's shutdown waits for its lease call in flight; stopping the
+    // server first answers that ten-second long poll at once.
+    drop(server);
+    let report = worker.stop();
+    assert_eq!(report.stats.succeeded, 1);
+    Ok(())
+}
+
+#[test]
+fn an_admin_can_shut_the_server_down_over_http() -> Result<()> {
+    let mut server = TestServer::builder().standard_tokens().start()?;
+    let producer = server.client_with_token(tokens::PRODUCER)?;
+    let id = producer.jobs().enqueue(&job("mail", "send"))?.id;
+    let shutdown = format!("{}/v1/admin/shutdown", server.url());
+
+    let refused = raw::request(
+        "POST",
+        &shutdown,
+        &[("Authorization", &format!("Bearer {}", tokens::PRODUCER))],
+        b"",
+    )?;
+    assert_eq!(refused.status, 403);
+
+    let accepted = raw::request(
+        "POST",
+        &shutdown,
+        &[("Authorization", &format!("Bearer {}", tokens::ADMIN))],
+        b"",
+    )?;
+    assert_eq!(accepted.status, 202);
+    assert_eq!(accepted.json()?["shutting_down"], true);
+    eventually(DEFAULT_TIMEOUT, || server.engine().is_shutting_down())?;
+    eventually(DEFAULT_TIMEOUT, || server.client().health().is_err())?;
+
+    // Nothing is lost: the harness brings it back on the same store.
+    server.restart()?;
+    let reader = server.client_with_token(tokens::READER)?;
+    assert_eq!(reader.jobs().get(id)?.state, JobState::Ready);
+    Ok(())
+}
