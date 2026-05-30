@@ -467,6 +467,19 @@ fn idempotent_request_is_retried_on_a_stale_pooled_connection() {
 }
 
 #[test]
+fn non_idempotent_request_is_not_retried() {
+    let (addr, server) = closes_reused_connections(1);
+    let client = client();
+    let base = format!("http://{addr}");
+    client.get(&format!("{base}/a"), &[]).expect("first");
+    let err = client
+        .post(&format!("{base}/jobs"), "{}", &[])
+        .expect_err("the server may have acted on the post");
+    assert!(matches!(err, Error::ConnectionClosed), "{err}");
+    assert_eq!(server.join().expect("fake server"), 1);
+}
+
+#[test]
 fn truncated_response_body_is_an_error() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
     let addr = listener.local_addr().expect("addr");
