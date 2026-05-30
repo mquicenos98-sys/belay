@@ -175,3 +175,42 @@ fn a_non_retryable_failure_goes_straight_to_dead() -> Result<()> {
     assert_eq!(error.worker.as_ref(), Some(worker.id()));
     Ok(())
 }
+
+#[test]
+fn a_handler_can_choose_its_own_retry_delay() -> Result<()> {
+    let server = TestServer::start()?;
+    let calls = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&calls);
+    let _worker = server
+        .worker()
+        .queue("api")
+        .handler(
+            "call",
+            handler_fn(move |_| {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(HandlerError::retry("upstream answered 429")
+                        .with_kind("http_429")
+                        .retry_after(Duration::from_secs(45)))
+                } else {
+                    Ok(Outcome::done())
+                }
+            }),
+        )
+        .start()?;
+    let client = server.client();
+    let t0 = server.now();
+    let id = client.jobs().enqueue(&job("api", "call"))?.id;
+    let waiting = wait_for_state(&client, id, JobState::Retrying, DEFAULT_TIMEOUT)?;
+    // 45 s as asked, not the 1 s the job's backoff would give.
+    assert_eq!(waiting.run_at, t0 + Duration::from_secs(45));
+    assert_eq!(
+        waiting.last_error().and_then(|e| e.kind.as_deref()),
+        Some("http_429")
+    );
+    server.tick(Duration::from_secs(44))?;
+    assert_eq!(client.jobs().get(id)?.state, JobState::Retrying);
+    server.tick(Duration::from_secs(1))?;
+    wait_for_state(&client, id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    Ok(())
+}
