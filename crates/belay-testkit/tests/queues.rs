@@ -171,3 +171,34 @@ fn a_concurrency_limit_holds_across_several_workers() -> Result<()> {
     assert!(recorder.overlaps().is_empty());
     Ok(())
 }
+
+#[test]
+fn a_purge_removes_waiting_jobs_but_never_running_ones() -> Result<()> {
+    let server = TestServer::start()?;
+    let client = server.client();
+    let gate = Gate::new();
+    let worker = server
+        .worker()
+        .queue("backfill")
+        .concurrency(1)
+        .gated("fill", &gate)
+        .start()?;
+    let running = client.jobs().enqueue(&job("backfill", "fill"))?.id;
+    worker.recorder().wait_for_start(running, DEFAULT_TIMEOUT)?;
+    client.queues().pause(&queue("backfill"))?;
+    for n in 0..4 {
+        client
+            .jobs()
+            .enqueue(&job("backfill", "fill").payload(numbered(n)))?;
+    }
+    let purged = client.queues().purge(&queue("backfill"), None)?;
+    assert_eq!(purged, 4);
+    let info = client.queues().get(&queue("backfill"))?;
+    assert_eq!(info.counts.get(JobState::Ready), 0);
+    assert_eq!(info.counts.get(JobState::Running), 1);
+
+    gate.open();
+    wait_for_state(&client, running, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(worker.recorder().len(), 1);
+    Ok(())
+}
