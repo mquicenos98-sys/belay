@@ -150,7 +150,7 @@ impl RetryPolicy {
         let backoff = self.backoff.delay_for(attempt, &mut lock(&self.rng));
         match retry_after {
             Some(wait) if wait > self.max_wait => None,
-            Some(wait) => Some(wait.min(backoff)),
+            Some(wait) => Some(wait.max(backoff)),
             None => Some(backoff),
         }
     }
@@ -262,6 +262,22 @@ mod tests {
             policy(0).next_delay(1, Safety::Repeatable, &status(503)),
             None
         );
+    }
+
+    #[test]
+    fn retry_after_lengthens_but_never_shortens_the_backoff() {
+        let p = policy(3);
+        let asked = |secs| Failure::Status {
+            status: 503,
+            retry_after: Some(Duration::from_secs(secs)),
+        };
+        assert_eq!(
+            p.next_delay(1, Safety::Repeatable, &asked(2)),
+            Some(Duration::from_secs(2))
+        );
+        assert_eq!(p.next_delay(1, Safety::Repeatable, &asked(0)), MS10);
+        // Longer than the client is willing to wait: give up at once.
+        assert_eq!(p.next_delay(1, Safety::Repeatable, &asked(31)), None);
     }
 
     #[test]
