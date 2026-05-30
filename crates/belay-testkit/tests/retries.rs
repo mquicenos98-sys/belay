@@ -95,3 +95,83 @@ fn failed_attempts_back_off_on_the_job_policy_then_succeed() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn exhausted_attempts_go_dead_and_an_operator_retry_brings_the_job_back() -> Result<()> {
+    let server = TestServer::start()?;
+    let events = server.event_log()?;
+    // Fails three times, whatever attempt number the server gives it: the
+    // bug is "fixed" by the time an operator retries.
+    let worker = server
+        .worker()
+        .queue("imports")
+        .failing_n_times("import", 3)
+        .start()?;
+    let client = server.client();
+    let id = client
+        .jobs()
+        .enqueue(&job("imports", "import").max_attempts(3))?
+        .id;
+
+    wait_for_job(&client, id, "retrying", DEFAULT_TIMEOUT, |j| {
+        j.attempt == 1 && j.state == JobState::Retrying
+    })?;
+    server.tick(Duration::from_secs(1))?;
+    wait_for_job(&client, id, "retrying again", DEFAULT_TIMEOUT, |j| {
+        j.attempt == 2 && j.state == JobState::Retrying
+    })?;
+    server.tick(Duration::from_secs(2))?;
+    let dead = wait_for_state(&client, id, JobState::Dead, DEFAULT_TIMEOUT)?;
+    assert_eq!(dead.attempt, 3);
+    assert_eq!(dead.errors.len(), 3);
+    assert!(dead.finished_at.is_some());
+    let died = events.wait_for_job_event(id, "job.dead", DEFAULT_TIMEOUT)?;
+    assert!(
+        matches!(died.kind, EventKind::JobDead { attempt: 3, .. }),
+        "{died:?}"
+    );
+
+    // Nothing happens to a dead job by itself.
+    server.tick(Duration::from_secs(3600))?;
+    worker.wait_for_empty_leases(2, DEFAULT_TIMEOUT)?;
+    assert_eq!(client.jobs().get(id)?.state, JobState::Dead);
+
+    let retried = client.jobs().retry(id)?;
+    assert_eq!(retried.state, JobState::Ready);
+    assert_eq!(
+        retried.attempt, 0,
+        "an operator retry grants fresh attempts"
+    );
+    let done = wait_for_state(&client, id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(done.attempt, 1);
+    assert_eq!(
+        done.errors.len(),
+        3,
+        "the failures before the retry stay on record"
+    );
+    assert_eq!(worker.recorder().attempts_of(id), [1, 2, 3, 1]);
+    events.wait_for_job_event(id, "job.succeeded", DEFAULT_TIMEOUT)?;
+    let types = events.types_of_job(id);
+    let retried_at = types.iter().position(|t| *t == "job.retried");
+    let dead_at = types.iter().position(|t| *t == "job.dead");
+    assert!(retried_at > dead_at, "{types:?}");
+    Ok(())
+}
+
+#[test]
+fn a_non_retryable_failure_goes_straight_to_dead() -> Result<()> {
+    let server = TestServer::start()?;
+    let worker = server.worker().queue("mail").failing("bounce").start()?;
+    let client = server.client();
+    let id = client
+        .jobs()
+        .enqueue(&job("mail", "bounce").max_attempts(10))?
+        .id;
+    let dead = wait_for_state(&client, id, JobState::Dead, DEFAULT_TIMEOUT)?;
+    assert_eq!(dead.attempt, 1);
+    let error = dead.last_error().expect("the failure is recorded");
+    assert!(!error.retryable);
+    assert_eq!(error.message, "bounce always fails");
+    assert_eq!(error.worker.as_ref(), Some(worker.id()));
+    Ok(())
+}
