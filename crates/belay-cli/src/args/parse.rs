@@ -194,7 +194,13 @@ impl<'a> Parser<'a> {
     fn take_value(&mut self, flag: &'a Flag, next: Option<&str>) -> usize {
         let forgotten = match next {
             None => true,
-            Some(next) => next.starts_with('-') && next != "-",
+            Some(next) => {
+                next.starts_with("--")
+                    || next
+                        .strip_prefix('-')
+                        .and_then(|rest| rest.chars().next())
+                        .is_some_and(|c| !c.is_ascii_digit() && self.find_short(c).is_some())
+            }
         };
         match next {
             Some(value) if !forgotten => {
@@ -470,6 +476,14 @@ mod tests {
         assert_eq!(m.count("verbose"), 2);
         assert_eq!(m.get::<i16>("priority").unwrap(), Some(7));
         assert_eq!(m.values("tag"), ["a", "b"]);
+    }
+
+    #[test]
+    fn negative_numbers_are_values_not_flags() {
+        let m = run(&["enqueue", "q", "k", "--priority", "-5"]);
+        assert_eq!(m.get::<i16>("priority").unwrap(), Some(-5));
+        let m = run(&["enqueue", "q", "k", "-p", "-10"]);
+        assert_eq!(m.get::<i16>("priority").unwrap(), Some(-10));
     }
 
     #[test]
