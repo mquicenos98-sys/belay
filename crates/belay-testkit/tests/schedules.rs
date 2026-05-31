@@ -286,3 +286,110 @@ fn a_calendar_keeps_a_schedule_to_office_hours_and_off_holidays() -> Result<()> 
     assert_eq!(refused.code(), Some(ErrorCode::FailedPrecondition));
     Ok(())
 }
+
+#[test]
+fn overlap_policies_decide_what_a_fire_does_while_the_last_job_runs() -> Result<()> {
+    let server = TestServer::builder().configure(keep_fired_jobs).start()?;
+    let events = server.event_log()?;
+    let gate = Gate::new();
+    // Leases outlast the minute jumps below, so running jobs stay running.
+    let worker = server
+        .worker()
+        .queue(SCHEDULED_QUEUE)
+        .gated("overlap-skip", &gate)
+        .gated("overlap-cancel", &gate)
+        .lease_for(Duration::from_secs(600))
+        .start()?;
+    let client = server.client();
+    client
+        .schedules()
+        .create(&schedule("overlap-skip", "* * * * *").overlap(belay_proto::OverlapPolicy::Skip))?;
+    client.schedules().create(
+        &schedule("overlap-cancel", "* * * * *")
+            .overlap(belay_proto::OverlapPolicy::CancelPrevious),
+    )?;
+
+    server.tick(Duration::from_secs(60))?;
+    let first_skip = fired_jobs(&client, "overlap-skip")?[0].id;
+    let first_cancel = fired_jobs(&client, "overlap-cancel")?[0].id;
+    worker
+        .recorder()
+        .wait_for_start(first_skip, DEFAULT_TIMEOUT)?;
+    worker
+        .recorder()
+        .wait_for_start(first_cancel, DEFAULT_TIMEOUT)?;
+
+    // A minute later both jobs still run.
+    let report = server.tick(Duration::from_secs(60))?;
+    assert_eq!(report.schedules.skipped.len(), 1);
+    assert_eq!(
+        report.schedules.skipped[0].schedule.as_str(),
+        "overlap-skip"
+    );
+    assert_eq!(fired_jobs(&client, "overlap-skip")?.len(), 1);
+    let skipped =
+        events.wait_for_event(DEFAULT_TIMEOUT, |e| e.type_name() == "schedule.skipped")?;
+    assert_eq!(
+        skipped.kind.schedule().map(|s| s.as_str()),
+        Some("overlap-skip")
+    );
+
+    // cancel_previous asked the old job to stop, which reached its handler
+    // through the worker's heartbeat, and fired a new one.
+    let cancelled = wait_for_state(&client, first_cancel, JobState::Cancelled, DEFAULT_TIMEOUT)?;
+    assert_eq!(cancelled.attempt, 1);
+    assert!(cancelled.finished_at.is_some());
+    let jobs = fired_jobs(&client, "overlap-cancel")?;
+    assert_eq!(jobs.len(), 2);
+    worker
+        .recorder()
+        .wait_for_start(jobs[1].id, DEFAULT_TIMEOUT)?;
+
+    gate.open();
+    wait_for_state(&client, first_skip, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    wait_for_state(&client, jobs[1].id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    let outcomes: Vec<Recorded> = worker
+        .recorder()
+        .of_job(first_cancel)
+        .into_iter()
+        .map(|e| e.outcome)
+        .collect();
+    assert_eq!(outcomes, [Recorded::Cancelled]);
+    Ok(())
+}
+
+#[test]
+fn jitter_holds_a_fired_job_back_by_a_fixed_offset_within_its_bound() -> Result<()> {
+    let server = TestServer::start()?;
+    let worker = server
+        .worker()
+        .queue(SCHEDULED_QUEUE)
+        .recording("jittery")
+        .start()?;
+    let client = server.client();
+    let bound = Duration::from_secs(600);
+    client
+        .schedules()
+        .create(&schedule("jittery", "0 * * * *").jitter(bound))?;
+
+    let fire = at("2025-03-03T09:00:00Z");
+    server.tick_at(fire)?;
+    let job = fired_jobs(&client, "jittery")?
+        .pop()
+        .expect("the schedule fired at 09:00");
+    assert_eq!(fire_time(&job), Some(fire));
+    assert!(
+        job.run_at > fire && job.run_at < fire + bound,
+        "{}",
+        job.run_at
+    );
+    assert_eq!(job.state, JobState::Scheduled);
+
+    // The job waits for its own time, not the fire time.
+    worker.wait_for_empty_leases(2, DEFAULT_TIMEOUT)?;
+    assert!(worker.recorder().is_empty());
+    server.tick_at(job.run_at)?;
+    let done = wait_for_state(&client, job.id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(done.started_at, Some(job.run_at));
+    Ok(())
+}
