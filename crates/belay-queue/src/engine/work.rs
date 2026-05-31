@@ -39,6 +39,7 @@ impl QueueEngine {
         req.validate()?;
         self.worker_call(*id, req.token, |cx, mut job| {
             let now = cx.now;
+            let deadline = job.deadline();
             let Some(lease) = job.lease.as_mut() else {
                 return Err(Error::LeaseLost(job.id));
             };
@@ -49,6 +50,9 @@ impl QueueEngine {
                     .clamp(MIN_LEASE, MAX_LEASE)
             });
             lease.renew(now, by);
+            if let Some(deadline) = deadline {
+                lease.expires_at = lease.expires_at.min(deadline);
+            }
             let response = HeartbeatResponse {
                 expires_at: lease.expires_at,
                 cancel_requested: job.cancel_requested,

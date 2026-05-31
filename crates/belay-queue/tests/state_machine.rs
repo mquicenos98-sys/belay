@@ -653,6 +653,34 @@ fn heartbeats_extend_the_lease_by_its_length_without_shortening_it() {
 }
 
 #[test]
+fn the_job_timeout_caps_the_lease_and_its_renewals() {
+    let h = Harness::new();
+    let id = h.enqueue(spec().timeout(Duration::from_secs(45)));
+    let req = belay_proto::api::LeaseRequest::new(w("w1"), vec![q("q")])
+        .lease_for(Duration::from_secs(300));
+    let l = h.engine.lease(&req).expect("lease").remove(0);
+    let deadline = start() + Duration::from_secs(45);
+    assert_eq!(l.job.lease.as_ref().map(|x| x.expires_at), Some(deadline));
+    h.secs(40);
+    let long = HeartbeatRequest {
+        extend_by: Some(Duration::from_secs(600)),
+        ..HeartbeatRequest::new(l.token)
+    };
+    assert_eq!(
+        h.engine
+            .heartbeat(&id, &long)
+            .expect("heartbeat")
+            .expires_at,
+        deadline
+    );
+    h.secs(5);
+    assert_eq!(h.tick().expired, 1);
+    let error = h.job(id).last_error().cloned().expect("error");
+    assert_eq!(error.kind.as_deref(), Some("timeout"));
+    assert_eq!(error.message, "timed out after 45s");
+}
+
+#[test]
 fn cancelled_ready_jobs_leave_the_ready_order() {
     let h = Harness::new();
     let a = h.enqueue(spec().priority(10));
