@@ -48,7 +48,7 @@ struct Pacing {
 pub(super) fn stream(app: &App, req: &mut Request) -> Result<Response, ApiError> {
     let mut filter = EventFilter::from_pairs(req.query.iter())?;
     if let Some(last) = last_event_id(req)? {
-        filter.from = filter.from.or(Some(last.saturating_add(1)));
+        filter.from = Some(last.saturating_add(1));
     }
     // The endpoint already turns requests away once the engine stops; a
     // bus closed by other means ends streams just the same.

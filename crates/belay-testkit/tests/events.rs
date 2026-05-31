@@ -8,6 +8,7 @@ use std::time::Duration;
 use belay_client::EventOptions;
 use belay_proto::event::EventPattern;
 use belay_testkit::prelude::*;
+use belay_testkit::raw::{RawEvent, RawEventStream};
 use belay_testkit::TcpProxy;
 
 fn enqueue_feed(client: &Client, n: usize) -> Result<JobId> {
@@ -15,6 +16,12 @@ fn enqueue_feed(client: &Client, n: usize) -> Result<JobId> {
         .jobs()
         .enqueue(&job("feed", "item").payload(numbered(n)))?
         .id)
+}
+
+fn next_raw(stream: &mut RawEventStream) -> Result<RawEvent> {
+    stream
+        .next_event()?
+        .ok_or_else(|| belay_testkit::Error::Invalid("the stream ended early".to_owned()))
 }
 
 #[test]
@@ -64,6 +71,51 @@ fn a_stream_resumes_after_a_dropped_connection_without_gaps_or_repeats() -> Resu
         .expect("the stream reconnected through the proxy");
     let wanted = format!("last-event-id: {last_before_cut}");
     assert!(resumed.to_ascii_lowercase().contains(&wanted), "{resumed}");
+    Ok(())
+}
+
+#[test]
+fn last_event_id_picks_where_a_new_stream_starts_and_wins_over_from() -> Result<()> {
+    let server = TestServer::start()?;
+    let client = server.client();
+    let ids: Vec<JobId> = (0..6)
+        .map(|n| enqueue_feed(&client, n))
+        .collect::<Result<_>>()?;
+    let url = format!("{}/v1/events", server.url());
+    let timeout = Duration::from_secs(10);
+
+    let mut everything = RawEventStream::open(&url, &[], timeout)?;
+    assert_eq!(everything.status, 200);
+    let first: Vec<RawEvent> = (0..6)
+        .map(|_| next_raw(&mut everything))
+        .collect::<Result<_>>()?;
+    for (event, id) in first.iter().zip(&ids) {
+        assert_eq!(event.event.as_deref(), Some("job.enqueued"));
+        let data = belay_json::parse(&event.data)?;
+        assert_eq!(data["job"], id.to_string().as_str());
+    }
+    let seq = |i: usize| first[i].id.clone().expect("events carry ids");
+
+    // A client that saw the third event resumes after it.
+    let third = seq(2);
+    let mut resumed = RawEventStream::open(&url, &[("Last-Event-ID", &third)], timeout)?;
+    let next: Vec<Option<String>> = (0..3)
+        .map(|_| next_raw(&mut resumed).map(|e| e.id))
+        .collect::<Result<_>>()?;
+    assert_eq!(next, [Some(seq(3)), Some(seq(4)), Some(seq(5))]);
+
+    // `from` asks for everything, Last-Event-ID says four were seen.
+    let with_from = format!("{url}?from={}", seq(0));
+    let mut both = RawEventStream::open(&with_from, &[("Last-Event-ID", &seq(4))], timeout)?;
+    assert_eq!(next_raw(&mut both)?.id, Some(seq(5)));
+
+    // Live events keep flowing on the resumed stream.
+    let seventh = enqueue_feed(&client, 6)?;
+    let live = next_raw(&mut resumed)?;
+    assert_eq!(
+        belay_json::parse(&live.data)?["job"],
+        seventh.to_string().as_str()
+    );
     Ok(())
 }
 

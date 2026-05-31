@@ -76,6 +76,19 @@ fn frames_carry_id_type_and_json_after_a_retry_hint() {
 }
 
 #[test]
+fn last_event_id_wins_over_from() {
+    let server = TestServer::start();
+    let first = server.engine.events().next_seq();
+    for queue in ["a", "b", "c"] {
+        enqueue(&server, queue);
+    }
+    // `from` asks for everything, Last-Event-ID says the first was seen.
+    let mut stream = open(&server, &format!("?from={first}"), Some(first));
+    assert_eq!(next(&mut stream).id, Some((first + 1).to_string()));
+    assert_eq!(next(&mut stream).id, Some((first + 2).to_string()));
+}
+
+#[test]
 fn filters_select_types_and_queues() {
     let server = TestServer::start();
     let first = server.engine.events().next_seq();
