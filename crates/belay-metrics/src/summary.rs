@@ -315,7 +315,7 @@ fn unpack(state: u64) -> (u32, u32) {
 /// Whether epoch tag `a` is later than `b`, tolerating wrap-around. Tags are
 /// only ever compared across a few sub-windows, far below 2^31 apart.
 fn is_later(a: u32, b: u32) -> bool {
-    a.wrapping_sub(b) > 0
+    (a.wrapping_sub(b) as i32) > 0
 }
 
 /// SplitMix64's output function: a cheap, well-mixed 64-bit hash.
@@ -522,6 +522,24 @@ mod tests {
         assert_eq!(values(&s), [7.0, 7.0]);
     }
 
+    // Regression: an observation stamped with an older time than the slot's
+    // current sub-window used to reset the slot and wipe newer samples.
+    #[test]
+    fn late_observation_for_an_evicted_sub_window_is_dropped() {
+        let opts = SummaryOpts::new()
+            .quantiles(&[0.5])
+            .max_age(Duration::from_secs(10))
+            .age_buckets(5);
+        let (time, s) = summary(opts);
+        time.set(Duration::from_secs(10));
+        s.observe(3.0);
+        time.set(Duration::ZERO);
+        s.observe(100.0);
+        time.set(Duration::from_secs(10));
+        assert_eq!(values(&s), [3.0]);
+        assert_eq!(s.count(), 2);
+    }
+
     #[test]
     fn sampling_beyond_capacity_stays_close_and_is_deterministic() {
         let opts = SummaryOpts::new()
@@ -609,6 +627,7 @@ mod tests {
     fn epoch_tags_compare_across_wrap_around() {
         assert!(is_later(1, 0));
         assert!(is_later(0, u32::MAX));
+        assert!(!is_later(u32::MAX, 0));
         assert!(!is_later(7, 7));
         assert_eq!(unpack(pack(0xdead_beef, 42)), (0xdead_beef, 42));
     }
