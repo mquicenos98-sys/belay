@@ -361,7 +361,7 @@ impl Client {
             let mut conn = Conn::new(stream, key.clone(), true);
             match exchange(&mut conn, &outgoing) {
                 Ok(head) => return self.respond(conn, head, &outgoing),
-                Err(failure) if failure.stale => {}
+                Err(failure) if failure.stale && method.is_idempotent() => {}
                 Err(failure) => return Err(failure.error),
             }
         }

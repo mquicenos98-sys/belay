@@ -175,3 +175,116 @@ fn a_non_retryable_failure_goes_straight_to_dead() -> Result<()> {
     assert_eq!(error.worker.as_ref(), Some(worker.id()));
     Ok(())
 }
+
+#[test]
+fn a_handler_can_choose_its_own_retry_delay() -> Result<()> {
+    let server = TestServer::start()?;
+    let calls = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&calls);
+    let _worker = server
+        .worker()
+        .queue("api")
+        .handler(
+            "call",
+            handler_fn(move |_| {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err(HandlerError::retry("upstream answered 429")
+                        .with_kind("http_429")
+                        .retry_after(Duration::from_secs(45)))
+                } else {
+                    Ok(Outcome::done())
+                }
+            }),
+        )
+        .start()?;
+    let client = server.client();
+    let t0 = server.now();
+    let id = client.jobs().enqueue(&job("api", "call"))?.id;
+    let waiting = wait_for_state(&client, id, JobState::Retrying, DEFAULT_TIMEOUT)?;
+    // 45 s as asked, not the 1 s the job's backoff would give.
+    assert_eq!(waiting.run_at, t0 + Duration::from_secs(45));
+    assert_eq!(
+        waiting.last_error().and_then(|e| e.kind.as_deref()),
+        Some("http_429")
+    );
+    server.tick(Duration::from_secs(44))?;
+    assert_eq!(client.jobs().get(id)?.state, JobState::Retrying);
+    server.tick(Duration::from_secs(1))?;
+    wait_for_state(&client, id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    Ok(())
+}
+
+#[test]
+fn a_panicking_handler_fails_the_attempt_and_the_job_is_retried() -> Result<()> {
+    let server = TestServer::start()?;
+    let calls = Arc::new(AtomicU32::new(0));
+    let counted = Arc::clone(&calls);
+    let worker = server
+        .worker()
+        .queue("parse")
+        .handler(
+            "parse",
+            handler_fn(move |_| {
+                if counted.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("unexpected token at line 3");
+                }
+                Ok(Outcome::with(json!("parsed")))
+            }),
+        )
+        .start()?;
+    let client = server.client();
+    let id = client.jobs().enqueue(&job("parse", "parse"))?.id;
+    let retrying = wait_for_state(&client, id, JobState::Retrying, DEFAULT_TIMEOUT)?;
+    let error = retrying.last_error().expect("the panic is recorded");
+    assert_eq!(error.kind.as_deref(), Some("panic"));
+    assert!(
+        error.message.contains("unexpected token at line 3"),
+        "{error:?}"
+    );
+    server.tick(Duration::from_secs(1))?;
+    let done = wait_for_state(&client, id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(done.result, Some(json!("parsed")));
+    assert_eq!(worker.stats().panicked, 1);
+    Ok(())
+}
+
+#[test]
+fn a_worker_stopped_mid_job_hands_it_back_for_another_worker() -> Result<()> {
+    let server = TestServer::start()?;
+    let gate = Gate::new();
+    let leaving = server
+        .worker()
+        .id("leaving")
+        .queue("render")
+        .gated("frame", &gate)
+        .start()?;
+    let client = server.client();
+    let id = client.jobs().enqueue(&job("render", "frame"))?.id;
+    leaving.recorder().wait_for_start(id, DEFAULT_TIMEOUT)?;
+
+    let report = leaving.stop();
+    assert_eq!(report.stats.succeeded, 0);
+    let handed_back = wait_for_job(&client, id, "handed back", DEFAULT_TIMEOUT, |j| {
+        j.state != JobState::Running
+    })?;
+    assert!(
+        matches!(handed_back.state, JobState::Retrying | JobState::Ready),
+        "{:?}",
+        handed_back.state
+    );
+    let error = handed_back.last_error().expect("the hand-back is recorded");
+    assert!(error.message.contains("shutting down"), "{error:?}");
+
+    let staying = server
+        .worker()
+        .id("staying")
+        .queue("render")
+        .recording("frame")
+        .start()?;
+    server.tick(Duration::from_secs(1))?;
+    let done = wait_for_state(&client, id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(done.attempt, 2);
+    assert_eq!(staying.recorder().attempts_of(id), [2]);
+    Ok(())
+}
