@@ -212,15 +212,15 @@ impl State {
         }
     }
 
-    /// Empties both waiting queues for a shutdown, giving their kind slots
-    /// back; nothing is promoted, since nothing new may start.
+    /// Empties both waiting queues for a shutdown. Cleared jobs give their
+    /// kind slots back; nothing is promoted, since nothing new may start.
     pub(crate) fn take_unstarted(&mut self) -> Vec<Arc<Tracked>> {
         let mut taken: Vec<Arc<Tracked>> = self.parked.drain(..).collect();
-        taken.extend(self.ready.drain(..));
-        for job in &taken {
+        while let Some(job) = self.ready.pop_front() {
             if let Some(n) = self.active.get_mut(job.kind()) {
-                *n -= 1;
+                *n = n.saturating_sub(1);
             }
+            taken.push(job);
         }
         taken
     }
@@ -441,5 +441,26 @@ mod tests {
         state.forget(parked.id());
         assert!(state.ready.is_empty() && state.parked.is_empty() && state.jobs.is_empty());
         assert_eq!(state.active_for("a"), 0);
+    }
+
+    #[test]
+    fn shutdown_takes_waiting_jobs_without_touching_running_counts() {
+        // Regression: parked jobs never held a kind slot, and giving one
+        // back for them undercounted the handler still running.
+        let r = registry(&[("a", Some(1)), ("b", None)]);
+        let mut state = State::default();
+        let running = tracked(&r, "a");
+        state.dispatch(running.clone());
+        state.ready.pop_front();
+        let parked = tracked(&r, "a");
+        state.parked.push_back(parked.clone());
+        let cleared = tracked(&r, "b");
+        state.dispatch(cleared.clone());
+
+        let taken: Vec<JobId> = state.take_unstarted().iter().map(|t| t.id()).collect();
+        assert_eq!(taken, [parked.id(), cleared.id()]);
+        assert_eq!(state.active_for("a"), 1, "the running handler still counts");
+        assert_eq!(state.active_for("b"), 0);
+        assert!(state.ready.is_empty() && state.parked.is_empty());
     }
 }
