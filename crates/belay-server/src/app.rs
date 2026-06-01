@@ -73,7 +73,11 @@ impl App {
             return Ok(());
         };
         let principal = auth::authorize(self.auth(), req, scope)?;
-        let limited = self.limiter.check(&principal.name, Instant::now()).err();
+        let limited = if self.auth().is_enforced() {
+            self.limiter.check(&principal.name, Instant::now()).err()
+        } else {
+            None
+        };
         let refusal = limited.map(|wait| {
             if let Some(metrics) = &self.metrics {
                 metrics.rate_limited(&principal.name);
@@ -202,6 +206,17 @@ mod tests {
         let app = Arc::new(app(true, ServerOptions::new()));
         let endpoint = Endpoint::new(app, Access::Public, whoami);
         assert_eq!(call(&endpoint, None).body_bytes(), Some(&b"nobody"[..]));
+    }
+
+    #[test]
+    fn open_servers_see_an_anonymous_unlimited_caller() {
+        let options = ServerOptions::new().with_rate_limit(Some(RequestRate::new(1.0, 1)));
+        let app = Arc::new(app(false, options));
+        let endpoint = Endpoint::new(app, Access::Token(Scope::Admin), whoami);
+        for _ in 0..5 {
+            let response = call(&endpoint, None);
+            assert_eq!(response.body_bytes(), Some(&b"anonymous"[..]));
+        }
     }
 
     #[test]
