@@ -78,3 +78,63 @@ impl fmt::Display for Error {
         }
     }
 }
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Usage(_) | Error::Invalid(_) => None,
+            Error::Io { source, .. } => Some(source),
+            Error::Store(e) => Some(e),
+            Error::Queue(e) => Some(e),
+            Error::Engine(e) => Some(e),
+            Error::Api(e) => Some(e),
+            Error::Server(e) => Some(e),
+            Error::Client(e) => Some(e),
+            Error::Worker(e) => Some(e),
+            Error::Cron(e) => Some(e),
+        }
+    }
+}
+
+macro_rules! from_error {
+    ($($source:ty => $variant:ident),* $(,)?) => {$(
+        impl From<$source> for Error {
+            fn from(e: $source) -> Error {
+                Error::$variant(e)
+            }
+        }
+    )*};
+}
+
+from_error! {
+    belay_store::Error => Store,
+    belay_queue::Error => Queue,
+    belay_core::Error => Engine,
+    ApiError => Api,
+    belay_server::Error => Server,
+    belay_client::Error => Client,
+    belay_worker::Error => Worker,
+    belay_cron::CronError => Cron,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::error::Error as _;
+
+    #[test]
+    fn usage_errors_exit_with_two_and_others_with_one() {
+        assert_eq!(Error::Usage("bad flag".into()).exit_code(), 2);
+        assert_eq!(Error::Invalid("ran dry".into()).exit_code(), 1);
+    }
+
+    #[test]
+    fn io_errors_name_the_context_and_keep_the_source() {
+        let e = Error::io(
+            "creating a directory under /nope",
+            io::Error::new(io::ErrorKind::PermissionDenied, "denied"),
+        );
+        assert_eq!(e.to_string(), "creating a directory under /nope: denied");
+        assert!(e.source().is_some());
+    }
+}
