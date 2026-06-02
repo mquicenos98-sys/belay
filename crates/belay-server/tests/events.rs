@@ -118,6 +118,23 @@ fn filters_select_types_and_queues() {
 }
 
 #[test]
+fn falling_behind_the_buffer_is_reported_as_a_lag_frame() {
+    let mut config = test_config();
+    config.events.buffer = 3;
+    let server = TestServer::with(config, ServerOptions::default());
+    let first = server.engine.events().next_seq();
+    for _ in 0..6 {
+        enqueue(&server, "emails");
+    }
+    let mut stream = open(&server, &format!("?from={first}"), None);
+    let lag = next(&mut stream);
+    assert_eq!(lag.event_type(), "lagged");
+    assert_eq!(lag.id, None);
+    assert_eq!(belay_json::parse(&lag.data).expect("json")["missed"], 3);
+    assert_eq!(next(&mut stream).id, Some((first + 3).to_string()));
+}
+
+#[test]
 fn idle_streams_send_heartbeat_comments() {
     let options = ServerOptions {
         event_heartbeat: Duration::from_millis(30),

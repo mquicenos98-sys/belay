@@ -231,6 +231,22 @@ mod tests {
     }
 
     #[test]
+    fn a_resume_point_older_than_the_buffer_yields_a_lag_frame() {
+        let engine = engine(2);
+        let first = engine.events().next_seq();
+        for _ in 0..5 {
+            engine.enqueue(JobSpec::new("emails", "send")).unwrap();
+        }
+        let (_, events) = stream(&engine, EventFilter::new().from_seq(first), 3);
+        let types: Vec<&str> = events.iter().map(SseEvent::event_type).collect();
+        assert_eq!(types, ["lagged", "job.enqueued", "job.enqueued"]);
+        assert_eq!(events[0].id, None);
+        let data = belay_json::parse(&events[0].data).expect("json");
+        assert_eq!(data["missed"], 3);
+        assert_eq!(events[2].id, Some((first + 4).to_string()));
+    }
+
+    #[test]
     fn filters_apply_to_the_stream() {
         let engine = engine(100);
         let first = engine.events().next_seq();

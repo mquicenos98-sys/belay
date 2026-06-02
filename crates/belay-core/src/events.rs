@@ -262,7 +262,7 @@ impl EventBus {
     pub fn subscribe(&self, filter: EventFilter) -> Subscription {
         let mut st = lock(&self.inner.state);
         let next = st.next_seq;
-        let cursor = filter.from.unwrap_or(0).max(st.oldest_seq());
+        let cursor = filter.from.unwrap_or_else(|| st.oldest_seq());
         let mode = if cursor >= next {
             Mode::Live
         } else {
@@ -614,6 +614,21 @@ mod tests {
         let rest: Vec<u64> = (0..3).map(|_| next_seq(&sub).unwrap()).collect();
         assert_eq!(rest, [8, 9, 10]);
         assert_eq!(bus.stats().lagged, 1);
+    }
+
+    // Regression: a resume point older than the buffer used to be clamped
+    // silently, hiding from the client that it had missed events.
+    #[test]
+    fn resuming_before_the_oldest_buffered_event_reports_the_gap() {
+        let bus = bus(2, 8);
+        for q in ["a", "b", "c", "d"] {
+            bus.emit(paused(q));
+        }
+        let sub = bus.subscribe(EventFilter::new().from_seq(1));
+        assert_eq!(next_seq(&sub), Err(Delivery::Lagged { missed: 2 }));
+        assert_eq!(next_seq(&sub), Ok(3));
+        let fresh = bus.subscribe(EventFilter::new().from_seq(50));
+        assert_eq!(fresh.try_recv(), Err(RecvError::Timeout));
     }
 
     #[test]

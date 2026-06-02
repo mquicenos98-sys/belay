@@ -159,3 +159,28 @@ fn filters_select_types_and_queues_over_http() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn a_subscriber_behind_the_replay_buffer_is_told_how_much_it_missed() -> Result<()> {
+    let server = TestServer::builder()
+        .configure(|config| config.events.buffer = 3)
+        .start()?;
+    let client = server.client();
+    for n in 0..6 {
+        enqueue_feed(&client, n)?;
+    }
+    let url = format!("{}/v1/events?from=1", server.url());
+    let mut stream = RawEventStream::open(&url, &[], Duration::from_secs(10))?;
+    let lag = next_raw(&mut stream)?;
+    assert_eq!(lag.event.as_deref(), Some("lagged"));
+    assert_eq!(lag.id, None, "a lag frame never becomes the resume point");
+    let missed = belay_json::parse(&lag.data)?["missed"]
+        .as_u64()
+        .unwrap_or(0);
+    assert!(missed >= 3, "missed {missed}");
+    // Then the three events the buffer still holds, in order.
+    let kept: Vec<Option<String>> = (0..3)
+        .map(|_| next_raw(&mut stream).map(|e| e.event))
+        .collect::<Result<_>>()?;
+    assert!(kept.iter().all(|t| t.as_deref() == Some("job.enqueued")));
+    Ok(())
+}
