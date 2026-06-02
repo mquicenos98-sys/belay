@@ -69,3 +69,50 @@ mod error;
 pub mod harness;
 
 pub mod histogram;
+
+pub mod report;
+
+pub mod scenarios;
+
+pub mod session;
+
+pub mod units;
+
+pub use args::{Command, Scale, Settings};
+pub use error::{Error, Result};
+pub use report::{Environment, Report};
+pub use session::{CaseResult, Session};
+
+/// This crate's version, which is belay's.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Runs the scenarios `settings` selects, writing a progress line per
+/// case to `progress`. A scenario that fails is recorded in
+/// [`Report::failures`] and the run continues with the next one.
+pub fn execute(
+    environment: Environment,
+    settings: Settings,
+    progress: Option<&mut dyn Write>,
+) -> Report {
+    let mut session = Session::new(settings.clone());
+    if let Some(out) = progress {
+        session = session.with_progress(out);
+    }
+    let mut failures = Vec::new();
+    for &name in &settings.scenarios {
+        match scenarios::find(name) {
+            Some(scenario) => {
+                if let Err(e) = (scenario.run)(&mut session) {
+                    failures.push((scenario.name, e));
+                }
+            }
+            None => failures.push((name, Error::Usage(format!("unknown scenario {name:?}")))),
+        }
+    }
+    Report {
+        environment,
+        settings,
+        results: session.into_results(),
+        failures,
+    }
+}
