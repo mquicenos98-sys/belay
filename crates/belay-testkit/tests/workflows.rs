@@ -244,3 +244,81 @@ fn cancelling_a_workflow_stops_its_running_step_through_the_worker() -> Result<(
     assert_ne!(cancelled.steps["report"].state, StepState::Succeeded);
     Ok(())
 }
+
+/// Waits until step `name` of run `id` has a job, and returns it.
+fn wait_for_workflow_step(
+    client: &Client,
+    id: belay_proto::WorkflowId,
+    name: &str,
+) -> Result<JobId> {
+    eventually_some(DEFAULT_TIMEOUT, "the step to be dispatched", || {
+        client
+            .workflows()
+            .get(id)
+            .ok()
+            .and_then(|run| run.steps.get(name).and_then(|s| s.job))
+    })
+}
+
+#[test]
+fn conditions_route_around_a_step_whose_template_cannot_be_filled() -> Result<()> {
+    let server = TestServer::start()?;
+    let worker = server
+        .worker()
+        .queue(QUEUE)
+        .recording("extract")
+        .recording("compensate")
+        .recording("report")
+        .recording("load")
+        .start()?;
+    let client = server.client();
+    let spec = workflow(
+        "partial",
+        [
+            step("extract", etl("extract").payload(json!({"rows": 10}))),
+            // The extract result has no `/missing`: the step fails when it
+            // is dispatched, before any job exists.
+            step(
+                "load",
+                etl("load").payload(json!({"rows": placeholder("extract", "/missing")})),
+            )
+            .after("extract")
+            .on_failure(StepFailurePolicy::Continue),
+            step("compensate", etl("compensate"))
+                .after("load")
+                .when(Condition::AnyFailed),
+            step(
+                "report",
+                etl("report").payload(json!({"rows": placeholder("extract", ".rows")})),
+            )
+            .after("extract")
+            .after("load")
+            .when(Condition::AnySucceeded),
+        ],
+    );
+    let run = client.workflows().submit(&spec)?;
+    let done = wait_for_workflow(&client, run.id, DEFAULT_TIMEOUT)?;
+    assert_eq!(done.state, WorkflowState::Succeeded);
+    assert_eq!(done.steps["load"].state, StepState::Failed);
+    assert_eq!(done.steps["load"].job, None, "no job was created for it");
+    assert_eq!(done.steps["compensate"].state, StepState::Succeeded);
+    assert_eq!(done.steps["report"].state, StepState::Succeeded);
+    assert_eq!(worker.recorder().payloads("report"), [json!({"rows": 10})]);
+    assert!(worker.recorder().of_kind("load").is_empty());
+
+    // The failure names the placeholder that could not be filled.
+    let details = belay_testkit::raw::request(
+        "GET",
+        &format!("{}/v1/workflows/{}?details=true", server.url(), run.id),
+        &[],
+        b"",
+    )?
+    .json()?;
+    let error = details["errors"]["load"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("{{steps.extract.result/missing}}"),
+        "{error}"
+    );
+    Ok(())
+}
+

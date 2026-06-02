@@ -1,0 +1,30 @@
+[package]
+name = "belay-bench"
+description = "Benchmark harness for belay: store, queue, HTTP, worker, cron and JSON throughput with latency percentiles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lib]
+name = "belay_bench"
+path = "src/lib.rs"
+
+[[bin]]
+name = "belay-bench"
+path = "src/main.rs"
+
+[dependencies]
+belay-common = { path = "../belay-common" }
+belay-json = { path = "../belay-json" }
+belay-cron = { path = "../belay-cron" }
+belay-proto = { path = "../belay-proto" }
+belay-store = { path = "../belay-store" }
+belay-queue = { path = "../belay-queue" }
+belay-worker = { path = "../belay-worker" }
+belay-client = { path = "../belay-client" }
+belay-core = { path = "../belay-core" }
+belay-server = { path = "../belay-server" }
