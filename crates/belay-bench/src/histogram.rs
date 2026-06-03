@@ -247,3 +247,14 @@ impl Default for Histogram {
         Histogram::new()
     }
 }
+
+impl fmt::Debug for Histogram {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Histogram")
+            .field("precision", &self.precision)
+            .field("count", &self.total)
+            .field("min", &self.min())
+            .field("max", &self.max())
+            .finish_non_exhaustive()
+    }
+}
