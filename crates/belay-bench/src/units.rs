@@ -45,3 +45,34 @@ pub fn format_nanos(ns: u64) -> String {
     }
     scaled(ns as f64 / 1_000.0, &["us", "ms", "s"])
 }
+
+/// [`format_nanos`] for a [`Duration`].
+#[must_use]
+pub fn format_elapsed(d: Duration) -> String {
+    format_nanos(u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
+}
+
+/// A count with an SI suffix: `950`, `12.3k`, `4.56M`.
+#[must_use]
+pub fn format_si(value: f64) -> String {
+    if !value.is_finite() || value < 0.0 {
+        return "-".to_owned();
+    }
+    scaled(value, &["", "k", "M", "G", "T"])
+}
+
+/// A count: exact below 1000 (`3`, `256`), then [`format_si`] (`16.4k`).
+#[must_use]
+pub fn format_count(n: u64) -> String {
+    if n < 1_000 {
+        n.to_string()
+    } else {
+        format_si(n as f64)
+    }
+}
+
+/// A rate per second: `0.50/s`, `456k/s`, `1.23M/s`.
+#[must_use]
+pub fn format_rate(per_second: f64) -> String {
+    format!("{}/s", format_si(per_second))
+}
