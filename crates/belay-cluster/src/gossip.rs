@@ -70,11 +70,12 @@ impl GossipQueue {
             if remaining < MIN_UPDATE_LEN {
                 break;
             }
-            if entry.bytes.len() > remaining {
-                break;
+            // Keep scanning past an update that does not fit: a smaller
+            // one further down the order may.
+            if entry.bytes.len() <= remaining {
+                remaining -= entry.bytes.len();
+                picked.push(*rank);
             }
-            remaining -= entry.bytes.len();
-            picked.push(*rank);
         }
         let mut out = Vec::with_capacity(picked.len());
         for rank in picked {
@@ -158,6 +159,20 @@ mod tests {
         assert!(q.is_empty());
         assert!(!q.contains("a"));
         assert!(q.select(100, 3).is_empty());
+    }
+
+    #[test]
+    fn respects_the_byte_budget_and_skips_oversized_entries() {
+        let mut q = GossipQueue::new();
+        q.push(id("small-old"), bytes(1, 20));
+        q.push(id("big"), bytes(2, 100));
+        q.push(id("small-new"), bytes(3, 30));
+        let picked = q.select(60, 10);
+        assert_eq!(tags(&picked), [3, 1]);
+        assert!(picked.iter().map(|b| b.len()).sum::<usize>() <= 60);
+        // The big one was not counted as sent and goes first next time.
+        assert_eq!(tags(&q.select(100, 10)), [2]);
+        assert!(q.select(MIN_UPDATE_LEN - 1, 10).is_empty());
     }
 
     #[test]
