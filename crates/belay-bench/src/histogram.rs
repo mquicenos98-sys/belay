@@ -258,3 +258,210 @@ impl fmt::Debug for Histogram {
             .finish_non_exhaustive()
     }
 }
+
+/// Count, extremes, mean and the percentiles reported for every case.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Summary {
+    /// Number of values.
+    pub count: u64,
+    /// Exact minimum.
+    pub min: u64,
+    /// Exact mean.
+    pub mean: f64,
+    /// Median.
+    pub p50: u64,
+    /// 90th percentile.
+    pub p90: u64,
+    /// 99th percentile.
+    pub p99: u64,
+    /// 99.9th percentile.
+    pub p999: u64,
+    /// Exact maximum.
+    pub max: u64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use belay_common::Rng;
+
+    /// The exact value at quantile `q` of sorted `values`, with the same
+    /// rank rule as `Histogram::quantile`.
+    fn exact_quantile(sorted: &[u64], q: f64) -> u64 {
+        let rank = ((q * sorted.len() as f64).ceil() as usize).clamp(1, sorted.len());
+        sorted[rank - 1]
+    }
+
+    /// Log-uniform values between 1 and 2^max_bits, like latencies that
+    /// span several orders of magnitude.
+    fn log_uniform(rng: &mut Rng, n: usize, max_bits: u32) -> Vec<u64> {
+        (0..n)
+            .map(|_| {
+                let bits = rng.gen_range(0..max_bits);
+                (1u64 << bits) | (rng.next_u64() & ((1u64 << bits) - 1))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn small_values_are_recorded_exactly() {
+        let mut h = Histogram::new();
+        for v in 0..128 {
+            h.record(v);
+        }
+        assert_eq!(h.quantile(0.5), Some(63));
+        assert_eq!(h.percentile(90.0), Some(115));
+        assert_eq!(h.min(), Some(0));
+        assert_eq!(h.max(), Some(127));
+        assert_eq!(h.mean(), Some(63.5));
+    }
+
+    #[test]
+    fn every_value_lies_within_its_bucket_and_buckets_are_narrow() {
+        let mut rng = Rng::seed_from_u64(1);
+        for precision in [1, 3, 7, 12] {
+            let h = Histogram::with_precision(precision);
+            let mut values = log_uniform(&mut rng, 2_000, 64);
+            values.extend([0, 1, u64::MAX, u64::MAX - 1, 1 << 63, (1 << precision) - 1]);
+            for v in values {
+                let (low, high) = h.bucket_bounds(h.index_of(v));
+                assert!(low <= v && v <= high, "{v} outside [{low}, {high}]");
+                let width = high - low;
+                assert!(
+                    width <= v >> precision,
+                    "bucket of {v} is {width} wide at precision {precision}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bucket_index_is_monotonic() {
+        let h = Histogram::with_precision(4);
+        let mut last = 0;
+        for v in (0..100_000u64).chain([u64::MAX / 2, u64::MAX]) {
+            let index = h.index_of(v);
+            assert!(index >= last, "index of {v} went backwards");
+            last = index;
+        }
+        // The top bucket is the last one a full-range histogram needs.
+        assert_eq!(h.index_of(u64::MAX), (65 - 4) * 16 - 1);
+    }
+
+    #[test]
+    fn percentiles_stay_within_the_relative_error_bound() {
+        let mut rng = Rng::seed_from_u64(0x5EED);
+        for precision in [2, 5, DEFAULT_PRECISION] {
+            let mut h = Histogram::with_precision(precision);
+            let mut values = log_uniform(&mut rng, 50_000, 34);
+            for &v in &values {
+                h.record(v);
+            }
+            values.sort_unstable();
+            for q in [0.0, 0.01, 0.25, 0.5, 0.75, 0.9, 0.99, 0.999, 0.9999, 1.0] {
+                let exact = exact_quantile(&values, q);
+                let reported = h.quantile(q).unwrap();
+                let bound = exact as f64 * h.relative_error();
+                assert!(
+                    reported >= exact && (reported - exact) as f64 <= bound,
+                    "q={q} precision={precision}: reported {reported}, exact {exact}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn extremes_and_mean_are_exact() {
+        let mut h = Histogram::new();
+        for v in [1_234_567u64, 89, 1_000_000_007] {
+            h.record(v);
+        }
+        assert_eq!(h.quantile(0.0), Some(89));
+        assert_eq!(h.quantile(1.0), Some(1_000_000_007));
+        assert_eq!(h.mean(), Some((1_234_567.0 + 89.0 + 1_000_000_007.0) / 3.0));
+    }
+
+    #[test]
+    fn largest_values_do_not_overflow() {
+        let mut h = Histogram::new();
+        h.record(u64::MAX);
+        h.record(u64::MAX - 5);
+        h.record(0);
+        assert_eq!(h.max(), Some(u64::MAX));
+        assert_eq!(h.percentile(50.0), Some(u64::MAX));
+        assert_eq!(h.mean(), Some((2.0 * u64::MAX as f64 - 5.0) / 3.0));
+    }
+
+    #[test]
+    fn empty_histograms_report_nothing() {
+        let h = Histogram::new();
+        assert!(h.is_empty());
+        assert_eq!(h.quantile(0.5), None);
+        assert_eq!(h.mean(), None);
+        assert_eq!(h.summary(), None);
+    }
+
+    #[test]
+    fn merging_equals_recording_everything_in_one() {
+        let mut rng = Rng::seed_from_u64(9);
+        let values = log_uniform(&mut rng, 3_000, 40);
+        let (mut a, mut b, mut all) = (Histogram::new(), Histogram::new(), Histogram::new());
+        for (i, &v) in values.iter().enumerate() {
+            let part = if i % 3 == 0 { &mut a } else { &mut b };
+            part.record(v);
+            all.record(v);
+        }
+        a.merge(&b);
+        assert_eq!(a, all);
+        // Merging into an empty histogram, whose counter vector is shorter.
+        let mut empty = Histogram::new();
+        empty.merge(&all);
+        assert_eq!(empty, all);
+    }
+
+    #[test]
+    fn weighted_records_count_every_occurrence() {
+        let mut h = Histogram::new();
+        h.record_n(10, 99);
+        h.record_n(5_000, 1);
+        h.record_n(7, 0);
+        assert_eq!(h.count(), 100);
+        assert_eq!(h.percentile(99.0), Some(10));
+        assert_eq!(h.percentile(99.5), Some(5_000));
+        assert_eq!(h.min(), Some(10), "a zero-weight record is not a value");
+    }
+
+    #[test]
+    fn durations_are_recorded_in_nanoseconds() {
+        let mut h = Histogram::new();
+        h.record_duration(Duration::from_micros(3));
+        h.record_duration(Duration::MAX);
+        assert_eq!(h.min(), Some(3_000));
+        assert_eq!(h.max(), Some(u64::MAX));
+    }
+
+    #[test]
+    fn summary_orders_its_percentiles() {
+        let mut rng = Rng::seed_from_u64(3);
+        let mut h = Histogram::new();
+        for v in log_uniform(&mut rng, 10_000, 30) {
+            h.record(v);
+        }
+        let s = h.summary().unwrap();
+        assert_eq!(s.count, 10_000);
+        assert!(s.min <= s.p50 && s.p50 <= s.p90 && s.p90 <= s.p99);
+        assert!(s.p99 <= s.p999 && s.p999 <= s.max);
+    }
+
+    #[test]
+    #[should_panic(expected = "histogram precision must be 1-16 bits, got 0")]
+    fn zero_precision_is_rejected() {
+        let _ = Histogram::with_precision(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "different precision")]
+    fn merging_different_precisions_panics() {
+        Histogram::with_precision(3).merge(&Histogram::with_precision(4));
+    }
+}
