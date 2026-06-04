@@ -76,3 +76,105 @@ pub fn format_count(n: u64) -> String {
 pub fn format_rate(per_second: f64) -> String {
     format!("{}/s", format_si(per_second))
 }
+
+/// A byte size in binary units without a space, so it can be a parameter
+/// value: `100B`, `64KiB`, `1.5MiB`.
+///
+/// ```
+/// use belay_bench::units::format_size;
+///
+/// assert_eq!(format_size(128), "128B");
+/// assert_eq!(format_size(8 << 20), "8MiB");
+/// assert_eq!(format_size(1536), "1.5KiB");
+/// ```
+#[must_use]
+pub fn format_size(bytes: u64) -> String {
+    const UNITS: [&str; 4] = ["KiB", "MiB", "GiB", "TiB"];
+    if bytes < 1024 {
+        return format!("{bytes}B");
+    }
+    let mut unit = 1024u64;
+    let mut index = 0;
+    while index + 1 < UNITS.len() && bytes >= unit * 1024 {
+        unit *= 1024;
+        index += 1;
+    }
+    if bytes % unit == 0 {
+        format!("{}{}", bytes / unit, UNITS[index])
+    } else {
+        format!("{:.1}{}", bytes as f64 / unit as f64, UNITS[index])
+    }
+}
+
+/// Megabytes (10^6 bytes) per second with one decimal, as storage and
+/// network benchmarks usually report them.
+#[must_use]
+pub fn format_mb_per_sec(bytes: u64, elapsed: Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if bytes == 0 || secs <= 0.0 {
+        return "-".to_owned();
+    }
+    format!("{:.1}", bytes as f64 / 1e6 / secs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nanoseconds_use_three_significant_digits() {
+        assert_eq!(format_nanos(0), "0ns");
+        assert_eq!(format_nanos(999), "999ns");
+        assert_eq!(format_nanos(1_000), "1.00us");
+        assert_eq!(format_nanos(1_234), "1.23us");
+        assert_eq!(format_nanos(99_940), "99.9us");
+        assert_eq!(format_nanos(123_456), "123us");
+        assert_eq!(format_nanos(1_500_000_000), "1.50s");
+        assert_eq!(format_nanos(4_000_000_000_000), "4000s");
+    }
+
+    #[test]
+    fn elapsed_durations_saturate() {
+        assert_eq!(format_elapsed(Duration::from_millis(250)), "250ms");
+        assert_eq!(format_elapsed(Duration::MAX), format_nanos(u64::MAX));
+    }
+
+    #[test]
+    fn counts_are_exact_until_they_need_a_suffix() {
+        assert_eq!(format_count(0), "0");
+        assert_eq!(format_count(3), "3");
+        assert_eq!(format_count(999), "999");
+        assert_eq!(format_count(1_000), "1.00k");
+        assert_eq!(format_count(16_384), "16.4k");
+        assert_eq!(format_count(u64::MAX), "18446744T");
+    }
+
+    #[test]
+    fn rates_carry_si_suffixes() {
+        assert_eq!(format_rate(0.5), "0.50/s");
+        assert_eq!(format_rate(950.0), "950/s");
+        assert_eq!(format_rate(456_000.0), "456k/s");
+        assert_eq!(format_rate(1_234_567.0), "1.23M/s");
+        assert_eq!(format_rate(f64::NAN), "-/s");
+        assert_eq!(format_si(-1.0), "-");
+    }
+
+    #[test]
+    fn sizes_are_exact_when_they_can_be() {
+        assert_eq!(format_size(0), "0B");
+        assert_eq!(format_size(1023), "1023B");
+        assert_eq!(format_size(1024), "1KiB");
+        assert_eq!(format_size(64 << 10), "64KiB");
+        assert_eq!(format_size((1 << 20) + (1 << 19)), "1.5MiB");
+        assert_eq!(format_size(3 << 30), "3GiB");
+        assert_eq!(format_size(5 << 40), "5TiB");
+        assert_eq!(format_size(u64::MAX), "16777216.0TiB");
+    }
+
+    #[test]
+    fn megabytes_per_second_need_bytes_and_time() {
+        assert_eq!(format_mb_per_sec(5_000_000, Duration::from_secs(2)), "2.5");
+        assert_eq!(format_mb_per_sec(0, Duration::from_secs(1)), "-");
+        assert_eq!(format_mb_per_sec(10, Duration::ZERO), "-");
+    }
+}
