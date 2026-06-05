@@ -283,3 +283,137 @@ where
     })?;
     timed(&mut op, first + share.warmup..first + share.total())
 }
+
+/// Calls `op` for each sequence number, timing every call and the whole.
+fn timed<F>(op: &mut F, seqs: Range<u64>) -> Result<Sample>
+where
+    F: FnMut(u64) -> Result<Work>,
+{
+    let mut sample = Sample::new();
+    let started = Instant::now();
+    for seq in seqs {
+        let call = Instant::now();
+        let work = op(seq)?;
+        sample.record(call.elapsed(), work);
+    }
+    sample.elapsed = started.elapsed();
+    Ok(sample)
+}
+
+/// Thread `index`'s share of `n` items split `parts` ways as evenly as
+/// possible, the remainder going to the first threads.
+fn split(n: u64, parts: usize, index: usize) -> u64 {
+    let parts = parts as u64;
+    let index = index as u64;
+    n / parts + u64::from(index < n % parts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[test]
+    fn params_render_in_insertion_order() {
+        let p = Params::new().with("sync", "always").with("batch", 16);
+        assert_eq!(p.to_string(), "sync=always batch=16");
+        assert_eq!(p.get("batch"), Some("16"));
+        assert_eq!(p.get("value"), None);
+        assert_eq!(Params::new().to_string(), "");
+    }
+
+    #[test]
+    fn measure_times_only_the_measured_calls() {
+        let plan = Plan::new(20).warmup(5);
+        assert_eq!((Plan::new(1_000).warmup, plan.total()), (100, 25));
+        let mut seen = Vec::new();
+        let sample = measure(plan, |seq| {
+            seen.push(seq);
+            Ok(Work::items(2).with_bytes(10))
+        })
+        .unwrap();
+        assert_eq!(seen, (0..25).collect::<Vec<_>>());
+        assert_eq!(
+            (sample.iterations, sample.items, sample.bytes),
+            (20, 40, 200)
+        );
+        assert_eq!(sample.latency.count(), 20);
+        assert!(sample.busy <= sample.elapsed);
+    }
+
+    #[test]
+    fn measure_stops_at_the_first_error() {
+        let mut calls = 0;
+        let err = measure(Plan::new(10).warmup(0), |seq| {
+            calls += 1;
+            match seq {
+                3 => Err(Error::Invalid("queue ran dry".into())),
+                _ => Ok(Work::ONE),
+            }
+        })
+        .unwrap_err();
+        assert_eq!((err.to_string().as_str(), calls), ("queue ran dry", 4));
+    }
+
+    #[test]
+    fn parallel_setup_errors_are_reported_without_hanging() {
+        let measured = AtomicU64::new(0);
+        let counter = &measured;
+        let err = measure_parallel(Plan::new(40).warmup(0), 3, |t| {
+            if t == 1 {
+                return Err(Error::Invalid("thread 1 could not connect".into()));
+            }
+            Ok(move |_| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok(Work::ONE)
+            })
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "thread 1 could not connect");
+        // The healthy threads still ran their shares (14 and 13 calls).
+        assert_eq!(measured.load(Ordering::Relaxed), 27);
+    }
+
+    #[test]
+    fn panicking_threads_are_errors_not_deadlocks() {
+        let err = measure_parallel(Plan::new(8), 2, |t| {
+            assert!(t != 0, "setup of thread 0 panics");
+            Ok(|_| Ok(Work::ONE))
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "a benchmark thread panicked during setup");
+        let err = measure_parallel(Plan::new(8).warmup(0), 2, |_| {
+            Ok(|seq| {
+                assert!(seq != 5, "call 5 panics");
+                Ok(Work::ONE)
+            })
+        })
+        .unwrap_err();
+        assert_eq!(err.to_string(), "a benchmark thread panicked");
+    }
+
+    #[test]
+    fn work_is_split_evenly_with_the_remainder_first() {
+        let shares: Vec<u64> = (0..4).map(|t| split(10, 4, t)).collect();
+        assert_eq!(shares, [3, 3, 2, 2]);
+        assert_eq!(split(0, 3, 2), 0);
+    }
+
+    #[test]
+    fn merged_samples_add_up_and_keep_the_longest_time() {
+        let mut a = Sample::new();
+        a.record(Duration::from_micros(5), Work::items(3));
+        a.elapsed = Duration::from_millis(2);
+        let mut b = Sample::new();
+        b.add(Work::ONE.with_bytes(7));
+        b.elapsed = Duration::from_millis(3);
+        a.merge(&b);
+        assert_eq!((a.iterations, a.items, a.bytes), (2, 4, 7));
+        assert_eq!(
+            (a.elapsed, a.latency.count()),
+            (Duration::from_millis(3), 1)
+        );
+        assert!((a.rate() - 4.0 / 0.003).abs() < 1e-6);
+        assert_eq!(Sample::new().rate(), 0.0);
+    }
+}
