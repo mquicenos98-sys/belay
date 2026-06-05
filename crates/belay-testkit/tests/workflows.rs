@@ -322,3 +322,51 @@ fn conditions_route_around_a_step_whose_template_cannot_be_filled() -> Result<()
     Ok(())
 }
 
+#[test]
+fn a_workflow_carries_on_across_a_server_restart() -> Result<()> {
+    let mut server = TestServer::builder()
+        .storage(Storage::Disk {
+            sync: belay_store::SyncPolicy::Interval(std::time::Duration::from_millis(10)),
+        })
+        .start()?;
+    let gate = Gate::new();
+    let worker = server
+        .worker()
+        .queue(QUEUE)
+        .recording("first")
+        .gated("second", &gate)
+        .recording("third")
+        .start()?;
+    let client = server.client();
+    let spec = workflow(
+        "long-haul",
+        [
+            step("first", etl("first").payload(json!({"batch": 7}))),
+            step(
+                "second",
+                etl("second").payload(json!({"batch": placeholder("first", ".batch")})),
+            )
+            .after("first"),
+            step("third", etl("third")).after("second"),
+        ],
+    );
+    let run = client.workflows().submit(&spec)?;
+    let second = wait_for_workflow_step(&client, run.id, "second")?;
+    worker.recorder().wait_for_start(second, DEFAULT_TIMEOUT)?;
+
+    // The server goes down while the second step works; its worker keeps
+    // its lease and reports once the server is back.
+    server.restart()?;
+    let client = server.client();
+    assert_eq!(
+        client.workflows().get(run.id)?.steps["second"].state,
+        StepState::Running
+    );
+    gate.open();
+    let done = wait_for_workflow(&client, run.id, DEFAULT_TIMEOUT)?;
+    assert_eq!(done.state, WorkflowState::Succeeded);
+    assert_eq!(worker.recorder().payloads("second"), [json!({"batch": 7})]);
+    assert_eq!(worker.recorder().of_kind("third").len(), 1);
+    assert_eq!(client.jobs().get(second)?.attempt, 1);
+    Ok(())
+}

@@ -216,10 +216,9 @@ fn shutdown_is_orderly_idempotent_and_releases_the_store() {
         vec![QueueName::from_static("q")],
     );
     assert_eq!(held.lease(&req).unwrap_err().code, ErrorCode::Unavailable);
+    assert!(held.enqueue(JobSpec::new("q", "k")).is_err());
 
-    // The directory lock is gone once the last handle is dropped.
-    drop(held);
-    drop(first);
+    // The directory lock is gone although `held` is still alive.
     let second = start(disk_config(dir.path()), &clock);
     assert_eq!(
         second

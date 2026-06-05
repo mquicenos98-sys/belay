@@ -39,6 +39,18 @@ fn fired_jobs(client: &Client, id: &str) -> Result<Vec<Job>> {
     Ok(jobs)
 }
 
+/// Waits until every job the schedules fired has succeeded. Called before
+/// each jump of the clock: a jump past a running job's lease would expire
+/// it and run it twice.
+fn settle(client: &Client, ids: &[&str]) -> Result<()> {
+    for id in ids {
+        for job in fired_jobs(client, id)? {
+            wait_for_state(client, job.id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+        }
+    }
+    Ok(())
+}
+
 fn fire_times(client: &Client, id: &str) -> Result<Vec<Timestamp>> {
     Ok(fired_jobs(client, id)?
         .iter()
@@ -186,6 +198,109 @@ fn a_new_york_schedule_fires_once_in_the_repeated_fall_back_hour() -> Result<()>
         .filter_map(|e| e.kind.schedule().map(|s| s.to_string()))
         .collect();
     assert_eq!(misfired, ["ny-half-hourly"]);
+    Ok(())
+}
+
+#[test]
+fn missed_fires_after_downtime_follow_each_misfire_policy() -> Result<()> {
+    let mut server = TestServer::builder().storage(Storage::disk()).start()?;
+    let worker = server
+        .worker()
+        .queue(SCHEDULED_QUEUE)
+        .recording("skipper")
+        .recording("once")
+        .recording("catch-up")
+        .start()?;
+    let client = server.client();
+    let ids = ["skipper", "once", "catch-up"];
+    for spec in [
+        schedule("skipper", "0 * * * *").misfire(MisfirePolicy::Skip),
+        schedule("once", "0 * * * *").misfire(MisfirePolicy::FireOnce),
+        schedule("catch-up", "0 * * * *").misfire(MisfirePolicy::FireAll { max: 3 }),
+    ] {
+        client.schedules().create(&spec)?;
+    }
+    // 09:00 fires on time for everyone.
+    server.tick_at(at("2025-03-03T09:00:00Z"))?;
+    for id in ids {
+        assert_eq!(
+            fire_times(&client, id)?,
+            [at("2025-03-03T09:00:00Z")],
+            "{id}"
+        );
+    }
+    settle(&client, &ids)?;
+
+    // Down from 09:00 to 13:30: 10:00, 11:00, 12:00 and 13:00 are missed.
+    server.restart_after(Duration::from_secs(4 * 3600 + 1800))?;
+    let client = server.client();
+    let events = server.event_log()?;
+    let report = server.tick_now();
+    assert!(
+        report.schedules.errors.is_empty(),
+        "{:?}",
+        report.schedules.errors
+    );
+
+    assert_eq!(
+        fire_times(&client, "skipper")?,
+        [at("2025-03-03T09:00:00Z")]
+    );
+    assert_eq!(
+        fire_times(&client, "once")?,
+        [at("2025-03-03T09:00:00Z"), at("2025-03-03T10:00:00Z")],
+        "fire_once fires once, stamped with the first missed time"
+    );
+    assert_eq!(
+        fire_times(&client, "catch-up")?,
+        [
+            at("2025-03-03T09:00:00Z"),
+            at("2025-03-03T10:00:00Z"),
+            at("2025-03-03T11:00:00Z"),
+            at("2025-03-03T12:00:00Z"),
+        ],
+        "fire_all:3 catches up the oldest three"
+    );
+    events.wait_for(DEFAULT_TIMEOUT, |events| {
+        events
+            .iter()
+            .filter(|e| e.type_name() == "schedule.misfired")
+            .count()
+            == 3
+    })?;
+    for event in events.matching(|e| e.type_name() == "schedule.misfired") {
+        match event.kind {
+            EventKind::ScheduleMisfired {
+                missed, fire_time, ..
+            } => {
+                assert_eq!(missed, 4, "{event:?}");
+                assert_eq!(fire_time, at("2025-03-03T10:00:00Z"));
+            }
+            other => panic!("expected schedule.misfired, got {other:?}"),
+        }
+    }
+
+    // Everyone is back on the hour.
+    for id in ids {
+        let current = client.schedules().get(&ScheduleId::new(id)?)?;
+        assert_eq!(
+            current.next_fire_at,
+            Some(at("2025-03-03T14:00:00Z")),
+            "{id}"
+        );
+    }
+    settle(&client, &ids)?;
+    server.tick_at(at("2025-03-03T14:00:00Z"))?;
+    let totals: Vec<usize> = ids
+        .iter()
+        .map(|id| fire_times(&client, id).map(|t| t.len()))
+        .collect::<Result<_>>()?;
+    assert_eq!(totals, [2, 3, 5]);
+    settle(&client, &ids)?;
+    // The worker rode out the restart and ran every fire exactly once.
+    let executions = worker.recorder().executions();
+    assert_eq!(executions.len(), 10);
+    assert!(executions.iter().all(|e| e.attempt == 1 && e.succeeded()));
     Ok(())
 }
 

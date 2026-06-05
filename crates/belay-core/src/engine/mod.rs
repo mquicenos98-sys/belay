@@ -66,7 +66,8 @@ pub(crate) struct Shared {
     pub(crate) storage: StorageKind,
     pub(crate) kv: Arc<dyn Kv>,
     /// The same store as `kv` when the engine opened a [`LogKv`], kept
-    /// typed for the store report.
+    /// typed so shutdown can close it (releasing its directory lock) even
+    /// while other handles to it are still alive.
     pub(crate) log_kv: Option<Arc<LogKv>>,
     pub(crate) queue: Arc<QueueEngine>,
     pub(crate) scheduler: Arc<Scheduler>,
@@ -282,8 +283,12 @@ impl Engine {
         }
         shared.queue.shutdown();
         shared.events.close();
-        if let Err(e) = shared.kv.flush() {
-            warn!("flushing the store failed"; error = %e);
+        let closed = match &shared.log_kv {
+            Some(kv) => kv.close(),
+            None => shared.kv.flush(),
+        };
+        if let Err(e) = closed {
+            warn!("closing the store failed"; error = %e);
         }
         info!("engine stopped"; node = %shared.node_id, uptime = shared.uptime());
     }

@@ -5,12 +5,91 @@
 
 use std::collections::BTreeSet;
 use std::thread;
+use std::time::Duration;
 
 use belay_store::SyncPolicy;
+use belay_testkit::fixtures::number_of;
 use belay_testkit::prelude::*;
 
 fn queue_counts(client: &Client, name: &'static str) -> Result<belay_proto::StateCounts> {
     Ok(client.queues().get(&QueueName::from_static(name))?.counts)
+}
+
+#[test]
+fn jobs_survive_a_graceful_restart_of_a_disk_store() -> Result<()> {
+    // Group commit keeps the test fast on slow disks; a graceful stop syncs
+    // the log whatever the policy.
+    let mut server = TestServer::builder()
+        .storage(Storage::Disk {
+            sync: SyncPolicy::Interval(Duration::from_millis(10)),
+        })
+        .start()?;
+    let client = server.client();
+    let quick = server.worker().queue("quick").recording("ping").start()?;
+
+    let mut backlog: Vec<JobId> = (0..40)
+        .map(|n| {
+            let spec = job("backlog", "load").payload(numbered(n));
+            Ok(client.jobs().enqueue(&spec)?.id)
+        })
+        .collect::<Result<_>>()?;
+    let batch = client.jobs().enqueue_batch(&numbered_jobs(
+        &QueueName::from_static("archive"),
+        "load",
+        160,
+    ))?;
+    backlog.extend(batch.iter().map(|r| r.id));
+    let pinged: Vec<JobId> = (0..5)
+        .map(|n| {
+            let spec = job("quick", "ping").payload(numbered(n));
+            Ok(client.jobs().enqueue(&spec)?.id)
+        })
+        .collect::<Result<_>>()?;
+    for id in &pinged {
+        wait_for_state(&client, *id, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    }
+
+    server.restart()?;
+    let client = server.client();
+    assert_eq!(server.engine().store_report().storage, "disk");
+    assert!(server.engine().verify()?.is_consistent());
+    for (n, id) in backlog.iter().enumerate() {
+        let job = client.jobs().get(*id)?;
+        assert_eq!(job.state, JobState::Ready, "{id}");
+        let expected = if n < 40 { n } else { n - 40 };
+        assert_eq!(number_of(&job.spec.payload), Some(expected as u64));
+    }
+    for (n, id) in pinged.iter().enumerate() {
+        let job = client.jobs().get(*id)?;
+        assert_eq!(job.state, JobState::Succeeded);
+        assert_eq!(job.result, Some(numbered(n)));
+    }
+    assert_eq!(queue_counts(&client, "backlog")?.get(JobState::Ready), 40);
+    assert_eq!(queue_counts(&client, "archive")?.get(JobState::Ready), 160);
+
+    // The worker started before the restart follows the server back.
+    let after = client.jobs().enqueue(&job("quick", "ping"))?.id;
+    wait_for_state(&client, after, JobState::Succeeded, DEFAULT_TIMEOUT)?;
+    assert_eq!(quick.recorder().len(), 6);
+
+    // And the backlog drains on the restarted server.
+    let _loader = server
+        .worker()
+        .queues(["backlog", "archive"])
+        .concurrency(8)
+        .recording("load")
+        .start()?;
+    eventually(DEFAULT_TIMEOUT, || {
+        ["backlog", "archive"].iter().all(|q| {
+            queue_counts(&client, q)
+                .is_ok_and(|c| c.pending() == 0 && c.get(JobState::Running) == 0)
+        })
+    })?;
+    assert_eq!(
+        queue_counts(&client, "archive")?.get(JobState::Succeeded),
+        160
+    );
+    Ok(())
 }
 
 #[test]
