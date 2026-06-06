@@ -189,3 +189,12 @@ impl<'a> Session<'a> {
         self.results
     }
 }
+
+impl fmt::Debug for Session<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Session")
+            .field("settings", &self.settings)
+            .field("results", &self.results.len())
+            .finish_non_exhaustive()
+    }
+}
