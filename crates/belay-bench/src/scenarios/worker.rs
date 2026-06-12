@@ -167,3 +167,121 @@ fn run_cases(
     }
     Ok(())
 }
+
+/// Warms the worker up on `warmup` jobs, then times it through `jobs`
+/// more; the worker is stopped after the clock stops.
+fn drain(
+    engine: &Engine,
+    queue: &QueueName,
+    start: &dyn Fn(Registry) -> Result<WorkerHandle>,
+    warmup: u64,
+    jobs: u64,
+) -> Result<Sample> {
+    const KIND: &str = "bench.noop";
+    let registry = Registry::new().register(KIND, handler_fn(|_| Ok(Outcome::done())));
+    let handle = start(registry)?;
+    let timed = || -> Result<Duration> {
+        enqueue_many(engine, queue, KIND, warmup)?;
+        wait_for_successes(&handle, warmup)?;
+        // Enqueueing while paused keeps enqueue time out of the
+        // measurement; resuming wakes the worker's long poll at once.
+        engine.pause_queue(queue)?;
+        enqueue_many(engine, queue, KIND, jobs)?;
+        let started = Instant::now();
+        engine.resume_queue(queue)?;
+        wait_for_successes(&handle, warmup + jobs)?;
+        Ok(started.elapsed())
+    };
+    let elapsed = timed();
+    let _ = handle.stop();
+    let mut sample = Sample::new();
+    sample.iterations = jobs;
+    sample.items = jobs;
+    sample.elapsed = elapsed?;
+    Ok(sample)
+}
+
+fn enqueue_many(engine: &Engine, queue: &QueueName, kind: &str, jobs: u64) -> Result<()> {
+    let mut left = jobs;
+    while left > 0 {
+        let n = left.min(belay_proto::limits::MAX_ENQUEUE_BATCH as u64);
+        engine.enqueue_batch((0..n).map(|_| JobSpec::new(queue.clone(), kind)).collect())?;
+        left -= n;
+    }
+    Ok(())
+}
+
+/// Polls the worker's statistics until `target` jobs have succeeded. The
+/// poll period (200us, longer where the OS timer is coarse) is small
+/// next to a drain, which takes hundreds of milliseconds.
+fn wait_for_successes(handle: &WorkerHandle, target: u64) -> Result<()> {
+    let deadline = Instant::now() + DRAIN_DEADLINE;
+    loop {
+        let stats = handle.stats();
+        if stats.succeeded >= target {
+            return Ok(());
+        }
+        if stats.failed > 0 || stats.abandoned > 0 {
+            return Err(Error::Invalid(format!(
+                "the worker failed {} and abandoned {} jobs (last error: {})",
+                stats.failed,
+                stats.abandoned,
+                stats.last_error.as_deref().unwrap_or("none")
+            )));
+        }
+        if Instant::now() >= deadline {
+            return Err(Error::Invalid(format!(
+                "the worker completed {} of {target} jobs within {}s",
+                stats.succeeded,
+                DRAIN_DEADLINE.as_secs()
+            )));
+        }
+        thread::sleep(Duration::from_micros(200));
+    }
+}
+
+/// Times enqueue-to-handler-start for one job at a time.
+fn pickup(
+    engine: &Engine,
+    queue: &QueueName,
+    start: &dyn Fn(Registry) -> Result<WorkerHandle>,
+    plan: Plan,
+) -> Result<Sample> {
+    const KIND: &str = "bench.ping";
+    let (started_tx, started_rx) = mpsc::channel::<JobId>();
+    let registry = Registry::new().register(
+        KIND,
+        handler_fn(move |ctx| {
+            // The receiver outlives the worker; a failed send would mean
+            // the case already gave up on this job.
+            let _ = started_tx.send(ctx.id());
+            Ok(Outcome::done())
+        }),
+    );
+    let handle = start(registry)?;
+    let sample = measure(plan, |_| {
+        let id = engine.enqueue(JobSpec::new(queue.clone(), KIND))?.id;
+        loop {
+            match started_rx.recv_timeout(PICKUP_DEADLINE) {
+                Ok(started) if started == id => return Ok(Work::ONE),
+                // A job of an earlier call that timed out; not this one.
+                Ok(_) => continue,
+                Err(_) => {
+                    return Err(Error::Invalid(format!(
+                        "job {id} was not picked up within {}s",
+                        PICKUP_DEADLINE.as_secs()
+                    )))
+                }
+            }
+        }
+    });
+    let report = handle.stop();
+    let sample = sample?;
+    if report.stats.failed > 0 {
+        return Err(Error::Invalid(format!(
+            "the worker failed {} ping jobs",
+            report.stats.failed
+        )));
+    }
+    Ok(sample)
+}
