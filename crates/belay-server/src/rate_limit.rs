@@ -86,10 +86,12 @@ impl RateLimiter {
     }
 }
 
-/// A `Retry-After` value in whole seconds (RFC 9110 §10.2.3), at least 1.
+/// A `Retry-After` value in whole seconds (RFC 9110 §10.2.3), rounded up
+/// so a client that waits exactly that long finds room.
 #[must_use]
 pub(crate) fn retry_after_secs(wait: Duration) -> u64 {
-    (wait.as_secs_f64().round() as u64).max(1)
+    let secs = wait.as_secs() + u64::from(wait.subsec_nanos() > 0);
+    secs.max(1)
 }
 
 #[cfg(test)]
@@ -157,5 +159,13 @@ mod tests {
         assert_eq!(limiter.check("a", later), Ok(()));
         let earlier = later - Duration::from_secs(5);
         assert!(limiter.check("a", earlier).is_err());
+    }
+
+    #[test]
+    fn retry_after_rounds_up_to_whole_seconds() {
+        assert_eq!(retry_after_secs(Duration::from_millis(1)), 1);
+        assert_eq!(retry_after_secs(Duration::from_millis(1000)), 1);
+        assert_eq!(retry_after_secs(Duration::from_millis(1001)), 2);
+        assert_eq!(retry_after_secs(Duration::ZERO), 1);
     }
 }
