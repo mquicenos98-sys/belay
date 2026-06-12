@@ -18,7 +18,6 @@ use crate::units::format_size;
 use crate::{Error, Result};
 
 pub const WRITE: &str = "store-write";
-
 pub const RECOVER: &str = "store-recover";
 
 /// Length of every key: `job/` and 16 hex digits.
@@ -201,4 +200,80 @@ pub fn run_recover(s: &mut Session<'_>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn recover_options() -> Options {
+    Options::new().sync(SyncPolicy::Never).manual_checkpoints()
+}
+
+/// Writes batches of 64 keys with 256-byte values until the log holds at
+/// least `size` bytes; returns the number of keys.
+fn fill_log(dir: &Path, pool: &ValuePool, size: u64) -> Result<u64> {
+    const BATCH: u64 = 64;
+    let kv = LogKv::open(dir, recover_options())?;
+    let mut seq = 0;
+    while kv.stats().wal_bytes < size {
+        let mut writes = WriteBatch::with_capacity(BATCH as usize);
+        for _ in 0..BATCH {
+            writes.put(key(seq), pool.value(seq, 256));
+            seq += 1;
+        }
+        kv.write(writes)?;
+    }
+    kv.close()?;
+    Ok(seq)
+}
+
+/// Opens the store `iterations` times after one unrecorded open that
+/// warms the page cache, timing the open alone (not the close). Throughput
+/// is keys and bytes loaded per second of opening.
+fn measure_opens(
+    dir: &Path,
+    iterations: u64,
+    expect_keys: u64,
+    bytes: impl Fn(&KvStats) -> u64,
+) -> Result<(Sample, KvStats)> {
+    let mut sample = Sample::new();
+    let mut last = KvStats::default();
+    for i in 0..=iterations {
+        let started = Instant::now();
+        let kv = LogKv::open(dir, recover_options())?;
+        let took = started.elapsed();
+        let stats = kv.stats();
+        kv.close()?;
+        if stats.keys != expect_keys {
+            return Err(Error::Invalid(format!(
+                "recovery loaded {} keys, expected {expect_keys}",
+                stats.keys
+            )));
+        }
+        if i > 0 {
+            sample.record(took, Work::items(stats.keys).with_bytes(bytes(&stats)));
+        }
+        last = stats;
+    }
+    sample.elapsed = sample.busy;
+    Ok((sample, last))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    #[test]
+    fn keys_are_unique_and_fixed_length() {
+        let keys: HashSet<Vec<u8>> = (0..10_000).map(key).collect();
+        assert_eq!(keys.len(), 10_000);
+        assert!(keys.iter().all(|k| k.len() == KEY_LEN));
+    }
+
+    #[test]
+    fn values_come_from_inside_the_pool() {
+        let pool = ValuePool::new(&mut Rng::seed_from_u64(1));
+        for seq in 0..1_000 {
+            assert_eq!(pool.value(seq, 8192).len(), 8192);
+        }
+        assert_eq!(pool.value(7, pool.0.len()).len(), pool.0.len());
+    }
 }
