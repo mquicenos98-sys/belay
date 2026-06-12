@@ -189,3 +189,101 @@ impl<'a> Session<'a> {
         self.results
     }
 }
+
+impl fmt::Debug for Session<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Session")
+            .field("settings", &self.settings)
+            .field("results", &self.results.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// `store-write  sync=never batch=16  1.23M/s  p50 812ns  p99 4.10us`.
+fn progress_line(result: &CaseResult) -> String {
+    let mut line = format!(
+        "{:<15} {:<44} {:>10}",
+        result.scenario,
+        result.params.to_string(),
+        format_rate(result.rate())
+    );
+    if let Some(latency) = result.latency() {
+        line.push_str(&format!(
+            "  p50 {:>7}  p99 {:>7}",
+            format_nanos(latency.p50),
+            format_nanos(latency.p99)
+        ));
+    }
+    line.trim_end().to_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::harness::Work;
+    use std::time::Duration;
+
+    fn session<'a>(scale: Scale, max_threads: usize) -> Session<'a> {
+        let mut settings = Settings::new().scale(scale);
+        settings.max_threads = max_threads;
+        Session::new(settings)
+    }
+
+    #[test]
+    fn full_scale_doubles_threads_up_to_the_maximum() {
+        assert_eq!(session(Scale::Full, 16).thread_counts(), [1, 2, 4, 8, 16]);
+        assert_eq!(session(Scale::Full, 12).thread_counts(), [1, 2, 4, 8, 12]);
+        assert_eq!(session(Scale::Full, 1).thread_counts(), [1]);
+        assert_eq!(session(Scale::Quick, 16).thread_counts(), [1, 4]);
+        assert_eq!(session(Scale::Quick, 1).thread_counts(), [1]);
+        assert_eq!(session(Scale::Smoke, 8).thread_counts(), [1, 2]);
+    }
+
+    #[test]
+    fn streams_are_independent_and_reproducible() {
+        let s = session(Scale::Smoke, 1);
+        assert_eq!(s.rng("json").next_u64(), s.rng("json").next_u64());
+        assert_ne!(s.rng("json").next_u64(), s.rng("cron").next_u64());
+    }
+
+    #[test]
+    fn recording_reports_progress() {
+        let mut out = Vec::new();
+        let mut s = session(Scale::Smoke, 1).with_progress(&mut out);
+        let mut sample = Sample::new();
+        sample.record(Duration::from_micros(2), Work::items(10));
+        sample.elapsed = Duration::from_millis(1);
+        s.record(CaseResult::new("cron", Params::new().with("tz", "UTC"), sample).note("x", 1));
+        assert_eq!(s.results().len(), 1);
+        drop(s);
+        let line = String::from_utf8(out).unwrap();
+        assert!(line.starts_with("cron            tz=UTC"), "{line}");
+        assert!(
+            line.contains("10.0k/s") && line.contains("p50  2.00us"),
+            "{line}"
+        );
+    }
+
+    #[test]
+    fn results_compute_rates_from_wall_clock_time() {
+        let mut sample = Sample::new();
+        sample.add(Work::items(500).with_bytes(2_000_000));
+        sample.elapsed = Duration::from_millis(500);
+        let result = CaseResult::new("json", Params::new(), sample)
+            .note("docs", 32)
+            .note("kind", "small");
+        assert_eq!(result.rate(), 1000.0);
+        assert_eq!(result.mb_per_sec(), Some(4.0));
+        assert_eq!(result.latency(), None);
+        assert_eq!(result.notes_text(), "docs=32 kind=small");
+    }
+
+    #[test]
+    fn temp_dirs_go_under_the_configured_directory() {
+        let parent = TempDir::with_prefix("bench-parent").unwrap();
+        let mut settings = Settings::new();
+        settings.dir = Some(parent.path().to_path_buf());
+        let dir = Session::new(settings).temp_dir("store-write").unwrap();
+        assert_eq!(dir.path().parent(), Some(parent.path()));
+    }
+}
