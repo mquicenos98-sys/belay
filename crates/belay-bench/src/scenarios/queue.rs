@@ -44,3 +44,49 @@ const BATCH: u64 = 100;
 
 /// Long enough that no lease expires during a case.
 const LEASE_FOR: Duration = Duration::from_secs(600);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Op {
+    Enqueue,
+    EnqueueBatch,
+    LeaseComplete,
+    Cycle,
+}
+
+impl Op {
+    const ALL: [Op; 4] = [Op::Enqueue, Op::EnqueueBatch, Op::LeaseComplete, Op::Cycle];
+
+    fn items(self) -> u64 {
+        if self == Op::EnqueueBatch {
+            BATCH
+        } else {
+            1
+        }
+    }
+
+    /// Calls for a case, given the job count a case should process.
+    fn iterations(self, jobs: u64, smoke: bool) -> u64 {
+        let floor = if smoke { 1 } else { 10 };
+        (jobs / self.items()).max(floor)
+    }
+}
+
+impl fmt::Display for Op {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Op::Enqueue => "enqueue",
+            Op::EnqueueBatch => "enqueue-batch",
+            Op::LeaseComplete => "lease-complete",
+            Op::Cycle => "cycle",
+        })
+    }
+}
+
+/// The calls the operations need, implemented by the engine and by the
+/// HTTP client so both scenarios run exactly the same loop.
+trait QueueApi {
+    fn enqueue(&self, spec: JobSpec) -> Result<()>;
+    fn enqueue_batch(&self, specs: Vec<JobSpec>) -> Result<()>;
+    fn lease(&self, req: &LeaseRequest) -> Result<Vec<LeasedJob>>;
+    fn complete(&self, job: &LeasedJob) -> Result<()>;
+}
