@@ -66,3 +66,139 @@ fn ratio(a: u64, b: u64) -> f64 {
         a as f64 / b as f64
     }
 }
+
+pub fn run_write(s: &mut Session<'_>) -> Result<()> {
+    let policies = [
+        SyncPolicy::Always,
+        SyncPolicy::Interval(Duration::from_millis(10)),
+        SyncPolicy::Never,
+    ];
+    let values: &[usize] = s.pick(&[16, 128, 1024, 8192], &[128, 1024], &[128]);
+    let pool = ValuePool::new(&mut s.rng(WRITE));
+    for policy in policies {
+        for batch in [1, 16, 256] {
+            for &value in values {
+                write_case(s, &pool, policy, batch, value, 1)?;
+            }
+        }
+    }
+    // Concurrent writers under `always` share syncs (group commit); the
+    // `group` note shows how many batches each sync carried.
+    for threads in s.thread_counts().into_iter().filter(|&t| t > 1) {
+        write_case(s, &pool, SyncPolicy::Always, 1, 128, threads)?;
+    }
+    Ok(())
+}
+
+fn write_case(
+    s: &mut Session<'_>,
+    pool: &ValuePool,
+    policy: SyncPolicy,
+    batch: usize,
+    value: usize,
+    threads: usize,
+) -> Result<()> {
+    let params = Params::new()
+        .with("sync", policy)
+        .with("batch", batch)
+        .with("value", format_size(value as u64))
+        .with("threads", threads);
+    if !s.wants(WRITE, &params) {
+        return Ok(());
+    }
+    let dir = s.temp_dir(WRITE)?;
+    let kv = LogKv::open(dir.path(), Options::new().sync(policy).manual_checkpoints())?;
+    let op_bytes = (batch * (KEY_LEN + value)) as u64;
+    let plan = Plan::new(write_iterations(s, policy, op_bytes, batch as u64));
+    // Each thread's closure copies this reference instead of borrowing
+    // the builder closure's capture.
+    let store = &kv;
+    let sample = measure_parallel(plan, threads, |_| {
+        Ok(move |seq: u64| {
+            let mut writes = WriteBatch::with_capacity(batch);
+            for i in 0..batch as u64 {
+                let n = seq * batch as u64 + i;
+                writes.put(key(n), pool.value(n, value));
+            }
+            store.write(writes)?;
+            Ok(Work::items(batch as u64).with_bytes(op_bytes))
+        })
+    })?;
+    let stats = kv.stats();
+    kv.close()?;
+    let mut result = CaseResult::new(WRITE, params, sample).note(
+        "syncs/write",
+        format!("{:.2}", ratio(stats.wal_syncs, stats.batches)),
+    );
+    if threads > 1 {
+        result = result.note(
+            "group",
+            format!("{:.1}", ratio(stats.batches, stats.commit_groups)),
+        );
+    }
+    s.record(result);
+    Ok(())
+}
+
+/// Enough writes for stable percentiles, bounded by the number of keys,
+/// by the bytes written (large values fill a disk fast) and, under
+/// `always`, by the number of syncs (tens of seconds on slow devices).
+fn write_iterations(s: &Session<'_>, policy: SyncPolicy, op_bytes: u64, batch: u64) -> u64 {
+    let keys: u64 = s.pick(1 << 18, 1 << 15, 4);
+    let bytes: u64 = s.pick(128 << 20, 16 << 20, 1 << 20);
+    let cap = if policy == SyncPolicy::Always {
+        s.pick(2_000, 200, 2)
+    } else {
+        s.pick(50_000, 5_000, 2)
+    };
+    (keys / batch).min(bytes / op_bytes).clamp(1, cap)
+}
+
+pub fn run_recover(s: &mut Session<'_>) -> Result<()> {
+    let sizes: &[u64] = s.pick(
+        &[4 << 20, 32 << 20, 128 << 20],
+        &[1 << 20, 8 << 20],
+        &[64 << 10],
+    );
+    let opens = s.pick(10, 5, 1);
+    let pool = ValuePool::new(&mut s.rng(RECOVER));
+    for &size in sizes {
+        let from_log = Params::new()
+            .with("from", "log")
+            .with("size", format_size(size));
+        let from_snapshot = Params::new()
+            .with("from", "snapshot")
+            .with("size", format_size(size));
+        let (want_log, want_snapshot) = (
+            s.wants(RECOVER, &from_log),
+            s.wants(RECOVER, &from_snapshot),
+        );
+        if !want_log && !want_snapshot {
+            continue;
+        }
+        let dir = s.temp_dir(RECOVER)?;
+        let keys = fill_log(dir.path(), &pool, size)?;
+        if want_log {
+            let (sample, stats) = measure_opens(dir.path(), opens, keys, |st| st.wal_bytes)?;
+            let replayed = stats.recovery.batches_replayed;
+            s.record(
+                CaseResult::new(RECOVER, from_log, sample)
+                    .note("keys", keys)
+                    .note("batches", replayed)
+                    .note("segments", stats.recovery.segments_replayed),
+            );
+        }
+        if want_snapshot {
+            let kv = LogKv::open(dir.path(), recover_options())?;
+            kv.checkpoint()?;
+            kv.close()?;
+            let (sample, stats) = measure_opens(dir.path(), opens, keys, |st| st.snapshot_bytes)?;
+            s.record(
+                CaseResult::new(RECOVER, from_snapshot, sample)
+                    .note("keys", keys)
+                    .note("snapshot", format_size(stats.snapshot_bytes)),
+            );
+        }
+    }
+    Ok(())
+}
