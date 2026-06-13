@@ -52,3 +52,28 @@ fn every_scenario_runs_at_smoke_scale() {
     assert!(belay_json::parse(&json).is_ok());
     assert!(!report.render_tables().is_empty());
 }
+
+#[test]
+fn filters_run_only_the_selected_cases() {
+    set_max_level(LevelFilter::Warn);
+    let mut settings = Settings::new().scale(Scale::Smoke).filter(
+        "queue-embedded,store=mem,op=cycle"
+            .parse()
+            .expect("valid filter"),
+    );
+    settings.max_threads = 2;
+    let report = execute(Environment::detect(None), settings, None);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let cases: Vec<String> = report
+        .results
+        .iter()
+        .map(|r| r.params.to_string())
+        .collect();
+    assert_eq!(
+        cases,
+        [
+            "store=mem op=cycle threads=1",
+            "store=mem op=cycle threads=2"
+        ]
+    );
+}
