@@ -5,6 +5,86 @@ All notable changes to belay are documented here. The format is based on
 follows [Semantic Versioning](https://semver.org/) (while it is at 0.x, a
 minor version may break things; the notes say when it does).
 
+## [0.4.0] - 2026-06-12
+
+Test harnesses, an end-to-end suite and benchmarks, and the fixes they
+turned up.
+
+### Added
+
+- `belay-testkit`: in-process harnesses for testing against real
+  servers: `TestServer` (an engine and HTTP server on `127.0.0.1:0` with
+  a manual clock, restarts and simulated crashes), `TestWorker`,
+  `TestCluster` (nodes gossiping over an in-memory network, with kills
+  and restarts), recording handlers, an event log collector, fixtures,
+  waits with timeouts that say what they waited for, log capture, and a
+  TCP proxy for cutting connections.
+- The end-to-end suite in `belay-testkit/tests`: jobs, retries, queues,
+  schedules, workflows, events, authentication, durability across
+  crashes, and clusters, all through the HTTP API and the worker
+  runtime.
+- `belay-bench`: throughput and latency percentiles for the store by
+  sync policy, recovery, the queue embedded and over HTTP, workers,
+  cron iteration and JSON, with filters, a quick mode for CI and JSON
+  output.
+
+### Fixed
+
+- `--url`, `--token` and `belay server --config` were silently
+  overridden by `BELAY_URL`, `BELAY_TOKEN` and `BELAY_CONFIG`; the
+  environment now only replaces defaults.
+- Negative option values (`--priority -5`, `--tz -05:00`) were taken for
+  missing values.
+- `belay` exits with status 4, not 1, when the server answers `429`.
+- Heartbeats extended leases past the job's `timeout`, so a stuck
+  handler that kept heartbeating was never timed out.
+- A `token_sha256` computed by other tools was refused for secrets whose
+  length is 56 modulo 64: belay's SHA-256 got the padding wrong for such
+  messages.
+- `Last-Event-ID` now takes precedence over `?from=` on `/v1/events`, so
+  a reconnecting event source no longer replays everything since its
+  original `from`.
+- Resuming the event stream from a point the buffer no longer holds
+  yields a `lagged` frame instead of silently skipping events.
+- `storage.checkpoint_interval` never triggered a checkpoint: each
+  housekeeping round restarted its clock.
+- `Engine::shutdown` now closes the store, releasing the data
+  directory's lock even while HTTP connections still hold the engine;
+  restarting an engine in-process on the same directory failed.
+- A graceful shutdown waited out the keep-alive timeout of idle client
+  connections.
+- A request body of exactly `server.max_body` bytes was refused.
+- Servers without authentication rate-limited all clients together as
+  one anonymous token.
+- `Retry-After` on `429` answers is rounded up, so waiting the advertised
+  time is enough.
+- The client retried a `POST` that failed on a stale keep-alive
+  connection, which could enqueue a job twice; only idempotent requests
+  are retried there now.
+- The client let a `Retry-After` shorten its backoff but not lengthen
+  it; it now waits for the longer of the two.
+- The client's event stream received a frame it could not decode again
+  after every reconnect instead of resuming past it.
+- An encoded plus sign (`%2B`) in a query string was decoded as a space,
+  so a filter on a tag like `c++` found nothing.
+- Schedule `jitter` spread fires over a thousandth of the window
+  (`5m` gave at most 300 ms).
+- Iterating backwards from 2033, 2097 or 2161 with a year-restricted
+  expression panicked in debug builds and skipped years in release
+  builds.
+- A worker shutting down with several jobs waiting for the same kind's
+  concurrency slot could panic.
+- A worker that could not reach its server logged a warning on every
+  retry; it now logs the outage once, and again when the server answers.
+- A gossip datagram with a huge update count made the receiving node's
+  gossip thread panic, after which the other nodes declared it dead.
+- Gossip packing stopped at the first update that did not fit in a
+  datagram, leaving room for smaller ones unused.
+- A late summary observation (a stalled thread, a clock stepped back)
+  could reset the current window and discard newer samples.
+- `process_max_fds` reported the hard open-files limit instead of the
+  soft one that `open` fails at.
+
 ## [0.3.0] - 2026-04-17
 
 The server. belay is now a single binary that serves an HTTP/JSON API
