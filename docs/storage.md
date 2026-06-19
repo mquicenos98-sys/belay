@@ -182,3 +182,178 @@ The writer keeps four invariants that recovery relies on:
 The active segment is sealed and a new one started once it holds at least
 `storage.segment_size` bytes (32 MiB by default). A single large batch may
 overshoot that size.
+
+## Group commit and sync policies
+
+Writers encode their batch outside any lock, take a sequence number and
+join a queue. A writer that finds no leader active becomes the leader: it
+takes the whole queue, frames every batch into one buffer, appends it with
+a single write, syncs once if the policy says so, applies the batches to
+the in-memory table and wakes everyone. Batches arriving meanwhile queue up
+for the next leader, so under load one sync covers many writes. Only one
+leader runs at a time, which keeps records in sequence order. The
+`commit_groups` statistic counts these log writes; `batches /
+commit_groups` is the average group size.
+
+A batch becomes visible to readers only once it has been written (and,
+under `always`, synced), so a reader never sees data a crash could take
+back.
+
+`storage.sync` chooses when the log reaches stable storage:
+
+| policy | `write` returns after | lost on power loss |
+|---|---|---|
+| `always` (default) | the batch is synced | nothing acknowledged |
+| `interval:<d>`, e.g. `interval:10ms` | the batch is handed to the OS | at most the batches acknowledged in the last `d` plus one sync |
+| `never` | the batch is handed to the OS | anything since the last segment roll, checkpoint, `flush` or close |
+
+Under `interval:<d>` a background thread (`belay-store`) syncs the active
+segment every `d`. Under `never` the log is synced only when a segment is
+sealed, on checkpoints, on `flush` and on close.
+
+Two guarantees hold under every policy:
+
+- recovery restores the state after some *prefix* of the acknowledged
+  batches, never a state with a batch missing in the middle;
+- a process crash that leaves the operating system running loses nothing
+  that was acknowledged, since the data is already in the OS cache.
+
+On disk, file syncs use `sync_data` (fdatasync), which also persists the
+file length. Directory syncs are real on Unix and a no-op on Windows,
+where NTFS journals metadata changes itself.
+
+If a log write or sync fails, the store stops accepting writes and every
+later write fails with "store stopped accepting writes after a failure
+(...); reopen it to recover". Retrying after a failed fsync could report
+success for data the kernel has already dropped, so belay does not try.
+Reopening recovers from whatever reached the disk; a batch whose write
+failed may or may not survive that reopen. The queue engine reports these
+errors to clients as `503 unavailable`.
+
+## Snapshots and checkpoints
+
+A checkpoint writes a snapshot of the whole table and deletes the log
+segments it covers, which bounds both the size of the log and the time
+recovery takes. It runs in three phases:
+
+1. **Freeze** (the log lock is held, writers wait): seal the active
+   segment and start `wal-<seq+1>.log`, then copy the in-memory table.
+2. **Write** (no store locks held, writers proceed): stream the copy to
+   `snap-<seq>.db.tmp`, sync it, rename it to `snap-<seq>.db`, sync the
+   directory.
+3. **Trim**: delete the segments sealed in phase 1 and the previous
+   snapshot.
+
+Writers therefore stall for one sync, one file creation and a copy of the
+table, not for the snapshot write. The copy doubles the memory held for
+the duration of the checkpoint.
+
+A snapshot file has this layout:
+
+```text
+header, 28 bytes
+  0   8  magic     "BELAYSNP"
+  8   2  version   1
+ 10   2  flags     0 (reserved)
+ 12   8  seq       sequence number of the last batch reflected
+ 20   8  count     number of entries
+entries, count times, keys strictly ascending
+         key:bytes value:bytes
+trailer, 20 bytes
+  0   8  body_len  length of header + entries
+  8   4  crc       masked CRC-32C of header + entries
+ 12   8  magic     "BELAYEND"
+```
+
+A snapshot under its final name is complete, because it only gets that
+name by an atomic rename after a sync; the trailer checksum guards against
+damage at rest. Reading one validates the trailer, the checksum, the header
+and the key order before anything is used.
+
+Checkpoints are triggered three ways:
+
+| trigger | setting | default |
+|---|---|---|
+| log size: the segments on disk add up to this many bytes (on the store's background thread) | `storage.checkpoint_bytes` | 128 MiB; 0 disables |
+| time: at least this often while anything is written (checked by the engine's housekeeping thread every `metrics.refresh`) | `storage.checkpoint_interval` | 1h; 0 disables |
+| by hand | `belay admin checkpoint`, `POST /v1/admin/checkpoint` | |
+
+A checkpoint with nothing written since the previous one does nothing.
+Keep `checkpoint_bytes` well above `segment_size`: the log is only ever
+discarded a whole segment at a time.
+
+A crash at any point leaves a recoverable directory. Before the rename,
+the previous snapshot plus the full log still describe the state (the
+leftover `.tmp` file is deleted on open); after it, the new snapshot does,
+and segments it covers are recognised by their sequence numbers and
+deleted on open.
+
+## Recovery
+
+Opening a store recovers its state:
+
+1. Delete `*.tmp` snapshots.
+2. Load the newest snapshot that validates. Invalid ones are skipped and,
+   once recovery succeeds, renamed to `*.corrupt`.
+3. Skip the segments wholly covered by the snapshot (every segment before
+   the last one whose `first_seq <= snapshot_seq + 1`) and delete them.
+4. Replay the rest in order. Records at or below `snapshot_seq` are
+   skipped; every other record must carry the next sequence number.
+5. Classify each region that fails to parse (bad checksum, truncated
+   record, bad header).
+6. Sync the last segment, which becomes sealed; the new active segment is
+   `wal-<last_seq+1>.log`.
+
+Step 5 is where a crash is told apart from damage:
+
+| where the region is | classification | what happens |
+|---|---|---|
+| in a sealed segment (any but the last) | corruption | error in strict mode |
+| in the last segment, and a later valid record has `synced_to` beyond the damaged offset | corruption: the damaged bytes had been synced before that record was written | error in strict mode |
+| in the last segment otherwise | torn tail | the segment is truncated at the damage (removed if the damage is in its header), a warning is logged and the event is counted in `RecoveryStats` |
+
+A torn tail is the normal result of a crash in the middle of a write, and
+is always truncated. The `synced_to` field is what lets a torn tail hold
+intact records after a damaged one, as happens when the operating system
+writes dirty pages back out of order, without mistaking it for corruption.
+For example, suppose one group wrote records at offsets 24 and 100 and
+synced the file up to offset 180, and the next group wrote records at 180
+and 260, both carrying `synced_to = 180`:
+
+```text
+offset  24        100       180       260
+        [ rec 7 ][ rec 8 ][ rec 9 ][ rec 10 ]
+        |---- synced ----|   synced_to = 180 in rec 9 and rec 10
+```
+
+Damage at offset 120 is corruption, because rec 9 proves the file had been
+synced past it. Damage at offset 200 is a torn tail: nothing proves it had
+ever reached the disk, so the segment is truncated at 200 and the store
+recovers through rec 8.
+
+The limit of the rule: damage confined to the final record of the log
+cannot be told apart from a torn write, so it is truncated (with the
+warning) even if that record had been synced.
+
+Corruption, a sequence gap, a record that fails to decode although its
+checksum matches, and a bad snapshot whose sequence number is beyond what
+the log restores are errors under `storage.recovery = "strict"`, the
+default. The server then refuses to start, and apart from truncating a torn
+tail the directory is left unchanged. With `storage.recovery =
+"skip-corrupt"` (also spelled `skip_corrupt`) those problems are skipped
+with a warning, everything else is recovered, and the store immediately
+writes a checkpoint so the damage is not met again.
+
+What recovery did is reported in `RecoveryStats`, visible under
+`recovery` in `belay admin store`:
+
+| field | meaning |
+|---|---|
+| `snapshot_seq`, `snapshot_keys` | the snapshot recovery started from (0 if none) |
+| `bad_snapshots` | snapshots passed over because they failed validation |
+| `segments_replayed`, `batches_replayed` | log read and applied |
+| `torn_tails`, `torn_bytes` | torn tails truncated (0 or 1) and the bytes removed |
+| `skipped_regions`, `skipped_bytes` | damaged regions skipped under `skip-corrupt` |
+| `removed_files` | leftover temporary snapshots, superseded snapshots and covered segments deleted |
+| `duration` | wall-clock time recovery took |
+| `lost_data` | whether anything was discarded or skipped |
