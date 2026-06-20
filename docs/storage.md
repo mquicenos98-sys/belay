@@ -357,3 +357,70 @@ What recovery did is reported in `RecoveryStats`, visible under
 | `removed_files` | leftover temporary snapshots, superseded snapshots and covered segments deleted |
 | `duration` | wall-clock time recovery took |
 | `lost_data` | whether anything was discarded or skipped |
+
+## Directory layout and the LOCK file
+
+```text
+LOCK                               exists while a store has the directory open;
+                                   holds the owner's process id
+wal-00000000000000000001.log       log segment; the number is the sequence
+                                   number of its first record
+snap-00000000000000000742.db       snapshot of the state after batch 742
+snap-00000000000000000742.db.tmp   snapshot being written; deleted on open
+snap-00000000000000000742.db.corrupt
+                                   snapshot that failed validation, set aside
+```
+
+Numbers are zero-padded to 20 digits so that names sort numerically. Other
+files are ignored.
+
+The `LOCK` file keeps a second process, or a second handle in the same
+process, from opening the directory. It is created exclusively and holds
+the owner's process id; closing the store removes it. A lock left behind
+by a crashed process is detected as stale only on Linux, where a lock whose
+process id has no `/proc` entry is taken over. Elsewhere the error names
+the holder, and the file must be deleted by hand once that process is
+known to be gone:
+
+```text
+store is locked by process 4127 (/var/lib/belay/LOCK); if that process is gone, delete the file
+```
+
+## Configuration
+
+The `[storage]` section of the configuration file:
+
+```toml
+[storage]
+dir = "belay-data"          # relative to the working directory
+in_memory = false           # keep everything in memory; lost on exit
+sync = "always"             # "always", "interval:10ms" or "never"
+checkpoint_bytes = "128MiB" # 0 disables size-triggered checkpoints
+checkpoint_interval = "1h"  # 0 disables time-triggered checkpoints
+segment_size = "32MiB"      # between 128 bytes and 1 GiB
+recovery = "strict"         # or "skip-corrupt"
+```
+
+Sizes are written as integers or strings such as `"64MiB"` or `"1GB"`;
+durations as `"30s"` or `"1h30m"`. Every key can be overridden from the
+environment, for example `BELAY_STORAGE__SYNC=interval:10ms` or
+`BELAY_STORAGE__DIR=/var/lib/belay`.
+
+`belay dev` keeps its data in memory unless given `--data DIR`.
+
+From Rust, `LogKv::open` takes an `Options` builder with the same knobs:
+
+```rust
+use belay_store::{LogKv, Options, RecoveryMode, SyncPolicy};
+use std::time::Duration;
+
+let kv = LogKv::open(
+    "/var/lib/belay",
+    Options::new()
+        .sync(SyncPolicy::Interval(Duration::from_millis(10)))
+        .segment_size(8 << 20)
+        .checkpoint_every(64 << 20)   // or .manual_checkpoints()
+        .recovery(RecoveryMode::Strict)
+        .create_if_missing(true),
+)?;
+```
