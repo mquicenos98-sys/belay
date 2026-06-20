@@ -24,3 +24,7 @@ belay-queue = { path = "../belay-queue" }
 belay-scheduler = { path = "../belay-scheduler" }
 belay-cluster = { path = "../belay-cluster" }
 belay-worker = { path = "../belay-worker" }
+
+[dev-dependencies]
+belay-server = { path = "../belay-server" }
+belay-client = { path = "../belay-client" }
