@@ -16,3 +16,6 @@ path = "src/lib.rs"
 belay-common = { path = "../belay-common" }
 belay-json = { path = "../belay-json" }
 belay-proto = { path = "../belay-proto" }
+
+[dev-dependencies]
+belay-client = { path = "../belay-client" }
