@@ -424,3 +424,148 @@ let kv = LogKv::open(
         .create_if_missing(true),
 )?;
 ```
+
+## Testing crashes with MemFs
+
+All file access goes through the `Vfs` trait, which covers the dozen
+operations the store performs. `OsFs` is the real file system; `MemFs`
+keeps files in memory and models what survives a crash. Each file keeps
+its contents and the length known to be synced, and directory entries are
+tracked both as visible and as of the last `sync_dir` of their directory.
+
+A simulated crash is one of:
+
+| `Crash` | what survives |
+|---|---|
+| `PowerLoss` | synced file data and synced directory entries only |
+| `ProcessExit` | everything written, synced or not (the OS keeps running) |
+| `TornWrite { path, keep }` | like `PowerLoss`, plus the first `keep` unsynced bytes of `path` |
+
+A file created or deleted without a directory sync therefore disappears or
+comes back after a power loss, as it can on a real disk.
+
+```rust
+use belay_store::vfs::{Crash, MemFs, Vfs};
+use std::io::Write;
+use std::path::Path;
+
+let fs = MemFs::new();
+fs.create_dir_all(Path::new("db")).unwrap();
+let path = Path::new("db").join("log");
+let mut f = fs.create(&path).unwrap();
+f.write_all(b"durable").unwrap();
+f.sync().unwrap();
+f.write_all(b" and not").unwrap();
+fs.sync_dir(Path::new("db")).unwrap();
+
+let after = fs.crash_copy(&Crash::PowerLoss);
+assert_eq!(after.read(&path).unwrap(), b"durable");
+let torn = fs.crash_copy(&Crash::TornWrite { path: path.clone(), keep: 4 });
+assert_eq!(torn.read(&path).unwrap(), b"durable and");
+```
+
+`crash` applies a crash in place: clones of the `MemFs` taken before it
+(the ones handed to a store) belong to the "dead process", and their file
+handles, locks and writes fail from then on. `crash_copy` returns an
+independent copy of what a crash would leave, which lets a test try many
+crash points against one history. Faults are injected with `fail_syncs`
+(every sync fails) and `fail_after_ops(Some(n))` (every mutating operation
+after the next `n` fails), and `overwrite` flips bytes in place, synced
+region included, to model bit rot.
+
+The store's crash tests use these to check, among other things, that every
+torn offset of an unsynced tail recovers an exact prefix of the batches,
+that a crash after any single I/O operation keeps every acknowledged
+write, that any damaged byte in a sealed segment is reported, and that a
+batch whose sync failed is all or nothing.
+
+## Inspecting a store
+
+`belay admin store-inspect <DIR>` reads a data directory directly, without
+taking the lock or changing a file, so it also works on a store that is
+open elsewhere (whose last segment may then show a torn tail that is just
+a write in progress). It checks every snapshot and record checksum and the
+continuity of sequence numbers:
+
+```console
+$ belay admin store-inspect /var/lib/belay
+FILE                          SEQS     ENTRIES     SIZE  NOTE
+snap-00000000000000000034.db  ..=34         18  7.8 KiB
+wal-00000000000000000035.log  35..=35        1    589 B
+snapshot seq 34, recoverable through seq 35
+no problems found
+```
+
+`--records` also lists every log record with its operations, and
+`--json` prints the report as JSON (`dir`, `ok`, `locked`,
+`snapshot_seq`, `last_seq`, `files`, `problems`):
+
+```console
+$ belay admin store-inspect /var/lib/belay --records
+...
+wal-00000000000000000035.log:
+  seq 35 at 24 (565 bytes, synced to 24)
+    put "queue\x00\x01emails\x00\x01" (172 bytes)
+    put "job\x00\x01\x01\xa0\xefJ\xa5k_R\x00Eg=\xc0\xed\xa7[" (323 bytes)
+```
+
+Problems come in four kinds: `torn tail`, `corrupt`, `gap` and `bad
+snapshot`. A torn tail alone is harmless, since opening the store truncates
+it, and the command exits with status 0:
+
+```console
+$ belay admin store-inspect /var/lib/belay
+FILE                          SEQS   ENTRIES     SIZE  NOTE
+snap-00000000000000000034.db  ..=34       18  7.8 KiB
+wal-00000000000000000035.log               0    400 B
+snapshot seq 34, recoverable through seq 34
+torn tail: /var/lib/belay/wal-00000000000000000035.log at offset 24: record of 540 bytes extends 189 bytes past the end of the file (376 bytes)
+```
+
+Anything else means a strict open would refuse the directory, and the
+command exits with status 1:
+
+```console
+$ belay admin store-inspect /var/lib/belay
+FILE                          SEQS     ENTRIES     SIZE  NOTE
+snap-00000000000000000034.db  ..=34             7.8 KiB  invalid
+wal-00000000000000000035.log  35..=35        1    589 B
+snapshot seq 0, recoverable through seq 35
+bad snapshot: /var/lib/belay/snap-00000000000000000034.db at offset 0: corrupt /var/lib/belay/snap-00000000000000000034.db at offset 8005: checksum mismatch (stored 14815b13, computed c7499d97)
+gap: /var/lib/belay/wal-00000000000000000035.log at offset 0: batches 1 to 34 are missing
+error: /var/lib/belay has 2 problems that opening it would not survive
+hint: storage.recovery = "skip-corrupt" opens it anyway, dropping the damaged records
+```
+
+Against a running server, `belay admin store` shows the store's
+statistics (`GET /v1/admin/store`): keys, live bytes, the last and the
+durable sequence number, batches, commit groups, log syncs and bytes
+written since open, log segments and their size, checkpoints, the newest
+snapshot, and the recovery statistics. `belay admin checkpoint` writes a
+checkpoint now. Both need a token with the `admin` scope when
+authentication is on. (`belay admin verify` is a different check: it
+compares the queue's in-memory indexes with the stored job documents.)
+
+The same inspection is available from Rust in `belay_store::inspect`:
+`list_files`, `verify` (returning a `VerifyReport`), `read_segment` and
+`read_snapshot`.
+
+## Limitations
+
+- The whole dataset lives in memory, twice over while a checkpoint copies
+  the table. Job payloads are limited to 1 MiB each for this reason, and
+  retention matters: finished jobs stay in memory until they are deleted.
+- One process per directory. A lock left by a crashed process is detected
+  as stale only on Linux; elsewhere the `LOCK` file must be deleted by
+  hand.
+- Scans return materialized vectors; large ranges have to be paged with
+  `limit` and `after`.
+- Damage confined to the very last record of the log looks exactly like a
+  torn write and is truncated with a warning rather than reported.
+- After a failed log write or sync the store refuses further writes until
+  it is reopened, which for a server means a restart.
+- Opening replays the log since the last snapshot and the queue engine
+  then scans every job, so start-up time grows with the log size and the
+  number of retained jobs.
+- No compression, no encryption, no replication. A node's data exists only
+  in its own data directory; see [cluster.md](cluster.md).
