@@ -168,3 +168,175 @@ queues it names, so a job whose time has come is leasable as soon as a
 worker asks, whether or not the tick has run. `belay job promote <id>`
 makes a scheduled or retrying job ready at once. `run_at` and `delay` are
 mutually exclusive.
+
+## Leases, tokens and heartbeats
+
+A worker asks for jobs with `POST /v1/lease`:
+
+| field | meaning | default and limits |
+|---|---|---|
+| `worker` | worker id, `[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,127}` | required |
+| `queues` | queues to take from, no duplicates | required; 1 to 32 |
+| `max_jobs` | most jobs to hand out | 1; at most 100 |
+| `lease_for` | lease length | 30s; 1s to 1h |
+| `wait` | long-poll up to this long when nothing is ready | none; at most 60s |
+
+Each leased job moves to `running`, its `attempt` goes up by one, and it
+comes with a fresh lease token of 16 hex digits. The lease lasts
+`lease_for`, but never beyond the attempt's deadline, `started_at +
+timeout`. Unknown queues are skipped rather than refused, so workers may
+start before anything has been enqueued.
+
+With `wait`, a request that finds nothing sleeps until something could
+produce work (an enqueue, a promotion, a resume, capacity freed on a
+limited queue) or until the earliest timer or rate-limit token it knows
+of, and returns as soon as it has at least one job, or empty when the wait
+runs out.
+
+When a request names several queues, `engine.queue_order` decides how
+picks spread over them: `round_robin` (the default) takes one job from each
+queue in turn, starting from a position that rotates between requests, so
+a flooded queue cannot starve the others; `in_order` drains the queues in
+the order the request lists them.
+
+Every later call about the job names it and presents the token:
+
+| call | body | answer |
+|---|---|---|
+| `POST /v1/jobs/:id/heartbeat` | `{"token", "extend_by"?, "progress"?}` | `{"expires_at", "cancel_requested"}` |
+| `POST /v1/jobs/:id/complete` | `{"token", "result"?}` | `204` |
+| `POST /v1/jobs/:id/fail` | `{"token", "error", "kind"?, "retryable"?, "retry_in"?}` | `204` |
+
+A heartbeat extends the lease to `extend_by` from now (1s to 1h), or by
+its previous renewal length when `extend_by` is absent. It never shortens
+a lease and never extends it past the attempt's deadline, so a handler that
+overruns its timeout loses its lease there even while it keeps
+heartbeating. A heartbeat may carry `progress` (`percent` from 0 to 100
+and a `message` up to 1024 bytes), which is stored on the job and
+published as `job.progress`.
+
+The token is what protects a job from a slow worker. A call is refused with
+`409 lease_lost` unless the job is running on that very token and the lease
+has not run out; after an expiry the job may already be running elsewhere,
+and a late report from the first worker must not overwrite the second's.
+A job that no longer exists is also `lease_lost`. The worker's only
+sensible reaction in both cases is to drop the job.
+
+```json
+{"error": {"code": "lease_lost",
+           "message": "lease on job 01M3QMCBNKJ9H9NQ7VZ376D17C is no longer held (expired or given to another worker)",
+           "details": {"job": "01M3QMCBNKJ9H9NQ7VZ376D17C"}}}
+```
+
+A lease that runs out is found by the queue tick and fails the attempt
+with the error `lease expired` (kind `lease_expired`), or `timed out after
+<timeout>` (kind `timeout`) when the job's own timeout is what ended it.
+Both are retryable: the job retries, dies or is cancelled like any failed
+attempt, and a `job.expired` event names the worker that held it.
+Completing a job whose cancellation was requested still succeeds: the work
+is done.
+
+## Failures, retries and backoff
+
+A failed attempt (`fail`, or lease expiry) moves the job to:
+
+- `cancelled`, if cancellation had been requested;
+- `retrying`, if the error is retryable (`retryable` defaults to true) and
+  attempts remain (`attempt < max_attempts`), eligible again after
+  `retry_in` if the worker gave one, or else after the delay of the job's
+  backoff policy;
+- `dead` otherwise.
+
+Backoff policies have a compact text form, used in JSON, the configuration
+file and CLI flags:
+
+```text
+const:5s                 5s every time
+linear:1s+2s..1m         1s, 3s, 5s, ... capped at 1m
+exp:1s*2..10m            1s, 2s, 4s, ... capped at 10m
+exp:500ms*1.5            uncapped (the ..max part is optional)
+exp:1s*2..10m~full       with jitter: ~full, ~equal, ~none or ~<p>%
+```
+
+`constant:` and `exponential:` are accepted as long spellings. The factor
+of `exp` must be at least 1, and a cap below the initial delay is refused.
+Retry number 1 is the retry after the first failed attempt. Jitter spreads
+simultaneous failures:
+
+| jitter | delay |
+|---|---|
+| `~none` | the base delay |
+| `~full` | uniform in `[0, d]` |
+| `~equal` | uniform in `[d/2, d]` |
+| `~10%` | uniform in `[0.9 d, 1.1 d]`; the only mode that can exceed the cap |
+
+The default queue policy is `exp:1s*2..1h~10%`: roughly 1s, 2s, 4s and so
+on, capped at an hour. With the default 25 attempts a job that keeps
+failing spends about 13 hours retrying (4,095 seconds for the first twelve
+retries, then twelve hour-long waits) before it dies.
+
+A job's `retry` is filled from the queue's `default_retry` when it is
+enqueued, so changing the queue default affects jobs enqueued afterwards.
+
+**Dead jobs** stay in the queue for the queue's dead retention (7 days by
+default) so that someone can look at them and retry them:
+
+```console
+$ belay job list --queue emails --state dead
+$ belay job retry 01M3QMCBNKJ9H9NQ7VZ376D17C
+$ belay job list -q --state dead | xargs belay job retry
+```
+
+A retry sends a dead or cancelled job back to `ready` with a fresh budget
+of attempts (`attempt` restarts at 0); its error history is kept and its
+result cleared.
+
+## Unique jobs
+
+`unique` deduplicates enqueues: at most one job per queue holds a key at a
+time.
+
+```json
+"unique": {"key": "user:42", "scope": "until_finished", "on_conflict": "return_existing"}
+```
+
+The object may be shortened to the key alone, `"unique": "user:42"`, which
+takes the defaults. Keys are up to 256 bytes, non-empty and without control
+characters. The scope says how long the key stays claimed:
+
+| scope | the key is held |
+|---|---|
+| `until_started` | while the job is scheduled or ready |
+| `until_finished` (default) | until the job reaches a terminal state |
+| `for:<duration>`, e.g. `for:1h` | for that long after enqueue, whatever happens to the job, even after retention deletes it; 1s to 30 days |
+
+`on_conflict` says what an enqueue meeting a held key does:
+
+| policy | holder scheduled, ready or retrying | holder running or finished |
+|---|---|---|
+| `reject` | `409 already_exists` | `409 already_exists` |
+| `return_existing` (default) | status `duplicate`, the holder's id | status `duplicate`, the holder's id |
+| `replace` | holder cancelled, new job with status `replaced` | status `duplicate`, the holder's id |
+
+`return_existing` makes an enqueue idempotent, which is also what lets the
+client retry enqueues with a key safely. A rejected enqueue's error names
+the holder in its details (`{"queue", "key", "job"}`).
+
+Claims are taken at enqueue only. A job sent back to `ready` by a retry,
+by hand or after a failure, does not claim its key again: it may have been
+taken by a newer job in the meantime.
+
+From the command line, `--unique KEY[:SCOPE]` and `--on-conflict POLICY`:
+
+```console
+$ belay enqueue reports build --delay 10m --unique daily-report:for:1h
+enqueued 01M3QMD2P744DNSQRGVEYWD4WM on reports (scheduled)
+$ belay enqueue reports build --delay 10m --unique daily-report:for:1h
+job 01M3QMD2P744DNSQRGVEYWD4WM already holds the unique key; nothing enqueued (scheduled)
+$ belay enqueue reports build --unique daily-report:for:1h --on-conflict reject
+error: unique key "daily-report" in queue reports is held by job 01M3QMD2P744DNSQRGVEYWD4WM
+```
+
+Keys often contain colons themselves, so the CLI only splits off a
+recognisable scope at the end (`:until_started`, `:until_finished`,
+`:for:<duration>`).
