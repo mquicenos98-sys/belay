@@ -340,3 +340,97 @@ error: unique key "daily-report" in queue reports is held by job 01M3QMD2P744DNS
 Keys often contain colons themselves, so the CLI only splits off a
 recognisable scope at the end (`:until_started`, `:until_finished`,
 `:for:<duration>`).
+
+## Queue configuration
+
+Each queue has a configuration, replaced as a whole by
+`PUT /v1/queues/:name/config` (which creates the queue if needed). Every
+field is optional in JSON, so `{}` is the default configuration.
+
+| field | meaning | default |
+|---|---|---|
+| `max_concurrency` | most jobs of the queue running at once, across all workers | none (no limit); at least 1 |
+| `rate_limit` | `{"per_second", "burst"}`: a token bucket for lease grants | none |
+| `default_timeout` | `timeout` for jobs that set none | `30m`; 1s to 7 days |
+| `default_retry` | `retry` for jobs that set none | `exp:1s*2..1h~10%` |
+| `default_max_attempts` | `max_attempts` for jobs that set none | 25; 1 to 1000 |
+| `retention` | `{"succeeded", "dead", "cancelled"}`: how long finished jobs are kept | `1d`, `7d`, `1d`; at most 365 days each |
+
+**Concurrency.** A queue at its `max_concurrency` hands out nothing until a
+running job finishes, however many workers ask.
+
+**Rate limits.** `per_second` may be fractional (`0.5` is one grant every
+two seconds, up to 1,000,000); each leased job takes one token, and
+`burst` (default: `per_second` rounded up, at least 1) is the bucket size,
+i.e. how many grants are allowed at once after a quiet spell. Tokens are
+only taken once a job is known to be available, so an idle queue does not
+drain its bucket. Changing the limit keeps the tokens accumulated so far,
+up to the new burst.
+
+**Retention.** The queue tick deletes finished jobs past their retention,
+at most 10,000 per tick, so a large backlog is worked off gradually.
+Retention of 0 deletes a finished job at the next tick.
+
+Concurrency, rate limit and retention apply at once; the defaults apply to
+jobs enqueued from then on.
+
+Queues can be configured in the configuration file, which applies each
+`[queues.<name>]` table at startup when it differs from what is stored:
+
+```toml
+[queues.emails]
+max_concurrency = 16
+rate_limit = { per_second = 50.0, burst = 100 }
+default_timeout = "5m"
+default_retry = "exp:1s*2..10m~full"
+default_max_attempts = 10
+retention = { succeeded = "1d", dead = "7d", cancelled = "1d" }
+```
+
+or from the command line, one key at a time, where `none` removes an
+optional setting:
+
+```console
+$ belay queue config emails --set max_concurrency=8 --set retention.dead=30d
+$ belay queue config emails --set rate_limit.per_second=5 --set rate_limit.burst=10
+$ belay queue config emails --set rate_limit=none
+$ belay queue config emails
+max_concurrency = 8
+rate_limit = none
+default_timeout = 30m
+default_retry = exp:1s*2..1h~10%
+default_max_attempts = 25
+retention.succeeded = 1d
+retention.dead = 30d
+retention.cancelled = 1d
+```
+
+`belay queue info <name>` shows the counts per state, the age of the oldest
+ready job (the best single sign that workers are falling behind) and the
+last minute's throughput.
+
+## Fair sharing between tenants
+
+Jobs may name a `tenant`, `[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}`. Within a
+queue, tenants take turns by deficit round robin: every tenant with ready
+jobs has a flow ordered by priority, eligibility time and id, and the
+flows sit in a ring. The tenant at the front gets a turn of `quantum`
+picks; when the turn is used up it moves to the back, and when its flow
+empties it leaves the ring. A turn interrupted by the end of a lease
+request carries over to the next request, which makes the share exact over
+time rather than per request.
+
+The quantum is `engine.tenant_quantum` (default 1) times the tenant's
+weight from `[engine.tenant_weights]` (default 1):
+
+```toml
+[engine]
+tenant_quantum = 1
+tenant_weights = { acme = 3 }
+```
+
+With this, while `acme` and `globex` both have ready jobs in a queue,
+`acme` gets three jobs for every one of `globex`'s. Jobs without a tenant
+form one flow of their own, so a queue that never uses tenants behaves as a
+plain priority queue. A tenant cannot buy more than its share by raising
+priorities: priority only orders jobs within its own turn.
