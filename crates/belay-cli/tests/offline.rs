@@ -80,7 +80,8 @@ fn cron_errors_point_at_the_column() {
     let out = belay("cron next '0 61 * * *'").exits(Exit::Usage);
     assert!(
         out.stderr.starts_with(
-            "error: invalid cron expression: invalid value 61 in hour field (0-23) at column 3\n"
+            "error: invalid cron expression: invalid value 61 in hour field (0-23) at column 3\n  \
+             0 61 * * *\n    ^\n"
         ),
         "{}",
         out.stderr

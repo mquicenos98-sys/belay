@@ -93,7 +93,7 @@ fn parse_expr(m: &Matches, text: &str) -> Result<CronExpr> {
     CronExpr::parse(text).map_err(|e| {
         let mut message = format!("invalid cron expression: {e}");
         if let Some(column) = e.column() {
-            let caret = " ".repeat(column) + "^";
+            let caret = " ".repeat(column.saturating_sub(1)) + "^";
             message.push_str(&format!("\n  {text}\n  {caret}"));
         }
         Error::Usage(m.constraint(message))
