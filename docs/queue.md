@@ -340,3 +340,185 @@ error: unique key "daily-report" in queue reports is held by job 01M3QMD2P744DNS
 Keys often contain colons themselves, so the CLI only splits off a
 recognisable scope at the end (`:until_started`, `:until_finished`,
 `:for:<duration>`).
+
+## Queue configuration
+
+Each queue has a configuration, replaced as a whole by
+`PUT /v1/queues/:name/config` (which creates the queue if needed). Every
+field is optional in JSON, so `{}` is the default configuration.
+
+| field | meaning | default |
+|---|---|---|
+| `max_concurrency` | most jobs of the queue running at once, across all workers | none (no limit); at least 1 |
+| `rate_limit` | `{"per_second", "burst"}`: a token bucket for lease grants | none |
+| `default_timeout` | `timeout` for jobs that set none | `30m`; 1s to 7 days |
+| `default_retry` | `retry` for jobs that set none | `exp:1s*2..1h~10%` |
+| `default_max_attempts` | `max_attempts` for jobs that set none | 25; 1 to 1000 |
+| `retention` | `{"succeeded", "dead", "cancelled"}`: how long finished jobs are kept | `1d`, `7d`, `1d`; at most 365 days each |
+
+**Concurrency.** A queue at its `max_concurrency` hands out nothing until a
+running job finishes, however many workers ask.
+
+**Rate limits.** `per_second` may be fractional (`0.5` is one grant every
+two seconds, up to 1,000,000); each leased job takes one token, and
+`burst` (default: `per_second` rounded up, at least 1) is the bucket size,
+i.e. how many grants are allowed at once after a quiet spell. Tokens are
+only taken once a job is known to be available, so an idle queue does not
+drain its bucket. Changing the limit keeps the tokens accumulated so far,
+up to the new burst.
+
+**Retention.** The queue tick deletes finished jobs past their retention,
+at most 10,000 per tick, so a large backlog is worked off gradually.
+Retention of 0 deletes a finished job at the next tick.
+
+Concurrency, rate limit and retention apply at once; the defaults apply to
+jobs enqueued from then on.
+
+Queues can be configured in the configuration file, which applies each
+`[queues.<name>]` table at startup when it differs from what is stored:
+
+```toml
+[queues.emails]
+max_concurrency = 16
+rate_limit = { per_second = 50.0, burst = 100 }
+default_timeout = "5m"
+default_retry = "exp:1s*2..10m~full"
+default_max_attempts = 10
+retention = { succeeded = "1d", dead = "7d", cancelled = "1d" }
+```
+
+or from the command line, one key at a time, where `none` removes an
+optional setting:
+
+```console
+$ belay queue config emails --set max_concurrency=8 --set retention.dead=30d
+$ belay queue config emails --set rate_limit.per_second=5 --set rate_limit.burst=10
+$ belay queue config emails --set rate_limit=none
+$ belay queue config emails
+max_concurrency = 8
+rate_limit = none
+default_timeout = 30m
+default_retry = exp:1s*2..1h~10%
+default_max_attempts = 25
+retention.succeeded = 1d
+retention.dead = 30d
+retention.cancelled = 1d
+```
+
+`belay queue info <name>` shows the counts per state, the age of the oldest
+ready job (the best single sign that workers are falling behind) and the
+last minute's throughput.
+
+## Fair sharing between tenants
+
+Jobs may name a `tenant`, `[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}`. Within a
+queue, tenants take turns by deficit round robin: every tenant with ready
+jobs has a flow ordered by priority, eligibility time and id, and the
+flows sit in a ring. The tenant at the front gets a turn of `quantum`
+picks; when the turn is used up it moves to the back, and when its flow
+empties it leaves the ring. A turn interrupted by the end of a lease
+request carries over to the next request, which makes the share exact over
+time rather than per request.
+
+The quantum is `engine.tenant_quantum` (default 1) times the tenant's
+weight from `[engine.tenant_weights]` (default 1):
+
+```toml
+[engine]
+tenant_quantum = 1
+tenant_weights = { acme = 3 }
+```
+
+With this, while `acme` and `globex` both have ready jobs in a queue,
+`acme` gets three jobs for every one of `globex`'s. Jobs without a tenant
+form one flow of their own, so a queue that never uses tenants behaves as a
+plain priority queue. A tenant cannot buy more than its share by raising
+priorities: priority only orders jobs within its own turn.
+
+## Persistence and locking
+
+Each state change is staged, written to the store as one atomic batch, and
+only then applied to memory; if the write fails, the engine is exactly as
+it was. Job documents are stored under their id, queue records and
+uniqueness claims under keys of their own (see [storage.md](storage.md)).
+Nothing else is persisted: the ready sets, timers, lease expiries and
+counts are rebuilt from the job documents when the engine opens. Claims are
+stored separately rather than derived because a `for:<duration>` scope
+outlives its job. Records carry a format version, and an engine refuses a
+store written in a newer format.
+
+With `storage.sync = "always"`, every acknowledged operation survives a
+crash.
+
+One mutex, the engine lock, guards all in-memory state, and every store
+write happens while it is held, in the order the changes are made. Each
+operation is therefore atomic and linearizable with respect to all others,
+and the indexes can never disagree with the store. The price is that store
+writes are serialized; operations that change many jobs (batch enqueues,
+multi-job leases, the tick, purges) write one batch for many changes to
+amortize the sync. Reads by id go straight to the store without the lock.
+A long-polling lease never holds the lock while it waits.
+
+The worker registry (who has been leasing, when they were last seen, what
+they hold) is kept in memory only and refills as workers call in. A worker
+silent for `engine.worker_timeout` (2 minutes) is reported lost with a
+`worker.lost` event, and forgotten `engine.worker_retention` (1 hour) later
+if it holds no jobs.
+
+`belay admin verify` rebuilds the indexes from the store and compares them
+with the live ones; a mismatch would mean a bug, and a restart rebuilds
+them.
+
+## Operator actions
+
+| action | CLI | HTTP | scope | rules |
+|---|---|---|---|---|
+| show a job | `belay job get <id>` | `GET /v1/jobs/:id` | `read` | |
+| list jobs | `belay job list [--queue] [--state] [--kind] [--tag] [--tenant] [--all]` | `GET /v1/jobs?queue=&state=&kind=&tag=&tenant=&created_after=&created_before=&order=&cursor=&limit=` | `read` | newest first; pages of 100, at most 1000 |
+| cancel | `belay job cancel <id>...` | `POST /v1/jobs/:id/cancel` | `enqueue` | scheduled, ready and retrying jobs at once; running jobs get `cancel_requested`; cancelling a cancelled job does nothing |
+| retry | `belay job retry <id>...` | `POST /v1/jobs/:id/retry` | `admin` | dead or cancelled jobs only |
+| promote | `belay job promote <id>...` | `POST /v1/jobs/:id/promote` | `admin` | scheduled or retrying; a ready job is left as is |
+| delete | `belay job delete <id>...` | `DELETE /v1/jobs/:id` | `admin` | finished jobs only |
+| wait | `belay job wait <id> [--timeout D]` | (polls `GET /v1/jobs/:id`) | `read` | |
+| pause, resume | `belay queue pause <name>`, `belay queue resume <name>` | `POST /v1/queues/:name/pause`, `/resume` | `admin` | a paused queue still accepts jobs but hands none out |
+| purge | `belay queue purge <name> [--state S] --yes` | `POST /v1/queues/:name/purge?state=` | `admin` | never running jobs; without a state, every other job |
+| configure | `belay queue config <name> --set K=V` or `--file` | `PUT /v1/queues/:name/config` | `admin` | |
+| delete a queue | `belay queue delete <name> --yes` | `DELETE /v1/queues/:name[?force=true]` | `admin` | refused while jobs are pending unless forced |
+
+A running job whose cancellation is requested learns it from its next
+heartbeat (`"cancel_requested": true`); its worker should stop and report
+with `fail`, which then cancels the job, as does the lease running out.
+Actions that make no sense for a job's state fail with `409
+failed_precondition`, naming the states that would allow them:
+
+```text
+cannot retry job 01M3QMCBNKJ9H9NQ7VZ376D17C: it is succeeded, expected dead or cancelled
+```
+
+Purges and forced queue deletions run in batches of `engine.batch_size`
+(256) jobs, releasing the engine lock between batches so workers are not
+stalled; each batch is atomic, the whole operation is not. Purged jobs do
+not count as finished, so workflows waiting on them only notice at their
+next reconciliation. A timed uniqueness claim held by a purged job stays
+until it runs out. Deleting a queue with `force` deletes its running jobs
+too; their workers get `lease_lost` on their next call.
+
+## Limitations
+
+- Store writes happen under the engine lock, so under `sync = "always"`
+  commit throughput is bounded by the device's sync latency. Batch
+  enqueues and multi-job leases amortize it.
+- Opening scans every job; start-up time grows with the number of retained
+  jobs, which also all live in memory.
+- Leases are stored with their expiry. If the server is down for longer
+  than a lease, the lease runs out at the next tick even if the worker is
+  still going; the worker then gets `lease_lost` and the job runs again.
+- Fair sharing is per queue; there is no tenant quota across queues.
+- Rate-limit buckets are kept in memory and start full when the engine
+  opens.
+- A lease request cannot ask for particular kinds; a worker takes whatever
+  the queue hands out.
+- `belay queue delete` has no force option; a queue with pending jobs has
+  to be purged first, or deleted through the API with `?force=true`.
+- `belay job wait` and `--wait` poll the job rather than following the
+  event stream, so they see an outcome up to half a second late.
