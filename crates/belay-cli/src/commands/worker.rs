@@ -29,7 +29,7 @@ pub(crate) fn spec() -> Command {
              jobs it was running then come back after their lease expires.",
         )
         .flag(
-            Flag::option("queues", "LIST", "Queues to serve, in order of preference")
+            Flag::option("queues", "LIST", "Queues to serve (comma-separated)")
                 .repeated()
                 .default("default"),
         )
