@@ -104,7 +104,7 @@ pub(crate) fn redirect(req: &Request, owner: &RemoteOwner) -> Response {
 /// The request's path and query as received, without any scheme and
 /// authority a proxy may have sent in absolute form.
 pub(crate) fn path_and_query(req: &Request) -> String {
-    match req.path.split_once('?') {
+    match req.target.split_once('?') {
         Some((_, query)) => format!("{}?{}", req.path, query.split('#').next().unwrap_or("")),
         None => req.path.clone(),
     }
@@ -134,6 +134,7 @@ pub(crate) fn spread_batch(local: &[QueueName], remote: &[(QueueName, RemoteOwne
 #[cfg(test)]
 mod tests {
     use super::*;
+    use belay_http::Method;
 
     fn owner(node: &str) -> RemoteOwner {
         RemoteOwner {
@@ -191,6 +192,24 @@ mod tests {
                 local: vec![q("a1")],
                 remote: vec![(q("b1"), owner("b"))],
             }
+        );
+    }
+
+    #[test]
+    fn redirects_keep_path_and_query_and_drop_absolute_form() {
+        let req = Request::new(Method::Get, "/v1/jobs?queue=b1&limit=5");
+        let response = redirect(&req, &owner("b"));
+        assert_eq!(response.status, StatusCode::TEMPORARY_REDIRECT);
+        assert_eq!(
+            response.headers.get("location"),
+            Some("http://b:7700/v1/jobs?queue=b1&limit=5")
+        );
+        let proxied = Request::new(Method::Post, "http://a:7700/v1/lease");
+        assert_eq!(path_and_query(&proxied), "/v1/lease");
+        let encoded = Request::new(Method::Get, "/v1/queues/billing%3Ainvoices?x=1#frag");
+        assert_eq!(
+            path_and_query(&encoded),
+            "/v1/queues/billing%3Ainvoices?x=1"
         );
     }
 

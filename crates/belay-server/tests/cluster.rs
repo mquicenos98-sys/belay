@@ -143,9 +143,13 @@ fn requests_follow_queue_and_schedule_ownership() {
         missing.message
     );
 
-    // Queue-scoped reads are redirected too.
+    // Queue-scoped reads keep their query string.
     let listing = a.send(Method::Get, &format!("/v1/jobs?queue={on_b}&limit=5"), "");
     assert_eq!(listing.status, 307);
+    assert_eq!(
+        listing.header("location"),
+        Some(b.url(&format!("/v1/jobs?queue={on_b}&limit=5")).as_str())
+    );
     let info = a.send(Method::Get, &format!("/v1/queues/{on_b}"), "");
     assert_eq!(info.status, 307);
     let local = a.send(Method::Post, &format!("/v1/queues/{on_a}/pause"), "");
