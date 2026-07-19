@@ -36,7 +36,7 @@ pub const MAX_CONCURRENCY: usize = 1024;
 pub struct WorkerConfig {
     /// Name reported to the source; defaults to `host:pid`.
     pub id: WorkerId,
-    /// Queues to lease from, in order of preference.
+    /// Queues to lease from; the server decides the order it tries them in.
     pub queues: Vec<QueueName>,
     /// Executor threads, hence the most jobs run at once. Default 4.
     pub concurrency: usize,
@@ -113,7 +113,7 @@ impl WorkerConfig {
         self
     }
 
-    /// Sets the queues, in order of preference.
+    /// Sets the queues to lease from.
     #[must_use]
     pub fn queues(mut self, queues: Vec<QueueName>) -> WorkerConfig {
         self.queues = queues;

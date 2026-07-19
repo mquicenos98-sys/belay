@@ -180,15 +180,16 @@ impl FromJson for EnqueueResponse {
 
 /// `POST /v1/lease` body: hand me up to `max_jobs` jobs from `queues`.
 ///
-/// Queues are tried in the order given, which lets a worker express
-/// preference. With `wait`, the server holds the request open until a job
+/// Queues are tried in the engine's queue order: round robin by default,
+/// strictly as listed with `engine.queue_order = "in_order"`. With `wait`,
+/// the server holds the request open until a job
 /// arrives or the wait runs out (long polling), then answers with whatever
 /// it has, possibly nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LeaseRequest {
     /// Who is asking.
     pub worker: WorkerId,
-    /// Where to look, in order of preference.
+    /// Where to look; see the type docs for the order.
     pub queues: Vec<QueueName>,
     /// At most this many jobs; default 1.
     pub max_jobs: u32,
