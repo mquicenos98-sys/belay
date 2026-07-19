@@ -164,3 +164,123 @@ use belay_worker::job_info;
 job_info!(ctx, "rendered template"; template = "welcome");
 // ts=... level=info target=app::email msg="rendered template" job=01JAB... kind=send_email attempt=2 template=welcome
 ```
+
+## Registry, per-kind options and middleware
+
+The `Registry` maps kinds to handlers, with optional per-kind limits:
+
+```rust
+use std::time::Duration;
+use belay_worker::middleware::{LoggingMiddleware, TimingMiddleware};
+use belay_worker::{handler_fn, JobContext, KindOptions, Outcome, Registry};
+
+let timing = TimingMiddleware::new();
+let registry = Registry::new()
+    .register("send_email", handler_fn(|_: &mut JobContext| Ok(Outcome::done())))
+    .register_with(
+        "resize",
+        handler_fn(|_: &mut JobContext| Ok(Outcome::done())),
+        KindOptions::new().concurrency(2).timeout(Duration::from_secs(60)),
+    )
+    .wrap(LoggingMiddleware::new())
+    .wrap(timing.clone());
+```
+
+`KindOptions::concurrency(n)` limits how many jobs of the kind run at once
+on this worker; `KindOptions::timeout(d)` caps one attempt, the shorter of
+it and the job's own `timeout` winning. A lease request cannot filter by
+kind, so a job whose kind is at its limit waits on the worker, heartbeated
+and holding a slot, until a job of its kind finishes. When every
+registered kind has a limit, the worker asks for no more jobs than those
+limits leave room for. Give kinds with tight limits their own queue if they
+share one with high-volume work.
+
+A registry is refused by `Worker::new` if it has no handlers, registers a
+kind twice, has an empty kind name, or gives a kind a concurrency of 0 or a
+zero timeout.
+
+Middleware runs around every handler; the first added is outermost, seeing
+the job first and the outcome last:
+
+```rust
+use belay_worker::middleware::Next;
+use belay_worker::{HandlerError, JobContext, Middleware, Outcome};
+
+/// Refuses jobs from suspended tenants.
+struct DenyTenants(Vec<String>);
+
+impl Middleware for DenyTenants {
+    fn call(&self, ctx: &mut JobContext, next: Next<'_>) -> Result<Outcome, HandlerError> {
+        let denied = ctx.job().spec.tenant.as_ref()
+            .is_some_and(|t| self.0.iter().any(|d| d == t.as_str()));
+        if denied {
+            return Err(HandlerError::fatal("tenant is suspended"));
+        }
+        next.run(ctx)
+    }
+}
+```
+
+`middleware_fn` makes middleware from a closure. Two ship with the crate:
+`LoggingMiddleware` logs a line when a job starts and one when it finishes
+(failures always at warning level), and `TimingMiddleware` collects runs,
+errors, total, longest and latest duration per kind. Panics, timeouts and
+cancellation are handled by the worker itself, so they apply even without
+middleware. `Registry::run(ctx)` runs a handler through the middleware on
+the calling thread, for tests or inline execution.
+
+## Heartbeats, progress and cancellation
+
+Every `heartbeat_every` the heartbeat thread makes one pass over every job
+the worker holds, including jobs waiting for a slot, and renews each lease
+with one call. A heartbeat carries the latest progress the handler
+recorded with `ctx.progress(percent, message)`; percent is clamped to
+0..100 (NaN means unknown), an empty message is omitted and a long one is
+cut to 1024 bytes. If the call fails for another reason than a lost lease,
+the progress is kept for the next pass and the failure counted.
+
+Cancellation is cooperative. The worker sets a job's cancellation flag
+when:
+
+| reason | trigger |
+|---|---|
+| `Requested` | a heartbeat answer says `"cancel_requested": true` |
+| `TimedOut` | the attempt ran past its deadline |
+| `ShuttingDown` | the shutdown grace period is over |
+| `LeaseLost` | a heartbeat was answered `lease_lost`; any result will be dropped |
+
+A long-running handler should check `ctx.is_cancelled()` now and then, or
+sleep with `ctx.sleep_or_cancel(d)`, and return `HandlerError::cancelled()`
+when told to stop. The worker replaces that error with one that says why
+the job was stopped: a retryable `timeout`, a retryable `shutdown`, or,
+for a requested cancellation, a non-retryable `cancelled on request`,
+which the server turns into the job's `cancelled` state.
+
+## Timeouts and panics
+
+An attempt's budget is the shorter of the job's `timeout` and the kind's
+`KindOptions::timeout`, counted on the worker's monotonic clock from the
+moment the handler starts; time spent waiting for a slot does not count.
+The watchdog sleeps until the nearest deadline. At the deadline it sets the
+job's cancellation flag; if the handler has not returned `cancel_grace`
+later, the worker reports a retryable failure of kind `timeout` ("timed
+out after 30s") and abandons the job. Threads cannot be killed, so an
+abandoned handler keeps its executor slot until it returns, and whatever
+it returns is dropped.
+
+The server enforces the same budget independently: a lease never runs past
+`started_at + timeout`, so a worker that stops reporting still loses the
+job at its deadline.
+
+Panics are caught and reported as retryable failures of kind `panic`, with
+the panic message (`handler panicked: index out of bounds ...`). A panic
+may be caused by the input and recur, but it can as easily come from a
+transient condition; a job that keeps panicking still ends dead once its
+attempts run out, with the messages in its error history.
+
+A result that cannot be delivered is retried up to `report_attempts`
+times, with `source_backoff` between tries, on `unavailable`,
+`resource_exhausted`, `internal` and `conflict` answers; heartbeats keep the
+lease alive meanwhile. A `lease_lost` answer drops the result. If delivery
+still fails, the error is logged and the job runs again once its lease
+expires.
