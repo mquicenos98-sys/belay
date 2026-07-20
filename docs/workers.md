@@ -284,3 +284,111 @@ times, with `source_backoff` between tries, on `unavailable`,
 lease alive meanwhile. A `lease_lost` answer drops the result. If delivery
 still fails, the error is logged and the job runs again once its lease
 expires.
+
+## Graceful shutdown
+
+`WorkerHandle::stop()` (or the `Shutdown` passed to `run` triggering)
+drains the worker in four steps:
+
+1. Leasing stops. Jobs leased but not started are failed back at once as
+   retryable `worker shutting down` with `retry_in: 0`, so another worker
+   can take them; a lease call still in flight is waited for, and anything
+   it returns is handed back the same way.
+2. Running jobs get `shutdown_grace` to finish, with heartbeats keeping
+   their leases alive. Handlers can see `ctx.is_shutting_down()` and, for a
+   long job, checkpoint and fail with a short `retry_after` rather than race
+   the deadline.
+3. Jobs still running are cancelled (`ShuttingDown`), failed back like the
+   unstarted ones, and abandoned.
+4. Executor threads get `cancel_grace` to return; threads still inside a
+   handler after that are detached.
+
+Keep `poll_wait` well below `shutdown_grace`: step 1 waits for an
+in-flight lease call.
+
+A handed-back job has used up an attempt (the server counted it when the
+job was leased), and the protocol has no call that returns a lease without
+a failure, so a job on its last attempt ends dead.
+
+The returned `WorkerReport` has the final `WorkerStats`, the uptime,
+`drained` (every running job finished within the grace period) and
+`detached_threads`. `WorkerStats` counts jobs `leased`, `succeeded`,
+`failed`, `retried` (failed and reported retryable), `abandoned`,
+`panicked`, `timed_out`, `cancelled` and `handed_back`, errors of each
+kind of call (`lease_errors`, `heartbeat_errors`, `report_errors`), and
+shows `running`, `waiting`, `busy_slots`, `concurrency` and the most recent
+error.
+
+## Built-in handlers
+
+`belay_worker::builtin` has four handlers. `builtin::defaults()` registers
+the harmless ones as `echo`, `sleep` and `fail`; the shell handler is
+never registered implicitly.
+
+| kind | handler | payload | result |
+|---|---|---|---|
+| `echo` | `EchoHandler` | anything | the payload |
+| `sleep` | `SleepHandler` | `{"for": "1.5s"}`, or `null` for the default of 1s; at most 1h | `{"slept": "1.5s"}`; reports progress every tenth of the time and stops early when cancelled |
+| `fail` | `FailHandler` | optional overrides: `message`, `retryable`, `kind`, `retry_in`, `panic`, `succeed_on_attempt` | fails every attempt (`failed on purpose` by default); with `succeed_on_attempt: n`, attempts from `n` on succeed with `{"attempt": n}` |
+| `shell` | `ShellHandler` | see below | see below |
+
+The shell handler runs the command a job's payload describes:
+
+```json
+{
+  "cmd": ["convert", "in.png", "-resize", "50%", "out.png"],
+  "env": {"MAGICK_THREAD_LIMIT": "1"},
+  "cwd": "/srv/media",
+  "stdin": "text written to the command's standard input",
+  "timeout": "30s",
+  "retry_on_exit": [75]
+}
+```
+
+| field | meaning |
+|---|---|
+| `cmd` | program and arguments; the program is looked up on `PATH`, and no shell is involved unless the program is one (`["sh", "-c", "..."]`) |
+| `env` | extra environment variables, added to the worker's own |
+| `cwd` | working directory; the worker's own when absent |
+| `stdin` | text for standard input, which is otherwise empty |
+| `timeout` | kill the command after this long |
+| `retry_on_exit` | exit statuses worth retrying; `[75]` (`EX_TEMPFAIL`) when absent |
+
+Only the last 64 KiB of stdout and of stderr are kept. The outcome depends
+on how the command ends:
+
+| ending | outcome |
+|---|---|
+| exit status 0 | success with `{"exit_code": 0, "stdout": "...", "stderr": "..."}`, plus `"stdout_truncated": true` or `"stderr_truncated": true` when output was cut |
+| any other status | failure of kind `exit:<status>`, with the end of stderr (or of stdout, if stderr is empty) in the message; retryable only if the status is in `retry_on_exit` |
+| killed by a signal | retryable failure of kind `signal` |
+| program not found, or permission denied | non-retryable failure of kind `spawn` |
+| the payload's `timeout` passed | the command is killed; retryable failure of kind `timeout` |
+| the job was cancelled | the command is killed |
+| program not in the allow list | non-retryable failure of kind `not_allowed` |
+
+For example, through the worker in `belay dev`:
+
+```console
+$ belay enqueue default shell --payload '{"cmd": ["sh", "-c", "echo disk full >&2; exit 3"]}' --wait
+job 01M3QMMMNS9TTZMK3G9M22MCY5 dead after 1 attempt in 23ms
+error: job 01M3QMMMNS9TTZMK3G9M22MCY5 is dead: command exited with status 3: disk full
+```
+
+Running what a payload says is running arbitrary code for anyone who can
+enqueue, so restrict the programs with an allow list:
+
+```rust
+use belay_worker::builtin::{self, ShellHandler};
+
+let registry = builtin::defaults().register(
+    builtin::SHELL,
+    ShellHandler::new().allow(["convert", "ffmpeg"]),
+);
+```
+
+Programs are compared exactly with `cmd[0]`: list `/usr/bin/convert`
+separately from `convert` if both are wanted. `ShellHandler` also takes
+`max_output(bytes)`, `default_timeout(d)`, `clear_env()` (start commands
+with an empty environment plus the payload's `env`) and
+`retry_on_exit(codes)`.
