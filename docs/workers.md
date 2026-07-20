@@ -392,3 +392,164 @@ separately from `convert` if both are wanted. `ShellHandler` also takes
 `max_output(bytes)`, `default_timeout(d)`, `clear_env()` (start commands
 with an empty environment plus the payload's `env`) and
 `retry_on_exit(codes)`.
+
+## Running belay worker
+
+`belay worker` is a worker process that leases from a server over HTTP and
+runs the built-in `echo`, `sleep` and `fail` handlers, plus `shell` when
+asked for:
+
+```console
+$ belay worker --queues emails,reports --concurrency 8
+$ belay worker --queues media --allow convert --allow ffmpeg
+$ belay worker --queues default --burst --poll-wait 1s
+```
+
+| flag | meaning | default |
+|---|---|---|
+| `--queues LIST` | queues to serve, in order of preference; repeatable or comma-separated | `default` |
+| `-c`, `--concurrency N` | jobs run at once | 4 |
+| `--id ID` | worker id | `host:pid` |
+| `--shell` | also run shell jobs, any program | |
+| `--allow PROGRAM` | run shell jobs, only for this program; repeatable | |
+| `--lease-for DURATION` | lease length; heartbeats renew it | 30s |
+| `--poll-wait DURATION` | long-poll wait when idle | 10s |
+| `--burst` | exit once the queues stay empty for one poll wait | |
+| `--max-jobs N` | exit after this many jobs finished | |
+
+The server address and token come from `--url` and `--token`, or
+`BELAY_URL` and `BELAY_TOKEN`; the token needs the `work` scope. The
+worker logs to stderr in logfmt; `-v` and `-q` adjust the level.
+
+```console
+$ belay worker --queues images --concurrency 2
+worker host-a:4127 serving images from http://127.0.0.1:7700 with 2 slots; kinds: echo, fail, sleep
+```
+
+Without `--burst` or `--max-jobs` the worker runs until the process is
+stopped. The standard library cannot catch signals, so Ctrl-C ends it at
+once rather than draining; the jobs it was running return to their queues
+when their leases expire. With `--burst` or `--max-jobs` it drains
+gracefully before exiting and prints a summary such as `worker host-a:4127
+stopped: 12 succeeded, 1 failed, 0 abandoned`.
+
+`belay workers` lists the workers the server has heard from recently, with
+their queues, active jobs and counts.
+
+## Writing a worker in another language
+
+The worker protocol is four HTTP calls with JSON bodies. When
+authentication is on, every call needs `Authorization: Bearer <token>`
+with a token that has the `work` scope. Errors come back as
+`{"error": {"code": "...", "message": "...", "details": ...}}`; branch on
+`code`, never on the message.
+
+**1. Lease.** Ask for jobs, long-polling while there are none (the answer
+is wrapped here to fit the page):
+
+```console
+$ curl -s -X POST http://127.0.0.1:7700/v1/lease \
+    -d '{"worker": "py-worker-1", "queues": ["images"], "max_jobs": 1, "lease_for": "60s", "wait": "20s"}'
+{"jobs":[{"job":{"id":"01M3QMCBNKJ9H9NQ7VZ376D17C","state":"running","attempt":1,
+  "spec":{"queue":"images","kind":"resize","payload":{"src":"s3://bucket/a.png","width":640},
+  "priority":0,"max_attempts":3,"retry":"exp:1s*2..1h~10%","timeout":"30m"},
+  "created_at":"2026-09-29T22:25:49.235Z","updated_at":"2026-09-29T22:25:49.277Z",
+  "run_at":"2026-09-29T22:25:49.235Z","started_at":"2026-09-29T22:25:49.277Z",
+  "lease":{"worker":"py-worker-1","token":"6baa24b4fef0a186","acquired_at":"2026-09-29T22:25:49.277Z",
+  "expires_at":"2026-09-29T22:26:49.277Z","heartbeat_at":"2026-09-29T22:25:49.277Z"}},
+  "token":"6baa24b4fef0a186"}]}
+```
+
+An empty answer, `{"jobs":[]}`, means nothing was ready within `wait`; ask
+again. Durations are strings (`"60s"`); a bare number such as `"lease_for":
+30` is refused with `400 invalid_argument`.
+
+**2. Heartbeat.** While the job runs, renew the lease well before it
+expires (a third of `lease_for` survives one lost heartbeat), optionally
+with progress:
+
+```console
+$ curl -s -X POST http://127.0.0.1:7700/v1/jobs/01M3QMCBNKJ9H9NQ7VZ376D17C/heartbeat \
+    -d '{"token": "6baa24b4fef0a186", "progress": {"percent": 40, "message": "downloaded"}}'
+{"expires_at":"2026-09-29T22:26:54.854Z","cancel_requested":false}
+```
+
+If `cancel_requested` is true, stop the work and report with `fail`.
+
+**3a. Complete.** Report success with an optional result (at most 1 MiB):
+
+```console
+$ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+    http://127.0.0.1:7700/v1/jobs/01M3QMCBNKJ9H9NQ7VZ376D17C/complete \
+    -d '{"token": "269d0ffaffe59def", "result": {"dst": "s3://bucket/a-640.png"}}'
+204
+```
+
+**3b. Fail.** Report a failed attempt. `retryable` defaults to true;
+`retry_in` overrides the backoff delay (up to 365 days); `kind` follows the
+label rule (letters, digits, `_ . : / -`, at most 64 characters). The
+message is never refused for its length; it is cut to 4096 bytes when
+recorded.
+
+```console
+$ curl -s -o /dev/null -w '%{http_code}\n' -X POST \
+    http://127.0.0.1:7700/v1/jobs/01M3QMCBNKJ9H9NQ7VZ376D17C/fail \
+    -d '{"token": "6baa24b4fef0a186", "error": "upstream answered 503", "kind": "http_503", "retry_in": "30s"}'
+204
+```
+
+**Lost leases.** Any call with a token that no longer holds the lease is
+answered `409 lease_lost`. Drop the job without reporting anything else:
+it expired, or another worker has it.
+
+```console
+$ curl -s -X POST http://127.0.0.1:7700/v1/jobs/01M3QMCBNKJ9H9NQ7VZ376D17C/heartbeat \
+    -d '{"token": "0000000000000001"}'
+{"error":{"code":"lease_lost","message":"lease on job 01M3QMCBNKJ9H9NQ7VZ376D17C is no longer held (expired or given to another worker)","details":{"job":"01M3QMCBNKJ9H9NQ7VZ376D17C"}}}
+```
+
+A minimal worker loop, in any language:
+
+```text
+loop:
+    POST /v1/lease {worker, queues, max_jobs: free slots, lease_for, wait}
+    on 5xx or a connection error: back off, then retry
+    for each {job, token}:
+        start the handler for job.spec.kind with job.spec.payload
+        every lease_for / 3 while it runs:
+            POST /v1/jobs/{id}/heartbeat {token}
+            409 lease_lost      -> abandon the job, report nothing
+            cancel_requested    -> stop the handler, then fail
+        on success: POST /v1/jobs/{id}/complete {token, result}
+        on failure: POST /v1/jobs/{id}/fail {token, error, kind, retryable}
+        unknown kind: fail with retryable: false
+```
+
+`503` and `429` answers carry `Retry-After`. In a cluster, a lease for
+queues owned by another node is answered `307` with the owner's URL in
+`Location`; follow it, and send that job's heartbeats and result to the
+node that handed it out. A lease naming queues on several nodes is served
+from the queues owned by the node asked, and the others are listed in the
+`Belay-Remote-Queues` response header; see [cluster.md](cluster.md).
+
+## Limitations
+
+- Handler threads cannot be killed; a handler that ignores cancellation
+  costs a slot until it returns and is detached at shutdown.
+- A job handed back at shutdown has used up an attempt.
+- The shell handler kills only the direct child process. A command that
+  starts its own children (`sh -c "a | b"`) can leave them running after a
+  timeout, and if they keep the output pipes open the handler waits at most
+  a quarter of a second for end-of-file before reporting what it has.
+- Heartbeats are one call per job per period; the protocol has no batch
+  heartbeat.
+- Deadlines use the worker's monotonic clock from the moment the handler
+  starts; time spent waiting for a slot does not count.
+- `belay worker` cannot drain on Ctrl-C; jobs it was running return only
+  after their leases expire.
+- The HTTP client does not remember cluster redirects. A Rust worker (or
+  `belay worker`) pointed at a node that does not own its queues follows
+  the lease redirect, but then sends heartbeats and results to the node it
+  was configured with, which does not hold those jobs and answers
+  `lease_lost`; the jobs are abandoned and run again after their leases
+  expire. Point workers at the node that owns their queues.
