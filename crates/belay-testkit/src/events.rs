@@ -241,7 +241,7 @@ impl fmt::Debug for EventLog {
 #[must_use]
 pub fn first_gap(events: &[Event], after: Option<u64>) -> Option<(u64, u64)> {
     let mut expected = match (after, events.first()) {
-        (Some(seq), _) => seq,
+        (Some(seq), _) => seq + 1,
         (None, Some(first)) => first.seq,
         (None, None) => return None,
     };
@@ -275,6 +275,8 @@ mod tests {
     fn gaps_and_repeats_are_found() {
         let run: Vec<Event> = (10..14).map(event).collect();
         assert_eq!(first_gap(&run, None), None);
+        assert_eq!(first_gap(&run, Some(9)), None);
+        assert_eq!(first_gap(&run, Some(8)), Some((9, 10)));
         let repeated = vec![event(3), event(4), event(4)];
         assert_eq!(first_gap(&repeated, None), Some((5, 4)));
         assert_eq!(first_gap(&[], Some(1)), None);
