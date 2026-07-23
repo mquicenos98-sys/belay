@@ -270,15 +270,19 @@ fn open_store(config: &Config, custom: Option<Arc<dyn Kv>>) -> Result<OpenedStor
     Ok((kv, Some(log_kv), StorageKind::Disk))
 }
 
-/// Applies `[queues.*]`, `[[calendars]]` and `[[schedules]]`, creating or
-/// updating each.
+/// Applies `[queues.*]`, `[[calendars]]` and `[[schedules]]`. Each is
+/// written only when it differs from what is stored, so restarting with an
+/// unchanged file writes nothing and emits no events.
 fn apply_config(config: &Config, queue: &QueueEngine, scheduler: &Scheduler) -> Result<()> {
     let mut queues = 0;
     for (name, wanted) in &config.queues {
-        queue
-            .set_config(name, wanted.clone())
-            .map_err(|e| Error::apply(format!("queue {name}"), e))?;
-        queues += 1;
+        let current = queue.queue_info(name).ok().map(|info| info.config);
+        if current.as_ref() != Some(wanted) {
+            queue
+                .set_config(name, wanted.clone())
+                .map_err(|e| Error::apply(format!("queue {name}"), e))?;
+            queues += 1;
+        }
     }
     let mut calendars = 0;
     for spec in &config.calendars {

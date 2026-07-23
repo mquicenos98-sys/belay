@@ -108,6 +108,15 @@ fn a_restart_keeps_jobs_schedules_and_workflows() {
     assert_eq!(workflow.steps["extract"].state, StepState::Succeeded);
     assert_eq!(workflow.steps["load"].state, StepState::Running);
 
+    // An unchanged configuration is not written again.
+    let types: Vec<&str> = engine
+        .events()
+        .replay(0)
+        .iter()
+        .map(|e| e.type_name())
+        .collect();
+    assert!(types.is_empty(), "{types:?}");
+
     let load = lease_one(&engine, "wf");
     engine
         .complete(&load.job.id, &CompleteRequest::new(load.token))
