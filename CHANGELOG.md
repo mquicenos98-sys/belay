@@ -5,6 +5,50 @@ All notable changes to belay are documented here. The format is based on
 follows [Semantic Versioning](https://semver.org/) (while it is at 0.x, a
 minor version may break things; the notes say when it does).
 
+## [0.5.0] - 2026-07-24
+
+Documentation: a guide for every part of belay, a reference for the
+configuration, the HTTP API and the command line, and examples to start
+from.
+
+### Added
+
+- `docs/`: an architecture overview; references for the configuration
+  file, the HTTP API and the `belay` command; an operations guide
+  (installing, sync policies, backups, upgrades, monitoring, capacity,
+  troubleshooting); guides to the storage engine, the queue, workers,
+  cron expressions, scheduling, workflows, clustering and metrics.
+- `examples/`: a single-node production configuration, a three-node
+  cluster, schedules and a calendar, an ETL workflow, and a systemd
+  unit. Every configuration passes `belay config check`.
+- Runnable crate examples: an embedded queue (`belay-queue`), enqueueing
+  over HTTP (`belay-client`), a worker with a custom handler and the
+  shell handler (`belay-worker`), and an engine with its HTTP server in
+  one process (`belay-core`).
+- `CONTRIBUTING.md`: building, testing, benchmarks and conventions.
+
+### Fixed
+
+- Cluster redirects dropped the query string, so a redirected
+  `GET /v1/jobs?queue=...&state=dead` returned the owner's jobs
+  unfiltered, and a redirected preview lost its `?n=`.
+- Every start rewrote the `[queues.*]` tables of the configuration and
+  sent a `queue.configured` event per queue, even when nothing had
+  changed.
+- Resuming a schedule that had been paused across a restart fired a
+  catch-up job for a time it had been paused through.
+- A purge left one job behind at every batch boundary: purging 1000
+  ready jobs deleted 997.
+- The shell handler failed exit status 75 (`EX_TEMPFAIL`) permanently;
+  it is retried by default, as documented.
+- `belay enqueue --unique invoice:1234:until_started` took the whole
+  text as the key; the scope is now split off at the last colon, so keys
+  may contain colons.
+- The caret under a cron parse error in `belay cron` pointed one column
+  to the right of the offending field.
+- `belay-bench` printed values that round up to the next unit with four
+  digits (`1000us` instead of `1.00ms`).
+
 ## [0.4.0] - 2026-06-12
 
 Test harnesses, an end-to-end suite and benchmarks, and the fixes they
