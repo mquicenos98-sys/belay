@@ -331,6 +331,18 @@ fn paused_schedules_pass_their_fires_without_catching_up() {
 }
 
 #[test]
+fn resuming_after_downtime_does_not_catch_up() {
+    let h = Harness::new(MONDAY);
+    h.scheduler.create(spec("sync", "*/15 * * * *")).unwrap();
+    h.scheduler.pause(&id("sync")).unwrap();
+    let h = h.restart();
+    h.clock.set(ts("2025-06-04T08:05:00Z"));
+    let resumed = h.scheduler.resume(&id("sync")).unwrap();
+    assert_eq!(resumed.next_fire_at, Some(ts("2025-06-04T08:15:00Z")));
+    assert!(h.scheduler.tick(h.now()).is_empty());
+}
+
+#[test]
 fn fires_stop_at_ends_at() {
     let h = Harness::new(MONDAY);
     h.scheduler

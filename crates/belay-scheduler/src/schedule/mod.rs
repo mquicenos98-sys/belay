@@ -404,6 +404,13 @@ impl Scheduler {
         let mut schedule = entry.schedule;
         schedule.spec.paused = paused;
         schedule.updated_at = now;
+        if !paused {
+            if let Some(plan) = &entry.plan {
+                if schedule.next_fire_at.map_or(false, |t| t <= now) {
+                    schedule.next_fire_at = plan.next_fire(now);
+                }
+            }
+        }
         self.save(&schedule)?;
         state.schedules.insert(
             id.clone(),
