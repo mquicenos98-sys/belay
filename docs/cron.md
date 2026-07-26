@@ -129,3 +129,101 @@ $ belay cron explain "0 0 13 * FRI" --from 2026-01-01T00:00:00Z -n 3 --json
 An expression that no date can satisfy, such as `0 0 30 2 *` (February
 30th), is recognised at once: it never fires, and a schedule with it is
 refused ("can never match (no date satisfies its day and month fields)").
+
+## Nicknames and dialects
+
+A nickname stands alone in place of the fields:
+
+| nickname | same as |
+|---|---|
+| `@yearly`, `@annually` | `0 0 1 1 *` |
+| `@monthly` | `0 0 1 * *` |
+| `@weekly` | `0 0 * * SUN` |
+| `@daily`, `@midnight` | `0 0 * * *` |
+| `@hourly` | `0 * * * *` |
+
+The parser has two dialects:
+
+| dialect | fields | day of week | both day fields restricted |
+|---|---|---|---|
+| Vixie (default) | 5, 6 or 7 | 0-7, 0 and 7 are Sunday | a day matches if either field does |
+| Quartz | 6 or 7 (seconds required) | 1-7, 1 is Sunday | a day matches only if both fields do |
+
+The dialect and the day-matching rule can be chosen independently when the
+crate is used as a library:
+
+```rust
+use belay_cron::{CronExpr, DayMatch, ParseOptions};
+
+let friday_13th = CronExpr::parse_with("0 0 13 * FRI", ParseOptions::new().with_day_match(DayMatch::Both))?;
+let quartz = CronExpr::parse_with("0 15 10 ? * 2-6", ParseOptions::quartz())?;
+```
+
+Schedules, calendars and `belay cron` always use the default: the Vixie
+dialect with either-field day matching.
+
+## Time zones
+
+A zone is written in one of these forms, wherever a schedule, a calendar
+or `--tz` takes one:
+
+| form | examples | meaning |
+|---|---|---|
+| IANA name | `America/New_York`, `Europe/Berlin`, `Asia/Kolkata`, `America/Bogota` | the zone's current rule from the embedded table |
+| UTC | `UTC`, `Etc/UTC`, `GMT`, `Etc/GMT`, `Etc/Universal`, `Etc/Zulu`, `Z` | UTC |
+| fixed offset | `+05:30`, `-0800`, `+01`, `+05:30:00` | a constant offset east of UTC, at most 24:59:59 |
+| POSIX TZ rule | `EST5EDT,M3.2.0,M11.1.0`, `CET-1CEST,M3.5.0,M10.5.0/3`, `<+0330>-3:30` | a rule with or without daylight saving time |
+| `:` and a name | `:Europe/Paris` | a name, as in the `TZ` variable |
+
+The embedded table maps 184 IANA names to the POSIX rule that tzdata 2026d
+emits as each zone's footer, i.e. the rule in force today. Names are
+case-sensitive, exactly as in the tz database; a near miss gets a
+suggestion:
+
+```console
+$ belay cron explain "0 9 * * *" --tz Europe/Berln
+error: invalid value "Europe/Berln" for --tz: unknown time zone "Europe/Berln" (did you mean "Europe/Berlin"?)
+hint: list known zones with `belay cron zones`
+```
+
+`belay cron zones` lists the names, optionally only those containing a
+text (case-insensitively):
+
+```console
+$ belay cron zones america/b
+America/Bogota
+```
+
+Zones whose current rules cannot be written as a POSIX string, such as
+Morocco's Ramadan suspensions or the announced dates of Gaza and Hebron,
+are deliberately absent; use a fixed offset or a POSIX rule instead.
+
+POSIX rules count offsets the other way round from ISO offsets: they give
+the time to *add* to local time to reach UTC, so `EST5` is five hours west
+of Greenwich, and `UTC+3` is three hours *behind* UTC while `+03:00` is
+three hours ahead:
+
+```console
+$ belay cron next "0 12 * * *" --tz "UTC+3" --from 2026-01-01T00:00:00Z -n 1
+2026-01-01T12:00:00-03:00
+$ belay cron next "0 12 * * *" --tz "+03:00" --from 2026-01-01T00:00:00Z -n 1
+2026-01-01T12:00:00+03:00
+```
+
+The rule grammar is POSIX.1-2017 section 8.3 with the RFC 8536 extensions
+(transition times from -167 to +167 hours):
+
+```text
+std offset [dst [offset] [,start[/time],end[/time]]]
+```
+
+Transition dates are `Jn` (day 1-365, February 29 never counted), `n`
+(day 0-365, February 29 counted) or `Mm.w.d` (weekday `d` of week `w` of
+month `m`, `w = 5` meaning the last). A start time is read on the standard
+clock and an end time on the daylight clock; both default to 02:00. The
+DST offset defaults to one hour ahead of standard time.
+
+Only each zone's current rule is modelled. Historical offsets and past
+rule changes are not: `America/Sao_Paulo` is `-03` all year even for 2018
+dates, when Brazil still observed daylight saving time. Fire times in
+years before a zone's last rule change use today's rule.
