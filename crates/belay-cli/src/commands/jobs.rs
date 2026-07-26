@@ -156,7 +156,7 @@ impl FromArg for UniqueArg {
             let scope = UniqueScope::from_arg(&format!("for:{period}"))?;
             (key, Some(scope))
         } else {
-            match text.split_once(':') {
+            match text.rsplit_once(':') {
                 Some((key, scope @ ("until_started" | "until_finished"))) => {
                     (key, Some(UniqueScope::from_arg(scope)?))
                 }
@@ -624,6 +624,31 @@ pub(crate) fn report_finished(ctx: &mut Ctx<'_>, job: &Job) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unique_keys_keep_their_colons() {
+        let parse = |s: &str| UniqueArg::from_arg(s);
+        assert_eq!(
+            parse("user:42").unwrap(),
+            UniqueArg {
+                key: "user:42".into(),
+                scope: None
+            }
+        );
+        assert_eq!(
+            parse("user:42:until_started").unwrap().scope,
+            Some(UniqueScope::UntilStarted)
+        );
+        assert_eq!(
+            parse("report:for:1h").unwrap(),
+            UniqueArg {
+                key: "report".into(),
+                scope: Some(UniqueScope::For(Duration::from_secs(3600)))
+            }
+        );
+        assert!(parse("k:for:soon").is_err());
+        assert!(parse(":until_finished").is_err());
+    }
 
     #[test]
     fn info_column_says_what_matters_per_state() {
