@@ -7,21 +7,22 @@ use std::time::Duration;
 /// Formats a value with three significant digits: `1.23`, `12.3`, `123`.
 /// Values of 1000 and more keep all their integer digits.
 fn three_digits(value: f64) -> String {
-    if value < 10.0 {
+    if value < 9.995 {
         format!("{value:.2}")
-    } else if value < 100.0 {
+    } else if value < 99.95 {
         format!("{value:.1}")
     } else {
         format!("{value:.0}")
     }
 }
 
-/// Scales `value` by the largest step of 1000 that keeps it below 1000,
-/// and appends that step's suffix.
+/// Scales `value` by the largest step of 1000 that keeps it below 1000
+/// after rounding, and appends that step's suffix.
 fn scaled(value: f64, suffixes: &[&str]) -> String {
     let mut value = value;
     for (i, suffix) in suffixes.iter().enumerate() {
-        if value < 1000.0 || i + 1 == suffixes.len() {
+        // 999.5 would print as "1000" of this unit; move up instead.
+        if value < 999.5 || i + 1 == suffixes.len() {
             return format!("{}{suffix}", three_digits(value));
         }
         value /= 1000.0;
@@ -131,6 +132,15 @@ mod tests {
         assert_eq!(format_nanos(123_456), "123us");
         assert_eq!(format_nanos(1_500_000_000), "1.50s");
         assert_eq!(format_nanos(4_000_000_000_000), "4000s");
+    }
+
+    #[test]
+    fn rounding_up_moves_to_the_next_unit() {
+        // Regression: 999.6us used to print as "1000us".
+        assert_eq!(format_nanos(999_600), "1.00ms");
+        assert_eq!(format_nanos(999_400), "999us");
+        assert_eq!(format_nanos(9_996), "10.0us");
+        assert_eq!(format_si(999_999.0), "1.00M");
     }
 
     #[test]
