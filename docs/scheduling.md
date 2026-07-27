@@ -161,3 +161,129 @@ A previous job that has finished, or that no longer exists (deleted by
 retention), never blocks a fire. Cancelling a running job only requests
 cancellation: its worker learns of it at its next heartbeat. If cancelling
 fails, the error is reported and the fire happens anyway.
+
+## Jitter, start and end
+
+With `jitter`, each fire's job gets `run_at = fire time + offset`, where
+the offset lies in `[0, jitter)` at millisecond resolution. It is derived
+from the schedule id and the fire time by a hash, not drawn at random, so a
+fire that is repeated (after a crash, say) runs at the same moment as the
+original would have, and schedules sharing a minute spread out the same way
+every time. The job is enqueued at the nominal time and waits in
+`scheduled` until its `run_at`. A `delay` in the template is added on top
+of the offset.
+
+`starts_at` and `ends_at` clip the fire times to `[starts_at, ends_at)`.
+Once past `ends_at`, `next_fire_at` becomes absent and the schedule stays
+stored but never fires.
+
+## Pause, resume, triggers and previews
+
+A paused schedule keeps moving through its fire times without firing, so
+resuming never unleashes a burst of catch-up jobs: `resume` fires next at
+the first fire time after now. Replacing a schedule's definition (`PUT` or
+`--replace`) keeps its history (fire count, last fire and job) and
+recomputes the next fire time from now, so fires missed before the update
+are not caught up either.
+
+`trigger` fires the schedule now, whatever its expression, calendar,
+bounds, pause state or overlap policy say. The job's fire time is now, its
+`meta["belay.trigger"]` is `manual`, its uniqueness key gets a `:manual`
+suffix so it cannot collide with a regular fire in the same millisecond,
+and it becomes the schedule's last job. The next regular fire time does not
+change.
+
+```console
+$ belay schedule trigger nightly
+fired nightly: enqueued 01M3QMDSAMKP8WTTRJ1NBMNCT7
+```
+
+`preview` lists the next fire times (10 by default, at most 1000),
+starting with the stored `next_fire_at`, which may already be due. Paused
+schedules are previewed as if they were running. Calendars are applied;
+jitter is not:
+
+```console
+$ belay schedule preview standup -n 4
+TIME                  UTC                       IN
+2026-09-30T07:00:00Z  2026-09-30T07:00:00.000Z  in 8h
+2026-09-30T07:30:00Z  2026-09-30T07:30:00.000Z  in 9h
+2026-09-30T08:00:00Z  2026-09-30T08:00:00.000Z  in 9h
+2026-09-30T08:30:00Z  2026-09-30T08:30:00.000Z  in 10h
+```
+
+The first column is in the schedule's zone. To try an expression without
+creating anything, use `belay cron explain` or `belay cron next`.
+
+## Calendars
+
+A calendar is a named set of rules for when schedules may fire, such as
+"weekdays 09:00-17:00, not on public holidays". A schedule names at most one
+calendar; many schedules may share one.
+
+| field | meaning | default and limits |
+|---|---|---|
+| `name` | the calendar's name, `[a-z0-9][a-z0-9_.-]{0,127}` | required |
+| `timezone` | zone the rules are read in | `UTC` |
+| `exclude_dates` | dates (`YYYY-MM-DD`) on which nothing fires | at most 1000 |
+| `exclude_weekdays` | weekdays on which nothing fires | may not exclude all seven |
+| `windows` | allowed daily time ranges | none (the whole day); at most 64 |
+| `description` | free text | at most 1024 bytes |
+
+A local date and time is allowed when its date is not excluded, its
+weekday is not excluded, and it falls inside at least one window (or there
+are no windows). A window is `{"days", "start", "end"}`, the range
+`[start, end)` in local time with minute precision (`HH:MM`). `days` names
+the weekdays the window *starts* on, and an empty or absent `days` means
+every day. A window whose end is not after its start runs past midnight:
+`22:00-06:00` on `fri` covers Friday 22:00 to Saturday 06:00. `24:00` is
+accepted as an end, `start` and `end` must differ, and `00:00-24:00` is the
+whole day.
+
+Weekday sets are written as comma-separated days or ranges, `mon-fri`,
+`sat,sun`, `fri-mon` (ranges may wrap), with full or three-letter names in
+any case. In JSON they are arrays whose items may themselves be ranges, and
+a single string is accepted too; output is always an array of three-letter
+lowercase names.
+
+```json
+{
+  "name": "business-hours",
+  "timezone": "Europe/Berlin",
+  "exclude_dates": ["2026-12-25"],
+  "windows": [{"days": ["mon-fri"], "start": "09:00", "end": "17:00"}]
+}
+```
+
+```console
+$ belay calendar put business-hours --tz Europe/Berlin \
+    --window 'mon-fri 09:00-17:00' --exclude-date 2026-12-25
+saved calendar business-hours
+$ belay schedule add standup --cron '*/30 * * * *' --calendar business-hours \
+    --queue ops --kind remind
+```
+
+The calendar is evaluated in its own zone, which may differ from the
+schedule's: a schedule in `America/New_York` can use a calendar of Berlin
+business hours. A cron match that the calendar does not allow is *vetoed*:
+it is not a fire time. The search walks past vetoed matches, and after
+10,000 in a row jumps straight to the next moment the calendar opens, so an
+every-second expression under a weekday calendar costs no more than an
+hourly one. A calendar closed for more than about three years counts as
+closed for good.
+
+A schedule whose expression the calendar never allows is refused when it
+is created ("no time matching the cron expression is allowed by calendar
+..."). Replacing a calendar (`PUT /v1/calendars/:name`, `belay calendar
+put`) recomputes the next fire time of every schedule that uses it in the
+same write; an overdue fire stays due if the new calendar still allows it,
+and due fires the new calendar vetoes are reported as skipped with the
+reason `calendar`. A calendar cannot be deleted while a schedule uses it
+(`409 failed_precondition`, naming the schedules).
+
+| action | CLI | HTTP | scope |
+|---|---|---|---|
+| list | `belay calendar list` | `GET /v1/calendars` | `read` |
+| show | `belay calendar get <name>` | `GET /v1/calendars/:name` | `read` |
+| create or replace | `belay calendar put <name> [--tz] [--window]... [--exclude-date]... [--exclude-weekdays]` or `--file` | `PUT /v1/calendars/:name` | `admin` |
+| delete | `belay calendar rm <name>` | `DELETE /v1/calendars/:name` | `admin` |
