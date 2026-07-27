@@ -287,3 +287,111 @@ reason `calendar`. A calendar cannot be deleted while a schedule uses it
 | show | `belay calendar get <name>` | `GET /v1/calendars/:name` | `read` |
 | create or replace | `belay calendar put <name> [--tz] [--window]... [--exclude-date]... [--exclude-weekdays]` or `--file` | `PUT /v1/calendars/:name` | `admin` |
 | delete | `belay calendar rm <name>` | `DELETE /v1/calendars/:name` | `admin` |
+
+## Crash safety and deduplication
+
+Every job a schedule dispatches carries the uniqueness key
+`sched:<id>:<fire time in ms>`, held for `scheduler.dedupe_window` (24
+hours by default) with `on_conflict: return_existing`. A tick dispatches
+the due fires of every schedule, then saves all its bookkeeping (next fire
+times, last jobs, counts) in one batch, and emits its events only once
+that is saved. Fire selection is deterministic from the stored
+`next_fire_at`, so if belay stops after dispatching but before saving, the
+next tick repeats the same fires, and the queue hands back the jobs it
+already has instead of creating second ones. The same holds when the save
+itself fails: the schedules retry after `scheduler.retry_delay` (5s).
+
+When the queue cannot take a job (`unavailable`), the schedule stays at
+that fire time and retries after `retry_delay`; later fires wait behind it.
+When the queue rejects a job outright, for instance because the template
+is no longer valid, that fire is dropped and the error logged.
+
+```toml
+[scheduler]
+enabled = true            # false stops this node from firing schedules
+tick = "1s"               # longest sleep between checks
+misfire_threshold = "1m"  # later than this counts as missed
+dedupe_window = "1d"      # 1s to 30d
+retry_delay = "5s"        # after the queue could not take a fire
+```
+
+## Configuration file versus the API
+
+Schedules and calendars can be defined in the configuration file, and are
+created or updated when the server starts:
+
+```toml
+[[calendars]]
+name = "business-hours"
+timezone = "America/Bogota"
+exclude_dates = ["2025-12-25", "2026-01-01"]
+windows = [{ days = ["mon-fri"], start = "08:00", end = "18:00" }]
+
+[[schedules]]
+id = "hourly-sync"
+cron = "0 * * * *"
+calendar = "business-hours"
+[schedules.template]
+queue = "sync"
+kind = "sync_accounts"
+max_attempts = 3
+timeout = "10m"
+```
+
+The tables take exactly the fields of the JSON bodies and reject unknown
+ones. Loading the file already parses each expression and zone and refuses
+duplicate ids and names, pointing at the offending line.
+
+At startup each file-defined schedule is compared with the stored one. An
+identical definition is left alone, so restarting with an unchanged file
+writes nothing. A changed one replaces the stored definition, keeping the
+history and recomputing the next fire time from now. Schedules created
+through the API live alongside the file's, and removing a schedule from
+the file does not delete it.
+
+Because the file is applied on every start, a change made through the API
+to a schedule that the file also defines lasts only until the next
+restart. That includes pausing: `paused` is part of the definition, so a
+file-defined schedule paused through the API is resumed by a restart unless
+the file says `paused = true`.
+
+## Clusters
+
+In a cluster each schedule is owned by one live node, chosen by rendezvous
+hashing of the key `schedule:<id>` (see [cluster.md](cluster.md)), and fires
+only there. The other nodes move it past its due fire times without firing,
+reporting or emitting anything. A node fires nothing until it has joined
+the cluster through a seed, or until `cluster.join_grace` (10s) has passed,
+so that a node whose seeds are all down still runs.
+
+Every API call about one schedule is redirected (`307`) to its owner, and
+`belay schedule list` shows the schedules the node asked has stored. There
+is no replication: a schedule created through the API is stored only on the
+node that owned it at that moment. If that node goes away, the new owner
+has nothing to fire. In a cluster, define schedules and calendars in the
+configuration file shared by every node, so that every node stores them and
+whichever node owns a schedule can fire it.
+
+When a node takes over a schedule it continues from the present: a fire
+that the previous owner missed while dying is not caught up. Jobs a
+schedule creates go into the queue of the node that fires it, even if
+another node owns that queue; give schedule jobs queues that the same node
+owns, or run workers against every node. Calendars belong to no node: each
+node checks a schedule against its own stored calendars.
+
+## Limitations
+
+- Time zones follow belay-cron: only each zone's current rule is known.
+- Deduplication of a repeated fire relies on the fire's uniqueness key,
+  which lasts for `dedupe_window`. A crash between dispatching and saving
+  followed by a longer outage can produce a second job under `fire_once` or
+  `fire_all`.
+- Calendars have minute resolution.
+- The retry delay after a failed dispatch is kept in memory; a restart
+  retries at once.
+- A schedule whose stored definition no longer compiles (a calendar
+  removed by hand from the store, a zone missing from a newer table) is
+  kept and logged but does not fire until it is updated.
+- In a cluster, schedules are not replicated, ownership can briefly
+  overlap while membership views converge, and a takeover does not catch up
+  missed fires.
