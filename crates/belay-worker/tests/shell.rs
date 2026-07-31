@@ -95,6 +95,12 @@ fn failure_messages_quote_stderr() {
 }
 
 #[test]
+fn ex_tempfail_is_retried_by_default() {
+    let err = run(&ShellHandler::new(), ShellCommand::new(shell("exit 75"))).unwrap_err();
+    assert!(err.retryable);
+}
+
+#[test]
 fn payloads_and_handlers_choose_which_statuses_to_retry() {
     let from_payload = ShellCommand::new(shell("exit 3")).retry_on_exit(vec![3]);
     assert!(

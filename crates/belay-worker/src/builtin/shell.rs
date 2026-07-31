@@ -216,7 +216,7 @@ impl ShellHandler {
             max_output: DEFAULT_MAX_OUTPUT,
             default_timeout: None,
             inherit_env: true,
-            retry_on_exit: Vec::new(),
+            retry_on_exit: vec![EX_TEMPFAIL],
         }
     }
 
