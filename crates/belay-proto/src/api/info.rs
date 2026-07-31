@@ -235,7 +235,7 @@ impl FromJson for TriggerResponse {
 }
 
 /// `GET /v1/schedules/:id/preview?n=` response: upcoming fire times,
-/// before jitter and calendar filtering.
+/// with calendars and start/end bounds applied, before jitter.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PreviewResponse {
     /// Fire times, earliest first.
