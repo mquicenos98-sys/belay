@@ -182,8 +182,9 @@ impl TestWorkerBuilder {
 
     /// Per-kind limits for a kind added before.
     pub fn kind_options(mut self, kind: &str, options: KindOptions) -> TestWorkerBuilder {
-        if let Some(entry) = self.handlers.iter_mut().find(|(k, _, _)| k == kind) {
-            entry.2 = options;
+        match self.handlers.iter_mut().find(|(k, _, _)| k == kind) {
+            Some(entry) => entry.2 = options,
+            None => self.reject(format!("no handler for kind {kind:?} to set options on")),
         }
         self
     }
@@ -466,6 +467,12 @@ mod tests {
             .start()
             .unwrap_err();
         assert!(err.to_string().contains("at least one queue"), "{err}");
+        let err = TestWorker::builder("http://127.0.0.1:1")
+            .queue("q")
+            .kind_options("missing", KindOptions::new().concurrency(1))
+            .start()
+            .unwrap_err();
+        assert!(err.to_string().contains("\"missing\""), "{err}");
     }
 
     #[test]
