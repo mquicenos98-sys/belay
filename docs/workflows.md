@@ -290,3 +290,65 @@ either can run. With `"on_failure": "continue"` on `load`, a failure would
 instead let `notify-failure` run (its condition `any_failed` holds), skip
 `report` (its default condition needs `load` to succeed), and end the run
 `succeeded`.
+
+## Cancellation
+
+`belay workflow cancel <id>` (`POST /v1/workflows/:id/cancel`) cancels a
+run: the jobs of running steps are cancelled through the queue, every step
+still pending or running is marked `cancelled`, and the run ends
+`cancelled`. A step job that is already running only has its cancellation
+requested; its worker learns of it at its next heartbeat. Cancelling a run
+that is already over returns it unchanged.
+
+Cancelling one step's job directly (`belay job cancel`) is different: the
+step fails, and its failure policy applies.
+
+## Recovery and crash safety
+
+A run is stored before any of its jobs is dispatched, and each step's job
+carries the uniqueness key `wf:<run>:<step>`. If belay stops between
+dispatching a step and saving that fact, the step is dispatched again on
+recovery, and the queue returns the original job instead of creating a
+second one; if that job already finished, its outcome is picked up at once.
+
+The engine learns about finished jobs from the queue as they finish. To
+catch what it could not be told (completions while it was down, a job
+purged or deleted, a dispatch deferred because the queue was unavailable),
+it reconciles every running run at startup and every
+`workflows.sweep_every` (30s): it asks the queue about each running step's
+job, finishes the steps whose jobs finished, fails the steps whose jobs no
+longer exist (`job ... no longer exists`), and dispatches eligible steps
+that have no job yet.
+
+A step whose completion was recovered from the job's state alone, without
+the job record, has no stored result; a placeholder reading it then fails
+with a message saying so.
+
+## Retention
+
+Finished runs are kept for `workflows.keep_for` (7 days by default) after
+they finish, then deleted along with their stored step results, at most
+1000 per sweep. The jobs of their steps follow their queues' own retention.
+
+```toml
+[workflows]
+keep_for = "7d"         # finished runs are deleted after this long
+sweep_every = "30s"     # retention and reconciliation
+dedupe_window = "1d"    # how long a step's job is deduplicated; 1s to 30d
+```
+
+## Limitations
+
+- Retrying a step's dead job by hand after the run has moved on does not
+  reopen the step.
+- Results are kept only for steps that some placeholder reads, and only
+  placeholders in payloads are resolved; other job fields are copied as
+  written.
+- Deduplication of a repeated dispatch lasts for `dedupe_window`; a crash
+  between dispatching and saving followed by a longer outage can dispatch a
+  step twice.
+- In a cluster, a run is served by the node that accepted it, and all its
+  step jobs go into that node's queues, whichever node owns them. There is
+  no redirect for workflow calls.
+- Runs still going are held in memory in full; finished runs are read from
+  the store on demand.
