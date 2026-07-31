@@ -99,8 +99,8 @@ pub(super) fn trigger(app: &App, req: &mut Request) -> Result<Response, ApiError
     })
 }
 
-/// `?n=` fire times (default 10, at most 1000), before jitter and calendar
-/// exclusions.
+/// `?n=` fire times (default 10, at most 1000). Calendar exclusions are
+/// applied; jitter is not.
 pub(super) fn preview(app: &App, req: &mut Request) -> Result<Response, ApiError> {
     on_schedule(app, req, &["n"], |app, req, id| {
         let n = extract::query_value::<usize>(req, "n")?.unwrap_or(DEFAULT_PREVIEW);
