@@ -131,3 +131,162 @@ To run a cleanup step after a failure without failing the run, give the
 failing step `on_failure: continue` and the cleanup step `when: any_failed`.
 Under `fail_workflow` the cleanup step would be cancelled along with
 everything else before it could run.
+
+## Payload placeholders
+
+A string in a step's payload may refer to the result of an ancestor step:
+
+```text
+{{steps.<name>.result}}              the whole result
+{{steps.<name>.result/items/0/url}}  an RFC 6901 JSON Pointer into it
+{{steps.<name>.result.items.0.url}}  dotted keys, the same pointer spelled differently
+```
+
+Spaces just inside the braces are ignored. The rules:
+
+- A JSON string that is **exactly one placeholder** is replaced by the
+  referenced value, whatever its type: `"{{steps.count.result}}"` becomes
+  the number `42`, `"{{steps.fetch.result.urls}}"` an array.
+- Placeholders **inside a longer string** are replaced by text: string
+  values as they are, anything else as compact JSON (`null`, `42`,
+  `{"a":1}`). `"page {{steps.count.result}} of 9"` becomes `"page 42 of 9"`.
+- Only string values are scanned, at any depth; object keys are not.
+- `{{...}}` markers that do not start with `steps.` are left alone, so
+  payloads can carry templates meant for other tools.
+- Placeholders are resolved when the step is dispatched. A missing value
+  fails the step with a message naming the placeholder: the referenced step
+  did not succeed (`step "fetch" is failed, so it has no result`), or the
+  path leads nowhere in its result (`the result of step "fetch" has no value
+  at /items/9`). The step's failure policy then applies.
+
+There is no escape syntax: a payload cannot contain the literal text
+`{{steps.` followed by `}}` without it being treated as a placeholder.
+
+Results are stored alongside the run (under `wfr/<run>/<step>`) only for
+steps that some placeholder reads, so large results of other steps cost
+nothing beyond the job itself.
+
+## Submitting and following runs
+
+| action | CLI | HTTP | scope |
+|---|---|---|---|
+| submit | `belay workflow submit <FILE> [--wait] [--wait-timeout D]` | `POST /v1/workflows` (`201`, with `Location`) | `enqueue` |
+| show | `belay workflow get <id>` | `GET /v1/workflows/:id[?details=true]` | `read` |
+| list | `belay workflow list [-n N] [--all]` | `GET /v1/workflows?state=&name=&order=&cursor=&limit=` | `read` |
+| cancel | `belay workflow cancel <id>` | `POST /v1/workflows/:id/cancel` | `enqueue` |
+
+`submit` reads JSON or TOML, from a file or from stdin with `-`. The spec
+is validated in full before anything is stored; the answer is the new run
+with its root steps already running. Listings are newest first by default
+(`?order=asc` for oldest first), 100 per page, at most 1000.
+
+Every change is published on the event stream: `workflow.started`,
+`workflow.step` (a step changed state, with its job once dispatched) and
+`workflow.finished` (with the final state). The metrics are
+`belay_workflows_running` and `belay_workflows_finished_total{state}`.
+
+## A complete example
+
+`etl.json` extracts a file, transforms and loads it, then either reports or
+raises an alarm. It uses the built-in `echo` handler, which returns its
+payload as the result, so it runs as is against `belay dev --queues
+default,etl`:
+
+```json
+{
+  "name": "nightly-etl",
+  "meta": {"team": "data"},
+  "steps": [
+    {
+      "name": "extract",
+      "job": {"queue": "etl", "kind": "echo",
+              "payload": {"rows": 1200, "file": "s3://raw/2026-09-29.csv"}}
+    },
+    {
+      "name": "transform",
+      "depends_on": ["extract"],
+      "job": {"queue": "etl", "kind": "echo",
+              "payload": {"input": "{{steps.extract.result.file}}",
+                          "expected": "{{steps.extract.result/rows}}",
+                          "label": "batch of {{steps.extract.result.rows}} rows"}}
+    },
+    {
+      "name": "load",
+      "depends_on": ["transform"],
+      "job": {"queue": "etl", "kind": "echo",
+              "payload": {"from": "{{steps.transform.result.input}}"}}
+    },
+    {
+      "name": "notify-failure",
+      "depends_on": ["load"],
+      "when": "any_failed",
+      "job": {"queue": "default", "kind": "echo", "payload": {"channel": "#data"}}
+    },
+    {
+      "name": "report",
+      "depends_on": ["load"],
+      "on_failure": "continue",
+      "job": {"queue": "default", "kind": "echo",
+              "payload": {"rows": "{{steps.extract.result.rows}}"}}
+    }
+  ]
+}
+```
+
+```console
+$ belay workflow submit etl.json --wait
+id        01M3QMM68KYMYD3C1F8F8TJ4RR
+name      nightly-etl
+state     succeeded
+created   2026-09-29T22:30:05.843Z (just now)
+finished  2026-09-29T22:30:05.911Z (just now)
+
+STEP            STATE      JOB                         AFTER      STARTED   TOOK
+extract         succeeded  01M3QMM68YK12SSDARAM4JTD6Z  -          just now  26ms
+transform       succeeded  01M3QMM69D7767FFBH3QJBCATJ  extract    just now  14ms
+load            succeeded  01M3QMM69VVA8AM441HENGDZ7Y  transform  just now  14ms
+notify-failure  skipped    -                           load       -         -
+report          succeeded  01M3QMM6A9M19YR3P4MA34KRS7  load       just now  14ms
+```
+
+`notify-failure` was skipped because `load` succeeded. The `transform`
+step's job shows the resolved payload and the fields the engine added:
+
+```console
+$ belay job get 01M3QMM69D7767FFBH3QJBCATJ --json
+{
+  "id": "01M3QMM69D7767FFBH3QJBCATJ",
+  "state": "succeeded",
+  "attempt": 1,
+  "spec": {
+    "queue": "etl",
+    "kind": "echo",
+    "payload": {
+      "input": "s3://raw/2026-09-29.csv",
+      "expected": 1200,
+      "label": "batch of 1200 rows"
+    },
+    ...
+    "unique": {
+      "key": "wf:01M3QMM68KYMYD3C1F8F8TJ4RR:transform",
+      "scope": "for:1d",
+      "on_conflict": "return_existing"
+    },
+    "workflow": {
+      "id": "01M3QMM68KYMYD3C1F8F8TJ4RR",
+      "step": "transform"
+    }
+  },
+  ...
+}
+```
+
+`"{{steps.extract.result/rows}}"`, being the whole string, became the
+number `1200`; inside `"batch of ... rows"` the same value became text.
+
+Had `load` died, the run would have ended `failed` at once: `load` uses the
+default `fail_workflow`, which cancels `notify-failure` and `report` before
+either can run. With `"on_failure": "continue"` on `load`, a failure would
+instead let `notify-failure` run (its condition `any_failed` holds), skip
+`report` (its default condition needs `load` to succeed), and end the run
+`succeeded`.
