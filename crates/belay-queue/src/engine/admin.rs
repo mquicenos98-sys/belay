@@ -319,11 +319,11 @@ fn select(
     let mut last = after;
     let mut scanned = 0;
     for id in ids.range((start, Bound::Unbounded)) {
-        last = Some(*id);
         if picked.len() == limit || scanned == budget {
             return (picked, last, false);
         }
         scanned += 1;
+        last = Some(*id);
         if st.jobs.get(id).is_some_and(|meta| wanted(meta.state)) {
             picked.push(*id);
         }

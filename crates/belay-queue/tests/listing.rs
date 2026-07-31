@@ -7,6 +7,7 @@ mod support;
 use std::time::Duration;
 
 use belay_proto::api::{ApiError, CompleteRequest, Cursor, ErrorCode, JobFilter, SortOrder};
+use belay_proto::event::EventKind;
 use belay_proto::{JobId, JobSpec, JobState, QueueConfig, RateLimit, TenantId};
 use belay_queue::{EngineOptions, Error};
 use support::*;
@@ -350,6 +351,43 @@ fn invalid_configs_change_nothing() {
         .expect("config");
     assert_eq!(info.config, config);
     assert_eq!(h.events(), ["queue.configured"]);
+}
+
+#[test]
+fn purge_removes_only_the_requested_state() {
+    let h = Harness::with_options(EngineOptions::new().batch_size(2));
+    let ready: Vec<JobId> = (0..5).map(|_| h.enqueue(JobSpec::new("q", "k"))).collect();
+    let scheduled = h.enqueue(JobSpec::new("q", "later").delay(Duration::from_secs(60)));
+    let running = h.lease_one("q");
+    h.sink.take();
+    assert_eq!(
+        h.engine
+            .purge(&q("q"), Some(JobState::Ready))
+            .expect("purge"),
+        4
+    );
+    assert_eq!(h.state(scheduled), JobState::Scheduled);
+    assert_eq!(h.state(running.job.id), JobState::Running);
+    assert!(ready[1..].iter().all(|id| h.engine.get(id).is_err()));
+    match h.sink.take().as_slice() {
+        [EventKind::QueuePurged { count, state, .. }] => {
+            assert_eq!((*count, *state), (4, Some(JobState::Ready)));
+        }
+        other => panic!("expected one queue.purged, got {other:?}"),
+    }
+    // Without a state, everything but running jobs goes.
+    assert_eq!(h.engine.purge(&q("q"), None).expect("purge"), 1);
+    assert_eq!(h.all_jobs().len(), 1);
+    let err = h
+        .engine
+        .purge(&q("q"), Some(JobState::Running))
+        .unwrap_err();
+    assert_eq!(err.code(), ErrorCode::FailedPrecondition);
+    assert!(matches!(
+        h.engine.purge(&q("missing"), None),
+        Err(Error::QueueNotFound(_))
+    ));
+    h.assert_consistent();
 }
 
 #[test]
