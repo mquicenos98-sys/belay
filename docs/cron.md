@@ -227,3 +227,124 @@ Only each zone's current rule is modelled. Historical offsets and past
 rule changes are not: `America/Sao_Paulo` is `-03` all year even for 2018
 dates, when Brazil still observed daylight saving time. Fire times in
 years before a zone's last rule change use today's rule.
+
+## Daylight saving time
+
+Fire times follow the wall clock of the schedule's zone. Two situations
+need a rule, because the wall clock and real time stop corresponding one
+to one:
+
+**Clocks jump forward.** Readings inside the gap never occur. If any of
+them match, the schedule fires once, at the first instant after the gap;
+several matches in the gap collapse into that one fire. In New York on
+2025-03-09 the clocks go from 02:00 EST straight to 03:00 EDT:
+
+```console
+$ belay cron next "30 2 * * *" --tz America/New_York --from 2025-03-07T00:00:00Z -n 4
+2025-03-07T02:30:00-05:00
+2025-03-08T02:30:00-05:00
+2025-03-09T03:00:00-04:00
+2025-03-10T02:30:00-04:00
+$ belay cron next "*/15 2 * * *" --tz America/New_York --from 2025-03-09T06:00:00Z -n 3
+2025-03-09T03:00:00-04:00
+2025-03-10T02:00:00-04:00
+2025-03-10T02:15:00-04:00
+```
+
+**Clocks go back.** The readings of the last hour occur twice. A matching
+reading fires only on its first occurrence, unless the expression is
+*periodic*: it fires more than once an hour (several seconds or minutes
+listed) or every hour (`*` in the hour field). Periodic expressions follow
+the wall clock through both passes, as cronie does for its wildcard jobs.
+In New York on 2025-11-02 the clocks go from 02:00 EDT back to 01:00 EST:
+
+```console
+$ belay cron next "30 1 * * *" --tz America/New_York --from 2025-10-31T00:00:00Z -n 4
+2025-10-31T01:30:00-04:00
+2025-11-01T01:30:00-04:00
+2025-11-02T01:30:00-04:00
+2025-11-03T01:30:00-05:00
+$ belay cron next "*/30 * * * *" --tz America/New_York --from 2025-11-02T04:45:00Z -n 6
+2025-11-02T01:00:00-04:00
+2025-11-02T01:30:00-04:00
+2025-11-02T01:00:00-05:00
+2025-11-02T01:30:00-05:00
+2025-11-02T02:00:00-05:00
+2025-11-02T02:30:00-05:00
+$ belay cron next "0 * * * *" --tz America/New_York --from 2025-11-02T04:30:00Z -n 4
+2025-11-02T01:00:00-04:00
+2025-11-02T01:00:00-05:00
+2025-11-02T02:00:00-05:00
+2025-11-02T03:00:00-05:00
+```
+
+The same rules hold in every zone. In Berlin, where the clocks change at
+02:00 UTC+1 in March and 03:00 UTC+2 in October:
+
+```console
+$ belay cron next "30 2 * * *" --tz Europe/Berlin --from 2025-03-29T00:00:00Z -n 3
+2025-03-29T02:30:00+01:00
+2025-03-30T03:00:00+02:00
+2025-03-31T02:30:00+02:00
+$ belay cron next "30 2 * * *" --tz Europe/Berlin --from 2025-10-25T00:00:00Z -n 3
+2025-10-25T02:30:00+02:00
+2025-10-26T02:30:00+02:00
+2025-10-27T02:30:00+01:00
+```
+
+A daily job therefore runs exactly once on both transition days. Jobs that
+must never run twice should not rely on periodic expressions across the
+autumn change, or should use UTC.
+
+## Checking expressions from the command line
+
+`belay cron` works offline; it needs no server.
+
+```console
+$ belay cron explain "30 9 * * MON-FRI" --tz America/New_York
+$ belay cron explain "0 0 L * *" -n 3
+$ belay cron next "*/15 * * * *" -n 4
+$ belay cron zones
+```
+
+| option | meaning | default |
+|---|---|---|
+| `--tz ZONE` | zone: IANA name, `+05:30` or a POSIX rule | `UTC` |
+| `-n`, `--count N` | how many fire times, 1 to 1000 | 5 |
+| `--from TIME` | start after this RFC 3339 time instead of now | now |
+
+`explain` prints the expression, its normalised form, an English
+description, the zone with its abbreviation and offset, and the next fire
+times with their weekday and distance from now. When a clock change falls
+among the listed times it adds a note:
+
+```console
+$ belay cron explain "0 9 * * *" --tz "CET-1CEST,M3.5.0,M10.5.0/3" --from 2026-03-27T00:00:00Z -n 3
+expression  0 9 * * *
+meaning     at 09:00 every day
+time zone   +01:00 (CET +01:00)
+next 3      2026-03-27T09:00:00+01:00  Fri  ...
+            2026-03-28T09:00:00+01:00  Sat  ...
+            2026-03-29T09:00:00+02:00  Sun  ...
+note        clocks go forward at 2026-03-29T01:00:00.000Z (+01:00 to +02:00); fire times follow wall-clock time
+```
+
+(The elided column is the distance from the current time, such as `in 3d`.)
+`next` prints only the times, one per line, and exits with status 1 when
+the expression never fires after the start time. Both take `--json`.
+Usage mistakes, including a bad expression or zone, exit with status 2.
+
+## Limitations
+
+- Only each zone's current rule is known; fire times before a zone's last
+  rule change use today's rule. The table is only as current as the tzdata
+  release it was built from (2026d), and zones without a POSIX footer are
+  missing.
+- Fire times have one-second resolution, and iteration covers wall-clock
+  times from 1970 to the end of 2199, the range of the year field. Searches
+  past that return nothing.
+- Schedules always use the Vixie dialect with either-field day matching;
+  Quartz numbering and both-field matching are available only to Rust code
+  calling the crate directly.
+- A repeated hour fires a non-periodic expression once, on the first pass.
+  There is no option to fire on the second pass instead.
