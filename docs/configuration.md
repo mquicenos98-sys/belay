@@ -164,3 +164,83 @@ What the scopes allow (`admin` allows everything):
 [http-api.md](http-api.md#authentication-and-scopes). Each token is also
 rate limited (1000 requests per second, bursts of 2000) while
 authentication is enforced.
+
+## [log]
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `level` | string | `"info"` | A default level, optionally followed by per-module directives: `"debug,belay_store=trace,belay_server::access=warn"`. Levels are `off`, `error`, `warn` (or `warning`), `info`, `debug`, `trace`. A directive applies to its module and every module below it; the longest matching one wins. |
+| `format` | string | `"logfmt"` | `logfmt` (also `text`) or `json`. |
+
+Logs go to stderr. `belay server -v` (or `-vv`) and `-q` replace the
+configured level with `debug` (`trace`) or `warn`, keeping the format.
+Each request is logged under the target `belay_server::access`: at
+`info`, at `warn` for `5xx` answers, and at `debug` for `/healthz`,
+`/readyz` and `/metrics`.
+
+## [engine]
+
+Queue engine settings that apply to every queue.
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `tick` | duration | `"250ms"` | How often due jobs are promoted, expired leases reaped and retention enforced. Must be positive. |
+| `queue_order` | string | `"round_robin"` | How a lease naming several queues picks between them: `round_robin` takes from them in turn, `in_order` strictly in the order the worker listed them. |
+| `worker_timeout` | duration | `"2m"` | Silence after which a worker is reported lost (`worker.lost`). Must be positive. |
+| `worker_retention` | duration | `"1h"` | How long a lost worker stays in `GET /v1/workers`. |
+| `batch_size` | integer | `256` | Job changes per store write in bulk operations (purges, retention, promotions). At least 1. |
+| `tenant_quantum` | integer | `1` | Jobs a tenant takes per turn when a queue shares out work between tenants. At least 1. |
+| `tenant_weights` | table | empty | Per-tenant multipliers of the quantum, `[engine.tenant_weights]` or `tenant_weights = { acme = 3 }`. Keys are tenant ids, values at least 1. |
+
+Fair sharing between tenants is described in [queue.md](queue.md).
+
+## [queues.name]
+
+Per-queue settings, applied at startup. A queue that is not configured
+here is created with the defaults when a job is first enqueued into it,
+and can be configured later with `PUT /v1/queues/:name/config` or
+`belay queue config`.
+
+```toml
+[queues.emails]
+max_concurrency = 16
+rate_limit = { per_second = 20.0, burst = 40 }
+default_timeout = "2m"
+default_retry = "exp:30s*2..2h~full"
+default_max_attempts = 15
+retention = { succeeded = "1d", dead = "14d", cancelled = "1d" }
+```
+
+Queue names are 1 to 64 characters: a lowercase letter or digit, then
+lowercase letters, digits, `_`, `.`, `:` or `-`. Names with `.` or `:`
+must be quoted in TOML: `[queues."billing.v2"]`.
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `max_concurrency` | integer | no limit | Most jobs of the queue running at once, across all workers. At least 1; leave it out for no limit. |
+| `rate_limit` | inline table | no limit | A token bucket on lease grants: `per_second` (a number above 0 and at most 1000000; fractions allowed, `0.5` is one every two seconds) and `burst` (at least 1; default `per_second` rounded up, at least 1). |
+| `default_timeout` | duration | `"30m"` | Execution budget of one attempt, for jobs that do not set `timeout`. Between `1s` and `7d`. |
+| `default_retry` | backoff policy | `"exp:1s*2..1h~10%"` | Delay curve between attempts, for jobs that do not set `retry`. |
+| `default_max_attempts` | integer | `25` | Attempts (including the first) for jobs that do not set `max_attempts`. Between 1 and 1000. |
+| `retention` | inline table | see below | How long finished jobs are kept: `succeeded` (default `1d`), `dead` (`7d`), `cancelled` (`1d`), each between `0s` and `365d`. Keys left out keep their defaults. |
+
+A job's own `timeout`, `retry` and `max_attempts` are filled in from its
+queue when it is enqueued, so changing a queue later affects new jobs
+only.
+
+Configured queues are written at startup only when they differ from
+what is stored. Removing a queue from the file does not delete it or
+reset it; use `belay queue delete` or `belay queue config`.
+
+## [scheduler]
+
+How cron schedules fire. Schedule semantics are described in
+[cron.md](cron.md) and [scheduling.md](scheduling.md).
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `enabled` | boolean | `true` | Whether this node fires schedules at all. With `false`, schedules can still be created and listed. |
+| `tick` | duration | `"1s"` | Longest sleep of the scheduler thread. It normally wakes exactly at the next fire time; this bounds how late it notices schedules changed by other means. Must be positive. |
+| `misfire_threshold` | duration | `"1m"` | How late a fire may be processed and still count as on time; later fires are misfires and the schedule's `misfire` policy applies. |
+| `dedupe_window` | duration | `"1d"` | How long the uniqueness key of a fire's job is held, so that a fire retried after a crash cannot create a second job. Between `1s` and `30d`. |
+| `retry_delay` | duration | `"5s"` | Wait before retrying a fire the queue could not take. Must be positive. |
