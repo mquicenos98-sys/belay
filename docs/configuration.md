@@ -364,3 +364,136 @@ everything and none of the other keys matter.
 `belay config check` validates the syntax of these addresses but does not
 resolve seeds or bind sockets; those problems surface when the server
 starts.
+
+## [metrics]
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `enabled` | boolean | `true` | Register belay's metric families (engine and HTTP). With `false` nothing is registered, `process` included, and `/metrics` answers an empty body. |
+| `process` | boolean | `true` | Also export the `process_*` families: start time and uptime everywhere; memory, threads and file descriptors where `/proc` exists (Linux). |
+| `refresh` | duration | `"5s"` | How often lease latency samples are folded into `belay_lease_wait_seconds`, and how often a time-based checkpoint is considered. Must be positive. |
+
+The metric families are listed in [metrics.md](metrics.md).
+
+## Environment overrides
+
+`belay server`, `belay config check` and `belay config print` apply
+environment variables named `BELAY_<SECTION>__<KEY>` on top of the file.
+After the `BELAY_` prefix, double underscores separate path segments and
+single underscores stay part of the key; segments are lowercased:
+
+| variable | sets |
+|---|---|
+| `BELAY_SERVER__LISTEN=0.0.0.0:7700` | `server.listen` |
+| `BELAY_STORAGE__SYNC=interval:10ms` | `storage.sync` |
+| `BELAY_STORAGE__CHECKPOINT_BYTES=256MiB` | `storage.checkpoint_bytes` |
+| `BELAY_QUEUES__EMAILS__MAX_CONCURRENCY=4` | `queues.emails.max_concurrency` |
+| `BELAY_SCHEDULES__0__PAUSED=true` | `paused` of the first `[[schedules]]` entry |
+| `BELAY_CLUSTER__SEEDS=["10.0.0.6:7946","10.0.0.7:7946"]` | `cluster.seeds` |
+| `BELAY_AUTH__DISABLED=true` | `auth.disabled` |
+
+Values are typed as TOML would type them: `16` is an integer, `true` a
+boolean, text starting with `[`, `{` or a quote is parsed as an array,
+inline table or string, and anything else is a string. Where the file
+already holds a string, the value stays a string, so
+`BELAY_SERVER__LISTEN=7700` cannot turn an address into a number. A
+segment of digits selects an element of an existing array. A table can
+only be replaced by an inline table.
+
+Variables with a single segment are not configuration and are ignored:
+`BELAY_CONFIG` names the file, and `BELAY_URL` and `BELAY_TOKEN` are read
+by the client commands. Variables are applied in name order, and a value
+that does not fit is reported against the variable:
+
+```text
+error: expected integer at server.threads, found string
+ --> environment variable BELAY_SERVER__THREADS
+```
+
+A whole array of tables can be given as a TOML array of inline tables,
+which is one way to keep tokens out of the file (the variable replaces
+any `[[auth.tokens]]` the file has):
+
+```sh
+BELAY_AUTH__TOKENS='[{ name = "ci", token_sha256 = "88643a67...", scopes = ["enqueue", "read"] }]'
+```
+
+`token_sha256` in the file is usually simpler, since a digest is not a
+secret.
+
+## Validation, errors and warnings
+
+The whole configuration is checked when it is read, before anything is
+opened. Every problem is reported with its key path and, when the value
+came from the file, its line and column:
+
+```text
+error: invalid value for server.listen: 0.0.0.0:7700 accepts connections from other hosts, but no [[auth.tokens]] are configured; add a token, or set auth.disabled = true to serve without authentication
+ --> belay.toml:2:10
+  |
+2 | listen = "0.0.0.0:7700"
+  |          ^^^^^^^^^^^^^^
+```
+
+Besides the per-key rules in the tables above, reading checks that:
+
+- a non-loopback `server.listen` comes with tokens or `auth.disabled`;
+- `cluster.enabled` with a wildcard `server.listen` comes with a
+  `cluster.api_addr`;
+- token names and secrets, schedule ids and calendar names are unique;
+- cron expressions and time zones of schedules and calendars parse;
+- queue, schedule and calendar tables have only known fields, with valid
+  values (all problems of one table are counted in the message).
+
+Unknown keys in the plain sections are not errors: they are collected as
+warnings, each with a suggestion when a known key is close. The server
+prints them to stderr at startup and starts anyway.
+
+```text
+warning: unknown key `server.max_conections`
+ --> belay.toml:3:1
+  |
+3 | max_conections = 10
+  | ^^^^^^^^^^^^^^
+  = help: did you mean `server.max_connections`?
+```
+
+Some problems can only show when the server starts: the listen address
+is in use, the data directory is locked by another process, a seed does
+not resolve, or the gossip socket cannot be bound. `belay server` exits
+with status 1 and the reason.
+
+## belay config check, print and default
+
+All three work offline and load files exactly as `belay server` does,
+environment overrides included. Without a path they use `BELAY_CONFIG`,
+and without that the built-in defaults.
+
+`belay config check [PATH]` validates the file. It prints warnings to
+stderr, then the file name with `ok` and a summary of the settings that
+matter most; errors exit with status 1. `--strict` also fails (status 1)
+when there are warnings, which suits CI. `--json` prints
+`{"file": ..., "ok": ..., "warnings": [...]}`.
+
+```text
+$ belay config check examples/belay.toml
+examples/belay.toml: ok
+listen     0.0.0.0:7700
+storage    /var/lib/belay (sync always)
+auth       4 tokens
+queues     emails, reports, webhooks
+schedules  nightly-sales-report, crm-sync
+calendars  business-hours
+cluster    off
+```
+
+`belay config print [PATH]` prints the effective configuration as TOML,
+every setting included, with byte sizes as integers and durations in
+their shortest form. Tokens appear as `token_sha256`, never in the clear.
+Reading the output back gives the same configuration, so it can serve as
+a fully spelled-out file.
+
+`belay config default` prints a commented example covering every
+section, with each setting at its default; lines starting with `#`
+directly followed by a key are optional settings to uncomment. The
+example itself is a valid configuration.
