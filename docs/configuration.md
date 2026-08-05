@@ -244,3 +244,123 @@ How cron schedules fire. Schedule semantics are described in
 | `misfire_threshold` | duration | `"1m"` | How late a fire may be processed and still count as on time; later fires are misfires and the schedule's `misfire` policy applies. |
 | `dedupe_window` | duration | `"1d"` | How long the uniqueness key of a fire's job is held, so that a fire retried after a crash cannot create a second job. Between `1s` and `30d`. |
 | `retry_delay` | duration | `"5s"` | Wait before retrying a fire the queue could not take. Must be positive. |
+
+## [[schedules]]
+
+Schedules created or updated at startup. Each entry takes the fields of
+the JSON body of `POST /v1/schedules`:
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `id` | string | required | 1 to 128 characters: a lowercase letter or digit, then lowercase letters, digits, `_`, `.` or `-`. Unique in the file. |
+| `cron` | string | required | 5 fields (minute hour day month weekday), 6 (a leading seconds field) or 7 (a trailing year), or a nickname such as `@daily`. At most 256 bytes. |
+| `timezone` | string | `"UTC"` | An IANA name from belay's table (`belay cron zones`), a fixed offset (`+05:30`) or a POSIX TZ rule (`CET-1CEST,M3.5.0,M10.5.0/3`). |
+| `template` | table | required | The job each fire enqueues: the fields of a job spec (`queue`, `kind`, `payload`, `priority`, `delay`, `max_attempts`, `retry`, `timeout`, `tags`, `tenant`, `meta`). `run_at`, `unique` and `workflow` are not allowed, and `meta` keys may not start with `belay.`: belay sets `belay.schedule` and `belay.fire_time` itself. |
+| `misfire` | string | `"fire_once"` | Fires missed while belay was down or behind: `skip`, `fire_once` (one catch-up job for the first missed time), `fire_all` (every missed time, up to 100) or `fire_all:<n>` (up to `n`, 1 to 1000). |
+| `overlap` | string | `"allow"` | When the previous fire's job is still running: `allow`, `skip` this fire, or `cancel_previous` (cancel it, then fire). |
+| `jitter` | duration | `"0s"` | A random delay of up to this much added to each fire, the same for the same schedule and fire time. At most `1h`. |
+| `paused` | boolean | `false` | Create the schedule paused. |
+| `starts_at`, `ends_at` | time | none | Do not fire before `starts_at`, or at or after `ends_at`. `ends_at` must be after `starts_at`. |
+| `calendar` | string | none | Only fire when this calendar allows (see below); other fires are skipped. |
+| `description` | string | none | Free text, at most 1024 bytes. |
+
+```toml
+[[schedules]]
+id = "nightly-report"
+cron = "30 2 * * *"
+timezone = "America/Bogota"
+misfire = "fire_once"
+overlap = "skip"
+template = { queue = "reports", kind = "build_report", payload = { format = "pdf" } }
+
+[[schedules]]
+id = "crm-sync"
+cron = "*/15 * * * *"
+calendar = "business-hours"
+[schedules.template]
+queue = "sync"
+kind = "crm_sync"
+timeout = "10m"
+```
+
+The cron expression and the time zone are parsed when the file is read,
+so a bad field is reported with its line. A schedule in the file whose
+stored definition differs is replaced at startup; one that is unchanged
+is left alone. Schedules created through the API live alongside the
+configured ones, and removing an entry from the file does not delete the
+schedule. [`examples/schedules.toml`](../examples/schedules.toml) has
+more.
+
+## [[calendars]]
+
+Calendars restrict when schedules may fire. Each entry takes the fields
+of `PUT /v1/calendars/:name`:
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `name` | string | required | Same rules as a schedule id. Unique in the file. |
+| `timezone` | string | `"UTC"` | Zone of the local dates and times below. |
+| `exclude_dates` | array of strings | none | `YYYY-MM-DD` dates on which nothing fires; at most 1000. |
+| `exclude_weekdays` | string or array | none | Weekdays on which nothing fires: `"sat,sun"`, `["sat", "sun"]`, ranges such as `"fri-mon"`. Excluding all seven is an error. |
+| `windows` | array of inline tables | none (the whole day) | Allowed local time ranges: `days` (a weekday set as above; empty or absent for every day), `start` and `end` as `HH:MM`, start inclusive, end exclusive. `24:00` is allowed as an end. A window whose end is not after its start runs past midnight into the next day, and `days` names the day it starts. At most 64. |
+| `description` | string | none | Free text, at most 1024 bytes. |
+
+A local time is allowed when its date and its weekday are not excluded
+and it falls inside at least one window (or there are no windows).
+
+```toml
+[[calendars]]
+name = "business-hours"
+timezone = "America/Bogota"
+exclude_dates = ["2026-12-25", "2027-01-01"]
+windows = [{ days = ["mon-fri"], start = "08:00", end = "18:00" }]
+```
+
+Calendars are applied before schedules, so a schedule in the same file
+can name one. They are stored per node: in a cluster, every node needs
+the calendars its schedules use, which a shared configuration file
+provides.
+
+## [workflows]
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `keep_for` | duration | `"7d"` | How long finished workflow runs are kept. |
+| `sweep_every` | duration | `"30s"` | Interval of the workflow chores: deleting runs past `keep_for` and reconciling running steps with their jobs. Must be positive. |
+| `dedupe_window` | duration | `"1d"` | How long a step's job is deduplicated against a repeated dispatch. Between `1s` and `30d`. |
+
+Workflows themselves are described in [workflows.md](workflows.md).
+
+## [events]
+
+The in-memory event stream behind `GET /v1/events`.
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `buffer` | integer | `10000` | Events kept for subscribers that resume with `Last-Event-ID` or `from`. At least 1. |
+| `subscriber_queue` | integer | `1024` | Events queued for one live subscriber before it counts as lagging and is switched to reading from the buffer (it is told how many events it missed if the buffer has moved past it). At least 1. |
+
+Events are not persisted: a restart starts a new buffer.
+
+## [cluster]
+
+Membership and ownership across several nodes, described in
+[cluster.md](cluster.md). Without `enabled = true` the node owns
+everything and none of the other keys matter.
+
+| key | type | default | meaning |
+|---|---|---|---|
+| `enabled` | boolean | `false` | Join a cluster. |
+| `node_id` | string | the host name | This node's id, unique in the cluster: 1 to 128 characters from letters, digits, `-`, `_`, `.`, `:` and `@`, starting with a letter or digit. The default is `HOSTNAME` (or `COMPUTERNAME`) lowercased, other characters turned into `-`; `belay` if neither is set. |
+| `name` | string | `"belay"` | Shared by every node of one cluster. Datagrams tagged with another name are dropped. It keeps misconfigured clusters apart; it is not a secret. |
+| `gossip_listen` | address | `"0.0.0.0:7946"` | UDP address for membership gossip. |
+| `advertise` | `ip:port` | the bound address | The gossip address other nodes should use. Required in practice when `gossip_listen` is a wildcard address: a node refuses to start advertising `0.0.0.0`. |
+| `api_addr` | string | from `server.listen` | Base URL of this node's HTTP API as other nodes redirect clients to it, such as `http://10.0.0.5:7700` (`http://` is added to a bare `host:port`). Required when `server.listen` is a wildcard address. |
+| `seeds` | array of addresses | `[]` | Gossip addresses of nodes to join through. Resolved once at startup; a seed that does not resolve fails the start. |
+| `profile` | string | `"lan"` | Timing preset of the failure detector: `lan` (one data centre, 1 s probes), `wan` (slower probes, longer timeouts) or `local` (processes on one machine, sub-second detection). |
+| `join_grace` | duration | `"10s"` | Until the node has joined through a seed it fires no schedules and `/readyz` answers `503`; after this long it fires the schedules it owns anyway, so a node whose seeds are all down still works. |
+| `meta` | table of strings | empty | Metadata gossiped with the node, `[cluster.meta]` or `meta = { zone = "eu-1a" }`: at most 32 entries, keys of 1 to 64 characters from letters, digits, `-`, `_` and `.`, 512 bytes encoded in all. The key `weight` sets the node's share of keys (a number above 0 and at most 1000). |
+
+`belay config check` validates the syntax of these addresses but does not
+resolve seeds or bind sockets; those problems surface when the server
+starts.
