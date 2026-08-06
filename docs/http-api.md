@@ -139,3 +139,134 @@ first.
 curl -s -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/jobs?queue=emails&state=dead&limit=50"
 curl -s -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/jobs?queue=emails&state=dead&limit=50&cursor=05tg387f8b47bdd8vgt6yp73yv9tkdr"
 ```
+
+## Authentication and scopes
+
+Authentication is enforced once `[[auth.tokens]]` are configured (and
+`auth.disabled` is not set). Send the token as
+`Authorization: Bearer <token>`. Tokens and their configuration are
+described in [configuration.md](configuration.md#auth).
+
+A missing or unknown token is `401 unauthenticated`, a token without the
+route's scope `403 permission_denied`. Both carry an RFC 6750 challenge
+that tells the cases apart:
+
+```text
+WWW-Authenticate: Bearer realm="belay"                                          (no token)
+WWW-Authenticate: Bearer realm="belay", error="invalid_token"                   (unknown token)
+WWW-Authenticate: Bearer realm="belay", error="insufficient_scope", scope="admin"
+```
+
+Every route and the scope it needs; `admin` grants every scope:
+
+| route | scope |
+|---|---|
+| `GET /healthz`, `GET /readyz` | none |
+| `GET /metrics`, `GET /v1/info` | `read` |
+| `POST /v1/jobs` | `enqueue` |
+| `GET /v1/jobs`, `GET /v1/jobs/:id` | `read` |
+| `POST /v1/jobs/:id/cancel` | `enqueue` |
+| `POST /v1/jobs/:id/retry`, `POST /v1/jobs/:id/promote`, `DELETE /v1/jobs/:id` | `admin` |
+| `POST /v1/lease`, `POST /v1/jobs/:id/heartbeat`, `/complete`, `/fail` | `work` |
+| `GET /v1/queues`, `GET /v1/queues/:name` | `read` |
+| `PUT /v1/queues/:name/config`, `POST /v1/queues/:name/pause`, `/resume`, `/purge`, `DELETE /v1/queues/:name` | `admin` |
+| `GET /v1/schedules`, `GET /v1/schedules/:id`, `GET /v1/schedules/:id/preview` | `read` |
+| `POST /v1/schedules`, `PUT` and `DELETE /v1/schedules/:id`, `POST /v1/schedules/:id/pause`, `/resume`, `/trigger` | `admin` |
+| `GET /v1/calendars`, `GET /v1/calendars/:name` | `read` |
+| `PUT /v1/calendars/:name`, `DELETE /v1/calendars/:name` | `admin` |
+| `POST /v1/workflows`, `POST /v1/workflows/:id/cancel` | `enqueue` |
+| `GET /v1/workflows`, `GET /v1/workflows/:id` | `read` |
+| `GET /v1/workers`, `GET /v1/events`, `GET /v1/cluster/members` | `read` |
+| `POST /v1/admin/checkpoint`, `GET /v1/admin/store`, `GET /v1/admin/verify`, `POST /v1/admin/shutdown` | `admin` |
+
+Producers may withdraw what they submitted (cancelling a job or a
+workflow run) but not operate the system: retrying and promoting change
+what runs when, and deleting erases history. Before 0.6.0, cancelling a
+job needed `admin`.
+
+Without tokens every request is served as the principal `anonymous` with
+every scope.
+
+## Rate limiting
+
+While authentication is enforced, each token has a token bucket of 2000
+requests refilled at 1000 per second (programs embedding `belay-server`
+can change both, per token). A request over it is answered `429
+resource_exhausted` with `Retry-After`, and counted in
+`belay_http_rate_limited_total{token="..."}`. The limit is a guard
+against runaway clients rather than a quota: one token is often shared
+by a whole worker fleet, and every job costs at least two requests. An
+open server (no tokens) is not rate limited.
+
+## Clusters and redirects
+
+In a cluster ([cluster.md](cluster.md)) every queue and every schedule
+is owned by one live node. A request about a queue or schedule owned by
+another node is answered `307 Temporary Redirect` with an absolute
+`Location` on the owner, keeping the path and query:
+
+```text
+HTTP/1.1 307 Temporary Redirect
+Location: http://10.0.0.11:7700/v1/jobs?queue=emails&state=dead
+
+{"redirect":{"node":"belay-a","location":"http://10.0.0.11:7700/v1/jobs?queue=emails&state=dead"}}
+```
+
+A 307 keeps the method and body, so a client replays the request on the
+owner with its own credentials; every node accepts the same tokens.
+Nothing is proxied. Redirected are: `POST /v1/jobs`, `GET /v1/jobs` with
+`queue=`, `POST /v1/lease`, every `/v1/queues/:name...` route,
+`POST /v1/schedules` and every `/v1/schedules/:id...` route.
+
+Everything else is served by the node asked: listings show what that
+node holds, the event stream carries that node's events, and a job or
+workflow run can only be reached on the node that stores it (a node that
+does not have it says so in its `not_found` message). An enqueue batch
+naming queues owned by different nodes is refused with `400`, listing the
+owners in `details.owners`. A lease is served from the requested queues
+this node owns; the others are named in the `Belay-Remote-Queues`
+response header, and only when it owns none is the lease redirected, to
+the owner of the first queue listed.
+
+## Health, readiness and metrics
+
+### GET /healthz
+
+No authentication. `200` with the text `ok` as long as the process can
+answer. Restart on this.
+
+### GET /readyz
+
+No authentication. `200` with `ready`, or `503 unavailable` while the
+node should not get traffic: from the moment a shutdown begins
+(`"shutting down"`) and, in a cluster, until the node has joined or its
+`join_grace` has passed (`"not ready: waiting to join the cluster"`).
+Route traffic on this.
+
+### GET /metrics
+
+Scope `read`. The Prometheus text format (version 0.0.4,
+`Content-Type: text/plain; version=0.0.4; charset=utf-8`). The families
+are listed in [metrics.md](metrics.md).
+
+```sh
+curl -s -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/metrics" | grep ^belay_queue_jobs
+```
+
+### GET /v1/info
+
+Scope `read`. The server's identity.
+
+```json
+{"version":"0.6.0","node":"belay-1","started_at":"2026-09-29T22:21:09.012Z","uptime":"4s876ms",
+ "time":"2026-09-29T22:21:13.888Z","storage":"disk","cluster_size":1}
+```
+
+| field | meaning |
+|---|---|
+| `version` | belay version |
+| `node` | node id (`cluster.node_id`) |
+| `started_at`, `uptime` | when the engine started, and since how long |
+| `time` | the server's clock; compare with yours to spot skew, which matters for `run_at` and lease deadlines |
+| `storage` | `disk`, `memory` or `custom` (an embedded engine given its own store) |
+| `cluster_size` | live members; 1 without clustering |
