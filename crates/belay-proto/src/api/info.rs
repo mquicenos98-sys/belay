@@ -165,7 +165,8 @@ pub struct MemberInfo {
     pub addr: String,
     /// Health.
     pub state: MemberState,
-    /// Whether it runs cluster-wide chores (the lowest live node id).
+    /// Whether it has the lowest live node id. Reported only; nothing
+    /// depends on it yet.
     pub leader: bool,
 }
 
