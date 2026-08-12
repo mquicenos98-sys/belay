@@ -41,8 +41,8 @@ pub fn edit_distance(a: &str, b: &str) -> usize {
 }
 
 /// The candidate closest to `input`, if any is close enough to be a
-/// plausible typo: within a third of the input's length in edits, or a
-/// candidate that `input` is an unambiguous prefix of.
+/// plausible typo: within a third of the input's length in edits (at least
+/// one), or a candidate that `input` is an unambiguous prefix of.
 ///
 /// ```
 /// use belay_cli::args::suggest;
@@ -58,7 +58,7 @@ where
     I: IntoIterator<Item = &'a str>,
 {
     let candidates: Vec<&'a str> = candidates.into_iter().collect();
-    let limit = input.chars().count() / 3;
+    let limit = (input.chars().count() / 3).max(1);
     let best = candidates
         .iter()
         .map(|c| (edit_distance(input, c), *c))
@@ -108,6 +108,13 @@ mod tests {
         assert_eq!(suggest("paylod", flags), Some("payload"));
         assert_eq!(suggest("tga", flags), Some("tag"));
         assert_eq!(suggest("x", flags), None);
+    }
+
+    #[test]
+    fn short_inputs_allow_one_edit_only() {
+        assert_eq!(suggest("lss", ["ls", "list"]), Some("ls"));
+        assert_eq!(suggest("gt", ["get"]), Some("get"));
+        assert_eq!(suggest("xy", ["get"]), None);
     }
 
     #[test]
