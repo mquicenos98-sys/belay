@@ -270,3 +270,315 @@ Scope `read`. The server's identity.
 | `time` | the server's clock; compare with yours to spot skew, which matters for `run_at` and lease deadlines |
 | `storage` | `disk`, `memory` or `custom` (an embedded engine given its own store) |
 | `cluster_size` | live members; 1 without clustering |
+
+## Jobs
+
+A job is submitted as a **job spec** and stored as a **job**.
+
+Job spec fields (the body of `POST /v1/jobs`, a schedule's `template`, a
+workflow step's `job`):
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `queue` | string | required | Queue to enqueue into; created on first use. |
+| `kind` | string | required | Handler name workers dispatch on: 1 to 128 characters, a letter or digit then letters, digits, `_ . : / -`. |
+| `payload` | any JSON | `null` | Handler input; at most 1 MiB as compact JSON. |
+| `priority` | integer | `0` | `-1000` to `1000`; higher runs first. |
+| `run_at` | timestamp | now | Do not run before this time. Exclusive with `delay`. |
+| `delay` | duration | none | Do not run until this long after enqueue; at most `365d`. |
+| `max_attempts` | integer | queue default | Total attempts including the first, 1 to 1000. |
+| `retry` | backoff policy | queue default | Delay curve between attempts. |
+| `timeout` | duration | queue default | Execution budget of one attempt, `1s` to `7d`. Leases never extend past it. |
+| `unique` | object or string | none | Deduplication: `{"key": "user:42", "scope": "until_finished", "on_conflict": "return_existing"}`, or just the key as a string for those defaults. See below. |
+| `tags` | array of strings | none | Up to 16 distinct labels of at most 64 characters, for filtering. |
+| `tenant` | string | none | Owner for fair sharing within the queue. |
+| `meta` | object of strings | none | Up to 32 annotations; keys up to 64 characters, values up to 1024 bytes. Keys starting with `belay.` are set by belay. |
+
+`unique.scope` is how long the key stays claimed: `until_started`,
+`until_finished` (default) or `for:<duration>` (`1s` to `30d` after
+enqueue). `unique.on_conflict` is what an enqueue does when the key is
+held in the same queue: `return_existing` (default; succeed without a new
+job, returning the holder with status `duplicate`), `reject` (`409
+already_exists`) or `replace` (cancel a holder that has not started and
+enqueue the new job, status `replaced`; a running holder is kept, as with
+`return_existing`).
+
+A job adds its state and history:
+
+| field | meaning |
+|---|---|
+| `id` | the job's ULID |
+| `state` | `scheduled` (waiting for its run time), `ready`, `running`, `retrying` (waiting out a backoff delay), `succeeded`, `dead` (attempts exhausted or a non-retryable failure) or `cancelled` |
+| `attempt` | attempts started so far: 0 until first leased |
+| `spec` | the spec, with the queue's `max_attempts`, `retry` and `timeout` filled in |
+| `created_at`, `updated_at` | when it was enqueued, and last changed |
+| `run_at` | when it becomes (or became) eligible: the spec's run time, then the end of each backoff delay |
+| `started_at`, `finished_at` | when the latest attempt started; when it reached a terminal state |
+| `lease` | while running: `worker`, `acquired_at`, `expires_at`, `heartbeat_at` (the token only in lease responses) |
+| `cancel_requested` | `true` while a running job has been asked to stop |
+| `errors` | failed attempts, oldest first, at most 10: `at`, `attempt`, `message`, `kind`, `retryable`, `worker` |
+| `result` | what the handler returned, once succeeded |
+| `progress` | the running attempt's latest report: `percent` (0 to 100), `message` |
+
+### POST /v1/jobs
+
+Scope `enqueue`. Enqueues one job (the body is a spec) or several
+(`{"jobs": [spec, ...]}`, 1 to 1000, all checked before any is
+enqueued). The response has one result per spec, in order:
+
+```sh
+curl -s -i -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/jobs" \
+  -d '{"queue": "emails", "kind": "send_welcome", "payload": {"user": 42}, "unique": "welcome:42"}'
+```
+
+```text
+HTTP/1.1 201 Created
+Location: /v1/jobs/01M3QM3YTBDKTE6E25JG340DV3
+
+{"results":[{"id":"01M3QM3YTBDKTE6E25JG340DV3","status":"created","state":"ready"}]}
+```
+
+`status` is `created`, `duplicate` (the uniqueness key was held; `id` is
+the holder) or `replaced`; `state` is the job's state after the call.
+The answer is `201 Created` when at least one job was created (with
+`Location` for a single spec) and `200 OK` when every spec matched an
+existing job, so a retried enqueue with a uniqueness key is safe.
+
+Other answers: `400` for invalid specs, `409 already_exists` under
+`on_conflict: reject`, and in a cluster `307` to the queue's owner or
+`400` for a batch spanning owners.
+
+### GET /v1/jobs
+
+Scope `read`. One page of jobs, newest first. Query parameters, all
+optional and combined with AND:
+
+| parameter | meaning |
+|---|---|
+| `queue` | only this queue (redirected to its owner in a cluster) |
+| `state` | only these states, comma-separated or repeated: `state=dead,retrying` |
+| `kind`, `tag`, `tenant` | only jobs with this kind, carrying this tag, of this tenant |
+| `created_after`, `created_before` | RFC 3339 times, exclusive |
+| `order` | `desc` (default) or `asc` |
+| `cursor`, `limit` | see [Pagination](#pagination) |
+
+```sh
+curl -s -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/jobs?queue=emails&state=dead&limit=20"
+```
+
+### GET /v1/jobs/:id
+
+Scope `read`. The job, or `404`. A malformed id is `400`.
+
+```json
+{"id":"01M3QM49XATSFSEX1EEWGPTZN3","state":"retrying","attempt":1,
+ "spec":{"queue":"manual","kind":"resize","payload":{"img":1},"priority":0,"max_attempts":25,"retry":"exp:1s*2..1h~10%","timeout":"30m"},
+ "created_at":"2026-09-29T22:21:25.290Z","updated_at":"2026-09-29T22:21:32.250Z","run_at":"2026-09-29T22:21:34.250Z",
+ "started_at":"2026-09-29T22:21:25.376Z",
+ "errors":[{"at":"2026-09-29T22:21:32.250Z","attempt":1,"message":"upstream returned 503","kind":"http_503","retryable":true,"worker":"w1"}]}
+```
+
+### POST /v1/jobs/:id/cancel
+
+Scope `enqueue`. Cancels a job and answers `200` with it. Scheduled,
+ready and retrying jobs are cancelled at once. A running job gets
+`cancel_requested: true`; its worker learns this from its next heartbeat
+and should stop and report with `fail`, which cancels it (as does its
+lease running out). Cancelling a cancelled job changes nothing. A
+succeeded or dead job is `409 failed_precondition`.
+
+```sh
+curl -s -X POST -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/jobs/01M3QM49XATSFSEX1EEWGPTZN4/cancel"
+```
+
+### POST /v1/jobs/:id/retry
+
+Scope `admin`. Sends a `dead` or `cancelled` job back to `ready` with a
+fresh budget of attempts (`attempt` restarts at 0, the error history is
+kept); its uniqueness key is not claimed again. `200` with the job;
+other states are `409 failed_precondition`.
+
+### POST /v1/jobs/:id/promote
+
+Scope `admin`. Makes a `scheduled` or `retrying` job ready now. `200`
+with the job; promoting a ready job changes nothing; other states are
+`409 failed_precondition`.
+
+### DELETE /v1/jobs/:id
+
+Scope `admin`. Deletes a finished (`succeeded`, `dead` or `cancelled`)
+job ahead of its retention. `204 No Content`; a pending job is `409
+failed_precondition` (cancel it first).
+
+## The worker protocol
+
+A worker leases jobs, keeps each lease alive with heartbeats while the
+handler runs, and reports the outcome. Every call after the lease
+presents the lease token; a stale one is `409 lease_lost`, which means
+the job is no longer this worker's to report on: another worker may be
+running it. The worker runtime (`belay-worker`, `belay worker`) does all
+of this; see [workers.md](workers.md).
+
+### POST /v1/lease
+
+Scope `work`. Asks for up to `max_jobs` jobs from `queues`.
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `worker` | string | required | Worker id, 1 to 128 characters: a letter or digit, then letters, digits, `_ . : @ / -`. |
+| `queues` | array | required | 1 to 32 distinct queue names. The server takes from them in turn (`engine.queue_order = "round_robin"`, the default) or strictly in the order listed (`"in_order"`). |
+| `max_jobs` | integer | `1` | 1 to 100. |
+| `lease_for` | duration | `"30s"` | Lease length, `1s` to `1h`, capped at each job's attempt deadline. |
+| `wait` | duration | none | Long-poll for up to this long (at most `60s`) when nothing is ready. |
+
+```sh
+curl -s -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/lease" \
+  -d '{"worker": "w1", "queues": ["manual"], "max_jobs": 1, "lease_for": "30s", "wait": "20s"}'
+```
+
+```json
+{"jobs":[{"job":{"id":"01M3QM49XATSFSEX1EEWGPTZN3","state":"running","attempt":1,
+  "spec":{"queue":"manual","kind":"resize","payload":{"img":1},"priority":0,"max_attempts":25,"retry":"exp:1s*2..1h~10%","timeout":"30m"},
+  "created_at":"2026-09-29T22:21:25.290Z","updated_at":"2026-09-29T22:21:25.376Z","run_at":"2026-09-29T22:21:25.290Z",
+  "started_at":"2026-09-29T22:21:25.376Z",
+  "lease":{"worker":"w1","token":"8a2a6ef0e3cb9895","acquired_at":"2026-09-29T22:21:25.376Z","expires_at":"2026-09-29T22:21:55.376Z","heartbeat_at":"2026-09-29T22:21:25.376Z"}},
+  "token":"8a2a6ef0e3cb9895"}]}
+```
+
+Jobs come highest priority first, then by `run_at`, from the queues that
+are not paused and have room under their `max_concurrency` and
+`rate_limit`, sharing between tenants. With `wait`, the request is held
+until a job is ready or the wait runs out, and then answered with
+whatever there is, possibly `{"jobs": []}`; a job enqueued meanwhile is
+handed out at once. A server shutdown ends a wait early with no jobs.
+The response is `200` either way. Each leased job starts an attempt:
+`state` becomes `running` and `attempt` goes up by one.
+
+The lease is also how the server knows about workers: `GET /v1/workers`
+lists the ids it has heard from.
+
+### POST /v1/jobs/:id/heartbeat
+
+Scope `work`. Renews the lease and optionally records progress.
+
+| field | type | meaning |
+|---|---|---|
+| `token` | string | the lease token (required) |
+| `extend_by` | duration | new lease length from now, `1s` to `1h`; default the original `lease_for` |
+| `progress` | object | `{"percent": 40, "message": "resizing"}`; percent 0 to 100, message at most 1024 bytes |
+
+```sh
+curl -s -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/jobs/01M3QM49XATSFSEX1EEWGPTZN3/heartbeat" \
+  -d '{"token": "8a2a6ef0e3cb9895", "extend_by": "1m", "progress": {"percent": 40, "message": "resizing"}}'
+```
+
+```json
+{"expires_at":"2026-09-29T22:22:32.076Z","cancel_requested":false}
+```
+
+A heartbeat never shortens a lease and never extends it past the
+attempt's deadline (`started_at` plus the job's `timeout`). When
+`cancel_requested` is `true`, stop the handler and report with `fail`.
+Heartbeat well within the lease: the worker runtime sends one every third
+of `lease_for`, which survives one lost heartbeat.
+
+### POST /v1/jobs/:id/complete
+
+Scope `work`. The attempt succeeded. Body `{"token": "...", "result":
+...}`; `result` is any JSON up to 1 MiB and is optional (an explicit
+`null` is stored as `null`). `204 No Content`; the job is `succeeded`.
+
+```sh
+curl -s -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/jobs/01M3QM49XATSFSEX1EEWGPTZN3/complete" \
+  -d '{"token": "8a2a6ef0e3cb9895", "result": {"thumbnail": "s3://media/1-small.png"}}'
+```
+
+### POST /v1/jobs/:id/fail
+
+Scope `work`. The attempt failed.
+
+| field | type | default | meaning |
+|---|---|---|---|
+| `token` | string | required | the lease token |
+| `error` | string | required | what went wrong; never refused for its length, truncated to 4096 bytes when recorded |
+| `kind` | string | none | a machine-readable class such as `timeout` or `http_503`, at most 64 characters |
+| `retryable` | boolean | `true` | whether another attempt may help |
+| `retry_in` | duration | none | retry after exactly this long (at most `365d`) instead of the backoff policy's delay, for example from a `Retry-After` |
+
+`204 No Content`. The job goes to `retrying` (with `run_at` at the end of
+the delay) if the error is retryable and attempts remain, to `cancelled`
+if cancellation was requested, and to `dead` otherwise.
+
+```sh
+curl -s -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/jobs/01M3QM49XATSFSEX1EEWGPTZN3/fail" \
+  -d '{"token": "8a2a6ef0e3cb9895", "error": "upstream returned 503", "kind": "http_503", "retry_in": "2s"}'
+```
+
+A lease that runs out counts as a failed, retryable attempt: its error
+is `lease expired` (kind `lease_expired`), or `timed out after <timeout>`
+(kind `timeout`) when the attempt's deadline is what ended it. A
+`job.expired` event is followed by `job.failed` or `job.dead`. Jobs are
+therefore run at least once, and handlers should be idempotent.
+
+## Queues
+
+Queues exist from their first enqueue, configuration, pause or resume;
+there is no separate "create". A queue's status:
+
+```json
+{"name":"emails","paused":false,
+ "config":{"max_concurrency":16,"rate_limit":{"per_second":20.0,"burst":40},"default_timeout":"2m",
+           "default_retry":"exp:30s*2..2h~full","default_max_attempts":15,
+           "retention":{"succeeded":"1d","dead":"14d","cancelled":"1d"}},
+ "counts":{"scheduled":0,"ready":3,"running":2,"retrying":1,"succeeded":120,"dead":0,"cancelled":0},
+ "oldest_ready_age":"8s470ms",
+ "throughput":{"window":"1m","enqueued":30,"succeeded":28,"failed":1,"dead":0}}
+```
+
+`oldest_ready_age` (absent when nothing is ready) is how long the oldest
+ready job has been waiting: the best single signal that workers are
+falling behind. `throughput` counts the last minute. The configuration
+fields are those of `[queues.<name>]` in
+[configuration.md](configuration.md#queuesname).
+
+### GET /v1/queues
+
+Scope `read`. One page of queue statuses, by name.
+
+### GET /v1/queues/:name
+
+Scope `read`. The queue's status, or `404` for a queue that does not
+exist.
+
+### PUT /v1/queues/:name/config
+
+Scope `admin`. Replaces the queue's configuration (fields left out take
+their defaults; `{}` is the default configuration) and answers `200` with
+the queue's status. Creates the queue if needed. Jobs already enqueued
+keep the defaults they were given.
+
+```sh
+curl -s -X PUT -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/queues/emails/config" \
+  -d '{"max_concurrency": 8, "rate_limit": {"per_second": 10}, "retention": {"dead": "30d"}}'
+```
+
+### POST /v1/queues/:name/pause, /resume
+
+Scope `admin`. Stops (or resumes) handing out jobs from the queue;
+enqueueing continues while paused. `200` with the status.
+
+### POST /v1/queues/:name/purge
+
+Scope `admin`. Deletes the queue's jobs, only those in `?state=` if
+given; running jobs are never purged. `200` with `{"purged": 12}`.
+
+```sh
+curl -s -X POST -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/queues/emails/purge?state=dead"
+```
+
+### DELETE /v1/queues/:name
+
+Scope `admin`. Deletes the queue, its configuration and its jobs. A
+queue with unfinished jobs is refused with `409 failed_precondition`
+unless `?force=true` (also `?force` or `?force=1`). `200` with
+`{"purged": n}`, the number of jobs deleted.
