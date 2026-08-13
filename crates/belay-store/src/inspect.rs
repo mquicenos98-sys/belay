@@ -1,5 +1,5 @@
 //! Read-only inspection of a store directory, behind `belay admin
-//! store-inspect` and `belay admin verify`.
+//! store-inspect`.
 //!
 //! Nothing here takes the directory lock or modifies a file, so these
 //! functions can look at a store that is open elsewhere. The active

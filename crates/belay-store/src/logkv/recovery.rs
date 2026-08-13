@@ -4,7 +4,7 @@
 //! Nothing is modified until the whole log has been read, except for the
 //! truncation of a torn tail, which is always the last step of reading.
 //! A strict recovery that fails leaves the directory unchanged apart from
-//! that truncation, for `belay admin verify` or a retry with
+//! that truncation, for `belay admin store-inspect` or a retry with
 //! `RecoveryMode::SkipCorrupt`.
 
 use std::collections::BTreeMap;
