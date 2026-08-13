@@ -582,3 +582,200 @@ Scope `admin`. Deletes the queue, its configuration and its jobs. A
 queue with unfinished jobs is refused with `409 failed_precondition`
 unless `?force=true` (also `?force` or `?force=1`). `200` with
 `{"purged": n}`, the number of jobs deleted.
+
+## Schedules
+
+A schedule is a cron expression, a time zone and a job template. The
+spec (the body of `POST` and `PUT`) has the fields of `[[schedules]]` in
+[configuration.md](configuration.md#schedules); the semantics are in
+[cron.md](cron.md) and [scheduling.md](scheduling.md). A stored schedule
+adds its bookkeeping:
+
+```json
+{"spec":{"id":"nightly-report","cron":"30 2 * * *","timezone":"America/Bogota",
+         "template":{"queue":"reports","kind":"build","payload":{"format":"pdf"},"priority":0},
+         "misfire":"fire_once","overlap":"skip","jitter":"30s","paused":false,"description":"Daily sales report"},
+ "next_fire_at":"2026-09-30T07:30:00.000Z","last_fire_at":"2026-09-29T07:30:00.000Z",
+ "last_job":"01M3QM5C658EQHTT18FRYQK19S","fire_count":1,
+ "created_at":"2026-09-28T22:21:53.829Z","updated_at":"2026-09-29T07:30:00.012Z"}
+```
+
+`next_fire_at` already accounts for the schedule's bounds and calendar
+(but not for jitter), and is absent when the schedule will never fire
+again. Jobs it creates carry `meta` entries `belay.schedule` (the id)
+and `belay.fire_time` (the nominal fire time).
+
+### GET /v1/schedules
+
+Scope `read`. One page of schedules, by id.
+
+### POST /v1/schedules
+
+Scope `admin`. Creates a schedule: `201 Created` with the schedule and
+`Location: /v1/schedules/<id>`. A taken id is `409 already_exists`; an
+invalid expression or zone is `400` naming the field.
+
+```sh
+curl -s -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/schedules" -d '{
+  "id": "nightly-report", "cron": "30 2 * * *", "timezone": "America/Bogota",
+  "template": {"queue": "reports", "kind": "build", "payload": {"format": "pdf"}},
+  "misfire": "fire_once", "overlap": "skip", "jitter": "30s"}'
+```
+
+### GET /v1/schedules/:id
+
+Scope `read`. The schedule, or `404`.
+
+### PUT /v1/schedules/:id
+
+Scope `admin`. Creates or replaces the schedule: `201` (with `Location`)
+when it was created, `200` when it replaced one. The body may leave out
+`id`; if it names one, it must match the path.
+
+### DELETE /v1/schedules/:id
+
+Scope `admin`. Deletes the schedule and answers `200` with its last
+state. Jobs it created stay.
+
+### POST /v1/schedules/:id/pause, /resume
+
+Scope `admin`. `200` with the schedule. Fires that fall while a schedule
+is paused are not caught up when it resumes.
+
+### POST /v1/schedules/:id/trigger
+
+Scope `admin`. Fires the schedule now, whatever its cron expression and
+paused state say. `200` with `{"job": "<id of the enqueued job>"}`.
+
+### GET /v1/schedules/:id/preview
+
+Scope `read`. The next `?n=` fire times (default 10, 1 to 1000), starting
+with the stored `next_fire_at`. Calendar exclusions and the schedule's
+bounds are applied; jitter is not. A paused schedule is previewed as if
+it were running.
+
+```sh
+curl -s -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/schedules/nightly-report/preview?n=3"
+```
+
+```json
+{"times":["2026-09-30T07:30:00.000Z","2026-10-01T07:30:00.000Z","2026-10-02T07:30:00.000Z"]}
+```
+
+## Calendars
+
+A calendar restricts when schedules may fire. Its fields are those of
+`[[calendars]]` in [configuration.md](configuration.md#calendars):
+
+```json
+{"name":"business-hours","timezone":"America/Bogota","exclude_dates":["2026-12-25"],
+ "windows":[{"days":["mon","tue","wed","thu","fri"],"start":"09:00","end":"17:00"}]}
+```
+
+Calendars are not owned by a node: each node stores its own and checks a
+schedule against the calendars of the node that fires it.
+
+### GET /v1/calendars
+
+Scope `read`. One page of calendars, by name.
+
+### GET /v1/calendars/:name
+
+Scope `read`. The calendar, or `404`.
+
+### PUT /v1/calendars/:name
+
+Scope `admin`. Creates or replaces the calendar: `201` (with `Location`)
+or `200`, with the calendar. The body may leave out `name`. Schedules
+using the calendar get their next fire time recomputed.
+
+```sh
+curl -s -X PUT -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/calendars/business-hours" \
+  -d @examples/calendar-business-hours.json
+```
+
+### DELETE /v1/calendars/:name
+
+Scope `admin`. `200` with the deleted calendar. A calendar that a
+schedule uses is refused with `409 failed_precondition`, naming the
+schedules in `details.schedules`.
+
+## Workflows
+
+A workflow is a DAG of steps, each running one job once its dependencies
+have finished; see [workflows.md](workflows.md) for the rules.
+
+Spec (the body of `POST /v1/workflows`):
+
+| field | type | meaning |
+|---|---|---|
+| `name` | string | a label for people and filtering |
+| `steps` | array | 1 to 256 steps: `name` (`[a-z0-9][a-z0-9_-]{0,63}`, unique), `job` (a job spec without `workflow`), `depends_on` (names of other steps), `on_failure` (`fail_workflow` (default), `continue` or `skip_dependents`), `when` (`all_succeeded` (default), `any_succeeded`, `any_failed` or `always`) |
+| `meta` | object of strings | annotations, as for jobs |
+
+Step payloads may contain `{{steps.<name>.result<path>}}` placeholders,
+resolved from an ancestor step's result when the step is dispatched.
+[`examples/workflow-etl.json`](../examples/workflow-etl.json) is a
+complete example.
+
+A run:
+
+```json
+{"id":"01M3QM5J3K82RX3ZXEG4P682BE","state":"running","spec":{...},
+ "steps":{"fetch":{"state":"succeeded","job":"01M3QM5J3M942A9EWY0CGZVF4Q","started_at":"2026-09-29T22:22:06.451Z","finished_at":"2026-09-29T22:22:06.453Z"},
+          "load":{"state":"running","job":"01M3QM5J3NPPMDRD3FB3HZDMX9","started_at":"2026-09-29T22:22:06.453Z"}},
+ "created_at":"2026-09-29T22:22:06.451Z"}
+```
+
+Run states are `running`, `succeeded`, `failed` and `cancelled`; step
+states `pending`, `running`, `succeeded`, `failed`, `skipped` and
+`cancelled`. A run's steps are enqueued on the node that accepted it,
+which alone serves it.
+
+### POST /v1/workflows
+
+Scope `enqueue`. Validates the graph (unique names, known dependencies,
+no cycles, placeholders naming ancestors), enqueues the steps without
+dependencies, and answers `201 Created` with the run and
+`Location: /v1/workflows/<id>`. A cycle is reported with its path:
+`$.steps: dependency cycle: a -> b -> a (each step depends on the next)`.
+
+```sh
+curl -s -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/workflows" -d @examples/workflow-etl.json
+```
+
+### GET /v1/workflows
+
+Scope `read`. One page of runs, newest first. `?state=` and `?name=`
+filter, `?order=asc` lists oldest first, `cursor` and `limit` page.
+
+### GET /v1/workflows/:id
+
+Scope `read`. The run, or `404`. With `?details=true` the answer is
+`{"workflow": {...}, "errors": {"<step>": "<failure message>"}}`, with the
+last error of each failed step.
+
+### POST /v1/workflows/:id/cancel
+
+Scope `enqueue`. Cancels the run and its unfinished steps' jobs, and
+answers `200` with the run. Cancelling a finished run changes nothing.
+
+## Workers
+
+### GET /v1/workers
+
+Scope `read`. One page of the workers this node has heard from, by id,
+built from their lease and heartbeat traffic:
+
+```json
+{"items":[{"id":"worker-7","queues":["default","emails"],
+  "first_seen":"2026-09-29T22:21:09.018Z","last_seen":"2026-09-29T22:22:11.498Z",
+  "active_jobs":2,"leased":130,"succeeded":127,"failed":1}]}
+```
+
+`queues` are the ones named in the worker's latest lease request;
+`failed` counts failed attempts, expired leases included. The format has
+room for an `addr` field, which this version does not fill in. A worker
+silent for `engine.worker_timeout` is reported lost (`worker.lost`) and
+listed for `engine.worker_retention` more. A worker polling several
+nodes of a cluster appears on each.
