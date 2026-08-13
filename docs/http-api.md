@@ -779,3 +779,162 @@ room for an `addr` field, which this version does not fill in. A worker
 silent for `engine.worker_timeout` is reported lost (`worker.lost`) and
 listed for `engine.worker_retention` more. A worker polling several
 nodes of a cluster appears on each.
+
+## Events
+
+### GET /v1/events
+
+Scope `read`. The node's events as a stream of server-sent events.
+
+| parameter | meaning |
+|---|---|
+| `from` | first sequence number to deliver (inclusive) |
+| `types` | comma-separated patterns: `*`, a category (`job.*`) or a type (`schedule.fired`); an unknown one is `400` with a suggestion |
+| `queue` | only events about this queue (events about no queue, such as schedule and workflow events, are then left out) |
+
+A client resuming after a disconnect sends the last id it received as
+`Last-Event-ID`, which takes precedence over `from` (the stream starts
+after it). Without either, the stream starts with the oldest event the
+server still buffers (`events.buffer`, 10000 by default). The answer is
+`200` with `Content-Type: text/event-stream`, `Cache-Control: no-cache`,
+`X-Accel-Buffering: no` (so nginx does not buffer it) and a chunked body:
+
+```sh
+curl -s -N -H "Authorization: Bearer $BELAY_TOKEN" "$BELAY_URL/v1/events?types=job.*&queue=emails"
+```
+
+```text
+retry: 2000
+
+id: 1877706506502145
+event: job.enqueued
+data: {"seq":1877706506502145,"at":"2026-09-29T22:21:13.932Z","type":"job.enqueued","job":"01M3QM3YTBDKTE6E25JG340DV3","queue":"emails","kind":"echo","run_at":"2026-09-29T22:21:13.931Z"}
+
+id: 1877706506502146
+event: job.started
+data: {"seq":1877706506502146,"at":"2026-09-29T22:21:13.932Z","type":"job.started","job":"01M3QM3YTBDKTE6E25JG340DV3","queue":"emails","worker":"dev-worker","attempt":1}
+
+:
+
+```
+
+The stream starts with `retry:` (how long to wait before reconnecting, in
+milliseconds). Each event is one frame: `id:` its sequence number,
+`event:` its type, `data:` its JSON, which repeats both as `seq` and
+`type` and adds `at` and the fields of the type. A comment line (`:`) is
+sent every 15 seconds when there is nothing else, which keeps proxies
+from closing the connection.
+
+Sequence numbers increase by one per event and keep increasing across
+restarts: a node numbers its events from its start time in seconds times
+2^20, so they are large, stay below 2^53, and an id from before a restart
+is never ahead of the stream. Events themselves live in memory only;
+those from before a restart cannot be replayed.
+
+**Lag frames.** A client that resumes from a point the buffer no longer
+holds, or reads too slowly to keep up (`events.subscriber_queue`), gets
+one frame without an id:
+
+```text
+event: lagged
+data: {"type":"lagged","missed":3}
+```
+
+`missed` is how many sequence numbers were skipped; the stream then
+continues with the oldest buffered event. Having no id, the frame does
+not move the client's resume point.
+
+The stream never answers `204`. It ends cleanly when the server shuts
+down or the client goes away; a request arriving while the engine stops
+gets `503` with `Retry-After`. A bad `Last-Event-ID` (not a number) is
+`400`.
+
+Event types, with the fields each adds:
+
+| type | fields |
+|---|---|
+| `job.enqueued` | `job`, `queue`, `kind`, `run_at` |
+| `job.started` | `job`, `queue`, `worker`, `attempt` |
+| `job.progress` | `job`, `queue`, `progress` |
+| `job.succeeded` | `job`, `queue`, `attempt`, `runtime` |
+| `job.failed` | `job`, `queue`, `attempt`, `error`, `retry_at` (an attempt failed; the job will retry) |
+| `job.dead` | `job`, `queue`, `attempt`, `error` |
+| `job.cancelled` | `job`, `queue` |
+| `job.expired` | `job`, `queue`, `worker`, `attempt` (a lease ran out; `job.failed` or `job.dead` follows) |
+| `job.retried` | `job`, `queue` (a dead or cancelled job sent back to ready) |
+| `job.promoted` | `job`, `queue` |
+| `job.deleted` | `job`, `queue` |
+| `schedule.created`, `schedule.updated`, `schedule.deleted`, `schedule.paused`, `schedule.resumed` | `schedule` |
+| `schedule.fired` | `schedule`, `job`, `fire_time` |
+| `schedule.misfired` | `schedule`, `fire_time` (the first missed), `missed`, `policy` |
+| `schedule.skipped` | `schedule`, `fire_time`, `reason` (`overlap` or `calendar`) |
+| `workflow.started` | `workflow`, `name` |
+| `workflow.step` | `workflow`, `step`, `state`, `job` (once dispatched) |
+| `workflow.finished` | `workflow`, `name`, `state` |
+| `queue.paused`, `queue.resumed`, `queue.configured`, `queue.deleted` | `queue` |
+| `queue.purged` | `queue`, `state` (when the purge named one), `count` |
+| `worker.seen` | `worker`, `queues` (first lease, or first after being lost) |
+| `worker.lost` | `worker`, `last_seen` |
+
+New fields may be added to a type; clients should ignore fields they do
+not know and skip types they do not know.
+
+## Cluster
+
+### GET /v1/cluster/members
+
+Scope `read`. One page of the members as this node sees them, by node
+id. A node that is not clustered lists itself.
+
+```json
+{"items":[{"id":"belay-a","addr":"http://10.0.0.11:7700","state":"alive","leader":true},
+          {"id":"belay-b","addr":"http://10.0.0.12:7700","state":"alive","leader":false},
+          {"id":"belay-c","addr":"http://10.0.0.13:7700","state":"suspect","leader":false}]}
+```
+
+`state` is `alive`, `suspect`, `dead` or `left`; `leader` marks the live
+member with the lowest id, which is reported only (nothing depends on it
+yet). Views converge through gossip but are not
+agreed on at any instant, so two nodes may briefly disagree.
+
+## Administration
+
+### POST /v1/admin/checkpoint
+
+Scope `admin`. Writes a snapshot of the store now and deletes the log it
+covers. `200` with `{"seq": 34, "took": "24us800ns"}`, the store
+sequence number the snapshot covers and how long it took.
+
+### GET /v1/admin/store
+
+Scope `admin`. What the store is and its statistics: `storage`
+(`disk`, `memory` or `custom`), `dir` for disk stores, key and byte
+counts, sequence numbers (`last_seq`, `durable_seq`), write-ahead log
+figures (`wal_segments`, `wal_bytes`, `wal_syncs`), checkpoint figures,
+and `recovery`, what opening the store found (snapshot loaded, batches
+replayed, torn tails truncated, regions skipped, `lost_data`).
+
+### GET /v1/admin/verify
+
+Scope `admin`. Rebuilds the queue engine's indexes from the store and
+compares them with the live ones:
+`{"consistent": true, "jobs": 4, "queues": 3, "claims": 3, "problems": [], "more_problems": 0}`.
+It holds the queue lock for a full scan, which is why it needs `admin`
+although it changes nothing: a diagnostic, not something to poll.
+
+### POST /v1/admin/shutdown
+
+Scope `admin`. Starts a graceful shutdown and answers `202 Accepted`
+before the connection closes:
+
+```json
+{"shutting_down":true,"already":false,"grace":"30s"}
+```
+
+The server stops accepting connections, `/readyz` turns to `503`,
+requests in flight finish (long polls answer with no jobs, event streams
+end), and after at most `server.shutdown_grace` the engine shuts down.
+This is the way to stop a server cleanly: the standard library cannot
+catch signals, so Ctrl-C and `SIGTERM` end the process at once. That is
+safe too (the store is crash-consistent), but running jobs then only
+return to their queues when their leases expire.
