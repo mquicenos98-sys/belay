@@ -136,9 +136,9 @@ pub fn default_max_threads() -> usize {
 
 /// A `--filter` value: comma-separated terms that must all match.
 ///
-/// A `key=value` term matches a case whose parameter `key` is `value`;
-/// any other term matches if it occurs in the scenario name or the
-/// case label.
+/// A `key=value` term matches a case whose parameter `key` is exactly
+/// `value` (so `batch=1` does not match `batch=16`); any other term
+/// matches if it occurs in the scenario name or the case label.
 ///
 /// ```
 /// use belay_bench::args::Filter;
@@ -147,6 +147,7 @@ pub fn default_max_threads() -> usize {
 /// let case = Params::new().with("sync", "never").with("batch", 16);
 /// let filter: Filter = "store,batch=16".parse()?;
 /// assert!(filter.matches("store-write", &case));
+/// assert!(!"batch=1".parse::<Filter>()?.matches("store-write", &case));
 /// assert!("never".parse::<Filter>()?.matches("store-write", &case));
 /// # Ok::<(), belay_bench::Error>(())
 /// ```
@@ -168,7 +169,7 @@ impl Filter {
     pub fn matches(&self, scenario: &str, params: &Params) -> bool {
         let label = params.to_string();
         self.terms.iter().all(|term| match term {
-            Term::Param { key, value } => label.contains(&format!("{key}={value}")),
+            Term::Param { key, value } => params.get(key) == Some(value.as_str()),
             Term::Text(text) => scenario.contains(text.as_str()) || label.contains(text.as_str()),
         })
     }
@@ -449,6 +450,25 @@ mod tests {
         );
         // `--` ends the options: what follows is a scenario name.
         assert!(error(&["--", "--quick"]).starts_with("unknown scenario \"--quick\""));
+    }
+
+    #[test]
+    fn param_terms_match_exactly_and_text_terms_as_substrings() {
+        let case = Params::new().with("sync", "always").with("batch", 16);
+        let matches = |f: &str| f.parse::<Filter>().unwrap().matches("store-write", &case);
+        assert!(matches("batch=16"));
+        assert!(
+            !matches("batch=1"),
+            "a parameter term is not a prefix match"
+        );
+        assert!(matches("store-write,sync=always"));
+        assert!(!matches("store-write,sync=never"), "all terms must match");
+        assert!(
+            matches("write") && matches("always"),
+            "text searches name and label"
+        );
+        assert!(!matches("queue"));
+        assert!(!matches("value=128"), "a missing parameter does not match");
     }
 
     #[test]
