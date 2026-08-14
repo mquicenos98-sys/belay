@@ -309,6 +309,9 @@ impl Recorder {
         let (job, queue) = (execution.job, execution.queue.clone());
         if let Some(attempts) = state.running.get_mut(&job) {
             attempts.retain(|i| *i != index);
+            if attempts.is_empty() {
+                state.running.remove(&job);
+            }
         }
         if let Some(running) = state.running_by_queue.get_mut(&queue) {
             *running = running.saturating_sub(1);
@@ -648,6 +651,7 @@ mod tests {
         recorder.finish(first, Recorded::Cancelled);
         recorder.finish(second, Recorded::Succeeded(None));
         assert_eq!(recorder.overlaps(), [ctx.id()]);
+        assert!(recorder.running().is_empty());
     }
 
     #[test]
