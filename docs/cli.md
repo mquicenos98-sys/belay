@@ -287,3 +287,117 @@ ID              CRON        TZ              STATE   NEXT    LAST     FIRES  JOB
 hourly          0 * * * *   UTC             active  in 15h  -            0  sync/sync_accounts
 nightly-report  30 2 * * *  America/Bogota  active  in 9h   26s ago      1  reports/build
 ```
+
+## belay calendar
+
+| command | does |
+|---|---|
+| `calendar list` (alias `ls`) | Lists calendars. |
+| `calendar get <NAME>` (alias `show`) | Shows a calendar. |
+| `calendar put [NAME] [flags]` | Creates or replaces a calendar from flags or a file. |
+| `calendar rm <NAME>` (alias `delete`) | Deletes a calendar no schedule uses. |
+
+`calendar put` flags:
+
+| flag | meaning |
+|---|---|
+| `--file <PATH>` | Load the spec from a JSON or TOML file. |
+| `--tz <ZONE>` | Time zone of the rules (default `UTC`). |
+| `--window <[DAYS] HH:MM-HH:MM>` | An allowed time range, optionally on some days (repeatable). A range whose end is not after its start runs past midnight. |
+| `--exclude-date <YYYY-MM-DD>` | A date on which nothing fires (repeatable). |
+| `--exclude-weekdays <DAYS>` | Weekdays on which nothing fires, such as `sat,sun`. |
+| `--description <TEXT>` | Free text. |
+
+```sh
+belay calendar put business-hours --tz Europe/Berlin --window 'mon-fri 09:00-17:00' --exclude-date 2025-12-25
+belay calendar put --file examples/calendar-business-hours.json
+```
+
+## belay workflow
+
+| command | does |
+|---|---|
+| `workflow submit <FILE> [--wait] [--wait-timeout DURATION]` | Starts a run from a JSON or TOML spec (`-` reads stdin). With `--wait`, follows it until it finishes; status 1 if it did not succeed. |
+| `workflow get <ID>` (alias `show`) | Shows a run and its steps. |
+| `workflow list [-n N] [--all]` (alias `ls`) | Lists runs, newest first. |
+| `workflow cancel <ID>` | Cancels a run and its unfinished steps. |
+
+```text
+$ belay workflow submit examples/workflow-etl.json
+started workflow 01M3QMR4RJHKW2Q078RW5RG7YD (nightly-etl, 7 steps)
+$ belay workflow list
+ID                          NAME         STATE    STEPS  CREATED   TOOK
+01M3QMR4RJHKW2Q078RW5RG7YD  nightly-etl  running  0/7    just now  -
+```
+
+The spec format is described in [http-api.md](http-api.md#workflows) and
+[workflows.md](workflows.md).
+
+## belay worker
+
+Runs a worker that leases jobs from the server over HTTP and runs them
+with the built-in handlers: `echo` (returns its payload), `sleep` and
+`fail`, plus `shell` with `--shell` or `--allow`.
+
+| flag | default | meaning |
+|---|---|---|
+| `--queues <LIST>` | `default` | Queues to serve, comma-separated or repeated. The server's `engine.queue_order` decides how it takes from several: in turn by default, or in the order listed with `in_order`. |
+| `-c`, `--concurrency <N>` | `4` | Jobs run at once. |
+| `--id <ID>` | `host:pid` | Worker id, as shown by `belay workers`. |
+| `--shell` | | Also run shell jobs, any program. |
+| `--allow <PROGRAM>` | | Run shell jobs, only for this program (repeatable). |
+| `--lease-for <DURATION>` | `30s` | Lease length; heartbeats renew it every third of it. |
+| `--poll-wait <DURATION>` | `10s` | Long-poll wait when idle. |
+| `--burst` | | Exit once the queues stay empty for one poll wait. |
+| `--max-jobs <N>` | | Exit after this many jobs finished. |
+
+A shell job's payload names the program and its arguments; no shell is
+involved unless the program is one:
+
+```sh
+belay worker --queues media --allow convert
+belay enqueue media shell --payload '{"cmd": ["convert", "in.png", "-resize", "50%", "out.png"], "timeout": "2m"}'
+```
+
+The job succeeds with `{"exit_code": 0, "stdout": "...", "stderr": "..."}`
+(the last 64 KiB of each stream) when the program exits with 0. Exit
+status 75 (`EX_TEMPFAIL`) is a retryable failure, any other status a
+permanent one. `--shell` without `--allow` warns: anyone who can enqueue
+can then run any program on the worker's machine. The payload fields
+(`cmd`, `env`, `cwd`, `stdin`, `timeout`, `retry_on_exit`) are described
+in [workers.md](workers.md).
+
+Without `--burst` or `--max-jobs` the worker runs until the process is
+stopped; jobs it was running then come back after their lease expires.
+When it exits on its own it prints what it did.
+
+```sh
+belay worker --queues emails,reports --concurrency 8
+belay worker --queues media --allow convert --allow ffmpeg
+belay worker --queues default --burst --poll-wait 1s
+```
+
+## belay workers, members, info, version
+
+`belay workers` lists the workers the server has heard from recently,
+`belay members` the cluster's members as the server sees them (a single
+node lists itself), `belay info` the server's version, node, storage,
+uptime and readiness, and `belay version` the version of the command
+itself.
+
+```text
+$ belay workers
+WORKER      QUEUES          ACTIVE  LEASED  SUCCEEDED  FAILED  LAST SEEN  ADDRESS
+dev-worker  default,emails       0       5          5       0  just now
+w1          manual               0       1          0       1  55s ago
+
+$ belay info
+server   http://127.0.0.1:7700
+version  0.6.0
+node     belay-1
+storage  memory
+started  2026-09-29T22:21:09.012Z (1m ago)
+uptime   1m18s
+cluster  1 live node
+ready    yes
+```
