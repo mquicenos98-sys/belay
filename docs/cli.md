@@ -401,3 +401,117 @@ uptime   1m18s
 cluster  1 live node
 ready    yes
 ```
+
+## belay events tail
+
+Prints events as they happen. It starts with the oldest event the server
+still holds (or `--from`), follows new ones, and reconnects and resumes
+after interruptions without gaps or repeats.
+
+| flag | meaning |
+|---|---|
+| `--types <PATTERNS>` | Only these types, such as `job.*,schedule.fired` (repeatable). |
+| `--queue <QUEUE>` | Only events about this queue. |
+| `--from <SEQ>` | Start at this sequence number. |
+| `-n`, `--limit <N>` | Exit after this many events. |
+
+```text
+$ belay events tail --types job.succeeded -n 2
+1877706506502147  2026-09-29T22:21:13.933Z  job.succeeded      job=01M3QM3YTBDKTE6E25JG340DV3 queue=emails attempt=1 runtime=0s
+1877706506502173  2026-09-29T22:22:06.453Z  job.succeeded      job=01M3QM5J3M942A9EWY0CGZVF4Q queue=default attempt=1 runtime=0s
+```
+
+With `--json`, each event is one line of JSON, as the API sends it:
+
+```sh
+belay events tail --types job.dead,job.failed --queue emails
+belay events tail --json | jq .type
+```
+
+## belay cron
+
+Offline tools for cron expressions; no server needed.
+
+| command | does |
+|---|---|
+| `cron explain <EXPR> [--tz ZONE] [-n N] [--from TIME]` | Describes the expression in English and lists its next fire times (default 5) with their weekday and distance, noting DST changes in between. |
+| `cron next <EXPR> [--tz ZONE] [-n N] [--from TIME]` | Prints the next fire times, one per line, in the zone's offset. |
+| `cron zones [FILTER]` | Lists the time zone names belay knows, or those containing `FILTER`. |
+
+`--tz` takes an IANA name, a fixed offset (`+05:30`) or a POSIX rule
+(default `UTC`); `--from` starts after an RFC 3339 time instead of now.
+Expressions have 5 fields (minute hour day month weekday), 6 (with
+leading seconds) or 7 (with trailing year), and support names (`JAN`,
+`MON`), steps (`*/15`), `L`, `W`, `#` and nicknames such as `@daily`; see
+[cron.md](cron.md).
+
+```text
+$ belay cron explain "30 9 * * MON-FRI" --tz America/New_York -n 3 --from 2026-03-06T00:00:00Z
+expression  30 9 * * MON-FRI
+meaning     at 09:30 on Monday through Friday
+time zone   America/New_York (EST -05:00)
+next 3      2026-03-06T09:30:00-05:00  Fri  207d ago
+            2026-03-09T09:30:00-04:00  Mon  204d ago
+            2026-03-10T09:30:00-04:00  Tue  203d ago
+note        clocks go forward at 2026-03-08T07:00:00.000Z (-05:00 to -04:00); fire times follow wall-clock time
+
+$ belay cron next "*/15 * * * *" -n 2 --from 2026-01-01T00:00:00Z
+2026-01-01T00:15:00Z
+2026-01-01T00:30:00Z
+```
+
+## belay config
+
+Offline tools for configuration files, loading them exactly as `belay
+server` does, `BELAY_...` overrides included. Without a path they use
+`BELAY_CONFIG`, else the built-in defaults.
+
+| command | does |
+|---|---|
+| `config check [PATH] [--strict]` | Validates the file. Errors point at the line (status 1); unknown keys are warnings with suggestions, and `--strict` makes them fail too. |
+| `config print [PATH]` | Prints the effective configuration as TOML, defaults included, tokens as `token_sha256`. |
+| `config default` | Prints a commented example configuration. |
+
+```text
+$ belay config check examples/belay.toml
+examples/belay.toml: ok
+listen     0.0.0.0:7700
+storage    /var/lib/belay (sync always)
+auth       4 tokens
+queues     emails, reports, webhooks
+schedules  nightly-sales-report, crm-sync
+calendars  business-hours
+cluster    off
+```
+
+See [configuration.md](configuration.md) for every setting.
+
+## belay admin
+
+| command | does |
+|---|---|
+| `admin checkpoint` | Writes a storage snapshot now and drops the log it covers. |
+| `admin store` | Shows the server's storage statistics. |
+| `admin verify` | Checks that the server's job indexes agree with its store; status 1 if they do not. Holds the queue lock for a full scan. |
+| `admin shutdown` | Stops the server gracefully: drains requests, then stops the engine. |
+| `admin store-inspect <DIR> [--records]` | Lists and verifies the files of a data directory, offline. |
+
+`store-inspect` reads the directory without locking or changing it, so
+it also works on a store that is open elsewhere (whose last log segment
+may then show a torn tail, which is just a write in progress). It checks
+every snapshot and log record checksum and the continuity of sequence
+numbers, and fails (status 1) when opening the store would lose data.
+`--records` also lists every log record.
+
+```text
+$ belay admin store-inspect /var/lib/belay
+FILE                          SEQS   ENTRIES     SIZE  NOTE
+wal-00000000000000000001.log  1..=4        4  1.6 KiB
+snapshot seq 0, recoverable through seq 4
+no problems found
+
+$ belay admin shutdown
+server at http://127.0.0.1:7700 is shutting down (requests get up to 30s to finish)
+```
+
+[operations.md](operations.md) shows these commands in use.
