@@ -36,8 +36,8 @@ pub(super) fn put(app: &App, req: &mut Request) -> Result<Response, ApiError> {
     let (calendar, outcome) = app.engine.put_calendar(spec)?;
     Ok(match outcome {
         Upserted::Created => {
-            // Calendar names are free text; keep a `/` or space in one
-            // from changing the shape of the path.
+            // Calendar names are slugs today, but encode anyway so the
+            // Location stays one path segment if that ever changes.
             let segment = encode(&name, EncodeSet::Component);
             reply::created(&calendar, &format!("/v1/calendars/{segment}"))
         }
