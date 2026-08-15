@@ -127,3 +127,73 @@ it within a few periods, confirmations from the others shrink the
 suspicion towards the minimum, and a crash on a `lan` cluster is typically
 declared in 5 to 10 seconds. For a 10-node `lan` cluster the worst case is
 about 45 seconds.
+
+## Ownership
+
+Every node scores every key with a hash of the pair (node, key), and the
+key belongs to the highest-scoring live node (rendezvous or highest random
+weight hashing). This needs no state beyond the member list, and moves the
+minimum: when a node joins it takes over only the keys it now scores
+highest for, about 1/n of them; when one leaves or dies, only its own keys
+move, spread evenly over the others. Suspect members count as live and keep
+their keys.
+
+A node's share can be changed with a weight in its metadata, a number in
+(0, 1000] defaulting to 1; a node of weight 2 owns about twice the keys of
+a node of weight 1:
+
+```toml
+[cluster]
+meta = { zone = "eu-west-1a", weight = "2" }
+```
+
+Weighted scores go through a floating-point logarithm, whose last bit may
+differ between platforms; nodes on different platforms could then disagree
+about a key whose two best scores are within a rounding error, a chance of
+roughly 2^-50 per key. Clusters whose weights are all equal compare integer
+hashes only.
+
+Ownership is decided per key, not per request. Queues and schedules are
+owned; jobs, workflow runs, calendars and events are not:
+
+| resource | served by |
+|---|---|
+| a queue: enqueue, `GET /v1/jobs?queue=`, lease, every `/v1/queues/:name` call | the queue's owner (redirect) |
+| a schedule: every `/v1/schedules/:id` call, and firing | the schedule's owner (redirect) |
+| a job by id: get, cancel, retry, promote, delete, heartbeat, complete, fail | the node that stores it; others answer `not_found` and say which node answered |
+| workflow runs | the node that accepted the run |
+| calendars | every node, from its own store |
+| listings of queues, schedules, jobs without `?queue=`, workers | the node asked, showing what it holds |
+| the event stream | the node asked, with its own events |
+
+## Redirects
+
+A redirect is a `307` with an absolute `Location` on the owner, for the
+same path and query. A 307 keeps the method and body, so a redirected
+`POST` is replayed as is. The body says where for people using curl:
+
+```json
+{"redirect": {"node": "belay-2", "location": "http://10.0.0.6:7700/v1/queues/emails"}}
+```
+
+The Rust client (and so the `belay` command and `belay worker`) follows up
+to 5 redirects, forwarding the bearer token, since every node of a cluster
+is equally trusted.
+
+Requests naming several queues are split by owner:
+
+- **Enqueue batches** are atomic and nodes share no storage, so a batch
+  must be owned by one node: all local is served, all on one other node is
+  redirected there, anything else is refused with `400 invalid_argument`,
+  whose `details.owners` lists each queue with its node and URL, so the
+  client can split the batch.
+- **Leases** are served from the queues owned by the node asked. The
+  others are skipped and named, comma-separated, in the
+  `Belay-Remote-Queues` response header. Only when none of the queues is
+  owned there is the lease redirected, to the owner of the first (most
+  preferred) queue.
+
+A worker whose queues live on different nodes therefore needs a connection
+to each of them. The client does not remember redirects, and a job's
+heartbeats and result must go to the node that handed the job out; see the
+limitations of [workers.md](workers.md).
