@@ -325,7 +325,7 @@ impl Config {
     /// after O(log n) rounds; the multiplier buys margin against loss.
     #[must_use]
     pub fn retransmit_limit(&self, n: usize) -> u32 {
-        let rounds = ((n as f64) + 1.0).log2().ceil().max(1.0) as u32;
+        let rounds = ((n as f64) + 1.0).log10().ceil().max(1.0) as u32;
         self.retransmit_mult.saturating_mul(rounds)
     }
 
@@ -487,6 +487,17 @@ mod tests {
     }
 
     #[test]
+    fn retransmit_limit_grows_logarithmically() {
+        let c = config();
+        assert_eq!(c.retransmit_limit(0), 4);
+        assert_eq!(c.retransmit_limit(1), 4);
+        assert_eq!(c.retransmit_limit(9), 4);
+        assert_eq!(c.retransmit_limit(10), 8);
+        assert_eq!(c.retransmit_limit(99), 8);
+        assert_eq!(c.retransmit_limit(100), 12);
+    }
+
+    #[test]
     fn push_pull_period_scales_above_32_members() {
         let c = config();
         assert_eq!(c.push_pull_period(1), Duration::from_secs(30));
@@ -500,10 +511,10 @@ mod tests {
     #[test]
     fn failure_detection_bound_adds_detection_suspicion_and_dissemination() {
         let c = config();
-        // 2 * 9 periods + 24 s suspicion + 16 * 200 ms + 1 s.
+        // 2 * 9 periods + 24 s suspicion + 8 * 200 ms + 1 s.
         assert_eq!(
             c.failure_detection_bound(10),
-            Duration::from_millis(18_000 + 24_000 + 3_200 + 1_000)
+            Duration::from_millis(18_000 + 24_000 + 1_600 + 1_000)
         );
         assert!(c.failure_detection_bound(20) > c.failure_detection_bound(10));
         assert!(c.failure_detection_bound(1) > Duration::ZERO);
