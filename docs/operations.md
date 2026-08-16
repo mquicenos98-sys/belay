@@ -117,3 +117,79 @@ Batch enqueues (`{"jobs": [...]}`) and multi-job leases (`max_jobs`)
 cost one store write each, whatever the policy, which is the cheapest
 way to more throughput. Writes from different parts of the engine (the
 queue, the scheduler, workflows) that arrive together do share one sync.
+
+## Checkpoints and disk usage
+
+Every change is appended to the log. A checkpoint writes the whole state
+to a new snapshot and deletes the log it covers; it runs when the log on
+disk reaches `storage.checkpoint_bytes` (128 MiB), at least every
+`storage.checkpoint_interval` (1 h) while anything changes, and on
+`belay admin checkpoint`. Disk usage therefore stays around one snapshot
+(the size of the live data) plus up to `checkpoint_bytes` of log plus one
+segment.
+
+Recovery time grows with the log to replay, which is what the interval
+bounds for quiet stores. A checkpoint copies the in-memory table, so it
+briefly needs as much memory again as the data (see
+[Capacity](#capacity)).
+
+## Backups
+
+The store is crash-consistent: any copy that a crash could have left
+behind can be opened. Three ways to take a backup, safest first:
+
+1. **Stop the server** (`belay admin shutdown`), copy the data
+   directory, start it again.
+2. **Snapshot the file system** (LVM, ZFS, a cloud volume snapshot)
+   while it runs. That captures what a crash would, which recovery
+   handles.
+3. **Checkpoint, then copy** while it runs:
+
+   ```sh
+   belay admin checkpoint                        # log is now one short segment
+   rsync -a --exclude LOCK /var/lib/belay/ /backup/belay-$(date +%F)/
+   belay admin store-inspect /backup/belay-$(date +%F)
+   ```
+
+   After the checkpoint the directory is one snapshot and a short log,
+   so the copy is quick and small. A write in progress at the end of the
+   log may be copied half-written; recovery truncates it, which loses
+   only that write. `store-inspect` verifies every checksum and the
+   continuity of sequence numbers without opening the store, and fails
+   (status 1) if the copy would lose data, for example because an
+   automatic checkpoint deleted a segment in the middle of the copy; in
+   that case copy again.
+
+Leave the `LOCK` file out of copies: on a restored directory it would
+make the next start refuse the store (see
+[Troubleshooting](#troubleshooting)).
+
+To restore, stop the server, replace the data directory with the copy,
+and start it. Jobs that were running when the backup was taken come back
+as running with their old leases, which expire at the first tick, so
+they run again: another reason for idempotent handlers.
+
+Events are not part of the store and are not backed up; the replay
+buffer starts empty after every restart.
+
+## Upgrades
+
+1. Read the [changelog](../CHANGELOG.md) for the versions in between;
+   behaviour changes are called out there (0.6.0, for example, lets
+   `enqueue` tokens cancel jobs).
+2. Take a backup.
+3. Check the new binary against your configuration:
+   `belay-new config check --strict /etc/belay/belay.toml`.
+4. Stop the server gracefully, replace the binary, start it.
+
+Jobs and other records are stored as JSON documents that are decoded but
+never re-validated, so a limit tightened in a new release cannot make
+existing jobs unreadable, and fields a newer version adds are ignored by
+readers that do not know them. The HTTP API stays at `/v1`, and clients
+ignore response fields they do not know, so workers and producers can be
+upgraded before or after the server.
+
+In a cluster, upgrade one node at a time and wait for its `/readyz`
+before moving on. While a node is down its queues are unavailable (there
+is no replication); requests for them are redirected to the node that
+takes over ownership, which does not have their jobs.
