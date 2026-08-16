@@ -193,3 +193,186 @@ In a cluster, upgrade one node at a time and wait for its `/readyz`
 before moving on. While a node is down its queues are unavailable (there
 is no replication); requests for them are redirected to the node that
 takes over ownership, which does not have their jobs.
+
+## Monitoring
+
+Three endpoints:
+
+- `GET /healthz` (no token): `200 ok` while the process answers. Use it
+  for liveness: restart on failure.
+- `GET /readyz` (no token): `503` while shutting down and, in a cluster,
+  until the node has joined. Use it for load balancers.
+- `GET /metrics` (`read` scope): Prometheus text format.
+
+A Prometheus scrape job with a `read` token:
+
+```yaml
+scrape_configs:
+  - job_name: belay
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/belay-token
+    static_configs:
+      - targets: ["10.0.0.11:7700", "10.0.0.12:7700", "10.0.0.13:7700"]
+```
+
+What to alert on (the families are described in [metrics.md](metrics.md)):
+
+| signal | metric |
+|---|---|
+| workers falling behind | `belay_queue_oldest_ready_seconds` above what the queue tolerates |
+| jobs failing for good | `rate(belay_jobs_dead_total[5m])`, `belay_queue_jobs{state="dead"}` |
+| workers dying or stalling | `rate(belay_jobs_expired_total[5m])` (leases that ran out), `belay_workers` |
+| slow pickup | `belay_lease_wait_seconds` percentiles per queue |
+| server errors | `belay_http_requests_total{status=~"5.."}` |
+| checkpoints not keeping up | `belay_store_wal_bytes` staying well above `storage.checkpoint_bytes` |
+| subscribers too slow | `rate(belay_event_lags_total[5m])` |
+| cluster degraded | `belay_cluster_members{state!="alive"}` |
+| descriptor exhaustion (Linux) | `process_open_fds / process_max_fds` |
+| schedules missing fires | `rate(belay_schedule_misfires_total[1h])` |
+
+For a quick look without Prometheus, `belay queue list`, `belay workers`
+and `belay events tail` show the same picture, and `belay info` the
+server's clock, uptime and readiness.
+
+Every request is logged under the target `belay_server::access` with its
+route, status, duration, token name and request id (`X-Request-Id`),
+which clients can set to trace a call through their own logs. Probes and
+scrapes are logged at `debug` so they do not flood the log;
+`level = "info,belay_server::access=warn"` keeps only failed requests.
+
+## Capacity
+
+**Memory.** The store keeps the whole dataset in memory, and the queue
+keeps indexes over it. A job with a small payload takes about 400 bytes
+of store; payloads and results add their JSON size (each is limited to
+1 MiB). What is held is what is retained: pending jobs, plus finished
+jobs until their queue's `retention` runs out (dead jobs are kept 7 days
+by default), plus finished workflow runs for `workflows.keep_for`. A
+checkpoint briefly doubles the store's share. Size the machine for the
+retained jobs, not the rate: 10 million retained jobs of a few hundred
+bytes is a few gigabytes; the same number of 100 KiB payloads is not
+sensible, so keep large inputs elsewhere and pass references.
+
+**Start-up.** Opening the store replays the log since the last snapshot,
+and the queue engine then scans every job to rebuild its indexes, so
+start-up time grows with the retained jobs. Shorter retention and a
+tighter `checkpoint_interval` both shorten it.
+
+**Connections.** Every connection is a thread, including the ones idle
+in a long poll or streaming events. `server.max_connections` must cover
+every worker slot that may be polling at once, every event subscriber,
+and ordinary traffic; beyond it clients get `503` with `Retry-After: 1`.
+The file descriptor limit must cover it too.
+
+**Throughput.** Under `sync = "always"` the queue's commit rate is
+bounded by the disk's sync latency, one change per sync; batch enqueues
+and multi-job leases, which write many changes at once, help the most. `belay-bench` measures store, queue and
+HTTP throughput on your hardware (see
+[CONTRIBUTING.md](../CONTRIBUTING.md#benchmarks)).
+
+**Scaling out.** A cluster spreads queues over nodes by hashing their
+names, so it adds capacity when there are many queues; one busy queue is
+always served by one node. See [cluster.md](cluster.md).
+
+## Troubleshooting
+
+**`store is locked by process 1234 (/var/lib/belay/LOCK)`.** Another
+process has the directory open, or one that crashed left its lock. Make
+sure no belay process uses the directory (`ps`, `systemctl status`). On
+Linux a lock whose process no longer exists is taken over automatically;
+elsewhere, or when the recorded process id now belongs to an unrelated
+process, delete the `LOCK` file by hand. Never run two servers on one
+directory.
+
+**The store refuses to open with a corruption error.** A crash leaves at
+most a half-written record at the very end of the log; recovery truncates
+it with a warning and starts. Damage anywhere else (a flipped bit, a
+file truncated by hand, a bad copy) is reported with the file and offset,
+and under the default `storage.recovery = "strict"` the server refuses
+to start rather than lose data silently. Then:
+
+1. Look at the damage offline: `belay admin store-inspect
+   /var/lib/belay` (add `--records` to list every log record).
+2. Restore the latest backup if you have one.
+3. Otherwise start once with `storage.recovery = "skip-corrupt"` (or
+   `BELAY_STORAGE__RECOVERY=skip-corrupt`): it skips the damaged records,
+   logs what it skipped, and writes a fresh checkpoint so the damage is
+   not met again. `belay admin store` shows what was skipped under
+   `recovery`. Go back to `strict` afterwards.
+
+A snapshot that fails validation is skipped when the log still restores
+everything it held, and renamed to `*.corrupt`; otherwise it counts as
+corruption like any other damage.
+
+**Jobs stay `running` although no worker has them.** A worker that dies
+keeps its leases until they expire: `lease_for` after its last heartbeat
+(30 s for belay's workers), never later than the job's `timeout`. The
+next queue tick then fails the attempt with `lease expired` and the job
+retries. Check `belay job list --state running` and `belay workers`
+(last seen). Leases are stored with their expiry, so they also run out
+if the server itself was down for longer. To stop waiting, `belay job
+cancel <id>`: the job is cancelled when its worker's next heartbeat or
+its lease expiry comes.
+
+**Jobs stay `ready`.** Something keeps them from being leased:
+
+- the queue is paused (`belay queue info <name>`, STATE `paused`);
+- its `max_concurrency` is reached, or its `rate_limit` is spending
+  (`belay queue config <name>`);
+- no worker serves the queue: `belay workers` shows each worker's
+  queues;
+- in a cluster, the queue is owned by another node: a lease skips queues
+  owned elsewhere and names them in the `Belay-Remote-Queues` response
+  header, so the worker needs a connection to that node.
+
+A job whose kind no handler is registered for is not stuck: the worker
+fails it at once, non-retryably, with `no handler registered for kind
+"x"` in its errors.
+
+**Schedules do not fire.** `belay schedule get <id>` shows the next fire
+time; `belay events tail --types schedule.*` shows fires, misfires and
+skips (with the reason, `calendar` or `overlap`). Check that the
+schedule is not paused and within its `starts_at`/`ends_at`, that
+`scheduler.enabled` is true, and in a cluster that the node owning the
+schedule is up and has joined (`/readyz`).
+
+**`/readyz` answers 503 in a cluster.** The node has not joined through
+any seed and its `cluster.join_grace` has not passed. Check the seeds'
+addresses, that UDP port 7946 (or your `gossip_listen`) is open between
+the nodes, that every node uses the same `cluster.name`, and that
+`cluster.advertise` is an address the others can reach.
+
+**Clients get `503` or connections are refused under load.** The server
+is at `server.max_connections`, or the process at its descriptor limit.
+Raise both; see [Capacity](#capacity).
+
+**Times look off.** `belay info` prints the server's clock; compare it
+with the clients'. `run_at`, delays and lease deadlines use the server's
+clock.
+
+## Graceful shutdown
+
+`belay admin shutdown` (or `POST /v1/admin/shutdown` with an `admin`
+token) stops a server cleanly:
+
+1. The server stops accepting connections and `/readyz` turns to `503`.
+2. Requests in flight finish; long-polling leases answer with no jobs and
+   event streams end, so neither holds up the stop by more than a
+   fraction of a second.
+3. After at most `server.shutdown_grace` (30 s), the engine shuts down:
+   background duties stop, the store is flushed and closed, and the
+   process exits with status 0.
+
+Results reported while the server drains are still accepted, since the
+engine stops last. A worker whose job outlasts the drain gets errors for
+its heartbeats and result once the server is gone; that job runs again
+after its lease expires on the next start.
+
+Ctrl-C, `SIGTERM` or `kill -9` end the process at once instead: the
+standard library cannot catch signals. That is safe. Nothing acknowledged
+is lost (under `sync = "always"`), the next start replays the log, and
+jobs that were running return to their queues when their leases expire.
+`belay worker` behaves the same way when killed. `belay dev` stops its
+built-in worker first when asked to shut down, so its jobs finish or are
+handed back.
