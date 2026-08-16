@@ -197,3 +197,151 @@ A worker whose queues live on different nodes therefore needs a connection
 to each of them. The client does not remember redirects, and a job's
 heartbeats and result must go to the node that handed the job out; see the
 limitations of [workers.md](workers.md).
+
+## Configuring a three-node cluster
+
+Every node runs `belay server` with its own configuration. For three nodes
+on `10.0.0.5`, `10.0.0.6` and `10.0.0.7`, the first one:
+
+```toml
+[server]
+listen = "0.0.0.0:7700"
+
+[[auth.tokens]]
+name = "workers"
+token_sha256 = "87cbebfeebc05f7c54ac9336c4b4bbec831227a641951a4bde7edd56020f8590"  # gitleaks:allow
+scopes = ["work"]
+
+[storage]
+dir = "/var/lib/belay"
+
+[cluster]
+enabled = true
+node_id = "belay-1"
+name = "belay-prod"
+gossip_listen = "0.0.0.0:7946"
+advertise = "10.0.0.5:7946"
+api_addr = "http://10.0.0.5:7700"
+seeds = ["10.0.0.6:7946", "10.0.0.7:7946"]
+profile = "lan"
+join_grace = "10s"
+```
+
+The other two differ in `node_id`, `advertise`, `api_addr` and `seeds`.
+Everything that must exist on every node (queue configurations,
+`[[calendars]]`, `[[schedules]]`) belongs in the part of the file they
+share; see [scheduling.md](scheduling.md#clusters).
+
+| key | meaning | default |
+|---|---|---|
+| `enabled` | join a cluster; without it a single node owns everything | `false` |
+| `node_id` | unique in the cluster; letters, digits, `-`, `_`, `.`, `:`, `@`, starting with a letter or digit, at most 128 bytes | the host name (`HOSTNAME` or `COMPUTERNAME`), cleaned |
+| `name` | shared by every node of one cluster | `belay` |
+| `gossip_listen` | UDP address for membership gossip | `0.0.0.0:7946` |
+| `advertise` | gossip address other nodes use | the bound address |
+| `api_addr` | this node's API as other nodes redirect clients to it | derived from `server.listen` |
+| `seeds` | gossip addresses of nodes to join through | none |
+| `profile` | timing preset: `lan`, `wan` or `local` | `lan` |
+| `join_grace` | how long a node that has not joined waits before firing schedules and reporting ready | 10s |
+| `meta` | free-form metadata gossiped with the node: at most 32 entries, keys of letters, digits, `-`, `_` and `.`, 512 bytes encoded in all; `weight` sets its share of keys | none |
+
+Things the configuration checks:
+
+- With `server.listen` on a wildcard address (`0.0.0.0`, `[::]`), other
+  nodes cannot redirect clients to it, so `api_addr` is required; loading
+  the configuration fails without it.
+- Listening on anything but a loopback address requires `[[auth.tokens]]`
+  or `auth.disabled = true`.
+- With `gossip_listen` on a wildcard address, `advertise` is required; the
+  node refuses to start without it ("set an advertise address other nodes
+  can reach").
+- Seed host names are resolved once, at start. A seed that does not
+  resolve fails the start rather than being skipped, since starting without
+  it would make the node a cluster of one that owns everything.
+
+List the other nodes as seeds on every node, so the cluster forms in any
+start order. A node without seeds starts as the first node of a new
+cluster. Until a node has joined through a seed, `/readyz` answers `503`
+("not ready: waiting to join the cluster") and it fires no schedules; after
+`join_grace` it does both regardless, so that a node whose seeds are all
+down still runs.
+
+A running cluster:
+
+```console
+$ belay --url http://10.0.0.5:7700 members
+NODE     ADDRESS               STATE  LEADER
+belay-1  http://10.0.0.5:7700  alive  yes
+belay-2  http://10.0.0.6:7700  alive
+belay-3  http://10.0.0.7:7700  alive
+```
+
+## Failure scenarios
+
+**A node crashes.** The others notice within seconds (see Timing) and
+declare it dead. Its queues and schedules move to the survivors, spread
+over them, and requests for those queues are redirected to the new owners,
+which start them empty: new jobs are accepted and run there. The crashed
+node's own jobs stay in its data directory, including those its workers
+were running; nothing can lease them until it comes back. When it returns
+with the same id and data directory, it refutes its death, recovers its
+store, takes its keys back, and its expired leases send their jobs back to
+their queues at its next tick.
+
+**Jobs left behind by a move.** Because ownership follows the membership
+and data stays put, a queue can have jobs on two nodes after a move: the
+old owner's from before, the new owner's from after. Leases go to the
+current owner only, so the other node's jobs wait until their node owns the
+queue again (they can still be read, cancelled or deleted by id on that
+node). The same happens when a node joins and takes over keys that had
+work on other nodes.
+
+**A node shuts down gracefully.** On `belay admin shutdown` the node
+gossips that it has left before stopping, and its keys move at once,
+without waiting out a suspicion period.
+
+**A node is slow or loses packets.** It becomes suspect, keeps its keys,
+and refutes the suspicion as soon as it hears of it. Indirect probes and the
+refutation window make false positives rare; the protocol's tests run at
+10% packet loss without any.
+
+**The network partitions.** Each side declares the other dead and, within
+itself, owns every key. Both sides then accept jobs for the same queue
+names, each into its own stores, and fire the schedules they have, so a
+schedule defined on every node fires on both sides (the deduplication key
+of a fire is per node). When the partition heals, reconnect attempts find
+the other side, each side refutes the other's belief that it died, and
+ownership converges again; jobs stay where they were enqueued.
+
+**A node cannot reach any seed.** It stays joining, retries its seeds, and
+after `join_grace` becomes ready and fires every schedule it has, since
+alone it owns them all. If the rest of the cluster is in fact running, that
+is a partition of one: see above.
+
+**A node takes over a schedule.** It continues from the present. A fire
+the previous owner missed while dying is not caught up, and a fire the
+previous owner made just before losing ownership is not known to the new
+owner.
+
+## Limitations
+
+- No replication: a node's queues, jobs and schedules are unavailable
+  while it is down, and data never moves with ownership.
+- No consensus: ownership can briefly overlap after a membership change,
+  and for the whole of a partition. Anything that must happen at most once
+  needs its own fencing.
+- Jobs created by schedules and workflows go into the queues of the node
+  that runs them, whichever node owns those queues. Give such jobs queues
+  that the same node owns, or run workers against every node, or they wait
+  on a node the owner's workers are not redirected to.
+- Schedules created through the API exist only on the node that stored
+  them; define schedules in the configuration file shared by all nodes.
+- Gossip is unauthenticated and unencrypted, over UDP only, with no TCP
+  fallback for large state transfers (a full view is split over several
+  datagrams, and a lost one is repaired by the next exchange).
+- A node that is itself overloaded does not slow its own probing down
+  (Lifeguard's local health multiplier is not implemented), so it can
+  raise suspicions against healthy members; the dynamic suspicion timeout
+  limits the damage.
+- Only the three timing presets are available from the configuration file.
+- Event sequence numbers, the event stream and listings are per node.
