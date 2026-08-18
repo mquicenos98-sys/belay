@@ -95,3 +95,83 @@ limit, workers stuck on another queue).
 The terminal-state series of `belay_queue_jobs` count retained jobs, which
 retention deletes after a while; they are not cumulative. Use the counters
 above for rates.
+
+## Lease latency
+
+| family | type | labels | meaning |
+|---|---|---|---|
+| `belay_lease_wait_seconds` | histogram | `queue` | time jobs waited between becoming eligible and being leased |
+
+"Eligible" is the job's `run_at`: its enqueue time, the end of its delay,
+or the end of a backoff delay. The buckets run from 5 milliseconds to about
+5.8 hours, each four times the previous one:
+
+```text
+0.005 0.02 0.08 0.32 1.28 5.12 20.48 81.92 327.68 1310.72 5242.88 20971.52 +Inf
+```
+
+The queue engine keeps up to 4096 samples between refreshes.
+
+## Schedules and workflows
+
+| family | type | labels | meaning |
+|---|---|---|---|
+| `belay_schedule_fires_total` | counter | `schedule` | jobs enqueued by schedules (`schedule.fired`), manual triggers included |
+| `belay_schedule_misfires_total` | counter | `schedule` | times a schedule found fires missed while belay was down or late (`schedule.misfired`) |
+| `belay_schedules` | gauge | | schedules stored on this node |
+| `belay_workflows_finished_total` | counter | `state` | workflow runs finished, by outcome: `succeeded`, `failed`, `cancelled` |
+| `belay_workflows_running` | gauge | | workflow runs in progress |
+
+A misfire is counted once per schedule and tick, however many fire times
+were missed; the event carries the count. In a cluster `belay_schedules`
+counts every schedule a node stores, including those another node owns and
+fires.
+
+## Storage
+
+Read from the store's statistics at scrape time:
+
+| family | type | meaning |
+|---|---|---|
+| `belay_store_keys` | gauge | keys in the store |
+| `belay_store_live_bytes` | gauge | bytes of keys and values; the dataset held in memory |
+| `belay_store_wal_bytes` | gauge | bytes of write-ahead log on disk |
+| `belay_store_wal_segments` | gauge | write-ahead log segment files |
+| `belay_store_snapshot_bytes` | gauge | size of the newest snapshot |
+| `belay_store_last_seq` | gauge | sequence number of the last write |
+| `belay_store_checkpoints_total` | counter | checkpoints written since the store was opened |
+| `belay_store_wal_syncs_total` | counter | log syncs since the store was opened |
+
+With `storage.in_memory` the log, snapshot, checkpoint and sync figures are
+0. `belay_store_wal_bytes` climbs between checkpoints and drops after
+each; it staying above `storage.checkpoint_bytes` means checkpoints are
+failing. `rate(belay_store_wal_syncs_total[5m])` against the write rate
+shows how well group commit is sharing syncs. More figures, including what
+recovery did at startup, are in `belay admin store` (see
+[storage.md](storage.md)).
+
+## Events, cluster and process
+
+| family | type | labels | meaning |
+|---|---|---|---|
+| `belay_events_published_total` | counter | | events published on the bus |
+| `belay_event_lags_total` | counter | | times a subscriber fell behind the replay buffer and missed events |
+| `belay_event_subscribers` | gauge | | event stream subscribers |
+| `belay_events_buffered` | gauge | | events held for replay (at most `events.buffer`) |
+| `belay_cluster_members` | gauge | `state` | cluster members by state (`alive`, `suspect`, `dead`, `left`) as this node sees them; a node without clustering reports itself as one `alive` member |
+| `belay_uptime_seconds` | gauge | | time since the engine started |
+| `belay_info` | gauge | `version`, `node` | always 1; carries the version and node id |
+
+With `metrics.process = true` (the default) the process collector adds:
+
+| family | type | available |
+|---|---|---|
+| `process_start_time_seconds` | gauge | everywhere; the time the collector was created, milliseconds after the process started |
+| `process_uptime_seconds` | gauge | everywhere |
+| `process_resident_memory_bytes` | gauge | Linux (`/proc/self/status`) |
+| `process_virtual_memory_bytes` | gauge | Linux |
+| `process_threads` | gauge | Linux |
+| `process_open_fds` | gauge | Linux; may read one high, counting the directory handle used to list them |
+| `process_max_fds` | gauge | Linux; absent when unlimited |
+
+Where procfs is missing or unreadable those families are simply absent.
