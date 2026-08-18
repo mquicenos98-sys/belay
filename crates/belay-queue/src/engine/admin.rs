@@ -186,8 +186,8 @@ impl QueueEngine {
     /// Concurrency, rate limit and retention apply at once. Defaults
     /// (`default_timeout`, `default_retry`, `default_max_attempts`) apply
     /// to jobs enqueued from now on; existing jobs keep the values filled
-    /// in when they were enqueued, except that retries of jobs without a
-    /// policy of their own use the new default backoff.
+    /// in when they were enqueued. Every job carries its retry policy from
+    /// enqueue on, so a new default backoff only affects new jobs.
     pub fn set_config(&self, queue: &QueueName, config: QueueConfig) -> Result<QueueInfo> {
         config.validate()?;
         self.transact(|cx| {
