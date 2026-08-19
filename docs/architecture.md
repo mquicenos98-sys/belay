@@ -136,3 +136,67 @@ takes the lock, picks jobs from the ready index, writes their new state
 and lease in one batch, and answers; if nothing is ready and the request
 has a `wait`, it sleeps on a condition variable without holding the
 lock until an enqueue, promotion or release wakes it.
+
+## Threads
+
+The standard library has no async runtime and belay adds none: every
+concurrent activity is an OS thread, and blocking is normal. A running
+server has:
+
+| thread | what it does |
+|---|---|
+| main | starts everything, then waits for the server to stop |
+| `belay-server` | supervisor: waits for the HTTP server to drain, then stops the engine |
+| `belay-http-accept` | accepts connections |
+| `belay-http-conn-*` | one per open connection, from a pool that grows to `server.max_connections` and shrinks when idle; a long-polling lease or an event stream simply blocks its thread |
+| `belay-queue-tick` | the queue tick, every `engine.tick` |
+| `belay-scheduler` | sleeps until the next fire time (at most `scheduler.tick`) and fires what is due |
+| `belay-workflows` | workflow chores, every `workflows.sweep_every` |
+| `belay-housekeeping` | metrics refresh and time-based checkpoints, every `metrics.refresh` |
+| `belay-store` | the store's background thread: interval syncs, size-triggered checkpoints |
+| `belay-gossip-rx`, `belay-gossip-tick` | cluster membership, when clustered |
+
+`belay dev` and programs that embed a worker add the worker's threads: a
+poller, one executor per slot, a heartbeat thread and a watchdog.
+
+Thread-per-connection is a deliberate choice for this workload: the
+connections that matter (workers long-polling for jobs, dashboards
+following events) spend almost all their time blocked, a thread is the
+simplest correct way to block, and a few thousand threads are well
+within what current systems handle. The cost is that
+`server.max_connections` must be sized for every waiting worker slot and
+subscriber, and memory grows with it by one thread stack each.
+
+## The engine's background duties
+
+`belay-core` starts the four duty threads listed above. Nothing in the
+queue, scheduler or workflow engines runs by itself: each exposes a
+`tick(now)` and is driven from outside, which is what makes them
+deterministic under a manual clock in tests (`EngineBuilder::background
+(false)` turns the threads off and `Engine::tick` runs one round of
+everything).
+
+- **Queue tick** (`engine.tick`, 250 ms): promotes scheduled and retrying
+  jobs whose time has come, expires leases that ran out (the attempt
+  fails with `lease expired` or `timed out after ...`), deletes finished
+  jobs past their queue's retention, releases timed uniqueness claims,
+  and reports workers that went silent. A lease request also promotes the
+  due jobs of the queues it looks at, so a due job is leasable even
+  between ticks.
+- **Scheduler**: sleeps until the next fire time, then fires every due
+  schedule, applying its misfire policy (after downtime), overlap policy
+  (while the previous job runs), jitter, calendar and bounds. Each fire's
+  job carries the uniqueness key `sched:<id>:<fire time>`, so a crash
+  between dispatching a fire and recording it cannot fire it twice. In a
+  cluster only the schedule's owner fires it.
+- **Workflow chores** (`workflows.sweep_every`, 30 s): deletes finished
+  runs past `workflows.keep_for`, and reconciles running steps with their
+  jobs. Steps normally advance at once, from a hook the queue engine
+  calls when a job finishes; the sweep catches up on anything missed
+  while the engine was down.
+- **Housekeeping** (`metrics.refresh`, 5 s): folds lease latency samples
+  into `belay_lease_wait_seconds` and writes a checkpoint when
+  `storage.checkpoint_interval` has passed.
+
+Size-triggered checkpoints and interval syncs belong to the store's own
+thread; cluster probes and gossip to the cluster node's.
