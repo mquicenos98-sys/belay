@@ -59,6 +59,9 @@ pub(crate) fn request_framing(head: &RequestHead) -> Result<BodyFraming, ParseEr
     if head.version == Version::Http10 {
         return Err(ParseError::InvalidTransferEncoding);
     }
+    if length.is_some() {
+        return Err(ParseError::ConflictingFraming);
+    }
     let codings: Vec<&str> = head.headers.tokens(TRANSFER_ENCODING).collect();
     match codings.last() {
         Some(last) if last.eq_ignore_ascii_case("chunked") => {
@@ -188,6 +191,15 @@ mod tests {
         assert_eq!(
             framing(&[("Transfer-Encoding", "Chunked")]),
             Ok(BodyFraming::Chunked)
+        );
+    }
+
+    #[test]
+    fn transfer_encoding_with_content_length_is_refused() {
+        // Regression: accepting this pair is the classic CL.TE smuggling vector.
+        assert_eq!(
+            framing(&[("Content-Length", "4"), ("Transfer-Encoding", "chunked")]),
+            Err(ParseError::ConflictingFraming)
         );
     }
 

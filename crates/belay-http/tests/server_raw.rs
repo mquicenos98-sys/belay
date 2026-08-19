@@ -390,9 +390,10 @@ fn max_requests_per_connection_closes_after_the_last_one() {
 #[test]
 fn protocol_violations_get_specific_statuses() {
     let server = serve(app());
-    let cases: [(&[u8], u16); 8] = [
+    let cases: [(&[u8], u16); 9] = [
         (b"GET /hello HTTP/1.1\r\n\r\n", 400),
         (b"GET /hello HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n", 400),
+        (b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\nTransfer-Encoding: chunked\r\n\r\n", 400),
         (b"POST /echo HTTP/1.1\r\nHost: t\r\nTransfer-Encoding: gzip, chunked\r\n\r\n", 501),
         (b"POST /echo HTTP/1.1\r\nHost: t\r\nContent-Length: 1, 2\r\n\r\n", 400),
         (b"GET /hello HTTP/2.0\r\nHost: t\r\n\r\n", 505),
