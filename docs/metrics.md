@@ -175,3 +175,138 @@ With `metrics.process = true` (the default) the process collector adds:
 | `process_max_fds` | gauge | Linux; absent when unlimited |
 
 Where procfs is missing or unreadable those families are simply absent.
+
+## HTTP metrics
+
+The server records every request in the engine's registry:
+
+| family | type | labels | meaning |
+|---|---|---|---|
+| `belay_http_requests_total` | counter | `route`, `method`, `status` | requests answered |
+| `belay_http_request_duration_seconds` | histogram | `route` | time to produce a response |
+| `belay_http_requests_in_flight` | gauge | | requests being handled, long polls included |
+| `belay_http_event_streams` | gauge | | open event streams (`GET /v1/events`) |
+| `belay_http_rate_limited_total` | counter | `token` | requests refused because their token was over its rate |
+
+`route` is the route pattern, such as `/v1/jobs/:id`, never the path, and
+requests that matched no route share `route="unmatched"`, so a client
+probing random URLs cannot create new series. Methods outside `GET`,
+`HEAD`, `POST`, `PUT`, `DELETE`, `PATCH` and `OPTIONS` share
+`method="other"`. `token` is the token's configured name, never the secret;
+the family only counts while authentication is enforced, since per-token
+rate limits apply only then.
+
+Duration buckets, in seconds, run from sub-millisecond reads to the longest
+long-poll wait:
+
+```text
+0.001 0.005 0.01 0.025 0.05 0.1 0.25 0.5 1 2.5 5 10 30 60 +Inf
+```
+
+For an event stream the duration ends when streaming starts; for a
+long-polling lease it ends when the lease is answered, so `/v1/lease`
+durations mostly measure how long workers waited for work, not how fast the
+server is.
+
+A sample:
+
+```text
+belay_http_requests_total{route="/v1/jobs",method="POST",status="201"} 1
+belay_http_requests_total{route="/v1/jobs/:id",method="GET",status="200"} 2
+belay_info{version="0.6.0",node="belay-1"} 1
+belay_jobs_enqueued_total{queue="default"} 1
+belay_jobs_started_total{queue="default"} 1
+belay_jobs_succeeded_total{queue="default"} 1
+belay_lease_wait_seconds_bucket{queue="default",le="0.005"} 1
+belay_queue_jobs{queue="default",state="ready"} 0
+belay_queue_jobs{queue="default",state="succeeded"} 1
+belay_store_keys 3
+```
+
+## Queries and alerts
+
+Throughput and failure ratio per queue:
+
+```promql
+sum by (queue) (rate(belay_jobs_succeeded_total[5m]))
+
+sum by (queue) (rate(belay_jobs_dead_total[15m]))
+  / sum by (queue) (rate(belay_jobs_started_total[15m]))
+```
+
+Backlog and latency:
+
+```promql
+# ready jobs waiting, across a cluster
+sum by (queue) (belay_queue_jobs{state="ready"})
+
+# 95th percentile of the time jobs wait to be leased
+histogram_quantile(0.95,
+  sum by (queue, le) (rate(belay_lease_wait_seconds_bucket[10m])))
+```
+
+Rules worth starting from (thresholds depend on the workload):
+
+```yaml
+groups:
+  - name: belay
+    rules:
+      - alert: BelayQueueFallingBehind
+        expr: max by (queue) (belay_queue_oldest_ready_seconds) > 300
+        for: 10m
+        annotations:
+          summary: "jobs in {{ $labels.queue }} have been ready for over 5 minutes"
+      - alert: BelayDeadJobs
+        expr: sum by (queue) (increase(belay_jobs_dead_total[1h])) > 0
+        annotations:
+          summary: "jobs died in {{ $labels.queue }}; see belay job list --state dead"
+      - alert: BelayLeasesExpiring
+        expr: sum by (queue) (rate(belay_jobs_expired_total[15m])) > 0.1
+        for: 15m
+        annotations:
+          summary: "workers on {{ $labels.queue }} lose leases: crashes, timeouts or missed heartbeats"
+      - alert: BelayNoWorkers
+        expr: belay_workers == 0 and on() sum(belay_queue_jobs{state="ready"}) > 0
+        for: 5m
+      - alert: BelayScheduleMisfires
+        expr: increase(belay_schedule_misfires_total[1h]) > 0
+      - alert: BelayCheckpointsStalled
+        expr: belay_store_wal_bytes > 2 * 134217728
+        for: 30m
+        annotations:
+          summary: "the write-ahead log is over twice checkpoint_bytes (default 128 MiB)"
+      - alert: BelayClusterMemberDown
+        expr: sum(belay_cluster_members{state=~"suspect|dead"}) > 0
+        for: 2m
+      - alert: BelayEventSubscribersLagging
+        expr: increase(belay_event_lags_total[10m]) > 0
+```
+
+`belay_queue_paused == 1` combined with the oldest-ready alert tells a
+forgotten pause apart from missing workers. A rise in
+`belay_jobs_expired_total` alongside `timeout` errors in the jobs' history
+means handlers overrun their timeout; alongside `lease_expired` errors it
+means workers crash or cannot reach the server to heartbeat.
+
+## Configuration and limitations
+
+```toml
+[metrics]
+enabled = true     # register belay's families; false leaves /metrics empty
+process = true     # also export process_* metrics
+refresh = "5s"     # how often lease latencies are folded into the histogram
+```
+
+With `enabled = false` neither the engine nor the HTTP server registers
+anything, and `/metrics` answers with an empty body.
+
+- Counters are in memory and restart from zero with the process; the store
+  counters restart from zero whenever the store is opened.
+- Every node reports only its own queues, store and events; there is no
+  cluster-wide view without aggregating scrapes.
+- The job and schedule counters are keyed by queue name and schedule id;
+  deployments that create queues or schedules dynamically create series at
+  the same rate.
+- Request durations of streamed responses stop when streaming starts.
+- Memory, thread and file descriptor figures of the process collector are
+  available on Linux only.
