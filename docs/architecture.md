@@ -200,3 +200,84 @@ everything).
 
 Size-triggered checkpoints and interval syncs belong to the store's own
 thread; cluster probes and gossip to the cluster node's.
+
+## Design decisions
+
+**Standard library only.** No crate from crates.io: the JSON parser, the
+TOML reader, the HTTP server and client, cron and time zones, SHA-256,
+CRC-32C and the metrics registry are all part of the workspace. The
+build needs nothing but a Rust toolchain, the binary has no supply chain
+beyond it, and every behaviour is in code that can be read and tested
+here. The cost is scope: belay speaks plain HTTP only (no TLS; put a
+proxy in front), has no async I/O, knows only the current rule of each
+time zone (not its history), and every one of those pieces had to be
+written and tested rather than imported.
+
+**The whole dataset in memory.** The store keeps every key and value in
+an in-memory B-tree; the disk holds a log and snapshots for durability
+only. Reads never touch the disk, recovery is "load the snapshot, replay
+the log", and the code stays small enough to test at every crash point.
+Job records are small (a few hundred bytes plus payload), so a machine
+with a few gigabytes holds millions of retained jobs. The cost: the data
+must fit in memory, twice during a checkpoint; start-up time grows with
+the retained jobs; and large payloads belong elsewhere, with a reference
+in the job. Limits (1 MiB payloads and results, bounded error history)
+keep one client from making that an outage.
+
+**One engine lock.** The queue engine guards all its state with one
+mutex and writes to the store while holding it. Every operation is
+atomic and linearizable, and the in-memory indexes can never disagree
+with the store. The cost is that commits are serialized, so under
+`sync = "always"` throughput is bounded by the disk's sync latency;
+batch enqueues and multi-job leases amortize it. Per-queue locks were
+considered and rejected: most deployments have one hot queue, which
+sharding would not relieve, while listings, lookups by id, uniqueness and
+multi-queue leases would need cross-shard coordination.
+
+**Leases, not acknowledgements.** A worker holds a job by a lease with a
+random token and keeps it by heartbeating; everything it reports must
+carry the current token, so a slow worker whose lease expired cannot
+overwrite the result of the one that took over. If a worker vanishes its
+jobs come back when the lease runs out. Delivery is therefore
+at-least-once, and handlers must be idempotent; there is no exactly-once
+mode.
+
+**No replication.** A cluster decides which node serves each queue
+(rendezvous hashing over live members, found by SWIM gossip) but does
+not copy data between nodes. That keeps nodes independent and clusters
+simple to run, and adds capacity for many queues. The cost is
+availability: a node's jobs are unavailable while it is down, and moving
+a queue to a new owner moves none of its jobs. Membership views converge
+without consensus, so ownership can briefly overlap after a change.
+Durability comes from each node's own disk and backups.
+
+**Events in memory.** The event stream is a numbered ring buffer that
+subscribers resume from with `Last-Event-ID`. It is cheap and has no
+effect on write latency, but events are not persisted: a subscriber away
+longer than the buffer lasts, or across a restart, is told how much it
+missed rather than given it. The authoritative state is always the
+API's job, queue and schedule records.
+
+**Validation at the edge, not on read.** Every request body and
+configuration table is decoded and validated by the same code in
+`belay-proto`, which rejects unknown fields with a suggestion. Stored
+records are only decoded, never re-validated, so a limit tightened in a
+later release cannot make existing jobs unreadable, and records ignore
+unknown fields, so an older reader can read a newer writer's records.
+
+## Further reading
+
+| document | covers |
+|---|---|
+| [configuration.md](configuration.md) | every configuration key, environment overrides, validation |
+| [http-api.md](http-api.md) | every endpoint, errors, pagination, scopes, redirects, the event stream |
+| [cli.md](cli.md) | the `belay` command |
+| [operations.md](operations.md) | installing, backups, upgrades, monitoring, capacity, troubleshooting |
+| [storage.md](storage.md) | the log-structured store, its file format and recovery |
+| [queue.md](queue.md) | the job lifecycle, leases, retries, uniqueness, limits and fair sharing |
+| [workers.md](workers.md) | the worker runtime, handlers and the built-in shell handler |
+| [cron.md](cron.md) | cron expressions and time zones |
+| [scheduling.md](scheduling.md) | schedules, misfires, overlap, jitter and calendars |
+| [workflows.md](workflows.md) | workflow DAGs, conditions, failure policies and placeholders |
+| [cluster.md](cluster.md) | membership, ownership, redirects and their limits |
+| [metrics.md](metrics.md) | every metric family |
