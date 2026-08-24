@@ -739,7 +739,7 @@ impl TestServer {
     }
 
     fn relaunch(&mut self) -> Result<()> {
-        let running = launch(&mut self.setup, &mut self.store, 0)?;
+        let running = launch(&mut self.setup, &mut self.store, self.addr.port())?;
         if running.addr != self.addr {
             self.endpoint.set(format!("http://{}", running.addr));
             self.addr = running.addr;
@@ -770,6 +770,7 @@ impl fmt::Debug for TestServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use belay_proto::JobSpec;
     use std::path::Path;
 
     fn file_names(dir: &Path) -> Vec<String> {
@@ -802,6 +803,23 @@ mod tests {
             Err(Error::Unsupported(_))
         ));
         assert!(clock.manual().is_none());
+    }
+
+    #[test]
+    fn memory_stores_survive_a_restart_on_the_same_port() {
+        let mut server = TestServer::start().unwrap();
+        let id = server
+            .client()
+            .jobs()
+            .enqueue(&JobSpec::new("emails", "send"))
+            .unwrap()
+            .id;
+        let url = server.url();
+        server.restart().unwrap();
+        assert!(server.is_running());
+        assert_eq!(server.client().jobs().get(id).unwrap().id, id);
+        // Ports are reused when free, which they are right after a stop.
+        assert_eq!(server.url(), url);
     }
 
     #[test]
