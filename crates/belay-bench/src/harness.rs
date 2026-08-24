@@ -223,6 +223,7 @@ where
     let threads = threads.max(1);
     // The calling thread waits too, and starts the clock on release.
     let ready = Barrier::new(threads + 1);
+    let mut first = 0;
     std::thread::scope(|scope| {
         let handles: Vec<_> = (0..threads)
             .map(|t| {
@@ -230,7 +231,8 @@ where
                     warmup: split(plan.warmup, threads, t),
                     iterations: split(plan.iterations, threads, t),
                 };
-                let (ready, make, start) = (&ready, &make, t as u64 * share.total());
+                let (ready, make, start) = (&ready, &make, first);
+                first += share.total();
                 scope.spawn(move || run_share(ready, make, t, start, share))
             })
             .collect();
@@ -311,7 +313,9 @@ fn split(n: u64, parts: usize, index: usize) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
 
     #[test]
     fn params_render_in_insertion_order() {
@@ -353,6 +357,21 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!((err.to_string().as_str(), calls), ("queue ran dry", 4));
+    }
+
+    #[test]
+    fn parallel_sequence_numbers_are_unique_and_complete() {
+        let seen = Mutex::new(BTreeSet::new());
+        let seen_ref = &seen;
+        let sample = measure_parallel(Plan::new(103).warmup(7), 4, |_| {
+            Ok(move |seq| {
+                assert!(seen_ref.lock().unwrap().insert(seq), "{seq} twice");
+                Ok(Work::ONE)
+            })
+        })
+        .unwrap();
+        assert_eq!((sample.iterations, sample.latency.count()), (103, 103));
+        assert_eq!(seen.into_inner().unwrap(), (0..110).collect());
     }
 
     #[test]
