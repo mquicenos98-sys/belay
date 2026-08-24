@@ -39,3 +39,9 @@ id = "hourly-report"
 cron = "0 * * * *"
 template = { queue = "reports", kind = "build_report", payload = { scope = "hour" } }
 "#;
+
+fn build_report(ctx: &mut JobContext) -> Result<Outcome, HandlerError> {
+    let scope = ctx.payload()["scope"].as_str().unwrap_or("day").to_owned();
+    ctx.progress(50.0, format!("summing the last {scope}"));
+    Ok(Outcome::with(json!({"scope": scope, "orders": 128})))
+}
