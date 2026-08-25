@@ -169,8 +169,7 @@ impl Runner {
         let parsed = match args::parse(&root, args, &lookup) {
             Ok(parsed) => parsed,
             Err(e) => {
-                // The flags did not parse, so there is no --no-color to go by.
-                let color = self.is_terminal();
+                let color = style::color_enabled(false, &lookup, self.is_terminal());
                 let mut output = Output::new(out, err);
                 output.color = color;
                 report_usage(&mut output, &root, &e);
