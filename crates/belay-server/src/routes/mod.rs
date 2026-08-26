@@ -114,7 +114,7 @@ pub(crate) const ROUTES: &[Route] = &[
     Route::new(Get, "/v1/jobs", READ, jobs::list),
     Route::new(Get, "/v1/jobs/:id", READ, jobs::get),
     Route::new(Delete, "/v1/jobs/:id", ADMIN, jobs::delete),
-    Route::new(Post, "/v1/jobs/:id/cancel", ADMIN, jobs::cancel),
+    Route::new(Post, "/v1/jobs/:id/cancel", ENQUEUE, jobs::cancel),
     Route::new(Post, "/v1/jobs/:id/retry", ADMIN, jobs::retry),
     Route::new(Post, "/v1/jobs/:id/promote", ADMIN, jobs::promote),
     // The worker protocol.
@@ -361,6 +361,24 @@ mod tests {
             .map(|r| r.pattern)
             .collect();
         assert_eq!(work.len(), 4, "{work:?}");
+    }
+
+    #[test]
+    fn producers_submit_and_withdraw_but_do_not_administer() {
+        let enqueue: Vec<String> = ROUTES
+            .iter()
+            .filter(|r| r.access == ENQUEUE)
+            .map(|r| format!("{} {}", r.method(), r.pattern))
+            .collect();
+        assert_eq!(
+            enqueue,
+            [
+                "POST /v1/jobs",
+                "POST /v1/jobs/:id/cancel",
+                "POST /v1/workflows",
+                "POST /v1/workflows/:id/cancel",
+            ]
+        );
     }
 
     #[test]

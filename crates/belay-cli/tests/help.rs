@@ -254,6 +254,20 @@ fn invalid_environment_values_name_their_variable() {
 }
 
 #[test]
+fn colors_follow_the_terminal_and_no_color() {
+    let colored = run_with(&runner().terminal(true), "job bogus");
+    assert!(
+        colored.stderr.contains("\x1b[31merror:\x1b[0m"),
+        "{}",
+        colored.stderr
+    );
+    let plain = run_with(&runner().terminal(true).env("NO_COLOR", "1"), "job bogus");
+    assert!(plain.stderr.starts_with("error: "), "{}", plain.stderr);
+    let flag = run_with(&runner().terminal(true), "cron zones --no-color Bogota");
+    assert_eq!(flag.stdout, "America/Bogota\n");
+}
+
+#[test]
 fn test_command_lines_split_like_a_shell() {
     assert_eq!(
         words(r#"enqueue q k -d '{"a": 1}' --cron "0 9 * * MON"  x''"#),
