@@ -37,3 +37,49 @@ fn open(dir: &TempDir) -> Result<(Arc<LogKv>, QueueEngine), Box<dyn Error>> {
     )?;
     Ok((kv, queue))
 }
+
+/// Enqueues a job, then plays the worker: lease it, "send" the mail and
+/// report the result with the lease token.
+fn produce_and_work(dir: &TempDir) -> Result<JobId, Box<dyn Error>> {
+    let (kv, queue) = open(dir)?;
+
+    let created = queue.enqueue(
+        JobSpec::new("emails", "send_welcome")
+            .payload(json!({"user": 42, "template": "welcome-v2"}))
+            .max_attempts(5)
+            .tag("signup"),
+    )?;
+    println!("enqueued {} ({})", created.id, created.state);
+
+    let request = LeaseRequest::new(
+        WorkerId::new("example-worker")?,
+        vec![QueueName::new("emails")?],
+    )
+    .lease_for(Duration::from_secs(30));
+    let leased = queue.lease(&request)?;
+    let Some(first) = leased.first() else {
+        return Err("the job was not handed out".into());
+    };
+    let job = &first.job;
+    println!(
+        "leased {} ({}, attempt {}) with token {}",
+        job.id, job.spec.kind, job.attempt, first.token
+    );
+
+    let user = job.spec.payload["user"].as_u64().unwrap_or_default();
+    let result = json!({"sent_to": user, "provider": "smtp"});
+    queue.complete(
+        &job.id,
+        &CompleteRequest {
+            token: first.token,
+            result: Some(result),
+        },
+    )?;
+    println!("completed {}", job.id);
+
+    // Closing syncs the log and releases the directory lock, so the
+    // store can be opened again.
+    queue.shutdown();
+    kv.close()?;
+    Ok(created.id)
+}
