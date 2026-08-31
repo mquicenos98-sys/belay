@@ -83,3 +83,23 @@ fn produce_and_work(dir: &TempDir) -> Result<JobId, Box<dyn Error>> {
     kv.close()?;
     Ok(created.id)
 }
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let dir = TempDir::with_prefix("belay-embedded")?;
+    let id = produce_and_work(&dir)?;
+
+    // A new process would see the same thing: reopening replays the log.
+    let (kv, queue) = open(&dir)?;
+    let job = queue.get(&id)?;
+    println!(
+        "after reopening: job {} is {} with result {}",
+        job.id,
+        job.state,
+        job.result
+            .map_or_else(|| "none".to_owned(), |r| r.to_string()),
+    );
+    assert_eq!(job.state, JobState::Succeeded);
+    queue.shutdown();
+    kv.close()?;
+    Ok(())
+}
