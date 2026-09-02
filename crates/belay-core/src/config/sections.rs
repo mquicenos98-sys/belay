@@ -94,9 +94,13 @@ impl ServerConfig {
     /// Whether `listen` only accepts connections from this machine.
     #[must_use]
     pub fn is_loopback(&self) -> bool {
-        self.listen
-            .parse::<SocketAddr>()
-            .is_ok_and(|addr| addr.ip().is_loopback())
+        match self.listen.parse::<SocketAddr>() {
+            Ok(addr) => addr.ip().is_loopback(),
+            Err(_) => self
+                .listen
+                .rsplit_once(':')
+                .is_some_and(|(host, _)| host.eq_ignore_ascii_case("localhost")),
+        }
     }
 
     /// Whether `listen` names a wildcard address (`0.0.0.0`, `[::]`), which
@@ -793,6 +797,7 @@ mod tests {
         };
         assert!(server("127.0.0.1:1").is_loopback());
         assert!(server("[::1]:1").is_loopback());
+        assert!(server("localhost:1").is_loopback());
         assert!(!server("0.0.0.0:1").is_loopback());
         assert!(server("0.0.0.0:1").is_wildcard());
         assert!(server("[::]:1").is_wildcard());
