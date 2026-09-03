@@ -63,3 +63,64 @@ fn thumbnail(ctx: &mut JobContext) -> Result<Outcome, HandlerError> {
     let output = format!("{image}.{width}px.png");
     Ok(Outcome::with(json!({"thumbnail": output, "width": width})))
 }
+
+fn main() -> Result<(), Box<dyn Error>> {
+    belay_common::log::init_stderr(Filter::new(Level::Info), LogFormat::Logfmt);
+
+    let client = Client::new(ClientConfig::from_env())?;
+    let source: Arc<dyn JobSource> = Arc::new(client);
+
+    let registry = Registry::new()
+        // At most two thumbnails at once, and a minute each.
+        .register_with(
+            "thumbnail",
+            handler_fn(thumbnail),
+            KindOptions::new()
+                .concurrency(2)
+                .timeout(Duration::from_secs(60)),
+        )
+        // Shell jobs run the program their payload names, for anyone who
+        // can enqueue: allow only what this worker is meant to run.
+        .register(
+            builtin::SHELL,
+            ShellHandler::new().allow(["echo", "convert"]),
+        )
+        .register(builtin::ECHO, builtin::EchoHandler)
+        .wrap(LoggingMiddleware::new());
+
+    let config = WorkerConfig::new(
+        WorkerId::new(format!("example-{}", std::process::id()))?,
+        vec!["media".parse()?],
+    )
+    .concurrency(4)
+    .lease_for(Duration::from_secs(30))
+    .poll_wait(Duration::from_secs(10))
+    .shutdown_grace(Duration::from_secs(20));
+
+    let worker = Worker::new(source, registry, config)?;
+    println!(
+        "worker {} serving {:?}; press Enter to stop",
+        worker.id(),
+        worker
+            .config()
+            .queues
+            .iter()
+            .map(|q| q.as_str())
+            .collect::<Vec<_>>(),
+    );
+
+    let shutdown = Shutdown::new();
+    let trigger = shutdown.clone();
+    thread::spawn(move || {
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+        trigger.trigger();
+    });
+
+    let report = worker.run(shutdown)?;
+    println!(
+        "stopped after {:?}: {} (drained: {})",
+        report.uptime, report.stats, report.drained
+    );
+    Ok(())
+}
