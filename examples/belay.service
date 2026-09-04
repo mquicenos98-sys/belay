@@ -1,0 +1,57 @@
+# systemd unit for a belay server.
+#
+#   sudo useradd --system --home-dir /var/lib/belay --shell /usr/sbin/nologin belay
+#   sudo install -m 0755 target/release/belay /usr/local/bin/belay
+#   sudo install -m 0640 -o root -g belay examples/belay.toml /etc/belay/belay.toml
+#   sudo install -m 0640 -o root -g belay /dev/null /etc/belay/belay.env
+#   sudo install -m 0644 examples/belay.service /etc/systemd/system/belay.service
+#   sudo systemctl daemon-reload && sudo systemctl enable --now belay
+#
+# /etc/belay/belay.env holds what `belay admin shutdown` needs to stop the
+# server gracefully: BELAY_URL=http://127.0.0.1:7700 and BELAY_TOKEN set to
+# the secret of a token with the admin scope. The server itself ignores
+# these two variables; only BELAY_<SECTION>__<KEY> names override its
+# configuration.
+
+[Unit]
+Description=belay job queue and cron scheduler
+Documentation=https://github.com/mquicenos98-sys/belay/blob/main/docs/operations.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=belay
+Group=belay
+EnvironmentFile=/etc/belay/belay.env
+ExecStartPre=/usr/local/bin/belay config check /etc/belay/belay.toml
+ExecStart=/usr/local/bin/belay server --config /etc/belay/belay.toml
+
+# The standard library cannot catch signals, so SIGTERM ends belay at once.
+# That is safe (the store is crash-consistent and leased jobs return to
+# their queues when their leases expire), but a drain is gentler: ask the
+# server to shut down, then wait for the process to finish on its own.
+ExecStop=/bin/sh -c '/usr/local/bin/belay --quiet admin shutdown; while kill -0 "$MAINPID" 2>/dev/null; do sleep 0.5; done'
+# Longer than server.shutdown_grace, so the drain can complete.
+TimeoutStopSec=45s
+Restart=on-failure
+RestartSec=2s
+
+# /var/lib/belay, owned by the service user; storage.dir points here.
+StateDirectory=belay
+StateDirectoryMode=0750
+WorkingDirectory=/var/lib/belay
+
+# Every connection holds a thread and a descriptor: cover
+# server.max_connections plus the store's files.
+LimitNOFILE=65536
+
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/var/lib/belay
+
+[Install]
+WantedBy=multi-user.target
