@@ -1,0 +1,134 @@
+# A single belay node in production: durable storage, bearer tokens for
+# every client, three configured queues, a calendar and two schedules.
+#
+# Check it with `belay config check examples/belay.toml` and see every
+# setting it leaves at its default with `belay config print`. The token
+# digests below belong to secrets that were thrown away: generate your own
+# (`openssl rand -hex 32`), keep them in your secret store, and put their
+# SHA-256 here (`printf %s "$SECRET" | sha256sum`).
+
+[server]
+# Other hosts connect, which is only allowed with [[auth.tokens]]. Put a
+# TLS-terminating proxy in front if clients cross an untrusted network.
+listen = "0.0.0.0:7700"
+# Every long-polling worker slot and every event subscriber holds a
+# connection; leave room for ordinary requests on top.
+max_connections = 2048
+max_body = "4MiB"
+keep_alive = "1m"
+request_timeout = "30s"
+shutdown_grace = "30s"
+
+[storage]
+dir = "/var/lib/belay"
+# Every acknowledged write survives a power loss.
+sync = "always"
+checkpoint_bytes = "256MiB"
+checkpoint_interval = "30m"
+segment_size = "32MiB"
+recovery = "strict"
+
+# Operators and deploy scripts: everything, including queue and schedule
+# changes, checkpoints and `belay admin shutdown`.
+[[auth.tokens]]
+name = "ops"
+token_sha256 = "05160595885dec7604708ec8d6f4cff76fbcfcc61a0142b6e270753a53ef6328"  # gitleaks:allow
+scopes = ["admin"]
+
+# The application: enqueue jobs, start workflows, cancel what it
+# submitted, and read their outcome.
+[[auth.tokens]]
+name = "app"
+token_sha256 = "88643a677da2afbd7b70760293508d708f646cb7fe22c5edd0a8be6625664a7e"  # gitleaks:allow
+scopes = ["enqueue", "read"]
+
+# Worker processes: lease, heartbeat, complete and fail.
+[[auth.tokens]]
+name = "workers"
+token_sha256 = "dad82dd4f3b0db09e18a25fcc954a185f8be2dc274a692adaf311adae7af9c49"  # gitleaks:allow
+scopes = ["work"]
+
+# Prometheus and dashboards: /metrics and the read-only API.
+[[auth.tokens]]
+name = "monitoring"
+token_sha256 = "56d9a09f109c42dc237f2fb33386553c06f8c7d830fac530352cc57089f367e2"  # gitleaks:allow
+scopes = ["read"]
+
+[log]
+level = "info,belay_server::access=warn"
+format = "json"
+
+[engine]
+tick = "250ms"
+worker_timeout = "2m"
+worker_retention = "1h"
+
+# Outgoing mail: bounded by the provider's rate limit, retried for about
+# a day before giving up.
+[queues.emails]
+max_concurrency = 16
+rate_limit = { per_second = 20.0, burst = 40 }
+default_timeout = "2m"
+default_retry = "exp:30s*2..2h~full"
+default_max_attempts = 15
+retention = { succeeded = "1d", dead = "14d", cancelled = "1d" }
+
+# Webhook deliveries to customer endpoints, which fail often and briefly.
+[queues.webhooks]
+max_concurrency = 64
+default_timeout = "30s"
+default_retry = "exp:5s*2..30m~full"
+default_max_attempts = 20
+retention = { succeeded = "12h", dead = "30d", cancelled = "1d" }
+
+# Long report builds: few at a time, few attempts, kept for a week.
+[queues.reports]
+max_concurrency = 2
+default_timeout = "1h"
+default_retry = "const:5m"
+default_max_attempts = 3
+retention = { succeeded = "7d", dead = "30d", cancelled = "7d" }
+
+[scheduler]
+enabled = true
+misfire_threshold = "1m"
+
+[[calendars]]
+name = "business-hours"
+timezone = "America/Bogota"
+description = "Office hours, Monday to Friday, without public holidays"
+exclude_dates = ["2026-10-12", "2026-11-02", "2026-11-16", "2026-12-08", "2026-12-25"]
+windows = [{ days = ["mon-fri"], start = "08:00", end = "18:00" }]
+
+[[schedules]]
+id = "nightly-sales-report"
+cron = "30 2 * * *"
+timezone = "America/Bogota"
+description = "Yesterday's sales as a PDF"
+misfire = "fire_once"
+overlap = "skip"
+jitter = "2m"
+template = { queue = "reports", kind = "sales_report", payload = { range = "yesterday", format = "pdf" } }
+
+[[schedules]]
+id = "crm-sync"
+cron = "*/15 * * * *"
+calendar = "business-hours"
+misfire = "skip"
+overlap = "skip"
+[schedules.template]
+queue = "webhooks"
+kind = "crm_sync"
+timeout = "10m"
+max_attempts = 2
+tags = ["crm"]
+
+[workflows]
+keep_for = "14d"
+
+[events]
+buffer = 20000
+
+[metrics]
+enabled = true
+process = true
