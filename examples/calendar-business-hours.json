@@ -1,0 +1,19 @@
+{
+  "name": "business-hours",
+  "timezone": "Europe/Berlin",
+  "description": "Weekdays 09:00-17:30 in Berlin, a late shift on Thursdays, no public holidays",
+  "exclude_dates": [
+    "2026-10-03",
+    "2026-12-24",
+    "2026-12-25",
+    "2026-12-26",
+    "2026-12-31",
+    "2027-01-01",
+    "2027-03-26",
+    "2027-03-29"
+  ],
+  "windows": [
+    { "days": ["mon-fri"], "start": "09:00", "end": "17:30" },
+    { "days": ["thu"], "start": "17:30", "end": "21:00" }
+  ]
+}
