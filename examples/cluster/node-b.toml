@@ -1,0 +1,87 @@
+# Node b of a three-node belay cluster on 10.0.0.11-13. The three files
+# differ only in the [cluster] identity and addresses; everything else
+# (tokens, queues, calendars, schedules) must be the same on every node.
+#
+# Each queue and each schedule is owned by one live node. A node answers
+# requests about queues it does not own with a 307 redirect to the owner,
+# and fires only the schedules it owns. There is no replication: a node's
+# jobs stay on its disk and are unavailable while it is down.
+#
+# Check it with `belay config check examples/cluster/node-b.toml`.
+
+[server]
+listen = "0.0.0.0:7700"
+max_connections = 2048
+
+[storage]
+dir = "/var/lib/belay"
+sync = "always"
+
+[[auth.tokens]]
+name = "ops"
+token_sha256 = "b0b64ae8fc15faed5884550720758ea8789e502da6e69638b356b1ac3ecf6c5a"  # gitleaks:allow
+scopes = ["admin"]
+
+[[auth.tokens]]
+name = "app"
+token_sha256 = "ac3e8f712ef086ed8fc15c5736a8925f618e4e44363c55a5b7e17356ed5fb090"  # gitleaks:allow
+scopes = ["enqueue", "read"]
+
+[[auth.tokens]]
+name = "workers"
+token_sha256 = "aff84a3113d633bc37e487a7b0fe57032b067ac409358c64dfb6f52e5c088d94"  # gitleaks:allow
+scopes = ["work"]
+
+[log]
+format = "json"
+
+[cluster]
+enabled = true
+node_id = "belay-b"
+# Shared by the three nodes; datagrams from another cluster are dropped.
+name = "belay-prod"
+gossip_listen = "0.0.0.0:7946"
+# gossip_listen is a wildcard, so say which address the others should use.
+advertise = "10.0.0.12:7946"
+# server.listen is a wildcard too: redirects need a reachable URL.
+api_addr = "http://10.0.0.12:7700"
+# Any live node lets a new one join; list the other two.
+seeds = ["10.0.0.11:7946", "10.0.0.13:7946"]
+profile = "lan"
+join_grace = "10s"
+meta = { zone = "rack-2" }
+
+[queues.emails]
+max_concurrency = 8
+rate_limit = { per_second = 10.0, burst = 20 }
+default_timeout = "2m"
+default_retry = "exp:30s*2..2h~full"
+default_max_attempts = 15
+
+[queues.reports]
+max_concurrency = 2
+default_timeout = "1h"
+default_max_attempts = 3
+
+# Calendars are stored per node and a schedule is checked against the
+# calendars of the node that fires it, so every node carries the same ones.
+[[calendars]]
+name = "business-hours"
+timezone = "Europe/Berlin"
+windows = [{ days = ["mon-fri"], start = "09:00", end = "17:00" }]
+
+# Every node stores every schedule; only the owner of `schedule:<id>` fires
+# it, and a node that takes over continues from the present.
+[[schedules]]
+id = "nightly-sales-report"
+cron = "30 2 * * *"
+timezone = "Europe/Berlin"
+overlap = "skip"
+template = { queue = "reports", kind = "sales_report" }
+
+[[schedules]]
+id = "office-digest"
+cron = "0 9 * * *"
+timezone = "Europe/Berlin"
+calendar = "business-hours"
+template = { queue = "emails", kind = "office_digest" }
