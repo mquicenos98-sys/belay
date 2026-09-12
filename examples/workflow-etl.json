@@ -1,0 +1,90 @@
+{
+  "name": "nightly-etl",
+  "meta": {
+    "owner": "data-team",
+    "source": "examples/workflow-etl.json"
+  },
+  "steps": [
+    {
+      "name": "extract-orders",
+      "job": {
+        "queue": "etl",
+        "kind": "extract",
+        "payload": { "table": "orders", "since": "yesterday" },
+        "timeout": "20m",
+        "max_attempts": 3
+      }
+    },
+    {
+      "name": "extract-customers",
+      "job": {
+        "queue": "etl",
+        "kind": "extract",
+        "payload": { "table": "customers", "since": "yesterday" },
+        "timeout": "20m",
+        "max_attempts": 3
+      }
+    },
+    {
+      "name": "transform",
+      "depends_on": ["extract-orders", "extract-customers"],
+      "job": {
+        "queue": "etl",
+        "kind": "transform",
+        "payload": {
+          "orders": "{{steps.extract-orders.result.path}}",
+          "customers": "{{steps.extract-customers.result.path}}",
+          "rows_expected": "{{steps.extract-orders.result.rows}}"
+        },
+        "timeout": "1h"
+      }
+    },
+    {
+      "name": "load",
+      "depends_on": ["transform"],
+      "on_failure": "continue",
+      "job": {
+        "queue": "etl",
+        "kind": "load",
+        "payload": {
+          "input": "{{steps.transform.result.path}}",
+          "target": "warehouse.daily_orders"
+        },
+        "timeout": "30m"
+      }
+    },
+    {
+      "name": "rollback-load",
+      "depends_on": ["load"],
+      "when": "any_failed",
+      "job": {
+        "queue": "etl",
+        "kind": "rollback",
+        "priority": 100,
+        "payload": { "target": "warehouse.daily_orders", "batch": "{{steps.transform.result.batch}}" }
+      }
+    },
+    {
+      "name": "refresh-dashboards",
+      "depends_on": ["load"],
+      "on_failure": "continue",
+      "job": {
+        "queue": "etl",
+        "kind": "refresh_dashboards",
+        "payload": { "note": "loaded {{steps.load.result.rows}} rows" },
+        "max_attempts": 2
+      }
+    },
+    {
+      "name": "cleanup",
+      "depends_on": ["rollback-load", "refresh-dashboards"],
+      "when": "always",
+      "on_failure": "continue",
+      "job": {
+        "queue": "etl",
+        "kind": "cleanup",
+        "payload": { "prefix": "tmp/nightly-etl/" }
+      }
+    }
+  ]
+}
