@@ -5,6 +5,42 @@ All notable changes to belay are documented here. The format is based on
 follows [Semantic Versioning](https://semver.org/) (while it is at 0.x, a
 minor version may break things; the notes say when it does).
 
+## [0.6.0] - 2026-09-11
+
+A security and correctness release. Upgrade every server that sits
+behind a proxy; note the scope change for cancelling jobs.
+
+### Security
+
+- Requests carrying both `Content-Length` and `Transfer-Encoding:
+  chunked` are now refused with `400` and the connection is closed. The
+  server used to frame such a request by its `Transfer-Encoding`; behind
+  a proxy that frames by `Content-Length`, the two disagreed about where
+  the request ended, which allows request smuggling (CL.TE). RFC 9112
+  treats the combination as an error.
+
+### Changed
+
+- `POST /v1/jobs/:id/cancel` needs the `enqueue` scope instead of
+  `admin`, like `POST /v1/workflows/:id/cancel`: a producer may withdraw
+  what it submitted. Tokens with only `enqueue` can now cancel jobs;
+  review your tokens' scopes if you relied on the old rule.
+
+### Fixed
+
+- `server.listen = "localhost:7700"` counts as a loopback address, so a
+  configuration without tokens is accepted as it is for `127.0.0.1`.
+- Gossip updates were retransmitted `log2(n + 1)` times instead of
+  `log10(n + 1)`, two to three times the traffic a cluster needs.
+- Usage errors were colored even with `NO_COLOR` set or `TERM=dumb`.
+- Mistyped one- and two-letter commands (`belay job gt`, `belay
+  schedule mr`) get a "did you mean" suggestion like longer ones.
+- `belay-bench --filter batch=1` also ran the `batch=16` cases;
+  parameters are now compared for equality.
+- Multi-threaded `belay-bench` cases whose calls did not divide evenly
+  between threads reused sequence numbers, so some inserts were timed as
+  overwrites.
+
 ## [0.5.0] - 2026-07-24
 
 Documentation: a guide for every part of belay, a reference for the
