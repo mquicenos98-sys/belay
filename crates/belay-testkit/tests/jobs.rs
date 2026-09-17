@@ -581,6 +581,16 @@ fn a_job_of_a_kind_no_worker_handles_dies_without_blocking_the_queue() -> Result
 fn a_per_kind_limit_holds_on_a_worker_with_more_slots() -> Result<()> {
     let server = TestServer::start()?;
     let gate = Gate::new();
+    // Enqueue everything before the worker starts, so its first lease takes
+    // all three: started one by one, the second would park on the limit and
+    // stop the worker leasing before the third arrived.
+    let client = server.client();
+    let ids: Vec<JobId> = (0..3)
+        .map(|n| {
+            let spec = job("heavy", "transcode").payload(numbered(n));
+            Ok(client.jobs().enqueue(&spec)?.id)
+        })
+        .collect::<Result<_>>()?;
     // One unlimited kind makes the worker lease for all its free slots;
     // transcodes beyond their limit then wait on the worker.
     let worker = server
@@ -591,13 +601,6 @@ fn a_per_kind_limit_holds_on_a_worker_with_more_slots() -> Result<()> {
         .kind_options("transcode", belay_worker::KindOptions::new().concurrency(1))
         .recording("thumbnail")
         .start()?;
-    let client = server.client();
-    let ids: Vec<JobId> = (0..3)
-        .map(|n| {
-            let spec = job("heavy", "transcode").payload(numbered(n));
-            Ok(client.jobs().enqueue(&spec)?.id)
-        })
-        .collect::<Result<_>>()?;
     worker
         .recorder()
         .wait_until(DEFAULT_TIMEOUT, |r| r.running_in("heavy") == 1)?;
